@@ -10,13 +10,15 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import subprocess
 import tempfile
+import tomllib
 import uuid
 
 import yaml
 
-from integration import PG_IMAGE, ROOT, S3_IMAGE, command
+from integration import PG_IMAGE, ROOT, S3_IMAGE, command, wait_for
 
 
 class Cluster:
@@ -74,6 +76,17 @@ def dependency(name, image, env, args, volumes, mounts, security=None):
                                       "readinessProbe": {"tcpSocket": {"port": 5432 if name == "postgres" else 7070},
                                                          "periodSeconds": 2}}], "volumes": volumes}}}},
     ]
+
+
+def wait_ssh(address, port):
+    def listening():
+        try:
+            with socket.create_connection((address, port), timeout=1) as stream:
+                return stream.recv(256).startswith(b"SSH-2.0-")
+        except OSError:
+            return False
+
+    wait_for(listening, "SSH service dataplane readiness")
 
 
 def exercise(args, base, cluster):
@@ -144,8 +157,9 @@ def exercise(args, base, cluster):
                "--wait", "--timeout", "120s"]
     print("Installing the independent chart with verified TLS PostgreSQL/S3", flush=True)
     command(install)
+    version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
     assert cluster.kubectl("exec", "deployment/backend", "-c", "backend", "--",
-                           "/usr/local/bin/git-rs", "--version").stdout.startswith(b"git-rs ")
+                           "/usr/local/bin/git-rs", "--version").stdout == f"git-rs {version}\n".encode()
     cluster.kubectl("exec", "-i", "deployment/backend", "-c", "backend", "--", "curl", "--disable",
                     "--silent", "--fail", "--cacert", "/etc/git-rs/s3-ca/ca.crt", "--request", "PUT",
                     "--config", "-", data=(f'url = "https://s3.{cluster.namespace}.svc:7070/packs"\n'
@@ -179,16 +193,29 @@ def exercise(args, base, cluster):
     command(["git", "-C", source, "add", "."], env=env)
     command(["git", "-C", source, "-c", "commit.gpgsign=false", "commit", "-m", "Synthetic chart smoke"], env=env)
     print("Native SSH push/clone, unknown identity rejection, cold restart and Helm upgrade", flush=True)
+    wait_ssh(address, ssh_port)
     command(["git", "-C", source, "push", url, "main"], env=env)
     command(["git", "clone", url, base / "clone"], env=env)
     assert (base / "clone/payload.txt").read_bytes() == payload
     rejected = command(["git", "ls-remote", url], env=dict(env, GIT_SSH_COMMAND=ssh("unknown-key")), ok=False)
     assert rejected.returncode and b"Permission denied" in rejected.stderr, rejected.stderr
+    selector = "app.kubernetes.io/instance=smoke,app.kubernetes.io/name=git-rs"
+    old_names = {pod["metadata"]["name"] for pod in json.loads(
+        cluster.kubectl("get", "pods", "-l", selector, "-o", "json").stdout)["items"]}
     cluster.kubectl("rollout", "restart", "deployment/backend")
     cluster.kubectl("rollout", "status", "deployment/backend", "--timeout=120s")
+    # Deployment readiness does not wait for terminating pods or for kube-proxy
+    # to observe EndpointSlices. Establish the cold-start/transport preconditions
+    # explicitly; never retry the Git operation whose result is under test.
+    wait_for(lambda: not old_names.intersection(
+        pod["metadata"]["name"] for pod in json.loads(
+            cluster.kubectl("get", "pods", "-l", selector, "-o", "json").stdout)["items"]),
+        "old serving pods to disappear before cold clone")
+    wait_ssh(address, ssh_port)
     command(["git", "clone", url, base / "cold-clone"], env=env)
     assert (base / "cold-clone/payload.txt").read_bytes() == payload
     command(install)
+    wait_ssh(address, ssh_port)
     command(["git", "ls-remote", url], env=env)
     print(json.dumps({"status": "passed", "profile": "external TLS PostgreSQL/S3",
                       "replicas": 2, "ssh": "generated identity, strict host verification, unknown key rejected",

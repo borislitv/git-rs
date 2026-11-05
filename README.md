@@ -43,13 +43,13 @@ Versioned artifacts:
 
 | Artifact | Location |
 | --- | --- |
-| Runtime image, Linux amd64 | `ghcr.io/borislitv/git-rs:0.1.0-rc.1` |
+| Runtime image, Linux amd64 | `ghcr.io/borislitv/git-rs:0.1.0-rc.2` |
 | OCI application chart | `oci://ghcr.io/borislitv/charts/git-rs` |
 | Chart archive, checksums, provenance | [GitHub Releases](https://github.com/borislitv/git-rs/releases) |
 
 ```sh
-helm pull oci://ghcr.io/borislitv/charts/git-rs --version 0.1.0-rc.1
-helm show values oci://ghcr.io/borislitv/charts/git-rs --version 0.1.0-rc.1
+helm pull oci://ghcr.io/borislitv/charts/git-rs --version 0.1.0-rc.2
+helm show values oci://ghcr.io/borislitv/charts/git-rs --version 0.1.0-rc.2
 ```
 
 The chart is **independent, with `dependencies: []`**. It directly renders optional CNPG Cluster,

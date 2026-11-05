@@ -11,7 +11,7 @@ RUN cargo build --release --offline --locked
 FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS runtime
 ARG GIT_DEB_VERSION=1:2.53.0-1ubuntu1.1
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    git=${GIT_DEB_VERSION} git-man=${GIT_DEB_VERSION} curl postgresql-client ca-certificates coreutils openssh-server \
+    git=${GIT_DEB_VERSION} git-man=${GIT_DEB_VERSION} curl postgresql-client ca-certificates coreutils openssh-server tini \
     && git --version && curl --version && psql --version \
     && test "$(git --version)" = "git version 2.53.0" \
     && rm -rf /var/lib/apt/lists/* \
@@ -20,7 +20,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && groupadd -g 10001 git-rs && useradd -u 10001 -g 10001 -M -d /var/empty/git-rs -s /bin/sh -p '*' git-rs
 COPY --from=build /build/target/release/git-rs /usr/local/bin/git-rs
 USER 10001:10001
-ENTRYPOINT ["/usr/local/bin/git-rs"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/git-rs"]
 
 FROM runtime AS test
 USER 0:0

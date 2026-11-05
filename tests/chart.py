@@ -104,7 +104,7 @@ def main():
     assert "AuthorizedKeysFile none" in resource(defaults, "ConfigMap")["data"]["sshd_config"]
     assert "AuthorizedKeysCommandUser git-rs" in resource(defaults, "ConfigMap")["data"]["sshd_config"]
     assert resource(defaults, "Job")["metadata"]["annotations"]["helm.sh/hook"] == "post-install,post-upgrade"
-    assert backend["image"] == "ghcr.io/borislitv/git-rs:0.1.0-rc.1"
+    assert backend["image"] == f"ghcr.io/borislitv/git-rs:{manifest['package']['version']}"
     assert pg["spec"]["imageName"].endswith("@sha256:605c6e45e733ce0e908505e9ac3c441637d6794d330ec0e9d8d6f631b6918b1e")
 
     external_file = CHART / "values-external.example.yaml"

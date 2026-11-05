@@ -109,7 +109,7 @@ Edit `.local/values.yaml` for the selected profile and precreate the required Se
 
 ```sh
 helm upgrade --install git-rs oci://ghcr.io/borislitv/charts/git-rs \
-  --version 0.1.0-rc.1 --namespace git-backend -f .local/values.yaml \
+  --version 0.1.0-rc.2 --namespace git-backend -f .local/values.yaml \
   --wait --timeout 10m
 kubectl -n git-backend exec deployment/git-rs-git-rs -c backend -- \
   git-rs create team/project alice
@@ -135,5 +135,5 @@ copy. Identity-map Secrets are read by the authorization helper on authenticatio
 updates follow Kubernetes propagation delays. Rotate database/S3 credentials with a controlled
 rollout because they are process environment values.
 
-See [operations and recovery](https://github.com/borislitv/git-rs/blob/v0.1.0-rc.1/OPERATIONS.md)
+See [operations and recovery](https://github.com/borislitv/git-rs/blob/v0.1.0-rc.2/OPERATIONS.md)
 for backup/truncation semantics, resource limits and unverified production properties.

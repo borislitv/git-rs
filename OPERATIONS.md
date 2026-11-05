@@ -10,6 +10,10 @@ socket's parent directory must be private (`0700`). The socket has one serving o
 refuses a live socket and replaces only a stale socket, then sweeps the prior recorded instance
 scratch. A pod's `emptyDir` contains no authoritative Git data.
 
+The runtime uses Tini as PID 1 to forward termination signals and reap descendants. The backend
+does not implement application-level graceful signal draining: termination is a crash-safe stop,
+and active clients can receive an unknown outcome. Durable leases expire independently of the pod.
+
 | Environment | Meaning |
 | --- | --- |
 | `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | libpq primary metadata connection |
