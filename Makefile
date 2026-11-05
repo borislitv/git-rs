@@ -1,4 +1,4 @@
-.PHONY: check integration failures chart kubernetes image bench
+.PHONY: check integration failures chart kubernetes istio image bench
 
 HELM ?= helm
 K3S_CONTAINER ?= git-rs-k3s-test
@@ -21,6 +21,10 @@ chart:
 
 kubernetes: image
 	python3 tests/kubernetes.py --cluster-container $(K3S_CONTAINER) --helm $(HELM)
+
+# Uses an existing production image; owns a separate disposable cluster.
+istio:
+	python3 tests/istio.py --helm $(HELM)
 
 image:
 	docker build --target release -t git-rs:dev .

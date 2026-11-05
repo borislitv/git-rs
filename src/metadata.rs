@@ -1,7 +1,8 @@
 use crate::protocol::{Oid, Update, hex, unhex};
 use crate::{Result, auth, invalid, process, scratch};
 use std::collections::BTreeMap;
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -62,6 +63,65 @@ fn psql() -> Result<Command> {
 pub fn sql(query: &str) -> Result<String> {
     let output = process::capture(&mut psql()?, query.as_bytes(), 16 * 1024 * 1024)?;
     Ok(String::from_utf8(output)?)
+}
+
+// Keep one connection/transaction for snapshot consistency, but decode each row
+// as it arrives. Hex-encoded legal refs alone can exceed sql()'s 16 MiB capture
+// limit; pack catalogs also grow independently of the number of refs. The only
+// retained allocation is the decoded Snapshot, not a second full wire image.
+fn snapshot_rows(query: &str, mut row: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    process::check_operation()?;
+    let mut child = process::Guard::new(
+        psql()?
+            // psql otherwise buffers an entire PGresult before writing stdout.
+            .args(["-v", "FETCH_COUNT=256"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let mut stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| invalid("missing SQL input"))?;
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("missing SQL output"))?;
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(move || stdin.write_all(query.as_bytes()));
+        let result = (|| -> Result<()> {
+            let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
+            loop {
+                process::check_operation()?;
+                line.clear();
+                // Generated keys and hex-encoded 1024-byte names fit comfortably.
+                // Bound an individual row even if database contents are corrupt.
+                let count = reader.by_ref().take(8193).read_until(b'\n', &mut line)?;
+                if count == 0 {
+                    return Ok(());
+                }
+                if count > 8192 || line.last() != Some(&b'\n') {
+                    return Err(invalid("invalid metadata row length or framing"));
+                }
+                row(std::str::from_utf8(&line[..line.len() - 1])?)?;
+            }
+        })();
+        if result.is_err() {
+            child.terminate();
+        }
+        let sent = sender.join().map_err(|_| invalid("SQL writer panicked"))?;
+        result?;
+        sent?;
+        // Never expose a partial snapshot after a late SELECT/COMMIT failure.
+        if !child.wait()?.success() {
+            return Err(invalid("metadata snapshot transaction failed"));
+        }
+        Ok(())
+    })
 }
 
 /// A committed lease survives connection loss. Operations have at most 120 s;
@@ -133,7 +193,7 @@ impl Drop for Barrier {
 
 pub fn migrate() -> Result<()> {
     sql(&format!(
-        "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('git-rs-schema',0)); DO $migration$ BEGIN IF to_regclass('git_rs.schema_version') IS NULL THEN EXECUTE $ddl${}$ddl$; ELSIF NOT (SELECT count(*)=1 AND min(version)=1 FROM git_rs.schema_version) THEN RAISE EXCEPTION 'unsupported metadata schema version'; END IF; END $migration$; COMMIT;",
+        "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('git-rs-schema',0)); {} COMMIT;",
         include_str!("../migrations/001.sql")
     ))?;
     Ok(())
@@ -186,26 +246,23 @@ pub fn snapshot(slug: &str, principal: &str, write: bool) -> Result<Snapshot> {
         text(principal),
         if write { "AND p.role <> 'reader'" } else { "" }
     );
-    let output = sql(&query)?;
-    let mut lines = output.lines();
-    let header: Vec<_> = lines
-        .next()
-        .ok_or_else(|| invalid("repository unavailable"))?
-        .split('\t')
-        .collect();
-    if header.len() != 5 || header[0] != "repo" {
-        return Err(invalid("repository unavailable"));
-    }
-    let mut snapshot = Snapshot {
-        id: header[1].into(),
-        generation: header[2].parse()?,
-        default_ref: unhex(header[3].as_bytes())?,
-        storage_epoch: header[4].parse()?,
-        refs: BTreeMap::new(),
-        packs: Vec::new(),
-    };
-    for line in lines {
+    let mut snapshot = None;
+    snapshot_rows(&query, |line| {
         let fields: Vec<_> = line.split('\t').collect();
+        let Some(snapshot) = snapshot.as_mut() else {
+            if let ["repo", id, generation, default_ref, storage_epoch] = fields.as_slice() {
+                snapshot = Some(Snapshot {
+                    id: (*id).into(),
+                    generation: generation.parse()?,
+                    default_ref: unhex(default_ref.as_bytes())?,
+                    storage_epoch: storage_epoch.parse()?,
+                    refs: BTreeMap::new(),
+                    packs: Vec::new(),
+                });
+                return Ok(());
+            }
+            return Err(invalid("repository unavailable"));
+        };
         match fields.as_slice() {
             ["ref", name, oid] => {
                 snapshot
@@ -232,8 +289,9 @@ pub fn snapshot(slug: &str, principal: &str, write: bool) -> Result<Snapshot> {
             }),
             _ => return Err(invalid("invalid metadata snapshot")),
         }
-    }
-    Ok(snapshot)
+        Ok(())
+    })?;
+    snapshot.ok_or_else(|| invalid("repository unavailable"))
 }
 
 #[allow(clippy::too_many_arguments)]

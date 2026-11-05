@@ -12,6 +12,5 @@ s3:
   bucket: git-rs-packs
   credentialsSecret: git-rs-s3
   caSecret: git-rs-s3-ca
-rookCeph:
-  bucket:
-    enabled: false
+objectBucket:
+  enabled: false

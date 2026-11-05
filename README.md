@@ -2,7 +2,8 @@
 
 Experimental stateless Git backend in safe Rust, backed by PostgreSQL and S3-compatible storage.
 
-Ordinary Git clients connect through OpenSSH. Application replicas have no persistent repository
+Ordinary Git clients connect through OpenSSH or authenticated Smart HTTP behind a TLS gateway.
+Application replicas have no persistent repository
 volume: PostgreSQL stores authoritative refs/permissions and S3 stores immutable native Git
 pack/idx objects. Each request uses a private temporary bare repository; the only reusable
 application cache is bounded process memory.
@@ -34,16 +35,19 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
 - Concurrent requests share a bounded RAM LRU/singleflight cache. Request scratch is not reused as
   a disk cache. Cold replicas reconstruct everything from PostgreSQL and S3.
 - Native `git bundle` backups and owner-only physical history truncation are available.
-- Supported fetch behavior includes Git protocol v0/v1/v2, shallow clones, tags and notes. A
-  loopback-only development Smart HTTP endpoint exists for tests; the Helm chart serves SSH.
+- Supported fetch behavior includes Git protocol v0/v1/v2, shallow clones, tags and notes.
+  Smart HTTP verifies Secret-backed credentials for each request and applies the same repository
+  permissions as SSH. An optional HTTPRoute attaches to an existing Istio Gateway API listener.
 
 ## Releases and Helm
 
-Versioned artifacts:
+This branch prepares **0.1.0-rc.3**. Evaluate its HTTPRoute, authenticated HTTP and OBC-only
+configuration with an image built from this checkout and the local `charts/git-rs` chart.
+The latest published prerelease is **0.1.0-rc.2**:
 
 | Artifact | Location |
 | --- | --- |
-| Runtime image, Linux amd64 | `ghcr.io/borislitv/git-rs:0.1.0-rc.2` |
+| Published runtime image, Linux amd64 | `ghcr.io/borislitv/git-rs:0.1.0-rc.2` |
 | OCI application chart | `oci://ghcr.io/borislitv/charts/git-rs` |
 | Chart archive, checksums, provenance | [GitHub Releases](https://github.com/borislitv/git-rs/releases) |
 
@@ -53,11 +57,12 @@ helm show values oci://ghcr.io/borislitv/charts/git-rs --version 0.1.0-rc.2
 ```
 
 The chart is **independent, with `dependencies: []`**. It directly renders optional CNPG Cluster,
-Barman ObjectStore/ScheduledBackup, Rook CephCluster/CephObjectStore, bucket StorageClass and
-ObjectBucketClaim resources. Install the applicable operators and CRDs separately.
+Barman ObjectStore/ScheduledBackup and a namespaced ObjectBucketClaim. Ceph, RGW, its bucket
+StorageClass, operators and CRDs are existing platform infrastructure, not installed by this chart.
+Configure the HTTPS S3 endpoint explicitly and use a platform-managed Retain bucket class.
 
 - [Chart configuration and installation](charts/git-rs/README.md).
-- [CNPG + existing Rook CephCluster example](charts/git-rs/values-example.yaml).
+- [CNPG + existing Ceph/RGW bucket provisioning example](charts/git-rs/values-example.yaml).
 - [External TLS PostgreSQL/S3 example](charts/git-rs/values-external.example.yaml).
 
 The tag release workflow runs verification, publishes both GHCR packages and creates a draft
@@ -84,11 +89,24 @@ The supported URL form is `USER@HOST:relative/slug.git`. Slugs are logical names
 filesystem paths: slash-separated ASCII letters, digits, `_` and `-`, at most 200 bytes. Absolute
 paths, traversal, arbitrary SSH commands and shell sessions are rejected.
 
+For authenticated HTTPS, configure the chart's `http` and `httpRoute` settings and use an ordinary
+Git credential helper with a server-issued principal/token. Do not embed tokens in URLs or flags:
+
+```sh
+git clone https://git.example.invalid/team/project.git
+```
+
+The gateway terminates HTTPS, preserves `Authorization`, and connects over a trusted/encrypted
+path to the backend. The application HTTP listener is plaintext; HTTPRoute alone supplies neither
+authentication nor transport encryption. See [credential setup](OPERATIONS.md#authenticated-http).
+
 ## Build and verify
 
-Requires Linux, Rust 1.93+, Git **2.53.0**, OpenSSH server/client, PostgreSQL client, curl with
-AWS SigV4 support, GNU coreutils and `kill`. The Dockerfile pins the base image and Git package
-and checks the Git version; other distribution packages receive their current repository updates.
+Requires Linux, Rust **1.99+**, Git **2.56.0**, OpenSSH server/client, PostgreSQL client, curl with
+AWS SigV4 support, GNU coreutils and `kill`. Build and runtime use Ubuntu **26.04**. The Dockerfile
+checks official Rust/Git archive hashes, upgrades distribution packages and records the installed
+runtime inventory. [Dependency qualification](docs/dependencies.md) distinguishes reproducibility
+from security freshness; scheduled rebuilds are still necessary.
 
 ```sh
 cargo build --release --offline --locked
@@ -103,15 +121,15 @@ PostgreSQL/Versity containers. They require Docker, Python 3.11+ and the runtime
 make integration           # 64 MiB synthetic data, native Git/SSH and cold restart
 make failures              # real S3/PostgreSQL transport and maintenance faults
 make bench                 # release-mode RAM-cache microbenchmark
-python3 -m pip install PyYAML==6.0.3 jsonschema==4.19.2
-make chart                 # Helm 3.22.1; values/Secret/security contracts
+python3 -m pip install PyYAML==6.0.3 jsonschema==4.26.0
+make chart                 # Helm 4.3.1 and 3.22.1 compatibility in CI
 python3 tests/chart.py --operator-schemas  # opt-in network check of public pinned CRD schemas
 ```
 
 `tests/kubernetes.py --cluster-container NAME --image git-rs:dev` uses an explicitly selected
 disposable Docker k3s cluster. It imports images and creates/deletes its own isolated namespace,
-generates TLS/SSH keys, installs and upgrades the chart, pushes/clones through native SSH,
-rejects an unknown identity and checks cold restart. The test does not install CNPG/Rook or claim
+generates TLS/SSH/HTTP credentials, installs and upgrades the chart, pushes/clones through native
+SSH and authenticated HTTP, rejects unknown identities and checks cold restart. It does not install CNPG/Rook or claim
 to verify their failover behavior. CI also runs native tests inside the Docker `test` target so
 they use the same pinned Git version as the runtime.
 
@@ -125,8 +143,9 @@ they use the same pinned Git version as the runtime.
   additional resources. Kubernetes resource/scratch limits must match the intended workload.
 - Default branch `main` is protected from deletion/rewind, including owner pushes. Read access
   is repository-wide; ref write prefixes do not hide objects or branches from readers.
-- Only the current schema is initialized/verified. Future schema upgrades need explicit migrations.
-- No production HTTP authentication, Git LFS service, filtered clone promises, operator-managed
+- The current schema is initialized/verified and its publication function refreshed. Future schema
+  upgrades need explicit migrations.
+- No Git LFS service, filtered clone promises, operator-managed
   coordinated PITR, version-aware object purge or automatic serving-path garbage collection.
 - Local integration tests do not prove CNPG synchronous failover, Ceph durability or recovery
   after losing an entire storage failure domain.

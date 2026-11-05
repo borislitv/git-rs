@@ -237,7 +237,9 @@ impl Engine {
         output: &mut (impl Write + Send),
         cancel_input: &(dyn Fn() + Sync),
     ) -> Result<()> {
-        let operation = process::Operation::new(self.operation_seconds);
+        // Transport parsing and Git execution share one absolute request budget.
+        let operation = process::Operation::current()
+            .unwrap_or_else(|| process::Operation::new(self.operation_seconds));
         operation.enter(|| {
             self.run_operation(
                 slug,

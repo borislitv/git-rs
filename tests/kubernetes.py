@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Helm/SSH smoke test in an explicitly selected disposable Docker k3s cluster.
+"""Real Helm/SSH/authenticated HTTP smoke in a selected disposable Docker k3s cluster.
 
 Uses synthetic credentials, generated TLS/SSH keys, and an isolated namespace.
 It does not install CNPG/Rook operators or establish production durability.
@@ -117,6 +117,7 @@ def exercise(args, base, cluster):
                                       "AWS_SECRET_ACCESS_KEY": b"synthetic-secret-key"}),
         cluster.secret("fixture-host-keys", {"ssh_host_ed25519_key": (base / "host-key").read_bytes()}),
         cluster.secret("fixture-principals", {"principals": b"alice " + (base / "client-key.pub").read_bytes()}),
+        cluster.secret("fixture-http", {"credentials": b"alice synthetic-chart-token-0123456789abcdef\n"}),
     ])
     tls_volume = {"name": "tls", "secret": {"secretName": "fixture-tls", "defaultMode": 0o440}}
     tls_mount = {"name": "tls", "mountPath": "/fixture-tls", "readOnly": True}
@@ -145,7 +146,8 @@ def exercise(args, base, cluster):
                              "serverCASecret": "fixture-ca"},
               "s3": {"endpoint": f"https://s3.{cluster.namespace}.svc:7070", "bucket": "packs",
                      "credentialsSecret": "fixture-s3", "caSecret": "fixture-ca"},
-              "rookCeph": {"bucket": {"enabled": False}},
+              "objectBucket": {"enabled": False},
+              "http": {"enabled": True, "credentialsSecret": "fixture-http"},
               "ssh": {"hostKeysSecret": "fixture-host-keys", "authorizedKeysSecret": "fixture-principals"},
               "resources": {"requests": {"cpu": "50m", "memory": "64Mi", "ephemeral-storage": "256Mi"},
                             "limits": {"cpu": "1", "memory": "512Mi", "ephemeral-storage": "2Gi"}},
@@ -169,7 +171,8 @@ def exercise(args, base, cluster):
                     "/usr/local/bin/git-rs", "create", "team/project", "alice")
 
     service = json.loads(cluster.kubectl("get", "service/backend", "-o", "json").stdout)
-    ssh_port = service["spec"]["ports"][0]["nodePort"]
+    ssh_port = next(p["nodePort"] for p in service["spec"]["ports"] if p["name"] == "ssh")
+    http_port = next(p["nodePort"] for p in service["spec"]["ports"] if p["name"] == "http")
     address = next(iter(inspection["NetworkSettings"]["Networks"].values()))["IPAddress"]
     known_hosts = base / "known-hosts"
     known_hosts.write_text(f"[{address}]:{ssh_port} " + (base / "host-key.pub").read_text())
@@ -199,6 +202,38 @@ def exercise(args, base, cluster):
     assert (base / "clone/payload.txt").read_bytes() == payload
     rejected = command(["git", "ls-remote", url], env=dict(env, GIT_SSH_COMMAND=ssh("unknown-key")), ok=False)
     assert rejected.returncode and b"Permission denied" in rejected.stderr, rejected.stderr
+    # Plaintext is confined to this disposable Docker bridge fixture. Production
+    # requires gateway HTTPS plus the encrypted trusted gateway-to-pod path.
+    http_url = f"http://{address}:{http_port}/team/project.git"
+    auth = base64.b64encode(b"alice:synthetic-chart-token-0123456789abcdef").decode()
+    http_env = dict(env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
+                    GIT_CONFIG_VALUE_0="Authorization: Basic " + auth)
+
+    def http_listening():
+        try:
+            with socket.create_connection((address, http_port), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    wait_for(http_listening, "authenticated HTTP service dataplane readiness")
+    print("Native authenticated HTTP clone/push and unauthorized/forged identity rejection", flush=True)
+    command(["git", "clone", http_url, base / "http-clone"], env=http_env)
+    assert (base / "http-clone/payload.txt").read_bytes() == payload
+    (base / "http-clone/http.txt").write_bytes(b"authenticated chart HTTP push\n")
+    command(["git", "-C", base / "http-clone", "add", "http.txt"], env=http_env)
+    command(["git", "-C", base / "http-clone", "-c", "commit.gpgsign=false", "commit",
+             "-m", "Synthetic HTTP chart push"], env=http_env)
+    command(["git", "-C", base / "http-clone", "push", "origin", "main"], env=http_env)
+    command(["git", "clone", http_url, base / "http-pushed"], env=http_env)
+    assert (base / "http-pushed/http.txt").read_bytes() == b"authenticated chart HTTP push\n"
+    for extra in [{}, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader",
+                       "GIT_CONFIG_VALUE_0": "X-Forwarded-User: alice"},
+                  {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader",
+                   "GIT_CONFIG_VALUE_0": "Authorization: Basic " + base64.b64encode(
+                       b"alice:wrong-chart-token-0123456789abcdef").decode()}]:
+        rejected = command(["git", "ls-remote", http_url], env=dict(env, **extra), ok=False)
+        assert rejected.returncode and (b"401" in rejected.stderr or b"could not read Username" in rejected.stderr), rejected.stderr
     selector = "app.kubernetes.io/instance=smoke,app.kubernetes.io/name=git-rs"
     old_names = {pod["metadata"]["name"] for pod in json.loads(
         cluster.kubectl("get", "pods", "-l", selector, "-o", "json").stdout)["items"]}
@@ -214,11 +249,15 @@ def exercise(args, base, cluster):
     wait_ssh(address, ssh_port)
     command(["git", "clone", url, base / "cold-clone"], env=env)
     assert (base / "cold-clone/payload.txt").read_bytes() == payload
+    command(["git", "clone", http_url, base / "http-cold-clone"], env=http_env)
+    assert (base / "http-cold-clone/http.txt").read_bytes() == b"authenticated chart HTTP push\n"
     command(install)
     wait_ssh(address, ssh_port)
     command(["git", "ls-remote", url], env=env)
     print(json.dumps({"status": "passed", "profile": "external TLS PostgreSQL/S3",
                       "replicas": 2, "ssh": "generated identity, strict host verification, unknown key rejected",
+                      "http": "Secret-mounted Basic credentials, native clone/push, unauthenticated and forged identity rejected",
+                      "gateway": "not tested: direct disposable Docker bridge only, no TLS/mesh proof",
                       "cold_restart": "passed", "helm_upgrade_migration": "passed"}, indent=2))
 
 

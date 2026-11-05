@@ -20,7 +20,7 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-PG_IMAGE = "postgres:18.1-bookworm@sha256:cc9f4143a8d2fa8cf3749d0cb4d26ecf2d53a77a2ac807e9ebd67ae22426221a"
+PG_IMAGE = "postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5"
 S3_IMAGE = "versity/versitygw@sha256:89cad13cc981986ee284cbafea4613f9533ce6fd5f37a2c96c4c4fb8adb3a316"
 
 
@@ -455,6 +455,77 @@ def truncate_test(f, source, port, mib):
     f.results["truncate"] = {"old_pack_bytes": old_size, "new_pack_bytes": new_size, "remaining_commits": 2, "native_backup_commits": 5}
 
 
+def authenticated_http_test(f):
+    """Exercise native Basic challenge/retry and per-request repository ACLs."""
+    print("authenticated Smart HTTP identities and ACLs", flush=True)
+    # Only synthetic credentials; both server and native-client stores stay in
+    # the private fixture directory. Tokens never enter argv or child env.
+    actors = {"alice": "a" * 43, "bob": "b" * 43, "carol": "c" * 43}
+    server_credentials = f.base / "http-server-credentials"
+    server_credentials.write_text("".join(f"{actor} {token}\n" for actor, token in actors.items()))
+    server_credentials.chmod(0o600)
+    log_path = f.base / "authenticated-http.log"
+    log = log_path.open("wb")
+    f.logs.append(log)
+    process = subprocess.Popen([f.binary, "serve", "--scratch", str(f.base / "scratch"),
+                                "--socket", str(f.base / "authenticated-http.sock"),
+                                "--http", "127.0.0.1:0", "--http-credentials", str(server_credentials)],
+                               env=f.env, stdout=log, stderr=log)
+    f.processes.append(process)
+
+    def ready():
+        if process.poll() is not None:
+            raise AssertionError(log_path.read_text())
+        return re.search(r"^HTTP 127.0.0.1:(\d+)$", log_path.read_text(), re.MULTILINE)
+
+    wait_for(ready, "authenticated HTTP listener")
+    port = int(ready().group(1))
+    helpers = {}
+    for actor, token in actors.items():
+        # Git can clear a URL username after an initial 401 and ask its helper
+        # again without one. A shared store may then return another valid actor.
+        # Isolate clients so a reader attempt can never fall back to the owner.
+        client_credentials = f.base / f"http-client-{actor}-credentials"
+        client_credentials.write_text(f"http://{actor}:{token}@127.0.0.1:{port}\n")
+        client_credentials.chmod(0o600)
+        helpers[actor] = f"credential.helper=store --file={client_credentials}"
+        resolved = command(["git", "-c", helpers[actor], "credential", "fill"], env=f.env,
+                           data=f"protocol=http\nhost=127.0.0.1:{port}\n\n".encode(), ok=False)
+        assert resolved.returncode == 0, "native fixture credential helper must resolve its actor"
+        fields = dict(line.split(b"=", 1) for line in resolved.stdout.splitlines() if b"=" in line)
+        assert fields.get(b"username") == actor.encode(), "native fixture must use the intended principal"
+        assert fields.get(b"password") == token.encode(), "native fixture must use the intended token"
+    source = f.base / "authenticated-http-source"
+    f.git(f.base, "init", "-b", "main", source)
+    (source / "synthetic.txt").write_text("authenticated HTTP fixture\n")
+    f.git(source, "add", "synthetic.txt")
+    f.git(source, "commit", "-qm", "synthetic HTTP fixture")
+    oid = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    f.cli("create", "team/http-auth", "alice")
+    f.cli("grant", "team/http-auth", "alice", "bob", "reader", "refs/")
+    f.cli("create", "team/http-private", "carol")
+    url = f"http://alice@127.0.0.1:{port}/team/http-auth.git"
+    f.git(source, "-c", helpers["alice"], "push", url, "HEAD:refs/heads/main")
+    clone = f.base / "authenticated-http-clone"
+    f.git(source, "-c", helpers["bob"], "clone", url.replace("alice@", "bob@"), clone)
+    assert f.git(clone, "rev-parse", "HEAD").stdout.strip() == oid
+    assert (clone / "synthetic.txt").read_text() == "authenticated HTTP fixture\n"
+    before = f.git(source, "-c", helpers["alice"], "ls-remote", url).stdout
+    denied = f.git(source, "-c", helpers["bob"], "-c", "http.extraHeader=X-Remote-User: alice",
+                   "push", url.replace("alice@", "bob@"), "HEAD:refs/heads/reader-denied", ok=False)
+    assert denied.returncode, "reader credentials must not gain owner rights from identity headers"
+    refs = f.git(source, "-c", helpers["alice"], "ls-remote", url).stdout
+    assert refs == before, "rejected reader push must leave all remote refs unchanged"
+    assert b"reader-denied" not in refs
+    private_url = url.replace("http-auth.git", "http-private.git")
+    denied = f.git(source, "-c", helpers["alice"], "ls-remote", private_url, ok=False)
+    assert denied.returncode, "valid credentials must not grant access to another principal's repository"
+    denied = f.git(source, "-c", "credential.helper=", "ls-remote", url, ok=False)
+    assert denied.returncode, "native Git without a credential must receive an authentication challenge"
+    assert not any(token in log_path.read_text() for token in actors.values())
+    f.results["authenticated_http_acl_roundtrip"] = "passed"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--provision", action="store_true", help="create and remove private local Docker PostgreSQL/S3 fixtures")
@@ -472,6 +543,7 @@ def main():
             fixture = Fixture(Path(directory), args.binary.resolve())
             fixture.setup(args.provision)
             exercise(fixture, args.large_mib, args.skip_ssh)
+            authenticated_http_test(fixture)
             print(json.dumps({"status": "passed", **fixture.results}, indent=2))
         except Exception:
             if fixture:

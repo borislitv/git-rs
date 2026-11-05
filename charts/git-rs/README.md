@@ -1,6 +1,6 @@
 # git-rs application chart
 
-An independent Helm v3 chart with **no chart dependencies**. Kubernetes standard resources run
+An independent Helm v3/v4 chart with **no chart dependencies**. Kubernetes standard resources run
 the stateless backend and an OpenSSH sidecar; optional operator resources are rendered directly.
 Chart/app version and the Cargo package version must match.
 
@@ -8,13 +8,12 @@ Chart/app version and the Cargo package version must match.
 
 | Profile | Values | Required infrastructure |
 | --- | --- | --- |
-| Defaults | `values.yaml` | CNPG operator/CRDs, existing Rook TLS object store and `ceph-bucket` StorageClass, SSH Secrets |
-| Dedicated RGW/bucket | `values-example.yaml` | CNPG + Rook operators/CRDs, existing CephCluster, storage class, TLS/SSH Secrets |
+| Application bucket and HTTPS route | `values-example.yaml` | CNPG and bucket provisioner/CRDs, existing retained bucket class and HTTPS object endpoint, SSH/HTTP/CA Secrets, existing Gateway API Gateway |
 | Existing services | `values-external.example.yaml` | TLS PostgreSQL primary, HTTPS S3 bucket, PostgreSQL/S3/SSH Secrets |
 
 Standard application resources require Kubernetes 1.30+; operators have their own Kubernetes
 compatibility requirements. Contract checks use the public schemas from CNPG v1.30.1, Rook
-v1.21.1 and optional Barman Cloud plugin v0.15.1. The real application smoke test uses k3s
+v1.21.1 (OBC), Gateway API v1.7.0 and optional Barman Cloud plugin v0.15.1. The real application smoke test uses k3s
 v1.37.2+k3s1 with external test PostgreSQL/S3, not those operators.
 
 `cnpg.enabled` defaults to true. The default Cluster has three instances and synchronous `any 1`
@@ -22,21 +21,107 @@ with `dataDurability: required`. `cnpg.spec` is the upstream `Cluster.spec`; abs
 the chart inserts `initdb` with `postgresql.database`/`username`. Explicit `bootstrap` is passed
 through for recovery. Supply matching credentials and CA Secret overrides when restoring.
 
-`rookCeph.bucket.enabled` defaults to true and consumes generated `BUCKET_NAME` from the claim's
-ConfigMap and AWS credentials from its Secret. Other Rook resources are opt-in:
+`objectBucket.enabled` defaults to true. The chart creates only a namespaced ObjectBucketClaim;
+the storage platform, bucket class, provisioner and TLS object endpoint already exist. The
+platform-managed class **must use `reclaimPolicy: Retain`**. The chart cannot verify that policy
+offline: inspect the existing class before installing. It never installs storage infrastructure.
 
-- `rookCeph.objectStore.enabled`: create a TLS RGW store on an existing CephCluster.
-- `rookCeph.storageClass.enabled`: create a Retain bucket StorageClass, with the explicit operator
-  provisioner and object-store namespace.
-- `rookCeph.cluster.enabled`: render a deliberately configured `CephCluster.spec`. An empty spec
-  is rejected; the chart never chooses host disks automatically. Prefer an existing platform cluster.
+| Value | Default | Contract |
+| --- | --- | --- |
+| `objectBucket.enabled` | `true` | Create the application claim; disable for external S3 |
+| `objectBucket.name` | `<fullname>-packs` | Claim, generated Secret and ConfigMap share this name |
+| `objectBucket.storageClassName` | `ceph-bucket` | Existing retained bucket class |
+| `objectBucket.bucketName` | empty | Otherwise use `generateBucketName: <claim>` |
+| `objectBucket.additionalConfig` | `{}` | Provisioner-specific string map in claim spec |
+| `objectBucket.annotations` | `Prune=false,Delete=false` sync option | GitOps deletion protection; Helm keep is always added |
+| `s3.endpoint` | empty, **required** | Explicit HTTPS endpoint with a matching certificate; no endpoint is inferred |
+
+The claim-generated ConfigMap supplies `BUCKET_NAME`; its same-named Secret supplies
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. `s3.credentialsSecret` can explicitly override
+the credential source. Without a claim, supply `s3.bucket` and `s3.credentialsSecret`.
+
 - `cnpg.backup.enabled`: create a Barman ObjectStore/ScheduledBackup and attach its WAL archiver;
   install the plugin separately and provide a nonempty upstream ObjectStore spec. Use a dedicated
   metadata-backup bucket, separate from live Git packs.
 
-Cluster-scoped StorageClass and resources in the Rook namespace require corresponding installer
-permissions. Their namespaces must already exist. CNPG Cluster, Ceph resources and bucket claims
-are kept on uninstall; RGW pools are preserved and the generated bucket StorageClass uses Retain.
+CNPG Cluster and bucket claims are kept on uninstall. Keep the platform retention policy and
+GitOps protections in place; annotations do not replace storage retention or backups.
+
+### Durability is not failover proof
+
+The default `ANY 1`/`required` waits for one standby and stalls writes if none are available.
+It does not prove no-loss failover: if primary and the acknowledged standby disappear together,
+promoting a lagging remaining standby can lose acknowledged data. CNPG v1.30.1 offers
+experimental `cnpg.spec.postgresql.synchronous.failoverQuorum: true`; this chart leaves it
+unset, not silently enabled. See the pinned upstream
+[failover documentation](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/docs/src/failover.md#failover-quorum-quorum-based-failover).
+Evaluate the feature explicitly with the installed operator: it prevents promotion without a
+sufficient read/write quorum and may sacrifice availability. Do not use manual promotion to
+bypass that check without a separate recovery decision. Neither render tests nor replica count
+establish HA; test partitions, primary loss, fencing and recovery before a production claim.
+
+## Authenticated HTTP and Gateway API
+
+HTTP is opt-in. `http.enabled: true` requires an existing `http.credentialsSecret`;
+`http.credentialsKey` defaults to `credentials`. The Secret file contains one `PRINCIPAL TOKEN`
+mapping per line. Tokens are 32–128 base64url characters; use independent high-entropy tokens
+and keep the file out of values and version control. HTTP Basic uses the principal as username
+and token as password. Authorization is checked on every request, not taken from identity headers.
+The chart mounts the Secret read-only at `/etc/git-rs/http/credentials` (directory projection,
+not subPath, so rotation propagates). `http.port` defaults to 8080 and controls both Service and
+backend listener; 8081 is reserved for health probes. HTTP does not disable SSH.
+
+`httpRoute.enabled` defaults to false. Enabling it requires HTTP, explicit nonempty `parentRefs`
+and `hostnames`. Each parent must name the **HTTPS listener's `sectionName`** on an existing
+`gateway.networking.k8s.io` Gateway managed by Istio (not a legacy Istio Gateway).
+`parentRefs[].namespace` is optional; the Gateway must allow this route's namespace. The chart
+creates only a v1 HTTPRoute, never a Gateway or TLS Secret. Optional string `annotations` and
+Gateway API `timeouts.request`/`timeouts.backendRequest` pass through; configure timeouts for
+large pushes. The rule explicitly sets `retry.attempts: 0`: omitting retry configuration inherits
+automatic retries in Istio 1.31.3. Routing requires Gateway API **standard CRDs v1.7+** and a
+controller supporting retry disabling (verified with Istio 1.31.3). **Do not add automatic POST
+retries** at the Gateway, mesh or client, because a lost response can follow a committed push.
+
+Terminate trusted HTTPS at the Gateway and provide a trusted, encrypted Istio-to-pod path
+(for example sidecar injection with strict mTLS and appropriate authorization policy). The chart
+does not install mesh security policy. Do not expose port 8080 through an external plaintext
+listener or bypass TLS verification; Basic credentials are not encrypted by HTTP itself.
+An isolated local fixture may use plaintext solely to test the authenticated backend contract,
+not as a deployable external profile. Gateway attachment, `Accepted`/`ResolvedRefs` conditions,
+TLS trust and real native Git through Istio require runtime verification; Helm rendering proves
+none of them. The example uses reserved domains and must be configured before installation.
+
+### Optional real Istio verification
+
+On a Linux Docker host with an already built `git-rs:dev` production image, run
+`python3 tests/istio.py --helm /path/to/helm3` (or `make istio HELM=/path/to/helm3`).
+It requires privileged Docker, reachable Docker bridge addresses, Git, curl, OpenSSL, Python
+and PyYAML, plus public artifact/image access. It exclusively creates `git-rs-istio-test`, refuses
+an existing container with that name, and removes its own container/volumes on exit. It never
+attaches to the separate Kubernetes/benchmark fixture. `--keep-on-failure` is for explicit debugging.
+
+The test pins/checksums official Istio 1.31.3 distribution charts and Gateway API v1.7.0 standard
+CRDs on k3s v1.37.2+k3s1. It supplies a platform-owned HTTPS Gateway, CA-signed certificate,
+STRICT mTLS and gateway-principal authorization policy outside the application chart. It checks
+current-generation Gateway `Accepted`/`Programmed` and HTTPRoute `Accepted`/`ResolvedRefs`,
+then performs native Git push/clone and restart readback with strict CA/hostname verification and
+Secret-backed HTTP Basic. Negative controls reject an untrusted CA, absent/wrong credentials,
+spoofed identity headers and non-mesh plaintext traffic. Destination telemetry must show the
+gateway principal and `mutual_tls`; actual Envoy route configuration must have no retry policy.
+These checks passed with Helm 3.22.1. This is an isolated routing/security integration check,
+not a production deployment, load benchmark, CNPG failover or storage-retention proof.
+
+### Breaking values migration
+
+The previous `rookCeph` values API is removed and rejected. Migrate application claims to
+`objectBucket` and set an explicit `s3.endpoint`. Storage platform resources must be managed
+separately. Preserve existing claim identity with `objectBucket.name` and its bucket/class
+settings; do not delete protected resources as part of upgrading. Defaults intentionally do not
+invent a production endpoint, so even strict lint needs configured values, for example:
+
+```sh
+helm lint charts/git-rs --strict -f charts/git-rs/values-example.yaml
+```
 
 ## SSH identity Secrets
 
@@ -94,10 +179,9 @@ kubectl -n git-backend create secret generic git-rs-s3-ca \
 cp charts/git-rs/values-external.example.yaml .local/values.yaml
 ```
 
-The dedicated RGW example additionally needs the `git-rs-rgw-tls` certificate/key Secret in
-`rook-ceph` and its CA Secret in the application namespace. Its certificate must cover
-`rook-ceph-rgw-git-rs.rook-ceph.svc`, matching the derived S3 endpoint. A publicly trusted S3
-endpoint can omit `s3.caSecret`. Plain HTTP and certificate-verification bypasses are rejected.
+The bucket example needs an existing HTTPS object endpoint and its CA Secret in the application
+namespace. Its certificate must cover the configured `s3.endpoint`. A publicly trusted S3 endpoint
+can omit `s3.caSecret`. Plain HTTP and certificate-verification bypasses are rejected.
 
 Live pack buckets need read/write/list permissions; explicit maintenance additionally needs
 bucket-versioning inspection and delete permissions. Physical cleanup supports only a bucket

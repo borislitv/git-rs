@@ -77,7 +77,20 @@ spec:
         - name: backend
           image: {{ include "git-rs.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: [serve, --scratch, /scratch/private, --socket, /run/git-rs/private/ssh.sock, --health, "0.0.0.0:8081"]
+          args:
+            - serve
+            - --scratch
+            - /scratch/private
+            - --socket
+            - /run/git-rs/private/ssh.sock
+            - --health
+            - "0.0.0.0:8081"
+            {{- if .Values.http.enabled }}
+            - --http
+            - {{ printf "0.0.0.0:%v" .Values.http.port | quote }}
+            - --http-credentials
+            - /etc/git-rs/http/credentials
+            {{- end }}
           securityContext:
             runAsUser: 10001
             runAsGroup: 10001
@@ -95,6 +108,9 @@ spec:
               value: {{ .Values.operationSeconds | quote }}
           ports:
             - {name: health, containerPort: 8081}
+            {{- if .Values.http.enabled }}
+            - {name: http, containerPort: {{ .Values.http.port }}}
+            {{- end }}
           startupProbe:
             httpGet: {path: /livez, port: health}
             periodSeconds: 2
@@ -111,6 +127,9 @@ spec:
             - {name: bridge, mountPath: /run/git-rs}
             - {name: temporary, mountPath: /tmp}
             - {name: pg-ca, mountPath: /etc/git-rs/pg-ca, readOnly: true}
+            {{- if .Values.http.enabled }}
+            - {name: http-credentials, mountPath: /etc/git-rs/http, readOnly: true}
+            {{- end }}
             {{- if .Values.s3.caSecret }}
             - {name: s3-ca, mountPath: /etc/git-rs/s3-ca, readOnly: true}
             {{- end }}
@@ -141,6 +160,14 @@ spec:
             - {name: authorized-keys, mountPath: /etc/git-rs/authorized, readOnly: true}
         {{- end }}
       volumes:
+        {{- if .Values.http.enabled }}
+        - name: http-credentials
+          secret:
+            secretName: {{ .Values.http.credentialsSecret }}
+            defaultMode: 0440
+            items:
+              - {key: {{ .Values.http.credentialsKey }}, path: credentials}
+        {{- end }}
         - name: scratch
           emptyDir:
             sizeLimit: {{ .Values.scratch.sizeLimit }}

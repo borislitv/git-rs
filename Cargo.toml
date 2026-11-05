@@ -1,8 +1,8 @@
 [package]
 name = "git-rs"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.99"
 description = "Experimental stateless Git backend with PostgreSQL and immutable S3 packs"
 
 [lints.rust]

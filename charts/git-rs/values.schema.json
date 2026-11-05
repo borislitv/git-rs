@@ -47,6 +47,37 @@
         "resources": {"type": "object"}
       }
     },
+    "http": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "credentialsSecret": {"type": "string"},
+        "credentialsKey": {"type": "string", "minLength": 1},
+        "port": {"type": "integer", "minimum": 1024, "maximum": 65535}
+      }
+    },
+    "httpRoute": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "parentRefs": {"type": "array", "maxItems": 32, "items": {
+          "type": "object", "additionalProperties": false, "required": ["name", "sectionName"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "namespace": {"type": "string", "minLength": 1},
+            "sectionName": {"type": "string", "minLength": 1},
+            "group": {"enum": ["gateway.networking.k8s.io"]},
+            "kind": {"enum": ["Gateway"]}
+          }
+        }},
+        "hostnames": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1}},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "timeouts": {"type": "object", "additionalProperties": false, "properties": {
+          "request": {"type": "string", "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"},
+          "backendRequest": {"type": "string", "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"}
+        }}
+      }
+    },
     "postgresql": {
       "type": "object", "additionalProperties": false,
       "properties": {
@@ -89,24 +120,15 @@
         "caKey": {"type": "string", "minLength": 1}
       }
     },
-    "rookCeph": {
+    "objectBucket": {
       "type": "object", "additionalProperties": false,
       "properties": {
-        "namespace": {"type": "string", "minLength": 1},
-        "cluster": {"$ref": "#/definitions/operatorResource"},
-        "objectStore": {"$ref": "#/definitions/operatorResource"},
-        "storageClass": {
-          "type": "object", "additionalProperties": false,
-          "properties": {
-            "enabled": {"type": "boolean"},
-            "name": {"type": "string", "minLength": 1},
-            "provisioner": {"type": "string", "minLength": 1}
-          }
-        },
-        "bucket": {
-          "type": "object", "additionalProperties": false,
-          "properties": {"enabled": {"type": "boolean"}, "name": {"type": "string"}, "bucketName": {"type": "string"}}
-        }
+        "enabled": {"type": "boolean"},
+        "name": {"type": "string"},
+        "storageClassName": {"type": "string", "minLength": 1},
+        "bucketName": {"type": "string"},
+        "additionalConfig": {"type": "object", "additionalProperties": {"type": "string"}},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}, "propertyNames": {"not": {"const": "helm.sh/resource-policy"}}}
       }
     },
     "migration": {
@@ -115,12 +137,6 @@
         "enabled": {"type": "boolean"},
         "activeDeadlineSeconds": {"type": "integer", "minimum": 1}
       }
-    }
-  },
-  "definitions": {
-    "operatorResource": {
-      "type": "object", "additionalProperties": false,
-      "properties": {"enabled": {"type": "boolean"}, "name": {"type": "string", "minLength": 1}, "spec": {"type": "object"}}
     }
   }
 }

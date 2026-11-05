@@ -48,6 +48,21 @@ ssh:
       cpu: 250m
       memory: 128Mi
 
+http:
+  enabled: false
+  # Existing Secret: PRINCIPAL TOKEN lines. Requires HTTPS and encrypted pod path.
+  credentialsSecret: ""
+  credentialsKey: credentials
+  port: 8080
+httpRoute:
+  enabled: false
+  # Existing Gateway API Gateway and explicit HTTPS listener sectionName.
+  parentRefs: []
+  hostnames: []
+  annotations: {}
+  # Optional Gateway API request/backendRequest durations; never retry POST.
+  timeouts: {}
+
 postgresql:
   # Empty host/Secret names derive from the chart-managed CNPG Cluster.
   host: ""
@@ -82,10 +97,10 @@ cnpg:
     spec: {}
 
 s3:
-  # Empty derives the HTTPS Rook RGW Service endpoint below.
+  # Required explicit HTTPS endpoint of the existing object service.
   endpoint: ""
   region: us-east-1
-  # With rookCeph.bucket.enabled, BUCKET_NAME comes from its generated ConfigMap.
+  # With objectBucket.enabled, BUCKET_NAME comes from its generated ConfigMap.
   bucket: ""
   credentialsSecret: ""
   accessKeyKey: AWS_ACCESS_KEY_ID
@@ -94,44 +109,19 @@ s3:
   caSecret: ""
   caKey: ca.crt
 
-rookCeph:
-  namespace: rook-ceph
-  # Optional platform CR. Requires Rook operator/CRDs and deliberate disk/PVC
-  # configuration. No disks are automatically selected by this chart.
-  cluster:
-    enabled: false
-    name: rook-ceph
-    spec: {}
-  objectStore:
-    enabled: false
-    name: git-rs
-    spec:
-      preservePoolsOnDelete: true
-      metadataPool:
-        failureDomain: host
-        replicated:
-          size: 3
-      dataPool:
-        failureDomain: host
-        replicated:
-          size: 3
-      gateway:
-        instances: 2
-        securePort: 443
-        sslCertificateRef: git-rs-rgw-tls
-  storageClass:
-    enabled: false
-    name: ceph-bucket
-    # Must match the installed Rook operator's namespace/provisioner identity.
-    provisioner: rook-ceph.ceph.rook.io/bucket
-  bucket:
-    enabled: true
-    name: ""
-    # Empty requests a generated globally unique bucket name.
-    bucketName: ""
+objectBucket:
+  enabled: true
+  name: ""
+  # Existing platform-managed bucket class MUST have reclaimPolicy: Retain.
+  storageClassName: ceph-bucket
+  # Empty requests a generated globally unique bucket name.
+  bucketName: ""
+  additionalConfig: {}
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
 
 migration:
   enabled: true
-  # Only installs/verifies the current schema. A separate Helm hook Job runs
+  # Initializes/verifies the schema and refreshes its publication function. A hook runs
   # once per install/upgrade; serving replicas never race to run migrations.
   activeDeadlineSeconds: 600

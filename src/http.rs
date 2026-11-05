@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    auth::Service,
+    auth::{HttpCredentials, Service},
     engine::{Cgi, Engine},
     invalid,
 };
@@ -17,6 +17,7 @@ pub struct Request {
     pub protocol: String,
     pub cgi: Cgi,
     chunked: bool,
+    authorization: Option<String>,
 }
 
 fn line(input: &mut impl BufRead, max: usize) -> Result<String> {
@@ -127,7 +128,12 @@ impl Request {
                 length,
             },
             chunked,
+            authorization: headers.remove("authorization"),
         })
+    }
+
+    pub fn authenticate<'a>(&self, credentials: &'a HttpCredentials) -> Option<&'a str> {
+        credentials.authenticate(self.authorization.as_deref()?)
     }
 
     pub fn body<'a, R: BufRead>(&self, input: &'a mut R) -> Body<'a, R> {
@@ -209,6 +215,44 @@ impl<R: BufRead> Read for Body<'_, R> {
 }
 
 pub fn handle(mut stream: TcpStream, engine: &Engine, principal: &str) -> Result<()> {
+    handle_with_auth(&mut stream, engine, Authentication::Development(principal))
+}
+
+/// Plaintext Smart HTTP for a TLS-terminating gateway on a trusted/encrypted
+/// network path. Authenticate every discovery and RPC request independently.
+pub fn handle_authenticated(
+    mut stream: TcpStream,
+    engine: &Engine,
+    credentials: &HttpCredentials,
+) -> Result<()> {
+    handle_with_auth(&mut stream, engine, Authentication::Basic(credentials))
+}
+
+enum Authentication<'a> {
+    Development(&'a str),
+    Basic(&'a HttpCredentials),
+}
+
+fn handle_with_auth(
+    stream: &mut TcpStream,
+    engine: &Engine,
+    authentication: Authentication<'_>,
+) -> Result<()> {
+    let operation = crate::process::Operation::new(engine.operation_seconds);
+    let interrupt = stream.try_clone()?;
+    operation.with_interrupt(
+        || {
+            let _ = interrupt.shutdown(std::net::Shutdown::Both);
+        },
+        || handle_bounded(stream, engine, authentication),
+    )
+}
+
+fn handle_bounded(
+    stream: &mut TcpStream,
+    engine: &Engine,
+    authentication: Authentication<'_>,
+) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
     stream.set_write_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
     let mut input = BufReader::new(stream.try_clone()?);
@@ -222,6 +266,16 @@ pub fn handle(mut stream: TcpStream, engine: &Engine, principal: &str) -> Result
             return Ok(());
         }
     };
+    let principal = match authentication {
+        Authentication::Development(principal) => principal,
+        Authentication::Basic(credentials) => match request.authenticate(credentials) {
+            Some(principal) => principal,
+            None => {
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git-rs\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                return Ok(());
+            }
+        },
+    };
     engine.run(
         &request.slug,
         principal,
@@ -229,7 +283,7 @@ pub fn handle(mut stream: TcpStream, engine: &Engine, principal: &str) -> Result
         &request.protocol,
         Some(&request.cgi),
         &mut request.body(&mut input),
-        &mut stream,
+        stream,
         &|| {
             let _ = interrupt.shutdown(std::net::Shutdown::Read);
         },

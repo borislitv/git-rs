@@ -11,17 +11,17 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
-          toolchain: 1.93.1
+          toolchain: 1.99.1
           components: rustfmt, clippy
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: v3.22.1
+          version: v4.3.1
       - name: Rust checks and cache benchmark
         run: |
           make check
@@ -29,9 +29,35 @@ jobs:
       - name: Chart and pinned operator-schema contracts
         run: |
           python3 -m venv "$RUNNER_TEMP/python"
-          "$RUNNER_TEMP/python/bin/pip" install PyYAML==6.0.3 jsonschema==4.19.2
+          "$RUNNER_TEMP/python/bin/pip" install PyYAML==6.0.3 jsonschema==4.26.0
           printf '%s\n' "$RUNNER_TEMP/python/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/python/bin/python" tests/chart.py --operator-schemas
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.1
+      - name: Helm 3 compatibility
+        run: python3 tests/chart.py --operator-schemas
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - name: Real PostgreSQL metadata contracts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          pg=$(docker run --detach --rm --publish 127.0.0.1::5432 \
+            --env POSTGRES_PASSWORD=development-only --env POSTGRES_DB=git_rs \
+            postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5)
+          trap 'docker rm --force "$pg"' EXIT
+          export PGHOST=127.0.0.1 PGUSER=postgres PGDATABASE=git_rs PGPASSWORD=development-only PGSSLMODE=disable GIT_RS_DEV_HTTP=1
+          export PGPORT=$(docker port "$pg" 5432/tcp | cut -d: -f2)
+          ready=false
+          for attempt in $(seq 1 60); do
+            if psql -X -qAt -c 'SELECT 1'; then ready=true; break; fi
+            sleep 1
+          done
+          test "$ready" = true
+          cargo test --offline --locked --test metadata -- --ignored --test-threads=1
+          cargo test --offline --locked --test http_auth verified_authentication_reaches_existing_metadata_authorization -- --exact --ignored
       - name: Build runtime and native integration runner
         run: |
           docker build --target release -t git-rs:dev .

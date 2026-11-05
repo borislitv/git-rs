@@ -6,7 +6,9 @@ use git_rs::{
     blob::Store,
     cache::Cache,
     engine::Engine,
-    history, hooks, http, invalid, metadata, protocol,
+    history, hooks, http, invalid, metadata,
+    process::Admission,
+    protocol,
 };
 use std::fs::{self, DirBuilder};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -14,10 +16,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 
 fn option(args: &[String], key: &str) -> Result<String> {
@@ -93,18 +92,29 @@ fn field(socket: &mut UnixStream) -> Result<String> {
 }
 
 fn session(mut socket: UnixStream, engine: &Engine) -> Result<()> {
+    let operation = git_rs::process::Operation::new(engine.operation_seconds);
+    let interrupt = socket.try_clone()?;
+    operation.with_interrupt(
+        || {
+            let _ = interrupt.shutdown(std::net::Shutdown::Both);
+        },
+        || session_bounded(&mut socket, engine),
+    )
+}
+
+fn session_bounded(socket: &mut UnixStream, engine: &Engine) -> Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(git_rs::process::DEADLINE)))?;
     socket.set_write_timeout(Some(Duration::from_secs(git_rs::process::DEADLINE)))?;
-    if field(&mut socket)? != "git-rs-ssh-1" {
+    if field(socket)? != "git-rs-ssh-1" {
         return Err(invalid("unsupported SSH bridge version"));
     }
-    let principal = field(&mut socket)?;
-    let slug = field(&mut socket)?;
-    let service = Service::parse(&field(&mut socket)?)?;
-    let protocol = field(&mut socket)?;
+    let principal = field(socket)?;
+    let slug = field(socket)?;
+    let service = Service::parse(&field(socket)?)?;
+    let protocol = field(socket)?;
     let mut input = socket.try_clone()?;
     let interrupt = socket.try_clone()?;
-    let mut output = protocol::Framed(&mut socket);
+    let mut output = protocol::Framed(socket);
     let result = engine.run(
         &slug,
         &principal,
@@ -121,23 +131,48 @@ fn session(mut socket: UnixStream, engine: &Engine) -> Result<()> {
     result
 }
 
-struct Slot(Arc<AtomicUsize>);
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn admit(active: &Arc<AtomicUsize>) -> Option<Slot> {
-    active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            (value < 4).then_some(value + 1)
-        })
-        .ok()
-        .map(|_| Slot(active.clone()))
+enum HttpIdentity {
+    Development(String),
+    Basic(auth::HttpCredentials),
 }
 
 fn serve(args: &[String]) -> Result<()> {
+    // Validate credentials before opening any serving listener. Production and
+    // fixed-principal development HTTP can never be enabled in the same process.
+    let production_http = args
+        .iter()
+        .any(|arg| arg == "--http" || arg == "--http-credentials");
+    let development_http = args
+        .iter()
+        .any(|arg| arg == "--dev-http" || arg == "--dev-principal");
+    if production_http && development_http {
+        return Err(invalid(
+            "production and development HTTP are mutually exclusive",
+        ));
+    }
+    let http = if production_http {
+        for flag in ["--http", "--http-credentials"] {
+            if args.iter().filter(|arg| arg.as_str() == flag).count() != 1 {
+                return Err(invalid(
+                    "production HTTP requires one address and one credential file",
+                ));
+            }
+        }
+        Some((
+            option(args, "--http")?,
+            HttpIdentity::Basic(auth::HttpCredentials::load(Path::new(&option(
+                args,
+                "--http-credentials",
+            )?))?),
+        ))
+    } else if development_http {
+        let address = http::loopback(&option(args, "--dev-http")?)?;
+        let principal = option(args, "--dev-principal")?;
+        auth::principal(&principal)?;
+        Some((address.to_string(), HttpIdentity::Development(principal)))
+    } else {
+        None
+    };
     let root = PathBuf::from(option(args, "--scratch")?);
     if !root.exists() {
         DirBuilder::new().mode(0o700).create(&root)?;
@@ -159,27 +194,38 @@ fn serve(args: &[String]) -> Result<()> {
         scratch_root: own_root,
         operation_seconds: operation_seconds()?,
     });
-    let active = Arc::new(AtomicUsize::new(0));
+    let active = Admission::new(4);
     if let Ok(address) = option(args, "--health") {
         health(&address, engine.clone(), active.clone())?;
     }
-    if let Ok(address) = option(args, "--dev-http") {
-        let principal = option(args, "--dev-principal")?;
-        auth::principal(&principal)?;
-        let http = TcpListener::bind(http::loopback(&address)?)?;
-        eprintln!("development HTTP {}", http.local_addr()?);
+    if let Some((address, identity)) = http {
+        let http = TcpListener::bind(address)?;
+        let label = match &identity {
+            HttpIdentity::Development(_) => "development HTTP",
+            HttpIdentity::Basic(_) => "HTTP",
+        };
+        eprintln!("{label} {}", http.local_addr()?);
+        let identity = Arc::new(identity);
         let engine = engine.clone();
         let active = active.clone();
         std::thread::spawn(move || {
             for stream in http.incoming() {
                 match stream {
                     Ok(stream) => {
-                        if let Some(slot) = admit(&active) {
+                        if let Some(slot) = active.try_admit() {
                             let engine = engine.clone();
-                            let principal = principal.clone();
+                            let identity = identity.clone();
                             std::thread::spawn(move || {
                                 let _slot = slot;
-                                if let Err(error) = http::handle(stream, &engine, &principal) {
+                                let result = match identity.as_ref() {
+                                    HttpIdentity::Development(principal) => {
+                                        http::handle(stream, &engine, principal)
+                                    }
+                                    HttpIdentity::Basic(credentials) => {
+                                        http::handle_authenticated(stream, &engine, credentials)
+                                    }
+                                };
+                                if let Err(error) = result {
                                     eprintln!("HTTP operation failed: {error}");
                                 }
                             });
@@ -196,7 +242,7 @@ fn serve(args: &[String]) -> Result<()> {
     eprintln!("SSH bridge ready");
     for socket in listener.listener.incoming() {
         let socket = socket?;
-        if let Some(slot) = admit(&active) {
+        if let Some(slot) = active.try_admit() {
             let engine = engine.clone();
             std::thread::spawn(move || {
                 let _slot = slot;
@@ -209,7 +255,7 @@ fn serve(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn health(address: &str, engine: Arc<Engine>, active: Arc<AtomicUsize>) -> Result<()> {
+fn health(address: &str, engine: Arc<Engine>, active: Arc<Admission>) -> Result<()> {
     let listener = TcpListener::bind(address)?;
     eprintln!("health {}", listener.local_addr()?);
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -226,10 +272,40 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<AtomicUsize>) -> Resul
         }
     });
     std::thread::spawn(move || {
+        let health_active = Admission::new(8);
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
+            let Ok(stream) = stream else {
                 break;
             };
+            // Health requests cannot queue behind one slow peer. Keep a separate
+            // bounded budget, so Git admission cannot starve probes either.
+            let Some(slot) = health_active.try_admit() else {
+                continue;
+            };
+            let engine = engine.clone();
+            let active = active.clone();
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                let _slot = slot;
+                let _ = health_request(stream, &engine, &active, &ready);
+            });
+        }
+    });
+    Ok(())
+}
+
+fn health_request(
+    mut stream: std::net::TcpStream,
+    engine: &Engine,
+    active: &Admission,
+    ready: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let interrupt = stream.try_clone()?;
+    git_rs::process::Operation::new(1).with_interrupt(
+        || {
+            let _ = interrupt.shutdown(std::net::Shutdown::Both);
+        },
+        || {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
             let mut line = String::new();
@@ -238,7 +314,7 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<AtomicUsize>) -> Resul
                 .read_line(&mut line)
                 .is_err()
             {
-                continue;
+                return Ok(());
             }
             let (status, body) = match line
                 .split_whitespace()
@@ -258,7 +334,7 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<AtomicUsize>) -> Resul
                     "200 OK",
                     format!(
                         "git_rs_active_requests {}\ngit_rs_cache_allocated_bytes {}\n",
-                        active.load(Ordering::Acquire),
+                        active.active(),
                         engine.cache.allocated()
                     ),
                 ),
@@ -269,9 +345,9 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<AtomicUsize>) -> Resul
                 "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-        }
-    });
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 fn run() -> Result<()> {
@@ -323,7 +399,7 @@ fn run() -> Result<()> {
             })
         }
         _ => Err(invalid(
-            "usage: git-rs serve --scratch DIR --socket PATH [--dev-http 127.0.0.1:PORT --dev-principal NAME] | ssh --socket PATH --principal NAME | migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX",
+            "usage: git-rs serve --scratch DIR --socket PATH [--http ADDRESS --http-credentials FILE | --dev-http 127.0.0.1:PORT --dev-principal NAME] | ssh --socket PATH --principal NAME | migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX",
         )),
     }
 }

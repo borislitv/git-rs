@@ -125,7 +125,9 @@ pub fn unhex(bytes: &[u8]) -> Result<Vec<u8>> {
         return Err(invalid("invalid hex length"));
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |c: u8| match c {
                 b'0'..=b'9' => Ok(c - b'0'),

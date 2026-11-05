@@ -39,6 +39,32 @@ For loopback testing only, `--dev-http 127.0.0.1:PORT --dev-principal NAME` sets
 identity for an unauthenticated Smart HTTP listener. `GIT_RS_DEV_HTTP=1` permits loopback-only
 plaintext PostgreSQL/S3 fixtures. It is not a production authentication scheme.
 
+## Authenticated HTTP
+
+`serve --http 0.0.0.0:8080 --http-credentials /etc/git-rs/http/credentials` enables the authenticated
+Smart HTTP listener. It is mutually exclusive with `--dev-http`. Supply a read-only Secret file
+with one `PRINCIPAL TOKEN` entry per line, separated by exactly one ASCII space. Blank lines are
+allowed; comments are not. Principals use the SSH principal grammar. Tokens contain 32–128 ASCII
+letters, digits, `_` or `-`; generate each from at least 32 cryptographically random bytes encoded
+as unpadded Base64url. The file accepts 1–256 identities and at most 65,536 bytes; duplicate
+principals/tokens and malformed records fail startup. Actual tokens do not belong in documentation
+or Helm values. Credentials are loaded at startup; rotate the Secret and restart serving replicas.
+
+HTTP Basic credentials select the principal on every discovery and RPC request before backend
+access. Missing, malformed or incorrect credentials receive `401` and a Basic challenge. Forwarded
+identity headers are ignored; a reader cannot become an owner through gateway-provided headers.
+Repository permissions are shared with SSH. Use a Git credential helper, not credential-bearing URLs.
+
+The application listener is plaintext. Require an HTTPS listener on the existing Gateway API
+Gateway and a trusted/encrypted gateway-to-pod connection, such as correctly configured Istio mTLS.
+HTTPRoute does not configure TLS or authentication, and the legacy Istio Gateway kind is a different
+API. Preserve the Authorization header; do not automatically retry receive-pack POST requests.
+Enabled HTTPRoute requires standard Gateway API v1.7+ and a controller supporting explicit
+`retry.attempts: 0`. The chart sets this field: merely omitting retry configuration can leave
+controller-default retries active. Verify the effective proxy configuration as well as the route.
+Check the route's `Accepted` and `ResolvedRefs` status and perform an authenticated native Git smoke.
+Keep diagnostics on their separate port; they are not the HTTPRoute backend.
+
 ## Repository administration
 
 Run commands in a trusted backend/operator environment with the same TLS PostgreSQL connection:
@@ -53,7 +79,10 @@ git-rs grant team/project alice bob none refs/
 ```
 
 `migrate` serializes initialization with a transaction advisory lock; repeated/concurrent execution
-checks schema version 1. It does not migrate arbitrary older/unreleased database layouts.
+checks schema version 1 and refreshes its publication function without resetting stored data.
+It does not migrate arbitrary older/unreleased database layouts. Metadata snapshots use bounded
+cursor batches rather than retaining a second complete SQL wire image; the decoded catalog and
+request materialization still consume resources.
 
 | Role | Read | Ref writes |
 | --- | --- | --- |
@@ -159,6 +188,9 @@ client clones, WAL and retained metadata backups can still contain old data.
   8 MiB bypass it. Reservations and evicted-but-pinned buffers remain accounted against capacity.
 - Four admitted operations per process; native Git/curl/psql children consume additional memory,
   CPU and process slots. A cache metric is not total pod RSS.
+- Absolute transport deadlines cover headers, SSH handshake and blocked response writes; the
+  operation budget is not reset after parsing. Health has a separate eight-request admission cap
+  and one-second absolute connection budget, so a single trickling client cannot starve probes.
 - A snapshot's pack+idx catalog is admitted up to 12 GiB, incoming pack/HTTP body up to 4 GiB;
   request materialization and concurrent requests need additional scratch headroom. Chart defaults
   are an evaluation starting point, not a guarantee that four worst-case requests fit.
@@ -172,3 +204,9 @@ client clones, WAL and retained metadata backups can still contain old data.
 Before production use, validate CNPG synchronous failover and unknown-commit behavior under the
 actual topology, Ceph/RGW durability and deletion semantics, clock/deadline margins, namespace
 admission policy, resource exhaustion, credential rotation and a coordinated restore drill.
+
+CNPG `ANY 1` synchronous commit alone does not guarantee lossless automatic failover: the primary
+and its acknowledged standby can become unavailable while a stale standby remains. Evaluate the
+installed operator's experimental `postgresql.synchronous.failoverQuorum` option and test partitions
+and promotion behavior. The chart does not claim that replica count or synchronous configuration
+constitutes an HA acceptance test.

@@ -1,6 +1,8 @@
 -- Run by `git-rs migrate` inside its serialized transaction.
 CREATE SCHEMA IF NOT EXISTS git_rs;
 SET LOCAL search_path = git_rs, pg_catalog;
+DO $initialize$ BEGIN
+IF to_regclass('git_rs.schema_version') IS NULL THEN
 CREATE TABLE schema_version (version integer PRIMARY KEY CHECK (version = 1));
 INSERT INTO schema_version VALUES (1);
 CREATE TABLE repositories (
@@ -72,8 +74,13 @@ CREATE TABLE repository_leases (
     expires_at timestamptz NOT NULL
 );
 CREATE INDEX ON repository_leases (repo_id, expires_at);
+ELSIF NOT (SELECT count(*)=1 AND min(version)=1 FROM schema_version) THEN
+    RAISE EXCEPTION 'unsupported metadata schema version';
+END IF;
+END $initialize$;
 
-CREATE FUNCTION publish(
+-- Refresh the implementation for initialized version-1 databases as well.
+CREATE OR REPLACE FUNCTION publish(
     p_repo uuid, p_operation uuid, p_principal text, p_commands bytea, p_epoch bigint, p_lease uuid,
     p_names bytea[], p_old bytea[], p_new bytea[], p_fast_forward boolean[]
 ) RETURNS bigint LANGUAGE plpgsql AS $$
@@ -130,9 +137,15 @@ BEGIN
     END LOOP;
     -- Validate the complete post-image while holding the same repository lock.
     IF EXISTS (
-        SELECT 1 FROM refs a JOIN refs b ON a.repo_id = b.repo_id
-        AND substring(b.name FROM 1 FOR octet_length(a.name) + 1) = a.name || decode('2f', 'hex')
-        WHERE a.repo_id = p_repo
+        -- A descendant lies in [name || '/', name || '0') in bytea order.
+        -- Both bounds use the refs primary key rather than a quadratic scan
+        -- that exceeds statement_timeout for otherwise legal long ref names.
+        SELECT 1 FROM refs a CROSS JOIN LATERAL (
+            SELECT 1 FROM refs b WHERE b.repo_id = a.repo_id
+            AND b.name >= a.name || decode('2f', 'hex')
+            AND b.name < a.name || decode('30', 'hex')
+            ORDER BY b.name LIMIT 1
+        ) descendant WHERE a.repo_id = p_repo
     ) THEN RAISE EXCEPTION 'ref namespace conflict'; END IF;
     IF (SELECT count(*) FROM refs WHERE repo_id = p_repo) > 10000 THEN RAISE EXCEPTION 'ref limit exceeded'; END IF;
     UPDATE repositories SET generation = g WHERE id = p_repo;

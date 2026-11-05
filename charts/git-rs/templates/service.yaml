@@ -1,4 +1,4 @@
-{{- if .Values.ssh.enabled }}
+{{- if or .Values.ssh.enabled .Values.http.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -14,7 +14,14 @@ spec:
   selector:
     {{- include "git-rs.selectorLabels" . | nindent 4 }}
   ports:
+    {{- if .Values.ssh.enabled }}
     - name: ssh
       port: {{ .Values.service.sshPort }}
       targetPort: ssh
+    {{- end }}
+    {{- if .Values.http.enabled }}
+    - name: http
+      port: {{ .Values.http.port }}
+      targetPort: http
+    {{- end }}
 {{- end }}

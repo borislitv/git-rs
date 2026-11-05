@@ -4,12 +4,47 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
 pub const DEADLINE: u64 = 120;
+
+pub struct Admission {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+pub struct Permit(Arc<Admission>);
+
+impl Admission {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicUsize::new(0),
+            limit,
+        })
+    }
+
+    pub fn try_admit(self: &Arc<Self>) -> Option<Permit> {
+        self.active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Permit(self.clone()))
+    }
+
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub struct Operation {
     deadline: Instant,
@@ -26,6 +61,47 @@ impl Operation {
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+    pub fn current() -> Option<Arc<Self>> {
+        OPERATION.with(|slot| slot.borrow().clone())
+    }
+
+    /// Interrupt blocking transport I/O at the absolute operation deadline.
+    /// The caller owns admission before entering; at most one watcher is needed
+    /// per admitted connection. Completion wakes and joins it, including on panic.
+    pub fn with_interrupt<T>(
+        self: &Arc<Self>,
+        interrupt: impl FnOnce() + Send,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Completion<'a>(&'a (Mutex<bool>, Condvar));
+        impl Drop for Completion<'_> {
+            fn drop(&mut self) {
+                let (finished, changed) = self.0;
+                *finished.lock().expect("operation completion poisoned") = true;
+                changed.notify_one();
+            }
+        }
+        let completion = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (finished, changed) = &completion;
+                let finished = finished.lock().expect("operation completion poisoned");
+                let (finished, _) = changed
+                    .wait_timeout_while(
+                        finished,
+                        self.deadline.saturating_duration_since(Instant::now()),
+                        |finished| !*finished,
+                    )
+                    .expect("operation completion poisoned");
+                if !*finished {
+                    self.cancel();
+                    interrupt();
+                }
+            });
+            let _completion = Completion(&completion);
+            self.enter(run)
+        })
     }
     pub fn enter<T>(self: &Arc<Self>, run: impl FnOnce() -> T) -> T {
         struct Restore(Option<Arc<Operation>>);

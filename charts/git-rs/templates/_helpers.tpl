@@ -33,7 +33,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- default (printf "%s-pg" (include "git-rs.fullname" .)) .Values.cnpg.name -}}
 {{- end -}}
 {{- define "git-rs.bucketClaim" -}}
-{{- default (printf "%s-packs" (include "git-rs.fullname" .)) .Values.rookCeph.bucket.name -}}
+{{- default (printf "%s-packs" (include "git-rs.fullname" .)) .Values.objectBucket.name -}}
 {{- end -}}
 {{- define "git-rs.pgPasswordSecret" -}}
 {{- if .Values.cnpg.enabled -}}
@@ -78,11 +78,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{- define "git-rs.s3Env" -}}
 - name: GIT_RS_S3_ENDPOINT
-  value: {{ default (printf "https://rook-ceph-rgw-%s.%s.svc:%v" .Values.rookCeph.objectStore.name .Values.rookCeph.namespace .Values.rookCeph.objectStore.spec.gateway.securePort) .Values.s3.endpoint | quote }}
+  value: {{ required "s3.endpoint is required (explicit HTTPS endpoint)" .Values.s3.endpoint | quote }}
 - name: GIT_RS_S3_REGION
   value: {{ .Values.s3.region | quote }}
 - name: GIT_RS_S3_BUCKET
-  {{- if .Values.rookCeph.bucket.enabled }}
+  {{- if .Values.objectBucket.enabled }}
   valueFrom:
     configMapKeyRef:
       name: {{ include "git-rs.bucketClaim" . }}
@@ -91,7 +91,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ required "s3.bucket is required without a bucket claim" .Values.s3.bucket | quote }}
   {{- end }}
 {{- $credentials := .Values.s3.credentialsSecret -}}
-{{- if and (not $credentials) .Values.rookCeph.bucket.enabled -}}
+{{- if and (not $credentials) .Values.objectBucket.enabled -}}
 {{- $credentials = include "git-rs.bucketClaim" . -}}
 {{- end }}
 - name: GIT_RS_S3_ACCESS_KEY

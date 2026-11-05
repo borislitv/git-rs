@@ -4,9 +4,6 @@
 {{- if and .Values.cnpg.backup.enabled (empty .Values.cnpg.backup.spec) }}
 {{- fail "cnpg.backup.spec requires a Barman ObjectStore configuration" }}
 {{- end }}
-{{- if and .Values.rookCeph.cluster.enabled (empty .Values.rookCeph.cluster.spec) }}
-{{- fail "rookCeph.cluster.spec must explicitly configure the Ceph cluster" }}
-{{- end }}
 {{- if and .Values.cnpg.enabled (hasKey .Values.cnpg.spec "bootstrap") }}
 {{- with .Values.cnpg.spec.bootstrap.initdb }}
 {{- if or (ne .database $.Values.postgresql.database) (ne .owner $.Values.postgresql.username) }}
@@ -14,9 +11,26 @@
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if .Values.rookCeph.objectStore.enabled }}
-{{- $_ := required "Rook object store requires gateway.sslCertificateRef" .Values.rookCeph.objectStore.spec.gateway.sslCertificateRef }}
-{{- if not .Values.rookCeph.objectStore.spec.gateway.securePort }}
-{{- fail "Rook object store requires a TLS securePort" }}
+{{- if .Values.http.enabled }}
+{{- $_ := required "http.credentialsSecret is required when HTTP is enabled" .Values.http.credentialsSecret }}
+{{- if eq (int .Values.http.port) 8081 }}
+{{- fail "http.port must not collide with health port 8081" }}
+{{- end }}
+{{- if and .Values.ssh.enabled (eq (int .Values.http.port) 2222) }}
+{{- fail "http.port must not collide with SSH port 2222 while ssh.enabled" }}
+{{- end }}
+{{- if and .Values.ssh.enabled (eq (int .Values.http.port) (int .Values.service.sshPort)) }}
+{{- fail "HTTP and SSH Service ports must not collide while ssh.enabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.httpRoute.enabled }}
+{{- if not .Values.http.enabled }}
+{{- fail "httpRoute requires http.enabled" }}
+{{- end }}
+{{- if empty .Values.httpRoute.parentRefs }}
+{{- fail "httpRoute.parentRefs is required" }}
+{{- end }}
+{{- if empty .Values.httpRoute.hostnames }}
+{{- fail "httpRoute.hostnames is required" }}
 {{- end }}
 {{- end }}
