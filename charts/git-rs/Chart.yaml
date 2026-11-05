@@ -1,0 +1,13 @@
+apiVersion: v2
+name: git-rs
+description: Stateless Git backend with optional CloudNativePG and Rook-Ceph resources
+type: application
+version: 0.1.0-rc.1
+appVersion: 0.1.0-rc.1
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/borislitv/git-rs
+sources:
+  - https://github.com/borislitv/git-rs
+dependencies: []
+annotations:
+  org.opencontainers.image.source: https://github.com/borislitv/git-rs

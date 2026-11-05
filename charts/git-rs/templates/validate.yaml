@@ -1,0 +1,22 @@
+{{- if and .Values.cnpg.backup.enabled (not .Values.cnpg.enabled) }}
+{{- fail "cnpg.backup requires cnpg.enabled" }}
+{{- end }}
+{{- if and .Values.cnpg.backup.enabled (empty .Values.cnpg.backup.spec) }}
+{{- fail "cnpg.backup.spec requires a Barman ObjectStore configuration" }}
+{{- end }}
+{{- if and .Values.rookCeph.cluster.enabled (empty .Values.rookCeph.cluster.spec) }}
+{{- fail "rookCeph.cluster.spec must explicitly configure the Ceph cluster" }}
+{{- end }}
+{{- if and .Values.cnpg.enabled (hasKey .Values.cnpg.spec "bootstrap") }}
+{{- with .Values.cnpg.spec.bootstrap.initdb }}
+{{- if or (ne .database $.Values.postgresql.database) (ne .owner $.Values.postgresql.username) }}
+{{- fail "CNPG initdb database/owner must match postgresql.database/username" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.rookCeph.objectStore.enabled }}
+{{- $_ := required "Rook object store requires gateway.sslCertificateRef" .Values.rookCeph.objectStore.spec.gateway.sslCertificateRef }}
+{{- if not .Values.rookCeph.objectStore.spec.gateway.securePort }}
+{{- fail "Rook object store requires a TLS securePort" }}
+{{- end }}
+{{- end }}

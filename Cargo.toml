@@ -1,0 +1,17 @@
+[package]
+name = "git-rs"
+version = "0.1.0-rc.1"
+edition = "2024"
+rust-version = "1.93"
+description = "Experimental stateless Git backend with PostgreSQL and immutable S3 packs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[[bench]]
+name = "cache"
+harness = false

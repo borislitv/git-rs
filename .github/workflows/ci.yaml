@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.93.1
+          components: rustfmt, clippy
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.22.1
+      - name: Rust checks and cache benchmark
+        run: |
+          make check
+          make bench
+      - name: Chart and pinned operator-schema contracts
+        run: |
+          python3 -m venv "$RUNNER_TEMP/python"
+          "$RUNNER_TEMP/python/bin/pip" install PyYAML==6.0.3 jsonschema==4.19.2
+          printf '%s\n' "$RUNNER_TEMP/python/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/python/bin/python" tests/chart.py --operator-schemas
+      - name: Build runtime and native integration runner
+        run: |
+          docker build --target release -t git-rs:dev .
+          docker build --target test -t git-rs:test .
+          docker run --rm git-rs:dev --version
+      - name: Native Git integration with the runtime's pinned Git
+        run: |
+          docker run --rm --network host \
+            --group-add "$(stat -c %g /var/run/docker.sock)" \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$(command -v docker):/usr/bin/docker:ro" \
+            --entrypoint /usr/bin/python3 git-rs:test \
+            tests/integration.py --provision --binary /usr/local/bin/git-rs --large-mib 64
+      - name: PostgreSQL/S3 failure and recovery contracts
+        run: |
+          docker run --rm --network host \
+            --group-add "$(stat -c %g /var/run/docker.sock)" \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$(command -v docker):/usr/bin/docker:ro" \
+            --entrypoint /usr/bin/python3 git-rs:test \
+            tests/failures.py --provision --binary /usr/local/bin/git-rs
+      - name: Start disposable k3s
+        run: |
+          docker run --detach --name git-rs-ci-k3s --privileged \
+            --publish 127.0.0.1::6443 --tmpfs /run --tmpfs /var/run \
+            rancher/k3s:v1.37.2-k3s1@sha256:21ea6e0fac4e3930c2ce8aa40ddd41a8b18cb3e9a0222c030dc005e7e88c4332 \
+            server --disable traefik --disable servicelb --tls-san 127.0.0.1
+          state=''
+          for attempt in $(seq 1 60); do
+            state=$(docker exec git-rs-ci-k3s kubectl get nodes --request-timeout=5s \
+              -o 'jsonpath={.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+            if [ "$state" = True ]; then break; fi
+            sleep 2
+          done
+          test "$state" = True
+      - name: Real Helm install, SSH, restart and upgrade
+        run: python3 -u tests/kubernetes.py --cluster-container git-rs-ci-k3s
+      - name: Remove disposable cluster
+        if: always()
+        run: docker rm --force git-rs-ci-k3s || true

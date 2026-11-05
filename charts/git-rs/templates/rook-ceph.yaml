@@ -1,0 +1,53 @@
+{{- if .Values.rookCeph.cluster.enabled }}
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: {{ .Values.rookCeph.cluster.name }}
+  namespace: {{ .Values.rookCeph.namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  {{- toYaml (required "rookCeph.cluster.spec must explicitly configure the Ceph cluster" .Values.rookCeph.cluster.spec) | nindent 2 }}
+---
+{{- end }}
+{{- if .Values.rookCeph.objectStore.enabled }}
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: {{ .Values.rookCeph.objectStore.name }}
+  namespace: {{ .Values.rookCeph.namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  {{- toYaml .Values.rookCeph.objectStore.spec | nindent 2 }}
+---
+{{- end }}
+{{- if .Values.rookCeph.storageClass.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.rookCeph.storageClass.name }}
+  annotations:
+    helm.sh/resource-policy: keep
+provisioner: {{ .Values.rookCeph.storageClass.provisioner }}
+reclaimPolicy: Retain
+parameters:
+  objectStoreName: {{ .Values.rookCeph.objectStore.name }}
+  objectStoreNamespace: {{ .Values.rookCeph.namespace }}
+---
+{{- end }}
+{{- if .Values.rookCeph.bucket.enabled }}
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: {{ include "git-rs.bucketClaim" . }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  storageClassName: {{ .Values.rookCeph.storageClass.name }}
+  {{- if .Values.rookCeph.bucket.bucketName }}
+  bucketName: {{ .Values.rookCeph.bucket.bucketName | quote }}
+  {{- else }}
+  generateBucketName: {{ include "git-rs.bucketClaim" . | quote }}
+  {{- end }}
+{{- end }}

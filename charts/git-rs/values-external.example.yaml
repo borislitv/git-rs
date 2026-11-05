@@ -1,0 +1,17 @@
+# Use existing TLS-enabled PostgreSQL and S3. No operator resources are emitted.
+cnpg:
+  enabled: false
+postgresql:
+  host: postgres.example.invalid
+  database: git_rs
+  username: git_rs
+  passwordSecret: git-rs-postgresql
+  serverCASecret: git-rs-postgresql-ca
+s3:
+  endpoint: https://s3.example.invalid
+  bucket: git-rs-packs
+  credentialsSecret: git-rs-s3
+  caSecret: git-rs-s3-ca
+rookCeph:
+  bucket:
+    enabled: false

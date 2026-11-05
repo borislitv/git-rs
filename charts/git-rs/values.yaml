@@ -1,0 +1,137 @@
+nameOverride: ""
+fullnameOverride: ""
+replicaCount: 2
+image:
+  repository: ghcr.io/borislitv/git-rs
+  tag: "" # Defaults to Chart.appVersion.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  sshPort: 22
+  annotations: {}
+serviceAccount:
+  create: true
+  name: ""
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+    ephemeral-storage: 1Gi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+    ephemeral-storage: 18Gi
+scratch:
+  sizeLimit: 16Gi
+cacheBytes: 67108864
+operationSeconds: 120
+terminationGracePeriodSeconds: 150
+
+ssh:
+  enabled: true
+  # Existing Secrets; private keys and identity mappings are never chart values.
+  hostKeysSecret: git-rs-ssh-host-keys
+  authorizedKeysSecret: git-rs-ssh-authorized-keys
+  authorizedKeysKey: principals
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+postgresql:
+  # Empty host/Secret names derive from the chart-managed CNPG Cluster.
+  host: ""
+  port: 5432
+  database: git_rs
+  username: git_rs
+  passwordSecret: ""
+  passwordKey: password
+  serverCASecret: ""
+  serverCAKey: ca.crt
+
+cnpg:
+  enabled: true
+  name: ""
+  # Passed as the standard CNPG Cluster.spec, not a dependent Helm chart.
+  # If bootstrap is absent, initdb uses postgresql.database and .username.
+  spec:
+    instances: 3
+    imageName: ghcr.io/cloudnative-pg/postgresql:18.6-system-bookworm@sha256:605c6e45e733ce0e908505e9ac3c441637d6794d330ec0e9d8d6f631b6918b1e
+    storage:
+      size: 20Gi
+    postgresql:
+      synchronous:
+        method: any
+        number: 1
+        dataDurability: required
+  backup:
+    enabled: false
+    schedule: "0 0 2 * * *"
+    # Standard barmancloud.cnpg.io/v1 ObjectStore.spec. Requires the separately
+    # installed Barman Cloud plugin. Use a distinct backup bucket and retention.
+    spec: {}
+
+s3:
+  # Empty derives the HTTPS Rook RGW Service endpoint below.
+  endpoint: ""
+  region: us-east-1
+  # With rookCeph.bucket.enabled, BUCKET_NAME comes from its generated ConfigMap.
+  bucket: ""
+  credentialsSecret: ""
+  accessKeyKey: AWS_ACCESS_KEY_ID
+  secretKeyKey: AWS_SECRET_ACCESS_KEY
+  # Optional custom CA for HTTPS; omit for a publicly trusted certificate.
+  caSecret: ""
+  caKey: ca.crt
+
+rookCeph:
+  namespace: rook-ceph
+  # Optional platform CR. Requires Rook operator/CRDs and deliberate disk/PVC
+  # configuration. No disks are automatically selected by this chart.
+  cluster:
+    enabled: false
+    name: rook-ceph
+    spec: {}
+  objectStore:
+    enabled: false
+    name: git-rs
+    spec:
+      preservePoolsOnDelete: true
+      metadataPool:
+        failureDomain: host
+        replicated:
+          size: 3
+      dataPool:
+        failureDomain: host
+        replicated:
+          size: 3
+      gateway:
+        instances: 2
+        securePort: 443
+        sslCertificateRef: git-rs-rgw-tls
+  storageClass:
+    enabled: false
+    name: ceph-bucket
+    # Must match the installed Rook operator's namespace/provisioner identity.
+    provisioner: rook-ceph.ceph.rook.io/bucket
+  bucket:
+    enabled: true
+    name: ""
+    # Empty requests a generated globally unique bucket name.
+    bucketName: ""
+
+migration:
+  enabled: true
+  # Only installs/verifies the current schema. A separate Helm hook Job runs
+  # once per install/upgrade; serving replicas never race to run migrations.
+  activeDeadlineSeconds: 600

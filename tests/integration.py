@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Black-box native Git/SQL/S3 tests. All data and identities are synthetic."""
+import argparse
+import concurrent.futures
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import pwd
+import random
+import re
+import select
+import socket
+import socketserver
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+PG_IMAGE = "postgres:18.1-bookworm@sha256:cc9f4143a8d2fa8cf3749d0cb4d26ecf2d53a77a2ac807e9ebd67ae22426221a"
+S3_IMAGE = "versity/versitygw@sha256:89cad13cc981986ee284cbafea4613f9533ce6fd5f37a2c96c4c4fb8adb3a316"
+
+
+def command(args, *, env=None, cwd=None, data=None, ok=True):
+    result = subprocess.run([str(a) for a in args], input=data, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env, cwd=cwd, timeout=180)
+    if ok and result.returncode:
+        raise AssertionError(f"{args[0:3]} failed ({result.returncode}): "
+                             f"{result.stdout[-4000:]!r} {result.stderr[-4000:]!r}")
+    return result
+
+
+def wait_for(check, description):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"timed out: {description}")
+
+
+class Balancer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, ports):
+        self.ports = ports
+        self.counts = [0] * len(ports)
+        self.lock = threading.Lock()
+        super().__init__(("127.0.0.1", 0), Relay)
+
+
+class Relay(socketserver.BaseRequestHandler):
+    def handle(self):
+        with self.server.lock:
+            index = sum(self.server.counts) % len(self.server.ports)
+            self.server.counts[index] += 1
+        with socket.create_connection(("127.0.0.1", self.server.ports[index]), 30) as upstream:
+            peers = {self.request: upstream, upstream: self.request}
+            while peers:
+                readable, _, _ = select.select(list(peers), [], [], 130)
+                if not readable:
+                    return
+                for source in readable:
+                    data = source.recv(65536)
+                    target = peers[source]
+                    if not data:
+                        target.shutdown(socket.SHUT_WR)
+                        del peers[source]
+                    else:
+                        target.sendall(data)
+
+
+class Fixture:
+    def __init__(self, base, binary):
+        self.base, self.binary = base, str(binary)
+        self.containers, self.processes, self.logs = [], [], []
+        self.daemons, self.health_ports = {}, {}
+        self.results = {}
+        self.env = {k: v for k, v in os.environ.items() if k in ["PATH", "LANG", "TERM"]}
+        self.env.update(HOME=str(base), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
+                        GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Test Author",
+                        GIT_AUTHOR_EMAIL="author@example.invalid", GIT_COMMITTER_NAME="Test Author",
+                        GIT_COMMITTER_EMAIL="author@example.invalid", GIT_RS_CACHE_BYTES="1048576",
+                        GIT_RS_DEV_HTTP="1", GIT_RS_S3_ACCESS_KEY="test-access",
+                        GIT_RS_S3_SECRET_KEY="synthetic-secret-key", GIT_RS_S3_BUCKET="git-test",
+                        PGHOST="127.0.0.1", PGUSER="postgres", PGDATABASE="git_rs",
+                        PGPASSWORD="development-only", PGSSLMODE="disable", PGCONNECT_TIMEOUT="2",
+                        PGGSSENCMODE="disable")
+        (base / "scratch").mkdir(mode=0o700)
+
+    def setup(self, provision):
+        if provision:
+            pg = self.container(["-e", "POSTGRES_PASSWORD=development-only", "-e", "POSTGRES_DB=git_rs",
+                                 "-p", "127.0.0.1::5432", PG_IMAGE])
+            self.env["PGPORT"] = str(self.port(pg, "5432/tcp"))
+            # The image's initdb server accepts Unix-socket connections before
+            # its published TCP endpoint is ready. Wait through the real path.
+            try:
+                wait_for(lambda: command(["psql", "-X", "-qAt", "-c", "SELECT 1"], env=self.env,
+                                         ok=False).returncode == 0, "PostgreSQL TCP endpoint")
+            except AssertionError:
+                print(command(["docker", "logs", pg], ok=False).stderr.decode())
+                print(command(["psql", "-X", "-qAt", "-c", "SELECT 1"], env=self.env,
+                              ok=False).stderr.decode())
+                raise
+            s3 = self.container(["-e", "ROOT_ACCESS_KEY_ID=test-access", "-e", "ROOT_SECRET_ACCESS_KEY=synthetic-secret-key",
+                                 "--tmpfs", "/data:rw,size=4g", "-p", "127.0.0.1::7070", S3_IMAGE, "--quiet", "posix", "/data"])
+            self.env["GIT_RS_S3_ENDPOINT"] = f"http://127.0.0.1:{self.port(s3, '7070/tcp')}"
+            wait_for(lambda: self.s3("PUT", "", ok=False).returncode == 0, "S3 bucket")
+        else:
+            for key in ["PGPORT", "GIT_RS_S3_ENDPOINT"]:
+                self.env[key] = os.environ[key]
+
+    def container(self, args):
+        identifier = command(["docker", "run", "-d", *args]).stdout.decode().strip()
+        self.containers.append(identifier)
+        return identifier
+
+    def port(self, identifier, port):
+        return int(json.loads(command(["docker", "inspect", identifier]).stdout)[0]["NetworkSettings"]["Ports"][port][0]["HostPort"])
+
+    def s3(self, method, key, *, data=None, ok=True):
+        url = f"{self.env['GIT_RS_S3_ENDPOINT']}/git-test/{key}"
+        config = (f'url = "{url}"\naws-sigv4 = "aws:amz:us-east-1:s3"\n'
+                  'user = "test-access:synthetic-secret-key"\n')
+        args = ["curl", "--disable", "--silent", "--fail", "--max-time", "5", "--config", "-"]
+        if method == "HEAD":
+            args += ["--head", "--output", "/dev/null", "--write-out", "%{http_code}"]
+        else:
+            args += ["--request", method]
+        if data is not None:
+            args += ["--upload-file", str(data)]
+        return command(args, data=config.encode(), ok=ok)
+
+    def cli(self, *args, ok=True):
+        return command([self.binary, *args], env=self.env, ok=ok)
+
+    def git(self, path, *args, ok=True, env=None):
+        return command(["git", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-C", path, *args], env=env or self.env, ok=ok)
+
+    def sql(self, query):
+        return command(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], env=self.env, data=query.encode()).stdout.decode().strip()
+
+    def start(self, name, principal="alice"):
+        log_path = self.base / f"{name}.log"
+        log = log_path.open("wb")
+        self.logs.append(log)
+        process = subprocess.Popen([self.binary, "serve", "--scratch", str(self.base / "scratch"),
+                                   "--socket", str(self.base / f"{name}.sock"), "--health", "127.0.0.1:0",
+                                   "--dev-http", "127.0.0.1:0",
+                                   "--dev-principal", principal], env=self.env, stdout=log, stderr=log)
+        self.processes.append(process)
+
+        def ready():
+            if process.poll() is not None:
+                raise AssertionError(log_path.read_text())
+            return re.search(r"development HTTP 127.0.0.1:(\d+)", log_path.read_text())
+
+        wait_for(ready, "Rust daemon")
+        self.daemons[name] = process
+        self.health_ports[name] = int(re.search(r"health 127.0.0.1:(\d+)", log_path.read_text()).group(1))
+        return process, int(ready().group(1))
+
+    def health(self, name, path):
+        connection = http.client.HTTPConnection("127.0.0.1", self.health_ports[name], timeout=3)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        status, body = response.status, response.read()
+        connection.close()
+        return status, body
+
+    def record_memory(self):
+        peaks = []
+        for process in self.daemons.values():
+            if process.poll() is None:
+                status = Path(f"/proc/{process.pid}/status").read_text()
+                peaks.append(int(re.search(r"VmHWM:\s+(\d+)", status).group(1)) * 1024)
+        if peaks:
+            self.results["maximum_rust_daemon_hwm_bytes"] = max(peaks)
+            assert max(peaks) < 64 * 1024 * 1024, peaks
+
+    def close(self):
+        for process in reversed(self.processes):
+            if process.poll() is None:
+                process.terminate()
+        for process in reversed(self.processes):
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for log in self.logs:
+            log.close()
+        for identifier in self.containers:
+            command(["docker", "rm", "-f", identifier], ok=False)
+
+
+def pkt(payload):
+    return f"{len(payload) + 4:04x}".encode() + payload
+
+
+def raw_push(port, oid, names, *, missing=False, atomic=False):
+    zero = b"0" * 40
+    capabilities = b"report-status side-band-64k" + (b" atomic" if atomic else b"")
+    body = b""
+    for index, name in enumerate(names):
+        new = b"f" * 40 if missing and index else oid
+        body += pkt(zero + b" " + new + b" " + name + (b"\0" + capabilities if index == 0 else b""))
+    empty_pack = b"PACK" + struct.pack(">II", 2, 0)
+    body += b"0000" + empty_pack + hashlib.sha1(empty_pack).digest()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    conn.request("POST", "/team/project.git/git-receive-pack", body,
+                 {"Content-Type": "application/x-git-receive-pack-request"})
+    response = conn.getresponse()
+    payload = response.read()
+    conn.close()
+    assert response.status == 200, (response.status, payload)
+    return payload
+
+
+def generate(path, mib, seed):
+    rng = random.Random(seed)
+    digest = hashlib.sha256()
+    with path.open("wb") as output:
+        remaining, ordinal = mib * 1024 * 1024, 0
+        while remaining:
+            block = bytearray()
+            for _ in range(512):
+                block.extend(f"define(`RULE_{ordinal:012d}',`{rng.getrandbits(128):032x}')dnl\n".encode())
+                ordinal += 1
+            block = block[:remaining]
+            output.write(block)
+            digest.update(block)
+            remaining -= len(block)
+    return digest.hexdigest()
+
+
+def exercise(f, large_mib, skip_ssh):
+    f.cli("migrate")
+    print("schema and stateless Smart HTTP", flush=True)
+    f.cli("create", "team/project", "alice")
+    first, p1 = f.start("a")
+    second, p2 = f.start("b")
+    balancer = Balancer([p1, p2])
+    threading.Thread(target=balancer.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{balancer.server_address[1]}/team/project.git"
+    source, vanilla = f.base / "source", f.base / "vanilla.git"
+    command(["git", "init", "--initial-branch=main", source], env=f.env)
+    command(["git", "init", "--bare", "--initial-branch=main", vanilla], env=f.env)
+    assert not f.git(source, "ls-remote", url).stdout
+    (source / "hello.txt").write_text("synthetic initial content\n")
+    f.git(source, "add", ".")
+    f.git(source, "commit", "-m", "Initial synthetic commit")
+    f.git(source, "push", url, "main")
+    f.git(source, "push", vanilla, "main")
+    start = time.monotonic()
+    print("large file, native Git comparison, tags, notes and shallow fetch", flush=True)
+    expected_digest = generate(source / "generated.rules", large_mib, 7)
+    f.git(source, "add", ".")
+    f.git(source, "commit", "-m", "Add generated synthetic rules")
+    f.git(source, "push", url, "main")
+    f.results["generated_file_mib"] = large_mib
+    f.results["large_push_seconds"] = round(time.monotonic() - start, 3)
+    f.git(source, "push", vanilla, "main")
+    f.git(source, "tag", "-a", "release-test", "-m", "Synthetic annotated tag")
+    f.git(source, "notes", "add", "-m", "Synthetic note")
+    f.git(source, "push", "--atomic", url, "main", "refs/tags/release-test", "refs/notes/commits")
+    f.git(source, "push", "--atomic", vanilla, "main", "refs/tags/release-test", "refs/notes/commits")
+    for protocol in ["0", "1", "2"]:
+        assert f.git(source, "-c", f"protocol.version={protocol}", "ls-remote", url).stdout == f.git(source, "ls-remote", vanilla).stdout
+    clone = f.base / "clone"
+    native_clone = f.base / "native-clone"
+    start = time.monotonic()
+    f.git(source, "clone", "--no-local", vanilla, native_clone)
+    f.results["vanilla_local_clone_seconds"] = round(time.monotonic() - start, 3)
+    start = time.monotonic()
+    f.git(source, "clone", url, clone)
+    f.results["warm_clone_seconds"] = round(time.monotonic() - start, 3)
+    assert hashlib.sha256((clone / "generated.rules").read_bytes()).hexdigest() == expected_digest
+    f.git(clone, "fsck", "--full")
+    shallow = f.base / "shallow"
+    f.git(source, "clone", "--depth=1", url, shallow)
+    assert f.git(shallow, "rev-list", "--count", "HEAD").stdout.strip() == b"1"
+    f.git(shallow, "fetch", "--unshallow")
+    f.git(shallow, "fsck", "--full")
+    oid = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    before = f.git(source, "ls-remote", url).stdout
+    print("atomic failure and concurrent publication", flush=True)
+    for atomic in [False, True]:
+        report = raw_push(p1, oid, [b"refs/heads/raw-valid", b"refs/heads/raw-missing"], missing=True, atomic=atomic)
+        assert b"ok refs/heads/raw-valid" not in report, report
+        assert f.git(source, "ls-remote", url).stdout == before
+    blob_oid = f.git(source, "hash-object", "-w", "hello.txt").stdout.strip().decode()
+    assert f.git(source, "push", "--atomic", url, "HEAD:refs/heads/valid", f"{blob_oid}:refs/heads/blob", ok=False).returncode != 0
+    assert f.git(source, "ls-remote", url).stdout == before
+    # Delete-only and no-new-object pushes must not require an incoming pack.
+    packs_before = f.sql("SELECT count(*) FROM git_rs.packs")
+    f.git(source, "push", url, "HEAD:refs/heads/disposable")
+    f.git(source, "push", url, ":refs/heads/disposable")
+    assert f.sql("SELECT count(*) FROM git_rs.packs") == packs_before
+    assert f.git(source, "push", url, ":refs/heads/main", ok=False).returncode
+    assert f.git(source, "push", "--force", url, "HEAD~1:refs/heads/main", ok=False).returncode
+    assert f.git(source, "ls-remote", url).stdout == before
+    bridge_env = dict(f.env, SSH_ORIGINAL_COMMAND="git-upload-pack 'team/missing.git'")
+    assert command([f.binary, "ssh", "--socket", f.base / "a.sock", "--principal", "alice"], env=bridge_env, data=b"", ok=False).returncode != 0
+    assert f.cli("serve", "--scratch", str(f.base / "scratch"), "--socket", str(f.base / "a.sock"), ok=False).returncode != 0
+    start = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda i: f.git(source, "push", url, f"HEAD:refs/heads/parallel-{i}"), range(8)))
+    remote = f.git(source, "ls-remote", url).stdout
+    for i in range(8):
+        assert oid + f"\trefs/heads/parallel-{i}\n".encode() in remote
+    f.results["eight_parallel_ref_pushes_seconds"] = round(time.monotonic() - start, 3)
+    race = threading.Barrier(2)
+
+    def racer(port):
+        race.wait()
+        return raw_push(port, oid, [b"refs/heads/cas-race"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        reports = list(pool.map(racer, [p1, p2]))
+    assert sum(b"ok refs/heads/cas-race" in result for result in reports) == 1, reports
+    f.cli("grant", "team/project", "alice", "reader", "reader", "refs/")
+    print("read and ref-prefix permissions", flush=True)
+    _, ro_port = f.start("read-only", "reader")
+    ro_url = f"http://127.0.0.1:{ro_port}/team/project.git"
+    assert f.git(source, "ls-remote", ro_url).stdout
+    assert f.git(source, "push", ro_url, "HEAD:refs/heads/forbidden", ok=False).returncode != 0
+    f.cli("grant", "team/project", "alice", "scoped", "writer", "refs/heads/sandbox/")
+    _, scoped_port = f.start("scoped", "scoped")
+    scoped_url = f"http://127.0.0.1:{scoped_port}/team/project.git"
+    f.git(source, "push", scoped_url, "HEAD:refs/heads/sandbox/allowed")
+    before = f.git(source, "ls-remote", url).stdout
+    assert f.git(source, "push", "--atomic", scoped_url, "HEAD:refs/heads/sandbox/also-allowed", "HEAD:refs/heads/outside", ok=False).returncode
+    assert f.git(source, "ls-remote", url).stdout == before
+    if not skip_ssh:
+        print("restricted OpenSSH transport", flush=True)
+        ssh_test(f, source, before)
+    backup = f.base / "repository.bundle"
+    print("native bundle backup and restore", flush=True)
+    f.cli("backup", "team/project", "alice", "--scratch", str(f.base / "scratch"), "--output", str(backup))
+    backup_digest = hashlib.sha256(backup.read_bytes()).digest()
+    assert f.cli("backup", "team/project", "alice", "--scratch", str(f.base / "scratch"), "--output", str(backup), ok=False).returncode
+    assert hashlib.sha256(backup.read_bytes()).digest() == backup_digest
+    assert backup.stat().st_mode & 0o777 == 0o600
+    restored = f.base / "restored.git"
+    f.git(source, "clone", "--mirror", backup, restored)
+    f.git(restored, "fsck", "--full")
+    assert f.git(restored, "show-ref").stdout == f.git(source, "ls-remote", url).stdout.replace(b"\t", b" ").replace(oid + b" HEAD\n", b"").replace(f.git(source, "rev-parse", "release-test^{}").stdout.strip() + b" refs/tags/release-test^{}\n", b"")
+    f.cli("create", "team/restored", "alice")
+    restore_url = url.replace("project.git", "restored.git")
+    f.git(restored, "push", "--mirror", restore_url)
+    assert f.git(source, "ls-remote", restore_url).stdout == f.git(source, "ls-remote", url).stdout
+    for process in [first, second]:
+        process.kill()
+        process.wait()
+    _, cold_port = f.start("a")
+    print("cold restart and physical history truncation", flush=True)
+    cold_url = f"http://127.0.0.1:{cold_port}/team/project.git"
+    cold_clone = f.base / "cold-clone"
+    start = time.monotonic()
+    f.git(source, "clone", cold_url, cold_clone)
+    f.results["cold_clone_seconds"] = round(time.monotonic() - start, 3)
+    assert hashlib.sha256((cold_clone / "generated.rules").read_bytes()).hexdigest() == expected_digest
+    f.git(cold_clone, "fsck", "--full")
+    truncate_test(f, source, cold_port, large_mib)
+    wait_for(lambda: f.health("a", "/readyz")[0] == 200, "primary readiness")
+    assert f.health("a", "/livez") == (200, b"live\n")
+    assert b"git_rs_cache_allocated_bytes " in f.health("a", "/metrics")[1]
+    f.record_memory()
+    assert all(balancer.counts), balancer.counts
+    f.results["balanced_connections"] = balancer.counts
+    wait_for(lambda: not list((f.base / "scratch").glob("instance-*/request-*")), "request scratch cleanup")
+    balancer.shutdown()
+
+
+def ssh_test(f, source, expected):
+    for name in ["host-key", "client-key"]:
+        command(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", f.base / name])
+    user = pwd.getpwuid(os.getuid()).pw_name
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    forced = f'{f.binary} ssh --socket {f.base}/a.sock --principal alice'
+    (f.base / "authorized_keys").write_text(f'restrict,command="{forced}" ' + (f.base / "client-key.pub").read_text())
+    config = f.base / "sshd_config"
+    config.write_text(f"Port {port}\nListenAddress 127.0.0.1\nHostKey {f.base}/host-key\n"
+                      f"PidFile {f.base}/sshd.pid\nAuthorizedKeysFile {f.base}/authorized_keys\n"
+                      f"AllowUsers {user}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+                      "UsePAM no\nPermitRootLogin forced-commands-only\nAllowTcpForwarding no\n"
+                      "PermitTTY no\nX11Forwarding no\nAcceptEnv GIT_PROTOCOL\n")
+    log = (f.base / "sshd.log").open("wb")
+    f.logs.append(log)
+    sshd = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", config], stdout=log, stderr=log)
+    f.processes.append(sshd)
+
+    def ready():
+        if sshd.poll() is not None:
+            raise AssertionError((f.base / "sshd.log").read_text())
+        return "Server listening" in (f.base / "sshd.log").read_text()
+
+    wait_for(ready, "isolated OpenSSH server")
+    host_key = (f.base / "host-key.pub").read_text().split()
+    known = f.base / "known_hosts"
+    known.write_text(f"[127.0.0.1]:{port} {host_key[0]} {host_key[1]}\n")
+    env = dict(f.env, GIT_SSH_COMMAND=f"ssh -p {port} -i {f.base}/client-key -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known}")
+    remote = f"{user}@127.0.0.1:team/project.git"
+    assert f.git(source, "ls-remote", remote, env=env).stdout == expected
+    f.git(source, "push", remote, "HEAD:refs/heads/ssh-tested", env=env)
+    f.results["ssh_authentication"] = "generated Ed25519 key, restricted forced command, strict host verification"
+
+
+def truncate_test(f, source, port, mib):
+    f.cli("create", "team/history", "alice")
+    history = f.base / "history"
+    command(["git", "init", "--initial-branch=main", history], env=f.env)
+    generate(history / "obsolete.rules", mib, 12)
+    f.git(history, "add", ".")
+    f.git(history, "commit", "-m", "Synthetic obsolete large version")
+    url = f"http://127.0.0.1:{port}/team/history.git"
+    f.git(history, "push", url, "main")
+    (history / "obsolete.rules").unlink()
+    (history / "current.txt").write_text("current contents\n")
+    for index in range(4):
+        (history / "current.txt").write_text(f"current contents {index}\n")
+        f.git(history, "add", "-A")
+        f.git(history, "commit", "-m", f"Synthetic update {index}")
+    f.git(history, "push", url, "main")
+    original_tree = f.git(history, "rev-parse", "HEAD^{tree}").stdout
+    old_keys = f.sql("SELECT pack_key FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history') UNION ALL SELECT idx_key FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')").splitlines()
+    assert all(f.s3("HEAD", key).stdout == b"200" for key in old_keys)
+    old_size = int(f.sql("SELECT sum(pack_size+idx_size) FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')"))
+    backup = f.base / "before-truncate.bundle"
+    f.cli("truncate", "team/history", "alice", "--keep", "2", "--scratch", str(f.base / "scratch"), "--backup", str(backup))
+    trimmed = f.base / "trimmed"
+    f.git(source, "clone", url, trimmed)
+    f.git(trimmed, "fsck", "--full")
+    assert f.git(trimmed, "rev-list", "--count", "HEAD").stdout.strip() == b"2"
+    assert f.git(trimmed, "rev-parse", "HEAD^{tree}").stdout == original_tree
+    new_size = int(f.sql("SELECT sum(pack_size+idx_size) FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')"))
+    assert new_size < old_size / 2, (old_size, new_size)
+    for key in old_keys:
+        deleted = f.s3("HEAD", key, ok=False)
+        assert deleted.returncode == 22 and deleted.stdout == b"404", (key, deleted.stdout, deleted.stderr)
+    assert f.sql("SELECT count(*) FROM git_rs.retired_objects") == "0"
+    assert f.sql("SELECT count(*) FROM git_rs.operations WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')") == "1"
+    recovered = f.base / "history-recovered"
+    f.git(source, "clone", backup, recovered)
+    assert f.git(recovered, "rev-list", "--count", "HEAD").stdout.strip() == b"5"
+    f.git(recovered, "fsck", "--full")
+    f.results["truncate"] = {"old_pack_bytes": old_size, "new_pack_bytes": new_size, "remaining_commits": 2, "native_backup_commits": 5}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--provision", action="store_true", help="create and remove private local Docker PostgreSQL/S3 fixtures")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/git-rs")
+    parser.add_argument("--large-mib", type=int, default=16)
+    parser.add_argument("--skip-ssh", action="store_true")
+    args = parser.parse_args()
+    # OpenSSH StrictModes checks all parents of authorized_keys. A system /tmp
+    # parent is world-writable, so keep this private fixture under the checkout.
+    local = ROOT / ".local"
+    local.mkdir(mode=0o700, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="grs-", dir=local) as directory:
+        fixture = None
+        try:
+            fixture = Fixture(Path(directory), args.binary.resolve())
+            fixture.setup(args.provision)
+            exercise(fixture, args.large_mib, args.skip_ssh)
+            print(json.dumps({"status": "passed", **fixture.results}, indent=2))
+        except Exception:
+            if fixture:
+                for path in Path(directory).glob("*.log"):
+                    print(path.name, path.read_text()[-8000:])
+            raise
+        finally:
+            if fixture:
+                fixture.close()
+
+
+if __name__ == "__main__":
+    main()
