@@ -45,7 +45,8 @@ ssh:
       cpu: 25m
       memory: 32Mi
     limits:
-      cpu: 250m
+      # SSH crypto and bridge processes share this quota across all connections.
+      cpu: "1"
       memory: 128Mi
 
 http:

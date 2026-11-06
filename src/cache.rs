@@ -1,4 +1,7 @@
-use crate::Result;
+use crate::{
+    Result,
+    metrics::{self, CacheResult, Metric},
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -62,6 +65,7 @@ impl Cache {
         load: impl FnOnce(&mut [u8]) -> Result<()>,
     ) -> Result<Option<Arc<Buffer>>> {
         if size == 0 || size > self.max_entry || size > self.capacity {
+            metrics::global().cache(CacheResult::Bypass);
             return Ok(None);
         }
         let flight = {
@@ -79,13 +83,18 @@ impl Cache {
             }
         };
         let mut busy = flight.busy.lock().expect("cache flight poisoned");
+        let wait = (*busy).then(|| metrics::Timer::start(Metric::CacheWait));
         while *busy {
             busy = flight.finished.wait(busy).expect("cache flight poisoned");
+        }
+        if let Some(wait) = wait {
+            wait.finish(true);
         }
         let mut state = self.state.lock().expect("cache state poisoned");
         state.tick = state.tick.wrapping_add(1);
         let tick = state.tick;
         if let Some((last, buffer)) = state.entries.get_mut(key) {
+            metrics::global().cache(CacheResult::Hit);
             *last = tick;
             return Ok(Some(buffer.clone()));
         }
@@ -96,11 +105,13 @@ impl Cache {
                 .min_by_key(|(_, (tick, _))| tick)
                 .map(|(key, _)| key.clone())
             else {
+                metrics::global().cache(CacheResult::Bypass);
                 return Ok(None);
             };
             state.entries.remove(&oldest);
         }
         self.allocated.fetch_add(size, Ordering::AcqRel);
+        metrics::global().cache(CacheResult::Miss);
         *busy = true;
         drop(state);
         drop(busy);

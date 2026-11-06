@@ -42,6 +42,13 @@ def wait_for(check, description):
     raise AssertionError(f"timed out: {description}")
 
 
+def metric_value(body, series):
+    prefix = series.encode() + b" "
+    values = [float(line[len(prefix):]) for line in body.splitlines() if line.startswith(prefix)]
+    assert len(values) == 1, f"expected exactly one metric series: {series}"
+    return values[0]
+
+
 class Balancer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -355,6 +362,24 @@ def exercise(f, large_mib, skip_ssh):
     restore_url = url.replace("project.git", "restored.git")
     f.git(restored, "push", "--mirror", restore_url)
     assert f.git(source, "ls-remote", restore_url).stdout == f.git(source, "ls-remote", url).stdout
+    scrapes = [f.health(name, "/metrics")[1] for name in ["a", "b"]]
+    for series in [
+        'git_rs_requests_total{transport="http",outcome="success"}',
+        'git_rs_phase_duration_seconds_count{phase="graph"}',
+        'git_rs_phase_duration_seconds_count{phase="upload"}',
+        'git_rs_phase_duration_seconds_count{phase="publish"}',
+        'git_rs_dependency_duration_seconds_count{operation="sql"}',
+        'git_rs_dependency_duration_seconds_count{operation="s3_get"}',
+        'git_rs_dependency_duration_seconds_count{operation="s3_put"}',
+        'git_rs_subprocess_duration_seconds_count{program="git"}',
+        'git_rs_subprocess_duration_seconds_count{program="psql"}',
+        'git_rs_cache_lookups_total{result="hit"}',
+        'git_rs_s3_transferred_bytes_total{direction="download"}',
+        'git_rs_s3_transferred_bytes_total{direction="upload"}',
+    ]:
+        assert sum(metric_value(body, series) for body in scrapes) > 0, series
+    if not skip_ssh:
+        assert metric_value(scrapes[0], 'git_rs_requests_total{transport="ssh",outcome="success"}') > 0
     for process in [first, second]:
         process.kill()
         process.wait()

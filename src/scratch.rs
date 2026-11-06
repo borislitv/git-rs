@@ -1,4 +1,8 @@
-use crate::{Result, process};
+use crate::{
+    Result,
+    metrics::{self, Metric, Phase},
+    process,
+};
 use std::fs::{self, DirBuilder, File};
 use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
@@ -16,6 +20,10 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new(root: &Path) -> Result<Self> {
+        metrics::measure(Metric::Phase(Phase::ScratchInit), || Self::create(root))
+    }
+
+    fn create(root: &Path) -> Result<Self> {
         let path = root.join(format!("request-{}", identifier()?));
         DirBuilder::new().mode(0o700).create(&path)?;
         let scratch = Self { path };

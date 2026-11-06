@@ -4,6 +4,11 @@ The rc.3 changes received separate review passes for metadata/publication/histor
 transport/authentication/resource ownership, followed by integration and deployment review.
 These are engineering checks, not a security certification or production HA acceptance.
 
+Follow-up review of the metrics and leased-snapshot changes found no blocking correctness issue.
+Residual coverage gaps include simultaneous lease acquisition/revocation races, commit-boundary
+lease cleanup loss, and cancellation-specific metric outcomes. Existing fencing, late-stream
+failure, transport cancellation and publication-loss tests remain required.
+
 ## Confirmed issues and resolutions
 
 | Issue | Resolution | Regression evidence |
@@ -16,6 +21,8 @@ These are engineering checks, not a security certification or production HA acce
 | Routing the development listener would expose a fixed unauthenticated identity | Separate opt-in Secret-backed HTTP Basic authentication and per-request repository ACLs | Missing/wrong credentials, distinct principals, reader writes and cross-repository access |
 | Omitting HTTPRoute retries inherited Istio retry defaults | Explicit `retry.attempts: 0` | Effective Envoy route assertion failed before the change and passes afterward |
 | HTTP could collide with the SSH listener or SSH Service port | Reject port 2222 and duplicate Service ports while SSH is enabled | Both render-rejection tests failed before their guards; HTTP-only use of port 2222 remains valid |
+| Short-lived SQL calls repeatedly launched the distribution's Perl client wrapper and read the full catalog twice | Invoke the native PostgreSQL 18 client in the runtime; commit an authorized hold and read one consistent snapshot through one connection | Real PostgreSQL authorization, exclusive-maintenance rejection, late-read failure cleanup and native transport integration |
+| A small SSH CPU limit serialized otherwise independent work | Increase the chart's default SSH limit to one CPU and document independent-container quota effects | Controlled fixed-total-budget resource rebalancing and cgroup throttling observations; application metrics expose phase costs separately |
 
 The authenticated native-client test also found a fixture error: a shared credential store could
 return another actor's valid credential after Git's challenge/retry. Actor-specific stores now

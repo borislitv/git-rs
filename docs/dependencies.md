@@ -30,9 +30,14 @@ Checkout v7.0.1 and setup-helm v5.0.1 are pinned to resolved upstream tag commit
 
 The disposable PostgreSQL fixture uses the official `postgres:18.6-bookworm`
 index `sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5`.
-The four opt-in metadata tests run serially against a fresh disposable database;
+The six opt-in metadata tests run serially against a fresh disposable database;
 `GIT_RS_DEV_HTTP=1` permits their loopback-only plaintext PostgreSQL connection.
 CNPG 18.6 and k3s 1.37.2 pins are unchanged.
+
+The runtime's `/usr/bin/psql` points directly to
+`/usr/lib/postgresql/18/bin/psql`, avoiding Ubuntu's Perl multi-cluster launcher
+on every SQL invocation. libpq still owns PostgreSQL authentication and TLS.
+Requalify this explicit path when changing the distribution's PostgreSQL major.
 
 Local Docker builds on the qualification VM require `--network host` because
 outbound source downloads on the default Docker bridge time out. This is a local

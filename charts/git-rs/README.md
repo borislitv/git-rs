@@ -69,7 +69,14 @@ and keep the file out of values and version control. HTTP Basic uses the princip
 and token as password. Authorization is checked on every request, not taken from identity headers.
 The chart mounts the Secret read-only at `/etc/git-rs/http/credentials` (directory projection,
 not subPath, so rotation propagates). `http.port` defaults to 8080 and controls both Service and
-backend listener; 8081 is reserved for health probes. HTTP does not disable SSH.
+backend listener; 8081 is reserved for health and metrics. HTTP does not disable SSH.
+
+The internal `health` port also serves Prometheus metrics at `/metrics`; see
+[metric semantics and scraping](../../docs/metrics.md). The chart does not expose
+that port through its SSH/HTTP Service or HTTPRoute. The default SSH CPU limit is
+one CPU, shared by all SSH connections, authentication helpers and bridge processes.
+Tune backend and sidecar quotas together; idle quota cannot be borrowed between
+containers. Raising this limit also raises the configured aggregate CPU ceiling.
 
 `httpRoute.enabled` defaults to false. Enabling it requires HTTP, explicit nonempty `parentRefs`
 and `hostnames`. Each parent must name the **HTTPS listener's `sectionName`** on an existing

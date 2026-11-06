@@ -51,6 +51,9 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && mkdir -p /run/sshd /var/empty/git-rs \
     && groupadd -g 10001 git-rs && useradd -u 10001 -g 10001 -M -d /var/empty/git-rs -s /bin/sh -p '*' git-rs
 COPY --from=git-build /opt/git/usr/ /usr/
+# Avoid the distribution's Perl multi-cluster launcher on every SQL connection.
+RUN test -x /usr/lib/postgresql/18/bin/psql \
+    && ln -sfn /usr/lib/postgresql/18/bin/psql /usr/bin/psql
 RUN test "$(/usr/bin/git --version)" = "git version 2.56.0" \
     && test "$(/usr/bin/git --exec-path)" = /usr/lib/git-core \
     && test -x /usr/lib/git-core/git-http-backend \

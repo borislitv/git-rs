@@ -198,8 +198,10 @@ client clones, WAL and retained metadata backups can still contain old data.
 - `/livez` checks process responsiveness; `/readyz` checks a reachable writable PostgreSQL primary.
   Readiness does not certify the current schema, S3 availability or replication health. Gate initial
   client exposure on successful migration and a native Git smoke test.
-- `/metrics` reports `git_rs_active_requests` and `git_rs_cache_allocated_bytes`. Monitor pod/child
-  RSS, ephemeral storage, database replication/leases and S3 errors separately.
+- `/metrics` on the health listener exposes request/phase/dependency/subprocess histograms,
+  failures, cache outcomes, S3 object bytes and admission rejections, alongside the active/cache
+  gauges. See [metrics and PromQL](docs/metrics.md). Monitor pod/child RSS, CPU throttling,
+  ephemeral storage and database replication separately.
 
 Before production use, validate CNPG synchronous failover and unknown-commit behavior under the
 actual topology, Ceph/RGW durability and deletion semantics, clock/deadline margins, namespace

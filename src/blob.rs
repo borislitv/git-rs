@@ -1,4 +1,11 @@
-use crate::{Result, cache::Cache, invalid, metadata::Pack, process};
+use crate::{
+    Result,
+    cache::Cache,
+    invalid,
+    metadata::Pack,
+    metrics::{self, Dependency, Direction, Metric},
+    process,
+};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -134,8 +141,25 @@ impl Store {
                 cmd.env(name, value);
             }
         }
-        process::capture(&mut cmd, config.as_bytes(), 4096)?;
-        Ok(())
+        let operation = if delete {
+            Some(Dependency::S3Delete)
+        } else if upload.is_some() {
+            Some(Dependency::S3Put)
+        } else {
+            None
+        };
+        let mut transfer = || {
+            process::capture(&mut cmd, config.as_bytes(), 4096)?;
+            if upload.is_some() {
+                metrics::global().transferred(Direction::Upload, fs::metadata(file)?.len());
+            }
+            Ok(())
+        };
+        if let Some(operation) = operation {
+            metrics::measure(Metric::Dependency(operation), transfer)
+        } else {
+            transfer()
+        }
     }
 
     fn verify(&self, path: &Path, expected_size: u64, expected_digest: &str) -> Result<()> {
@@ -143,6 +167,15 @@ impl Store {
             return Err(invalid("object integrity check failed"));
         }
         Ok(())
+    }
+
+    fn download(&self, key: &str, destination: &Path, size: u64, hash: &str) -> Result<()> {
+        metrics::measure(Metric::Dependency(Dependency::S3Get), || {
+            self.transfer(key, destination, None, false, Some(size))?;
+            self.verify(destination, size, hash)?;
+            metrics::global().transferred(Direction::Download, size);
+            Ok(())
+        })
     }
 
     pub fn materialize(
@@ -159,8 +192,7 @@ impl Store {
             &cache_key,
             usize::try_from(size).unwrap_or(usize::MAX),
             |buffer| {
-                self.transfer(key, destination, None, false, Some(size))?;
-                self.verify(destination, size, hash)?;
+                self.download(key, destination, size, hash)?;
                 File::open(destination)?.read_exact(buffer)?;
                 Ok(())
             },
@@ -168,8 +200,7 @@ impl Store {
         if let Some(buffer) = cached {
             File::create(destination)?.write_all(buffer.as_ref().as_ref())?;
         } else {
-            self.transfer(key, destination, None, false, Some(size))?;
-            self.verify(destination, size, hash)?;
+            self.download(key, destination, size, hash)?;
         }
         Ok(())
     }
@@ -261,7 +292,9 @@ impl Store {
                 cmd.env(name, value);
             }
         }
-        let response = process::capture(&mut cmd, config.as_bytes(), 16384)?;
+        let response = metrics::measure(Metric::Dependency(Dependency::S3Versioning), || {
+            process::capture(&mut cmd, config.as_bytes(), 16384)
+        })?;
         let mut xml = std::str::from_utf8(&response)?.trim();
         if xml.starts_with("<?xml ") {
             xml = xml

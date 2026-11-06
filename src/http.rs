@@ -3,6 +3,7 @@ use crate::{
     auth::{HttpCredentials, Service},
     engine::{Cgi, Engine},
     invalid,
+    metrics::{Outcome, RequestTimer, Transport},
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -238,20 +239,26 @@ fn handle_with_auth(
     engine: &Engine,
     authentication: Authentication<'_>,
 ) -> Result<()> {
+    let mut request = RequestTimer::start(Transport::Http);
     let operation = crate::process::Operation::new(engine.operation_seconds);
     let interrupt = stream.try_clone()?;
-    operation.with_interrupt(
+    let result = operation.with_interrupt(
         || {
             let _ = interrupt.shutdown(std::net::Shutdown::Both);
         },
-        || handle_bounded(stream, engine, authentication),
-    )
+        || handle_bounded(stream, engine, authentication, &mut request),
+    );
+    if result.is_err() {
+        request.outcome(Outcome::Error);
+    }
+    result
 }
 
 fn handle_bounded(
     stream: &mut TcpStream,
     engine: &Engine,
     authentication: Authentication<'_>,
+    timer: &mut RequestTimer,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
     stream.set_write_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
@@ -260,6 +267,7 @@ fn handle_bounded(
     let request = match Request::parse(&mut input) {
         Ok(request) => request,
         Err(_) => {
+            timer.outcome(Outcome::BadRequest);
             stream.write_all(
                 b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
             )?;
@@ -271,12 +279,13 @@ fn handle_bounded(
         Authentication::Basic(credentials) => match request.authenticate(credentials) {
             Some(principal) => principal,
             None => {
+                timer.outcome(Outcome::Unauthorized);
                 stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"git-rs\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
                 return Ok(());
             }
         },
     };
-    engine.run(
+    let result = engine.run(
         &request.slug,
         principal,
         request.service,
@@ -287,7 +296,11 @@ fn handle_bounded(
         &|| {
             let _ = interrupt.shutdown(std::net::Shutdown::Read);
         },
-    )
+    );
+    if result.is_ok() {
+        timer.outcome(Outcome::Success);
+    }
+    result
 }
 
 pub fn loopback(address: &str) -> Result<SocketAddr> {

@@ -5,6 +5,7 @@ use crate::{
     cache::Cache,
     hooks, invalid,
     metadata::{self, Snapshot},
+    metrics::{self, Metric, Phase},
     process,
     protocol::{Oid, Update},
     scratch::Scratch,
@@ -27,6 +28,12 @@ pub struct Engine {
 
 impl Engine {
     pub fn materialize(&self, snapshot: &Snapshot) -> Result<Scratch> {
+        metrics::measure(Metric::Phase(Phase::Materialize), || {
+            self.materialize_inner(snapshot)
+        })
+    }
+
+    fn materialize_inner(&self, snapshot: &Snapshot) -> Result<Scratch> {
         let scratch = Scratch::new(&self.scratch_root)?;
         let total: u64 = snapshot
             .packs
@@ -163,15 +170,17 @@ impl Engine {
         }
         if !tips.is_empty() {
             // fsck walks actual graph edges; normalized deltas alone are insufficient.
-            process::capture(
-                process::git()
-                    .arg("-C")
-                    .arg(path)
-                    .args(["fsck", "--strict", "--no-reflogs", "--no-dangling"])
-                    .args(&tips),
-                b"",
-                64 * 1024,
-            )?;
+            metrics::measure(Metric::Phase(Phase::Graph), || {
+                process::capture(
+                    process::git()
+                        .arg("-C")
+                        .arg(path)
+                        .args(["fsck", "--strict", "--no-reflogs", "--no-dangling"])
+                        .args(&tips),
+                    b"",
+                    64 * 1024,
+                )
+            })?;
         }
         let directory = path.join("objects/pack");
         let baseline: std::collections::BTreeSet<_> =
@@ -208,20 +217,22 @@ impl Engine {
         hashes.sort();
         let mut packs = Vec::new();
         for hash in hashes {
-            packs.push(
+            packs.push(metrics::measure(Metric::Phase(Phase::Upload), || {
                 self.store
-                    .upload(&snapshot.id, operation, &directory, &hash)?,
-            );
+                    .upload(&snapshot.id, operation, &directory, &hash)
+            })?);
         }
-        metadata::publish(
-            snapshot,
-            lease,
-            operation,
-            principal,
-            commands,
-            &fast_forward,
-            &packs,
-        )?;
+        metrics::measure(Metric::Phase(Phase::Publish), || {
+            metadata::publish(
+                snapshot,
+                lease,
+                operation,
+                principal,
+                commands,
+                &fast_forward,
+                &packs,
+            )
+        })?;
         Ok(())
     }
 
@@ -273,9 +284,9 @@ impl Engine {
         if !["", "version=0", "version=1", "version=2"].contains(&protocol) {
             return Err(invalid("unsupported Git protocol header"));
         }
-        let initial = metadata::snapshot(slug, principal, service == Service::Receive)?;
-        let barrier = metadata::Barrier::acquire(&initial.id, false)?;
-        let snapshot = metadata::snapshot(slug, principal, service == Service::Receive)?;
+        let (snapshot, barrier) = metrics::measure(Metric::Phase(Phase::Snapshot), || {
+            metadata::leased_snapshot(slug, principal, service == Service::Receive)
+        })?;
         let scratch = self.materialize(&snapshot)?;
         let operation = crate::scratch::identifier()?;
         let socket = hooks::PrivateSocket::new()?;
@@ -321,21 +332,23 @@ impl Engine {
             command.env("GIT_PROTOCOL", protocol);
         }
         hooks::install(&scratch.path, &socket.path, &nonce, &mut command)?;
-        self.execute(
-            &scratch.path,
-            &snapshot,
-            &barrier,
-            principal,
-            &operation,
-            listener,
-            &nonce,
-            command,
-            cgi.is_some(),
-            input,
-            output,
-            cancel_input,
-            budget,
-        )
+        metrics::measure(Metric::Phase(Phase::Git), || {
+            self.execute(
+                &scratch.path,
+                &snapshot,
+                &barrier,
+                principal,
+                &operation,
+                listener,
+                &nonce,
+                command,
+                cgi.is_some(),
+                input,
+                output,
+                cancel_input,
+                budget,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -355,13 +368,12 @@ impl Engine {
         cancel_input: &(dyn Fn() + Sync),
         budget: &std::sync::Arc<process::Operation>,
     ) -> Result<()> {
-        let mut child = process::Guard::new(
+        let mut child = process::Guard::spawn(
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?,
-        );
+                .stderr(Stdio::null()),
+        )?;
         let mut stdin = child
             .0
             .stdin
@@ -394,8 +406,17 @@ impl Engine {
                                 return Err(invalid("HTTP body incomplete"));
                             }
                         }
-                        self.validate(
-                            path, snapshot, lease, principal, operation, commands, publish,
+                        metrics::measure(
+                            Metric::Phase(if publish {
+                                Phase::Validate
+                            } else {
+                                Phase::PreReceive
+                            }),
+                            || {
+                                self.validate(
+                                    path, snapshot, lease, principal, operation, commands, publish,
+                                )
+                            },
                         )
                     })
                 })

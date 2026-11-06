@@ -100,6 +100,9 @@ The gateway terminates HTTPS, preserves `Authorization`, and connects over a tru
 path to the backend. The application HTTP listener is plaintext; HTTPRoute alone supplies neither
 authentication nor transport encryption. See [credential setup](OPERATIONS.md#authenticated-http).
 
+Prometheus request, phase, dependency, subprocess and cache metrics are available at `/metrics`
+on the internal health listener. See [metric semantics and scrape configuration](docs/metrics.md).
+
 ## Build and verify
 
 Requires Linux, Rust **1.99+**, Git **2.56.0**, OpenSSH server/client, PostgreSQL client, curl with

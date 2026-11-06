@@ -7,6 +7,7 @@ use git_rs::{
     cache::Cache,
     engine::Engine,
     history, hooks, http, invalid, metadata,
+    metrics::{self, Listener, Outcome, RequestTimer, Transport},
     process::Admission,
     protocol,
 };
@@ -92,14 +93,21 @@ fn field(socket: &mut UnixStream) -> Result<String> {
 }
 
 fn session(mut socket: UnixStream, engine: &Engine) -> Result<()> {
+    let mut request = RequestTimer::start(Transport::Ssh);
     let operation = git_rs::process::Operation::new(engine.operation_seconds);
     let interrupt = socket.try_clone()?;
-    operation.with_interrupt(
+    let result = operation.with_interrupt(
         || {
             let _ = interrupt.shutdown(std::net::Shutdown::Both);
         },
         || session_bounded(&mut socket, engine),
-    )
+    );
+    request.outcome(if result.is_ok() {
+        Outcome::Success
+    } else {
+        Outcome::Error
+    });
+    result
 }
 
 fn session_bounded(socket: &mut UnixStream, engine: &Engine) -> Result<()> {
@@ -137,6 +145,7 @@ enum HttpIdentity {
 }
 
 fn serve(args: &[String]) -> Result<()> {
+    metrics::global();
     // Validate credentials before opening any serving listener. Production and
     // fixed-principal development HTTP can never be enabled in the same process.
     let production_http = args
@@ -229,6 +238,8 @@ fn serve(args: &[String]) -> Result<()> {
                                     eprintln!("HTTP operation failed: {error}");
                                 }
                             });
+                        } else {
+                            metrics::global().reject(Listener::Http);
                         }
                     }
                     Err(error) => {
@@ -250,6 +261,8 @@ fn serve(args: &[String]) -> Result<()> {
                     eprintln!("SSH operation failed: {error}");
                 }
             });
+        } else {
+            metrics::global().reject(Listener::Ssh);
         }
     }
     Ok(())
@@ -280,6 +293,7 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<Admission>) -> Result<
             // Health requests cannot queue behind one slow peer. Keep a separate
             // bounded budget, so Git admission cannot starve probes either.
             let Some(slot) = health_active.try_admit() else {
+                metrics::global().reject(Listener::Health);
                 continue;
             };
             let engine = engine.clone();
@@ -332,17 +346,13 @@ fn health_request(
                 ),
                 ["GET", "/metrics"] => (
                     "200 OK",
-                    format!(
-                        "git_rs_active_requests {}\ngit_rs_cache_allocated_bytes {}\n",
-                        active.active(),
-                        engine.cache.allocated()
-                    ),
+                    metrics::global().render(active.active(), engine.cache.allocated()),
                 ),
                 _ => ("404 Not Found", String::new()),
             };
             let _ = write!(
                 stream,
-                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             Ok(())

@@ -38,6 +38,22 @@ Docker build context. Do not enable CI, LFS smudging or client filters merely by
 - Define cache state precisely. Restarting Gitaly or git-rs clears selected process caches, not
   kernel page cache, database buffers or storage caches. Never flush a shared host's caches.
 
+## Latency diagnosis
+
+- Capture an unchanged-resource baseline before changing code. Test resource rebalancing as a
+  separate profile at the same aggregate budget; report any increased total allocation explicitly.
+- Inspect SSH cgroup throttling, including authentication and bridge processes sharing its quota.
+  A mostly idle backend does not prove that the SSH sidecar has spare CPU available.
+- Use [internal Prometheus metrics](metrics.md) to distinguish snapshot, materialization, native
+  Git, graph validation, upload and publication costs. Inclusive nested timings overlap.
+- Inspect actual executable paths and subprocess counts. Distribution command launchers can add
+  startup overhead even when the application itself is Rust. Attribute native-client launch cost
+  separately from database execution, network RTT and object-transfer throughput.
+- Keep tracing out of scored trials: syscall tracing changes scheduling and execution cost.
+  Retain raw traces privately and report uninstrumented timings separately.
+- Preserve object validation, publication confirmation and fencing when optimizing. Reduced
+  checks or durability establish a different contract, not an equivalent performance improvement.
+
 ## Interpretation
 
 Initial ingestion, tiny incremental publication, no-op checks and full reads can favor different

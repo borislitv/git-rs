@@ -1,5 +1,9 @@
 use crate::protocol::{Oid, Update, hex, unhex};
-use crate::{Result, auth, invalid, process, scratch};
+use crate::{
+    Result, auth, invalid,
+    metrics::{self, Dependency, Metric},
+    process, scratch,
+};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -61,8 +65,10 @@ fn psql() -> Result<Command> {
 }
 
 pub fn sql(query: &str) -> Result<String> {
-    let output = process::capture(&mut psql()?, query.as_bytes(), 16 * 1024 * 1024)?;
-    Ok(String::from_utf8(output)?)
+    metrics::measure(Metric::Dependency(Dependency::Sql), || {
+        let output = process::capture(&mut psql()?, query.as_bytes(), 16 * 1024 * 1024)?;
+        Ok(String::from_utf8(output)?)
+    })
 }
 
 // Keep one connection/transaction for snapshot consistency, but decode each row
@@ -70,16 +76,21 @@ pub fn sql(query: &str) -> Result<String> {
 // limit; pack catalogs also grow independently of the number of refs. The only
 // retained allocation is the decoded Snapshot, not a second full wire image.
 fn snapshot_rows(query: &str, mut row: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    metrics::measure(Metric::Dependency(Dependency::Sql), || {
+        snapshot_rows_inner(query, &mut row)
+    })
+}
+
+fn snapshot_rows_inner(query: &str, mut row: impl FnMut(&str) -> Result<()>) -> Result<()> {
     process::check_operation()?;
-    let mut child = process::Guard::new(
+    let mut child = process::Guard::spawn(
         psql()?
             // psql otherwise buffers an entire PGresult before writing stdout.
             .args(["-v", "FETCH_COUNT=256"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
+            .stderr(Stdio::null()),
+    )?;
     let mut stdin = child
         .0
         .stdin
@@ -239,15 +250,49 @@ pub fn grant(slug: &str, actor: &str, subject: &str, role: &str, prefix: &[u8]) 
 pub fn snapshot(slug: &str, principal: &str, write: bool) -> Result<Snapshot> {
     auth::repository(slug)?;
     auth::principal(principal)?;
-    let repo = format!("(SELECT id FROM repositories WHERE slug={})", text(slug));
-    let query = format!(
-        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT 'repo',r.id,r.generation,encode(r.default_ref,'hex'),r.storage_epoch FROM repositories r JOIN permissions p ON r.id=p.repo_id WHERE r.slug={} AND p.principal={} {}; SELECT 'ref',encode(name,'hex'),encode(oid,'hex') FROM refs WHERE repo_id={repo} ORDER BY name; SELECT 'pack',native_hash,pack_key,idx_key,pack_digest,idx_digest,pack_size,idx_size FROM packs WHERE repo_id={repo} ORDER BY native_hash; COMMIT;",
-        text(slug),
-        text(principal),
-        if write { "AND p.role <> 'reader'" } else { "" }
+    read_snapshot(
+        &snapshot_query(slug, principal, write, None),
+        None,
+        &mut None,
+    )?
+    .ok_or_else(|| invalid("repository unavailable"))
+}
+
+fn snapshot_query(slug: &str, principal: &str, write: bool, lease: Option<&str>) -> String {
+    let guard = lease.map(|id| format!(" AND EXISTS(SELECT 1 FROM repository_leases WHERE id={}::uuid AND repo_id=r.id AND NOT exclusive AND expires_at > clock_timestamp())", text(id))).unwrap_or_default();
+    let repo = format!(
+        "(SELECT id FROM repositories r WHERE slug={}{guard})",
+        text(slug)
     );
+    let role = if write { "AND p.role <> 'reader'" } else { "" };
+    format!(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT 'repo',r.id,r.generation,encode(r.default_ref,'hex'),r.storage_epoch FROM repositories r JOIN permissions p ON r.id=p.repo_id WHERE r.slug={} AND p.principal={} {role}{guard}; SELECT 'ref',encode(name,'hex'),encode(oid,'hex') FROM refs WHERE repo_id={repo} ORDER BY name; SELECT 'pack',native_hash,pack_key,idx_key,pack_digest,idx_digest,pack_size,idx_size FROM packs WHERE repo_id={repo} ORDER BY native_hash; COMMIT;",
+        text(slug),
+        text(principal)
+    )
+}
+
+fn read_snapshot(
+    query: &str,
+    lease_id: Option<&str>,
+    lease: &mut Option<Barrier>,
+) -> Result<Option<Snapshot>> {
     let mut snapshot = None;
-    snapshot_rows(&query, |line| {
+    snapshot_rows(query, |line| {
+        if let Some(repo) = line.strip_prefix("lease\t") {
+            let id = lease_id.ok_or_else(|| invalid("unexpected repository lease"))?;
+            if lease.is_some() || snapshot.is_some() || repo.contains('\t') {
+                return Err(invalid("invalid repository lease framing"));
+            }
+            *lease = Some(Barrier {
+                id: id.into(),
+                repo: repo.into(),
+            });
+            return Ok(());
+        }
+        if lease_id.is_some() && lease.is_none() {
+            return Err(invalid("snapshot requires a repository lease"));
+        }
         let fields: Vec<_> = line.split('\t').collect();
         let Some(snapshot) = snapshot.as_mut() else {
             if let ["repo", id, generation, default_ref, storage_epoch] = fields.as_slice() {
@@ -291,7 +336,48 @@ pub fn snapshot(slug: &str, principal: &str, write: bool) -> Result<Snapshot> {
         }
         Ok(())
     })?;
-    snapshot.ok_or_else(|| invalid("repository unavailable"))
+    Ok(snapshot)
+}
+
+/// Commit an authorized hold before reading one consistent catalog. Reuse one
+/// native client connection without retaining the repository row lock during a
+/// large snapshot. A streamed hold is cleaned up if the later read/COMMIT fails.
+pub fn leased_snapshot(slug: &str, principal: &str, write: bool) -> Result<(Snapshot, Barrier)> {
+    auth::repository(slug)?;
+    auth::principal(principal)?;
+    let remaining = process::remaining()?;
+    if remaining > Duration::from_secs(process::DEADLINE) {
+        return Err(invalid("operation exceeds repository lease budget"));
+    }
+    let deadline = Instant::now() + remaining.min(Duration::from_secs(5));
+    let id = scratch::identifier()?;
+    let role = if write { "AND p.role <> 'reader'" } else { "" };
+    let query = format!(
+        "BEGIN; DO $body$ DECLARE repo uuid; BEGIN SELECT r.id INTO STRICT repo FROM repositories r JOIN permissions p ON r.id=p.repo_id WHERE r.slug={} AND p.principal={} {role} FOR UPDATE OF r; DELETE FROM repository_leases WHERE repo_id=repo AND expires_at <= clock_timestamp(); END $body$; INSERT INTO repository_leases SELECT {}::uuid,r.id,false,clock_timestamp()+interval '150 seconds' FROM repositories r WHERE r.slug={} AND NOT EXISTS(SELECT 1 FROM repository_leases WHERE repo_id=r.id AND exclusive); SELECT 'lease',repo_id FROM repository_leases WHERE id={}::uuid; COMMIT; {}",
+        text(slug),
+        text(principal),
+        text(&id),
+        text(slug),
+        text(&id),
+        snapshot_query(slug, principal, write, Some(&id))
+    );
+    loop {
+        let mut lease = None;
+        let snapshot = read_snapshot(&query, Some(&id), &mut lease)?;
+        if let Some(lease) = lease {
+            let snapshot = snapshot.ok_or_else(|| invalid("repository unavailable"))?;
+            if snapshot.id != lease.repo {
+                return Err(invalid("repository lease mismatch"));
+            }
+            return Ok((snapshot, lease));
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(
+                "repository busy; retry after active requests or crashed leases expire",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

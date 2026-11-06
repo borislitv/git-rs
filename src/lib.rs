@@ -8,6 +8,7 @@ pub mod history;
 pub mod hooks;
 pub mod http;
 pub mod metadata;
+pub mod metrics;
 pub mod process;
 pub mod protocol;
 pub mod scratch;

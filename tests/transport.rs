@@ -115,6 +115,42 @@ fn partial_health_request_does_not_starve_liveness() {
 }
 
 #[test]
+fn prometheus_scrape_reports_real_transport_and_dependency_failures_without_identity_labels() {
+    let backend = Backend::start();
+    for request in [
+        "GET /not-a-git-route HTTP/1.1\r\nHost: example.invalid\r\n\r\n",
+        "GET /private-project.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: example.invalid\r\n\r\n",
+    ] {
+        let mut stream = TcpStream::connect(&backend.http).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.read_to_end(&mut Vec::new()).unwrap();
+    }
+    let metrics = backend.health("/metrics");
+    assert!(metrics.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(metrics.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+    for expected in [
+        "git_rs_requests_total{transport=\"http\",outcome=\"bad_request\"} 1\n",
+        "git_rs_requests_total{transport=\"http\",outcome=\"error\"} 1\n",
+        "git_rs_request_duration_seconds_count{transport=\"http\"} 2\n",
+        "git_rs_phase_errors_total{phase=\"snapshot\"} 1\n",
+    ] {
+        assert!(metrics.contains(expected), "missing metric: {expected}");
+    }
+    let errors: u64 = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("git_rs_dependency_errors_total{operation=\"sql\"} "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(errors >= 1);
+    assert!(!metrics.contains("private-project"));
+    assert!(!metrics.contains("alice"));
+}
+
+#[test]
 fn trickled_health_request_has_an_absolute_lifetime() {
     let backend = Backend::start();
     let mut stream = TcpStream::connect(&backend.health).unwrap();

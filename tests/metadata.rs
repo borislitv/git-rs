@@ -177,6 +177,7 @@ fn failed_late_catalog_query_never_returns_a_partial_snapshot() {
     // Hold a real dependency lock: snapshot can emit its authorized repository
     // header and refs, but its final catalog query cannot complete. The request
     // deadline must fail the snapshot rather than accept that partial stdout.
+    let repo = metadata::snapshot(&slug, "alice", false).unwrap().id;
     let mut locker = process::Guard::new(
         Command::new("/usr/bin/psql")
             .args(["-X", "-qAt", "-v", "ON_ERROR_STOP=1"])
@@ -204,6 +205,22 @@ fn failed_late_catalog_query_never_returns_a_partial_snapshot() {
         "partial snapshot must not escape after SQL failure"
     );
     assert!(started.elapsed() < Duration::from_secs(5));
+    let result =
+        process::Operation::new(1).enter(|| metadata::leased_snapshot(&slug, "alice", false));
+    assert!(
+        result.is_err(),
+        "a failed leased snapshot must not return partial data"
+    );
+    assert_eq!(
+        metadata::sql(&format!(
+            "SELECT count(*) FROM repository_leases WHERE repo_id={}::uuid;",
+            metadata::text(&repo)
+        ))
+        .unwrap()
+        .trim(),
+        "0",
+        "a known committed hold must be released after failed catalog streaming"
+    );
     drop(stdin);
     drop(locker);
     assert!(
@@ -212,4 +229,62 @@ fn failed_late_catalog_query_never_returns_a_partial_snapshot() {
             .refs
             .is_empty()
     );
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn leased_snapshot_preserves_authorization_and_a_live_committed_hold() {
+    process::Operation::new(120).enter(|| {
+        metadata::migrate().unwrap();
+        let slug = format!("metadata/leased-{}", git_rs::scratch::identifier().unwrap());
+        metadata::create(&slug, "alice").unwrap();
+        metadata::grant(&slug, "alice", "bob", "reader", b"refs/").unwrap();
+        let (snapshot, lease) = metadata::leased_snapshot(&slug, "bob", false).unwrap();
+        assert!(snapshot.refs.is_empty());
+        lease
+            .check()
+            .expect("returned snapshot must have a committed live hold");
+        let count = format!(
+            "SELECT count(*) FROM repository_leases WHERE repo_id={}::uuid;",
+            metadata::text(&snapshot.id)
+        );
+        assert_eq!(metadata::sql(&count).unwrap().trim(), "1");
+        assert!(metadata::leased_snapshot(&slug, "bob", true).is_err());
+        assert!(metadata::leased_snapshot(&slug, "unknown", false).is_err());
+        assert_eq!(
+            metadata::sql(&count).unwrap().trim(),
+            "1",
+            "denied requests must not acquire holds"
+        );
+        drop(lease);
+        assert_eq!(metadata::sql(&count).unwrap().trim(), "0");
+        metadata::grant(&slug, "alice", "bob", "none", b"refs/").unwrap();
+        assert!(metadata::leased_snapshot(&slug, "bob", false).is_err());
+        let (snapshot, lease) = metadata::leased_snapshot(&slug, "alice", true).unwrap();
+        assert!(snapshot.refs.is_empty());
+        lease.check().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn leased_snapshot_never_reads_through_exclusive_maintenance() {
+    process::Operation::new(120).enter(|| {
+        metadata::migrate().unwrap();
+        let slug = format!(
+            "metadata/exclusive-{}",
+            git_rs::scratch::identifier().unwrap()
+        );
+        metadata::create(&slug, "alice").unwrap();
+        let snapshot = metadata::snapshot(&slug, "alice", false).unwrap();
+        let exclusive = Barrier::acquire(&snapshot.id, true).unwrap();
+        assert!(
+            metadata::leased_snapshot(&slug, "alice", false).is_err(),
+            "a reader must not bypass an exclusive hold"
+        );
+        exclusive.check().unwrap();
+        drop(exclusive);
+        let (_, lease) = metadata::leased_snapshot(&slug, "alice", false).unwrap();
+        lease.check().unwrap();
+    });
 }

@@ -1,4 +1,7 @@
-use crate::{Result, invalid};
+use crate::{
+    Result, invalid,
+    metrics::{self, Metric, Program},
+};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
@@ -159,11 +162,22 @@ pub fn command(program: &str) -> Command {
     command
 }
 
-pub struct Guard(pub Child, bool);
+pub struct Guard(pub Child, bool, Option<metrics::Timer>);
 
 impl Guard {
     pub fn new(child: Child) -> Self {
-        Self(child, false)
+        Self(child, false, None)
+    }
+    pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        let program = match command.get_args().nth(2).and_then(|arg| arg.to_str()) {
+            Some("/usr/bin/git") => Program::Git,
+            Some("/usr/bin/psql") => Program::Psql,
+            Some("/usr/bin/curl") => Program::Curl,
+            Some("/usr/bin/sha256sum") => Program::Sha256sum,
+            _ => Program::Other,
+        };
+        let timer = metrics::Timer::start(Metric::Subprocess(program));
+        Ok(Self(command.spawn()?, false, Some(timer)))
     }
     pub fn terminate(&self) {
         if !self.1 {
@@ -177,6 +191,9 @@ impl Guard {
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         let status = self.0.wait()?;
         self.1 = true;
+        if let Some(timer) = self.2.take() {
+            timer.finish(status.success());
+        }
         Ok(status)
     }
 }
@@ -192,13 +209,12 @@ impl Drop for Guard {
 
 pub fn capture(command: &mut Command, input: &[u8], limit: u64) -> Result<Vec<u8>> {
     check_operation()?;
-    let mut child = Guard::new(
+    let mut child = Guard::spawn(
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
+            .stderr(Stdio::null()),
+    )?;
     let mut stdin = child
         .0
         .stdin
