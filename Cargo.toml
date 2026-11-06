@@ -5,6 +5,15 @@ edition = "2024"
 rust-version = "1.99"
 description = "Experimental stateless Git backend with PostgreSQL and immutable S3 packs"
 
+[dependencies]
+deadpool-postgres = "0.14.2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+native-tls = "0.2"
+openssl = "0.10"
+postgres-native-tls = "0.5.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio-postgres = "0.7.18"
+
 [lints.rust]
 unsafe_code = "forbid"
 

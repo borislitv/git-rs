@@ -88,7 +88,9 @@ def main():
     manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
     lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
     assert metadata["appVersion"] == manifest["package"]["version"]
-    assert lock["package"][0]["version"] == metadata["appVersion"]
+    application = next(package for package in lock["package"]
+                       if package["name"] == manifest["package"]["name"])
+    assert application["version"] == metadata["appVersion"]
     defaults = render(args.helm)
     deployment = resource(defaults, "Deployment")
     pod = deployment["spec"]["template"]["spec"]

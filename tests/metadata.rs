@@ -6,12 +6,219 @@ use git_rs::{
     protocol::{self, Oid, Update},
 };
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 // These tests initialize git_rs in a fresh, disposable PostgreSQL database. They
 // deliberately exercise the public metadata API, without requiring S3 or Git RPCs.
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn snapshot_budget_rejects_growth_without_partial_data_or_leaked_holds() {
+    if std::env::var("GIT_RS_METADATA_BYTES").as_deref() != Ok("4096") {
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "snapshot_budget_rejects_growth_without_partial_data_or_leaked_holds",
+            ])
+            .env("GIT_RS_METADATA_BYTES", "4096")
+            .status()
+            .unwrap();
+        assert!(result.success());
+        return;
+    }
+    process::Operation::new(120).enter(|| {
+        metadata::migrate().unwrap();
+        let slug = format!("metadata/budget-{}", git_rs::scratch::identifier().unwrap());
+        metadata::create(&slug, "alice").unwrap();
+        let initial = metadata::snapshot(&slug, "alice", false).unwrap();
+        metadata::sql(&format!(
+            "INSERT INTO refs VALUES({}::uuid,{},decode(repeat('01',20),'hex'));",
+            metadata::text(&initial.id),
+            metadata::bytes(b"refs/heads/small")
+        ))
+        .unwrap();
+        let error = metadata::snapshot(&slug, "alice", false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("metadata snapshot budget exceeded"),
+            "{error}"
+        );
+        assert!(metadata::leased_snapshot(&slug, "alice", false).is_err());
+        assert_eq!(
+            metadata::sql(&format!(
+                "SELECT count(*) FROM repository_leases WHERE repo_id={}::uuid;",
+                metadata::text(&initial.id)
+            ))
+            .unwrap()
+            .trim(),
+            "0"
+        );
+        metadata::sql(&format!(
+            "DELETE FROM refs WHERE repo_id={}::uuid;",
+            metadata::text(&initial.id)
+        ))
+        .unwrap();
+        assert!(
+            metadata::snapshot(&slug, "alice", false)
+                .unwrap()
+                .refs
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires loopback networking; run serially with metadata contracts"]
+fn sql_connection_creation_bounds_stalled_authentication() {
+    if std::env::var("GIT_RS_TEST_STALLED_PG").as_deref() == Ok("1") {
+        let started = Instant::now();
+        assert!(metadata::sql("SELECT 1;").is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(7),
+            "full connection creation exceeded five-second budget"
+        );
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (finished, stop) = std::sync::mpsc::channel();
+    let connected = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let connected = &connected;
+        scope.spawn(move || {
+            loop {
+                if let Ok((connection, _)) = listener.accept() {
+                    connected.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stop.recv_timeout(Duration::from_secs(10));
+                    drop(connection);
+                    break;
+                }
+                if stop.try_recv().is_ok() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "sql_connection_creation_bounds_stalled_authentication",
+            ])
+            .env("GIT_RS_TEST_STALLED_PG", "1")
+            .env("PGPORT", port.to_string())
+            .status()
+            .unwrap();
+        let _ = finished.send(());
+        assert!(result.success());
+    });
+    assert!(
+        connected.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture must reach TCP establishment"
+    );
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn sql_reuses_sessions_and_does_not_recycle_failed_transactions() {
+    process::Operation::new(120).enter(|| {
+        let mut sessions = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            sessions.insert(metadata::sql("SELECT pg_backend_pid();").unwrap());
+        }
+        assert!(
+            sessions.len() <= 8,
+            "successful queries must reuse bounded PostgreSQL sessions"
+        );
+        metadata::sql("BEGIN; SET LOCAL statement_timeout=1;").unwrap();
+        assert_eq!(
+            metadata::sql("SHOW statement_timeout;").unwrap().trim(),
+            "30s",
+            "an unfinished transaction must not leak to the next borrower"
+        );
+        assert!(metadata::sql("BEGIN; SELECT 1/0; COMMIT;").is_err());
+        for _ in 0..16 {
+            assert_eq!(
+                metadata::sql("SELECT 42;").unwrap().trim(),
+                "42",
+                "an aborted transaction must not be returned to another borrower"
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn cancelled_sql_rolls_back_and_returns_pool_capacity() {
+    metadata::migrate().unwrap();
+    let name = format!(
+        "cancel_{}",
+        git_rs::scratch::identifier().unwrap().replace('-', "")
+    );
+    metadata::sql(&format!("CREATE TABLE git_rs.{name}(value integer);")).unwrap();
+    let operation = process::Operation::new(120);
+    std::thread::scope(|scope| {
+        let request = scope.spawn(|| {
+            operation.enter(|| {
+                metadata::sql(&format!(
+                    "BEGIN; INSERT INTO git_rs.{name} VALUES (1); SELECT pg_sleep(15); COMMIT;"
+                ))
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            let running = metadata::sql(&format!(
+                "SELECT pid FROM pg_stat_activity WHERE pid<>pg_backend_pid() AND state='active' AND query LIKE '%INSERT INTO git_rs.{name}%';"
+            )).unwrap();
+            if !running.trim().is_empty() {
+                break running.trim().parse::<u32>().unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SQL transaction never became active"
+            );
+            std::thread::yield_now();
+        };
+        let started = Instant::now();
+        operation.cancel();
+        assert!(request.join().unwrap().is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation must interrupt an active SQL await"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while metadata::sql(&format!(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid={pid};"
+        ))
+        .unwrap()
+        .trim()
+            != "0"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled PostgreSQL backend still owns its transaction"
+            );
+            std::thread::yield_now();
+        }
+    });
+    assert_eq!(
+        metadata::sql(&format!("SELECT count(*) FROM git_rs.{name};"))
+            .unwrap()
+            .trim(),
+        "0",
+        "cancelled SQL must not commit its write"
+    );
+    metadata::sql(&format!("DROP TABLE git_rs.{name};")).unwrap();
+    for _ in 0..12 {
+        assert_eq!(metadata::sql("SELECT 1;").unwrap().trim(), "1");
+    }
+}
+
 #[test]
 #[ignore = "requires a disposable PostgreSQL database configured with PG* variables"]
 fn published_long_refs_remain_readable() {

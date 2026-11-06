@@ -297,17 +297,7 @@ fn every_git_route_challenges_before_accessing_metadata_or_body() {
 }
 
 #[test]
-#[ignore = "requires runtime /usr/bin/psql; run explicitly in the runtime test image"]
 fn verified_authentication_reaches_existing_metadata_authorization() {
-    assert!(
-        Command::new("/usr/bin/psql")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success()),
-        "runtime test dependency /usr/bin/psql is missing or unusable"
-    );
     let backend = Backend::start();
     // The server owns an immutable startup snapshot, not a per-request file read.
     fs::write(backend.root.join("credentials"), "invalid replacement").unwrap();

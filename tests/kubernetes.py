@@ -169,6 +169,13 @@ def exercise(args, base, cluster):
                                            'user = "test-access:synthetic-secret-key"\n').encode())
     cluster.kubectl("exec", "deployment/backend", "-c", "backend", "--",
                     "/usr/local/bin/git-rs", "create", "team/project", "alice")
+    print("In-process SQL rejects an untrusted CA and a mismatched TLS hostname", flush=True)
+    pg_service = json.loads(cluster.kubectl("get", "service/postgres", "-o", "json").stdout)
+    for setting in ["PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt",
+                    "PGHOST=" + pg_service["spec"]["clusterIP"]]:
+        result = cluster.kubectl("exec", "deployment/backend", "-c", "backend", "--",
+            "/usr/bin/env", setting, "/usr/local/bin/git-rs", "migrate", ok=False)
+        assert result.returncode != 0, "PostgreSQL TLS verification must reject " + setting.split("=")[0]
 
     service = json.loads(cluster.kubectl("get", "service/backend", "-o", "json").stdout)
     ssh_port = next(p["nodePort"] for p in service["spec"]["ports"] if p["name"] == "ssh")

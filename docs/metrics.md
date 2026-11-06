@@ -26,7 +26,7 @@ restart. Scrapes do not perform SQL or S3 requests.
 | `git_rs_phase_errors_total` | Counter | Failed phase outcomes, with the same `phase` labels |
 | `git_rs_dependency_duration_seconds` | Histogram | `operation=sql,s3_get,s3_put,s3_delete,s3_versioning` |
 | `git_rs_dependency_errors_total` | Counter | Failed dependency operations, with the same `operation` labels |
-| `git_rs_subprocess_duration_seconds` | Histogram | `program=git,psql,curl,sha256sum,other` |
+| `git_rs_subprocess_duration_seconds` | Histogram | `program=git,curl,sha256sum,other`; SQL has no subprocess |
 | `git_rs_subprocess_errors_total` | Counter | Failed spawn or nonzero exit, with the same `program` labels |
 | `git_rs_cache_lookups_total` | Counter | `result=hit,miss,bypass`; miss means this caller attempted a fill |
 | `git_rs_cache_wait_duration_seconds` | Histogram | Time waiting for another caller's single-flight fill; `_count` counts waits |
@@ -53,8 +53,10 @@ counter and no admitted-request duration. Subprocess histograms count
 application-owned invocations, not every descendant fork inside native Git.
 Successful RPC handling is not a successful ref publication: Git can report
 rejected ref commands inside a successful RPC. Inspect validation/publication
-phase errors as well. SQL measurements include background readiness queries and
-lease cleanup, so their count is not simply the Git command count.
+phase errors as well. SQL measurements include pool acquisition, connection establishment when
+needed, complete response consumption and session reset. One observation may send multiple SQL
+messages. Background readiness queries and lease cleanup also contribute, so the count is not
+simply the Git command count.
 
 ## Scraping
 

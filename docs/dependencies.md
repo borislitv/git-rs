@@ -19,7 +19,7 @@ proc-receive/pre-receive, HTTP and SSH contracts, not merely changing a version.
 
 Rust 1.99.1 uses official `static.rust-lang.org/dist` component archives, with
 the independently published `.sha256` values pinned in the Dockerfile. Components
-are installed without rustup, shell download pipelines or third-party Rust crates.
+are installed without rustup or shell download pipelines.
 The archive target and release platform are currently Linux x86-64 only.
 
 CI selects Ubuntu 26.04, Rust 1.99.1, Helm 4.3.1, PyYAML 6.0.3 and jsonschema
@@ -30,14 +30,17 @@ Checkout v7.0.1 and setup-helm v5.0.1 are pinned to resolved upstream tag commit
 
 The disposable PostgreSQL fixture uses the official `postgres:18.6-bookworm`
 index `sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5`.
-The six opt-in metadata tests run serially against a fresh disposable database;
+The ten opt-in metadata/driver tests run serially against a fresh disposable database;
 `GIT_RS_DEV_HTTP=1` permits their loopback-only plaintext PostgreSQL connection.
 CNPG 18.6 and k3s 1.37.2 pins are unchanged.
 
-The runtime's `/usr/bin/psql` points directly to
-`/usr/lib/postgresql/18/bin/psql`, avoiding Ubuntu's Perl multi-cluster launcher
-on every SQL invocation. libpq still owns PostgreSQL authentication and TLS.
-Requalify this explicit path when changing the distribution's PostgreSQL major.
+SQL uses Tokio 1.54.1, tokio-postgres 0.7.18 and deadpool-postgres 0.14.2, with
+postgres-native-tls 0.5.3/native-tls 0.2.18 and OpenSSL 0.10.82. Cargo.lock pins
+the complete dependency graph and registry checksums. Application code continues
+to forbid unsafe Rust; maintained dependencies implement the runtime and TLS.
+Builds need OpenSSL development headers and pkg-config. Fetch locked crates once
+before an offline build; production images contain no PostgreSQL CLI or libpq.
+The test-only image installs psql for independent fixture administration.
 
 Local Docker builds on the qualification VM require `--network host` because
 outbound source downloads on the default Docker bridge time out. This is a local

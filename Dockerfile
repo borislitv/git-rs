@@ -21,13 +21,17 @@ RUN set -eu; \
       rm -rf "$name" component.tar.xz; \
     done; rustc --version; cargo --version
 
-FROM toolchain AS build
+FROM toolchain AS rust-toolchain
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libssl-dev pkg-config && rm -rf /var/lib/apt/lists/*
+
+FROM rust-toolchain AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY benches ./benches
-RUN cargo build --release --offline --locked
+RUN cargo fetch --locked && cargo build --release --offline --locked
 
 FROM toolchain AS git-build
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -45,15 +49,12 @@ RUN curl --fail --show-error --location --max-time 180 --retry 3 \
 FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS runtime
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    curl postgresql-client ca-certificates coreutils openssh-server tini libcurl4t64 libexpat1 libssl3t64 zlib1g perl \
+    curl ca-certificates coreutils openssh-server tini libcurl4t64 libexpat1 libssl3t64 zlib1g perl \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/ssh/ssh_host_* \
     && mkdir -p /run/sshd /var/empty/git-rs \
     && groupadd -g 10001 git-rs && useradd -u 10001 -g 10001 -M -d /var/empty/git-rs -s /bin/sh -p '*' git-rs
 COPY --from=git-build /opt/git/usr/ /usr/
-# Avoid the distribution's Perl multi-cluster launcher on every SQL connection.
-RUN test -x /usr/lib/postgresql/18/bin/psql \
-    && ln -sfn /usr/lib/postgresql/18/bin/psql /usr/bin/psql
 RUN test "$(/usr/bin/git --version)" = "git version 2.56.0" \
     && test "$(/usr/bin/git --exec-path)" = /usr/lib/git-core \
     && test -x /usr/lib/git-core/git-http-backend \
@@ -70,7 +71,7 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/git-rs"]
 FROM runtime AS test
 USER 0:0
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3 python3-venv \
+    python3 python3-venv postgresql-client \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/test-python \
     && /opt/test-python/bin/pip install --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0 \

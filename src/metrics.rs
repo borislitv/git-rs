@@ -79,12 +79,11 @@ const DEPENDENCIES: [&str; 5] = ["sql", "s3_get", "s3_put", "s3_delete", "s3_ver
 #[derive(Clone, Copy)]
 pub enum Program {
     Git,
-    Psql,
     Curl,
     Sha256sum,
     Other,
 }
-const PROGRAMS: [&str; 5] = ["git", "psql", "curl", "sha256sum", "other"];
+const PROGRAMS: [&str; 4] = ["git", "curl", "sha256sum", "other"];
 
 #[derive(Clone, Copy)]
 pub enum Listener {

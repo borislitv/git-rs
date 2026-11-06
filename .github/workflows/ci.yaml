@@ -24,6 +24,8 @@ jobs:
           version: v4.3.1
       - name: Rust checks and cache benchmark
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
           make check
           make bench
       - name: Chart and pinned operator-schema contracts
@@ -57,7 +59,6 @@ jobs:
           done
           test "$ready" = true
           cargo test --offline --locked --test metadata -- --ignored --test-threads=1
-          cargo test --offline --locked --test http_auth verified_authentication_reaches_existing_metadata_authorization -- --exact --ignored
       - name: Build runtime and native integration runner
         run: |
           docker build --target release -t git-rs:dev .

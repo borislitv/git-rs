@@ -1,12 +1,10 @@
 use crate::protocol::{Oid, Update, hex, unhex};
 use crate::{
-    Result, auth, invalid,
+    Result, auth, database, invalid,
     metrics::{self, Dependency, Metric},
     process, scratch,
 };
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -31,7 +29,8 @@ pub struct Snapshot {
 }
 
 // No SQL value is interpolated as SQL syntax. Even non-UTF-8 ref names are
-// encoded as bytea literals. psql/libpq owns protocol, TLS and authentication.
+// encoded as bytea literals. tokio-postgres owns protocol and authentication;
+// native-tls verifies the server chain and hostname.
 pub fn bytes(value: &[u8]) -> String {
     format!("decode('{}','hex')", hex(value))
 }
@@ -39,35 +38,18 @@ pub fn text(value: &str) -> String {
     format!("convert_from({},'UTF8')", bytes(value.as_bytes()))
 }
 
-fn psql() -> Result<Command> {
-    let local_dev = std::env::var("GIT_RS_DEV_HTTP").as_deref() == Ok("1")
-        && matches!(
-            std::env::var("PGHOST").as_deref(),
-            Ok("127.0.0.1" | "localhost")
-        );
-    if std::env::var("PGSSLMODE").as_deref() != Ok("verify-full") && !local_dev {
-        return Err(invalid(
-            "PostgreSQL requires PGSSLMODE=verify-full outside loopback development",
-        ));
-    }
-    let mut command = process::command("/usr/bin/psql");
-    command.args(["-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-F", "\t"]);
-    for (name, value) in std::env::vars_os() {
-        if name.to_str().is_some_and(|s| s.starts_with("PG")) {
-            command.env(name, value);
-        }
-    }
-    command.env("PGCONNECT_TIMEOUT", "5").env(
-        "PGOPTIONS",
-        "-c statement_timeout=30000 -c lock_timeout=5000 -c search_path=git_rs,pg_catalog",
-    );
-    Ok(command)
-}
-
 pub fn sql(query: &str) -> Result<String> {
     metrics::measure(Metric::Dependency(Dependency::Sql), || {
-        let output = process::capture(&mut psql()?, query.as_bytes(), 16 * 1024 * 1024)?;
-        Ok(String::from_utf8(output)?)
+        let mut output = String::new();
+        database::rows(query, |row| {
+            if output.len().saturating_add(row.len()).saturating_add(1) > 16 * 1024 * 1024 {
+                return Err(invalid("SQL output limit exceeded"));
+            }
+            output.push_str(row);
+            output.push('\n');
+            Ok(())
+        })?;
+        Ok(output)
     })
 }
 
@@ -75,63 +57,9 @@ pub fn sql(query: &str) -> Result<String> {
 // as it arrives. Hex-encoded legal refs alone can exceed sql()'s 16 MiB capture
 // limit; pack catalogs also grow independently of the number of refs. The only
 // retained allocation is the decoded Snapshot, not a second full wire image.
-fn snapshot_rows(query: &str, mut row: impl FnMut(&str) -> Result<()>) -> Result<()> {
+fn snapshot_rows(queries: &[&str], row: impl FnMut(&str) -> Result<()>) -> Result<()> {
     metrics::measure(Metric::Dependency(Dependency::Sql), || {
-        snapshot_rows_inner(query, &mut row)
-    })
-}
-
-fn snapshot_rows_inner(query: &str, mut row: impl FnMut(&str) -> Result<()>) -> Result<()> {
-    process::check_operation()?;
-    let mut child = process::Guard::spawn(
-        psql()?
-            // psql otherwise buffers an entire PGresult before writing stdout.
-            .args(["-v", "FETCH_COUNT=256"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()),
-    )?;
-    let mut stdin = child
-        .0
-        .stdin
-        .take()
-        .ok_or_else(|| invalid("missing SQL input"))?;
-    let stdout = child
-        .0
-        .stdout
-        .take()
-        .ok_or_else(|| invalid("missing SQL output"))?;
-    std::thread::scope(|scope| {
-        let sender = scope.spawn(move || stdin.write_all(query.as_bytes()));
-        let result = (|| -> Result<()> {
-            let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
-            loop {
-                process::check_operation()?;
-                line.clear();
-                // Generated keys and hex-encoded 1024-byte names fit comfortably.
-                // Bound an individual row even if database contents are corrupt.
-                let count = reader.by_ref().take(8193).read_until(b'\n', &mut line)?;
-                if count == 0 {
-                    return Ok(());
-                }
-                if count > 8192 || line.last() != Some(&b'\n') {
-                    return Err(invalid("invalid metadata row length or framing"));
-                }
-                row(std::str::from_utf8(&line[..line.len() - 1])?)?;
-            }
-        })();
-        if result.is_err() {
-            child.terminate();
-        }
-        let sent = sender.join().map_err(|_| invalid("SQL writer panicked"))?;
-        result?;
-        sent?;
-        // Never expose a partial snapshot after a late SELECT/COMMIT failure.
-        if !child.wait()?.success() {
-            return Err(invalid("metadata snapshot transaction failed"));
-        }
-        Ok(())
+        database::session_rows(queries, row)
     })
 }
 
@@ -251,7 +179,7 @@ pub fn snapshot(slug: &str, principal: &str, write: bool) -> Result<Snapshot> {
     auth::repository(slug)?;
     auth::principal(principal)?;
     read_snapshot(
-        &snapshot_query(slug, principal, write, None),
+        &[&snapshot_query(slug, principal, write, None)],
         None,
         &mut None,
     )?
@@ -273,12 +201,27 @@ fn snapshot_query(slug: &str, principal: &str, write: bool, lease: Option<&str>)
 }
 
 fn read_snapshot(
-    query: &str,
+    queries: &[&str],
     lease_id: Option<&str>,
     lease: &mut Option<Barrier>,
 ) -> Result<Option<Snapshot>> {
+    // Charge encoded row bytes plus conservative per-entry allocation overhead
+    // (owned strings, Vec growth, BTree nodes). Reserve fixed header/root space.
+    // This is a snapshot allocation budget, not a bound on the whole process RSS.
+    const MAX_METADATA: usize = 128 * 1024 * 1024;
+    let limit = match std::env::var("GIT_RS_METADATA_BYTES") {
+        Ok(value) => value.parse::<usize>()?,
+        Err(std::env::VarError::NotPresent) => MAX_METADATA,
+        Err(error) => return Err(error.into()),
+    };
+    if !(4096..=MAX_METADATA).contains(&limit) {
+        return Err(invalid(
+            "metadata snapshot budget must be 4096..134217728 bytes",
+        ));
+    }
+    let mut allocated = 4096usize;
     let mut snapshot = None;
-    snapshot_rows(query, |line| {
+    snapshot_rows(queries, |line| {
         if let Some(repo) = line.strip_prefix("lease\t") {
             let id = lease_id.ok_or_else(|| invalid("unexpected repository lease"))?;
             if lease.is_some() || snapshot.is_some() || repo.contains('\t') {
@@ -292,6 +235,12 @@ fn read_snapshot(
         }
         if lease_id.is_some() && lease.is_none() {
             return Err(invalid("snapshot requires a repository lease"));
+        }
+        if line.starts_with("ref\t") || line.starts_with("pack\t") {
+            allocated = allocated.saturating_add(line.len()).saturating_add(512);
+            if allocated > limit {
+                return Err(invalid("metadata snapshot budget exceeded"));
+            }
         }
         let fields: Vec<_> = line.split('\t').collect();
         let Some(snapshot) = snapshot.as_mut() else {
@@ -353,17 +302,19 @@ pub fn leased_snapshot(slug: &str, principal: &str, write: bool) -> Result<(Snap
     let id = scratch::identifier()?;
     let role = if write { "AND p.role <> 'reader'" } else { "" };
     let query = format!(
-        "BEGIN; DO $body$ DECLARE repo uuid; BEGIN SELECT r.id INTO STRICT repo FROM repositories r JOIN permissions p ON r.id=p.repo_id WHERE r.slug={} AND p.principal={} {role} FOR UPDATE OF r; DELETE FROM repository_leases WHERE repo_id=repo AND expires_at <= clock_timestamp(); END $body$; INSERT INTO repository_leases SELECT {}::uuid,r.id,false,clock_timestamp()+interval '150 seconds' FROM repositories r WHERE r.slug={} AND NOT EXISTS(SELECT 1 FROM repository_leases WHERE repo_id=r.id AND exclusive); SELECT 'lease',repo_id FROM repository_leases WHERE id={}::uuid; COMMIT; {}",
+        "BEGIN; DO $body$ DECLARE repo uuid; BEGIN SELECT r.id INTO STRICT repo FROM repositories r JOIN permissions p ON r.id=p.repo_id WHERE r.slug={} AND p.principal={} {role} FOR UPDATE OF r; DELETE FROM repository_leases WHERE repo_id=repo AND expires_at <= clock_timestamp(); END $body$; INSERT INTO repository_leases SELECT {}::uuid,r.id,false,clock_timestamp()+interval '150 seconds' FROM repositories r WHERE r.slug={} AND NOT EXISTS(SELECT 1 FROM repository_leases WHERE repo_id=r.id AND exclusive); SELECT 'lease',repo_id FROM repository_leases WHERE id={}::uuid; COMMIT;",
         text(slug),
         text(principal),
         text(&id),
         text(slug),
-        text(&id),
-        snapshot_query(slug, principal, write, Some(&id))
+        text(&id)
     );
+    // A separate protocol message confirms/flushes the lease before a later
+    // catalog read can block. Both messages use the same checked-out connection.
+    let catalog = snapshot_query(slug, principal, write, Some(&id));
     loop {
         let mut lease = None;
-        let snapshot = read_snapshot(&query, Some(&id), &mut lease)?;
+        let snapshot = read_snapshot(&[&query, &catalog], Some(&id), &mut lease)?;
         if let Some(lease) = lease {
             let snapshot = snapshot.ok_or_else(|| invalid("repository unavailable"))?;
             if snapshot.id != lease.repo {

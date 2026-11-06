@@ -152,6 +152,7 @@ class CommitRelay(socketserver.BaseRequestHandler):
                 size = receive_exact(self.request, 4)
                 upstream.sendall(size + receive_exact(self.request, int.from_bytes(size, "big") - 4))
                 publishing = False
+                cut_before_commit = False
                 while True:
                     readable, _, _ = select.select([self.request, upstream], [], [], 15)
                     if not readable:
@@ -162,10 +163,21 @@ class CommitRelay(socketserver.BaseRequestHandler):
                         if source is self.request:
                             if header[:1] == b"Q" and b"SELECT publish(" in payload:
                                 publishing = True
+                                # The native driver sends a transaction batch in
+                                # one Query message. Execute publication, but
+                                # withhold its final COMMIT until disconnect.
+                                if self.server.mode == "before" and b"COMMIT;" in payload:
+                                    payload = payload.rsplit(b"COMMIT;", 1)[0] + b"\0"
+                                    header = b"Q" + (len(payload) + 4).to_bytes(4, "big")
+                                    cut_before_commit = True
                             if publishing and header[:1] == b"Q" and payload.strip().startswith(b"COMMIT") and self.server.cut("before"):
                                 return
                             upstream.sendall(header + payload)
                         else:
+                            if publishing and header[:1] == b"Z":
+                                if cut_before_commit and self.server.cut("before"):
+                                    return
+                                publishing = False
                             if publishing and header[:1] == b"C" and payload == b"COMMIT\0" and self.server.cut("after"):
                                 return
                             self.request.sendall(header + payload)

@@ -1,6 +1,9 @@
 # Development contract
 
-- Application code is safe Rust: `#![forbid(unsafe_code)]`, standard library only.
+- Application code is safe Rust: `#![forbid(unsafe_code)]`. SQL uses Tokio,
+  tokio-postgres and a bounded connection pool; never execute a SQL subprocess.
+- Prefer established, maintained Rust crates for standard functionality over
+  custom implementations. This is not a restriction to the Rust standard library.
 - Use upstream Git for protocols, packs, deltas and object validation. Never execute a shell
   with client input, check out client trees, or load client hooks/configuration.
 - PostgreSQL owns refs and the pack catalog; immutable S3 objects own pack/idx bytes.

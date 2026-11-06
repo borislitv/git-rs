@@ -25,7 +25,8 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
                                                         (CNPG)           (Ceph RGW)
 ```
 
-- Standard-library-only Rust; `unsafe_code` is forbidden. Upstream Git handles wire protocols,
+- Safe Rust with Tokio, tokio-postgres and a bounded SQL pool; `unsafe_code` is forbidden.
+  SQL runs in-process, with verified TLS and no SQL subprocess. Upstream Git handles wire protocols,
   pack/delta normalization and graph validation.
 - A push uploads immutable objects, then publishes the complete ref update and pack catalog in
   one SQL transaction with authorization and old-OID compare-and-swap. Every push is all-or-nothing,
@@ -105,13 +106,15 @@ on the internal health listener. See [metric semantics and scrape configuration]
 
 ## Build and verify
 
-Requires Linux, Rust **1.99+**, Git **2.56.0**, OpenSSH server/client, PostgreSQL client, curl with
-AWS SigV4 support, GNU coreutils and `kill`. Build and runtime use Ubuntu **26.04**. The Dockerfile
+Requires Linux, Rust **1.99+**, OpenSSL development headers/pkg-config for builds, Git **2.56.0**,
+OpenSSH server/client, curl with AWS SigV4 support, GNU coreutils and `kill`.
+Build and runtime use Ubuntu **26.04**. The Dockerfile
 checks official Rust/Git archive hashes, upgrades distribution packages and records the installed
 runtime inventory. [Dependency qualification](docs/dependencies.md) distinguishes reproducibility
 from security freshness; scheduled rebuilds are still necessary.
 
 ```sh
+cargo fetch --locked
 cargo build --release --offline --locked
 make check
 docker build --target release -t git-rs:dev .

@@ -171,7 +171,6 @@ impl Guard {
     pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
         let program = match command.get_args().nth(2).and_then(|arg| arg.to_str()) {
             Some("/usr/bin/git") => Program::Git,
-            Some("/usr/bin/psql") => Program::Psql,
             Some("/usr/bin/curl") => Program::Curl,
             Some("/usr/bin/sha256sum") => Program::Sha256sum,
             _ => Program::Other,

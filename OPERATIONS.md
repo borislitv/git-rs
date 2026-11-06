@@ -16,19 +16,36 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 
 | Environment | Meaning |
 | --- | --- |
-| `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | libpq primary metadata connection |
+| `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | Tokio PostgreSQL primary metadata connection |
 | `PGSSLMODE=verify-full`, `PGSSLROOTCERT` | required PostgreSQL certificate/hostname verification |
 | `PGTARGETSESSIONATTRS=read-write` | select a writable primary |
+| `PGSSLCERT`, `PGSSLKEY` | optional client certificate and unencrypted PKCS#8 key, configured together |
 | `GIT_RS_S3_ENDPOINT`, `GIT_RS_S3_BUCKET`, `GIT_RS_S3_REGION` | HTTPS path-style S3 endpoint/bucket; default region `us-east-1` |
 | `GIT_RS_S3_ACCESS_KEY`, `GIT_RS_S3_SECRET_KEY` | service S3 credentials |
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | custom S3 TLS trust roots passed to curl |
 | `GIT_RS_CACHE_BYTES` | reusable RAM cache capacity, default 67108864 bytes; `0` disables |
+| `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..120`, default 120 |
 
 The Helm chart obtains credentials from existing Secrets or bucket-claim outputs. Do not put
 credentials, private keys or real identity maps in values files, command-line flags or source
 control. S3 credentials are passed to curl over stdin; child environments do not inherit arbitrary
 Git configuration or proxies. Subprocess errors intentionally suppress raw external diagnostics.
+
+SQL uses an eight-connection process-local deadpool-postgres pool and a two-worker Tokio runtime.
+Pool waits, connection establishment, query streaming and session reset share the operation's
+absolute deadline. Failed/cancelled sessions are discarded; cancellation also attempts a bounded
+PostgreSQL CancelRequest. Successful sessions are rolled back/reset before reuse. No SQL subprocess
+or libpq is used. The application retains its synchronous transport API; database I/O runs on Tokio.
+The listed PG variables are supported explicitly, not the full libpq environment/service-file API.
+Connection setup is capped at five seconds; statement/lock timeouts are 30/5 seconds. Configuration,
+credentials and CA roots are loaded once per process; restart pods after rotating them.
+
+Snapshots charge encoded row bytes plus 512 bytes per retained ref/pack and a 4096-byte fixed
+reserve before decoding/insertion. Four admitted Git requests can retain up to four such snapshots
+at once. This is conservative accounting for current collection layouts, not an allocator
+or total-RSS guarantee; driver/TLS buffers, transient allocations, cache, Git children and scratch
+need separate resource allowances. Exceeding the budget fails the request without partial data.
 
 Only trusted operators holding database/service credentials may run administrative CLI commands.
 The supplied actor argument is not an authentication mechanism for an administrative shell.
@@ -80,9 +97,9 @@ git-rs grant team/project alice bob none refs/
 
 `migrate` serializes initialization with a transaction advisory lock; repeated/concurrent execution
 checks schema version 1 and refreshes its publication function without resetting stored data.
-It does not migrate arbitrary older/unreleased database layouts. Metadata snapshots use bounded
-cursor batches rather than retaining a second complete SQL wire image; the decoded catalog and
-request materialization still consume resources.
+It does not migrate arbitrary older/unreleased database layouts. Metadata snapshots consume a
+native query stream rather than retaining a second complete SQL wire image; the decoded catalog
+has a separate allocation-accounting budget and request materialization still consumes resources.
 
 | Role | Read | Ref writes |
 | --- | --- | --- |
@@ -186,7 +203,7 @@ client clones, WAL and retained metadata backups can still contain old data.
 
 - Default 64 MiB cache is shared by requests in one process, not replicas. Entries larger than
   8 MiB bypass it. Reservations and evicted-but-pinned buffers remain accounted against capacity.
-- Four admitted operations per process; native Git/curl/psql children consume additional memory,
+- Four admitted operations per process; native Git/curl children consume additional memory,
   CPU and process slots. A cache metric is not total pod RSS.
 - Absolute transport deadlines cover headers, SSH handshake and blocked response writes; the
   operation budget is not reset after parsing. Health has a separate eight-request admission cap

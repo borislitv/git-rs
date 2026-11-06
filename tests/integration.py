@@ -372,7 +372,6 @@ def exercise(f, large_mib, skip_ssh):
         'git_rs_dependency_duration_seconds_count{operation="s3_get"}',
         'git_rs_dependency_duration_seconds_count{operation="s3_put"}',
         'git_rs_subprocess_duration_seconds_count{program="git"}',
-        'git_rs_subprocess_duration_seconds_count{program="psql"}',
         'git_rs_cache_lookups_total{result="hit"}',
         'git_rs_s3_transferred_bytes_total{direction="download"}',
         'git_rs_s3_transferred_bytes_total{direction="upload"}',
