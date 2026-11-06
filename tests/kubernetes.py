@@ -62,12 +62,14 @@ def import_image(cluster, image):
 
 
 def dependency(name, image, env, args, volumes, mounts, security=None):
+    # Persistent fixture volumes must never be opened by overlapping writers.
     return [
         {"apiVersion": "v1", "kind": "Service", "metadata": {"name": name},
          "spec": {"selector": {"fixture": name},
                   "ports": [{"port": 5432 if name == "postgres" else 7070}]}},
         {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name},
-         "spec": {"replicas": 1, "selector": {"matchLabels": {"fixture": name}},
+         "spec": {"replicas": 1, "strategy": {"type": "Recreate"},
+                  "selector": {"matchLabels": {"fixture": name}},
                   "template": {"metadata": {"labels": {"fixture": name}}, "spec": {
                       "securityContext": security or {}, "automountServiceAccountToken": False,
                       "containers": [{"name": name, "image": image, "args": args,

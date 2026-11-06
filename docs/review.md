@@ -48,6 +48,7 @@ blocker in those changes. This does not establish production memory or latency b
 | Reused empty templates could leak request HEAD/hooks if captured too late | Capture only newly initialized application-owned bare state | A non-UTF-8 HEAD and installed hooks in one scratch do not affect another; removing template HEAD fails the regression |
 | Synchronous timing output could pin request admission and SQL sessions | Bounded lossy `tracing-appender` queue, one complete fixed-field record per write | A full unread sink fails the synchronous implementation; the fixed path releases admission and completes real session reuse/cancellation contracts |
 | Upstream logging guard could block on its stdout shutdown fallback | Process-owned guard destruction on a helper with 1200 ms acknowledgement wait | Handshake proves request completion first, then fills stdout and stderr; the former guard hangs and the bounded wrapper exits |
+| Stateful test dependencies could overlap writers on a reused persistent volume during RollingUpdate | Use Recreate for the single-instance PostgreSQL/S3 fixtures | An isolated PVC-backed PostgreSQL replacement retains its repository and authorization metadata through native Git readback |
 
 Additional failure-sensitivity checks temporarily removed write seals, short-fill checking, the
 file cap and waiter deadline in one **combined** mutation run; all four corresponding regressions
