@@ -30,7 +30,7 @@ Checkout v7.0.1 and setup-helm v5.0.1 are pinned to resolved upstream tag commit
 
 The disposable PostgreSQL fixture uses the official `postgres:18.6-bookworm`
 index `sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5`.
-The ten opt-in metadata/driver tests run serially against a fresh disposable database;
+The twelve opt-in metadata/driver tests run serially against a fresh disposable database;
 `GIT_RS_DEV_HTTP=1` permits their loopback-only plaintext PostgreSQL connection.
 CNPG 18.6 and k3s 1.37.2 pins are unchanged.
 
@@ -41,6 +41,21 @@ to forbid unsafe Rust; maintained dependencies implement the runtime and TLS.
 Builds need OpenSSL development headers and pkg-config. Fetch locked crates once
 before an offline build; production images contain no PostgreSQL CLI or libpq.
 The test-only image installs psql for independent fixture administration.
+
+The RAM cache uses `memfd` 0.6.6 for Linux anonymous, sealable backing files. SHA-256 uses the
+existing OpenSSL crate in-process, with a bounded read buffer; it no longer starts `sha256sum`.
+Same-UID native Git children must be able to reopen `/proc/<serving-pid>/fd` paths. This removes
+the complete Rust payload buffer and cache-to-scratch copy, not TLS/kernel/Git processing copies.
+
+Opt-in diagnostic output uses Tokio's `tracing-appender` 0.2.5, with an explicit 1024-record lossy
+queue and one complete fixed-field record per write. Its guard can emit a stdout fallback when
+shutdown cannot enqueue; a process-owned wrapper runs guard destruction off-thread and waits
+at most 1200 ms for acknowledgement. Sink-stalled workers may remain until process exit.
+
+Runtime and CI install Ubuntu `gnu-coreutils` alongside the default provider and explicitly call
+`/usr/bin/gnutimeout` (qualified GNU coreutils 9.7). The default Ubuntu uutils `timeout` 0.10.0
+rejects non-UTF-8 argv, which breaks valid native ref names. Do not substitute that executable
+or replace the system provider implicitly. Package versions are recorded in the runtime inventory.
 
 Local Docker builds on the qualification VM require `--network host` because
 outbound source downloads on the default Docker bridge time out. This is a local

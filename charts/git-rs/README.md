@@ -78,6 +78,10 @@ one CPU, shared by all SSH connections, authentication helpers and bridge proces
 Tune backend and sidecar quotas together; idle quota cannot be borrowed between
 containers. Raising this limit also raises the configured aggregate CPU ceiling.
 
+`debugTimings: true` sets `GIT_RS_DEBUG_TIMINGS=1` only on the backend and rolls its pods. It is
+disabled by default. The bounded lossy writer emits correlated fixed-field diagnostics; monitor
+its dropped-record counter and keep enabled profiling trials separate from scored benchmarks.
+
 `httpRoute.enabled` defaults to false. Enabling it requires HTTP, explicit nonempty `parentRefs`
 and `hostnames`. Each parent must name the **HTTPS listener's `sectionName`** on an existing
 `gateway.networking.k8s.io` Gateway managed by Istio (not a legacy Istio Gateway).

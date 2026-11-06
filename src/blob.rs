@@ -1,14 +1,17 @@
 use crate::{
     Result,
-    cache::Cache,
+    cache::{Cache, CachedFile},
     invalid,
     metadata::Pack,
-    metrics::{self, Dependency, Direction, Metric},
+    metrics::{self, Dependency, Direction, Metric, Stage},
     process,
 };
+use openssl::sha::Sha256;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek};
+use std::os::unix::fs::symlink;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Store {
@@ -30,20 +33,23 @@ fn quote(value: &str) -> Result<String> {
 }
 
 pub fn digest(path: &Path) -> Result<String> {
-    let bytes = process::capture(
-        process::command("/usr/bin/sha256sum").arg("--").arg(path),
-        b"",
-        4096,
-    )?;
-    let value = std::str::from_utf8(
-        bytes
-            .get(..64)
-            .ok_or_else(|| invalid("invalid checksum output"))?,
-    )?;
-    if !value.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(invalid("invalid checksum"));
+    digest_reader(File::open(path)?)
+}
+
+fn digest_reader(mut input: impl Read) -> Result<String> {
+    let timer = metrics::Timer::start(Metric::Stage(Stage::ObjectHash));
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        process::check_operation()?;
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            let hash = crate::protocol::hex(&digest.finish());
+            timer.finish(true);
+            return Ok(hash);
+        }
+        digest.update(&buffer[..count]);
     }
-    Ok(value.into())
 }
 
 impl Store {
@@ -82,6 +88,7 @@ impl Store {
         upload: Option<&str>,
         delete: bool,
         max_download: Option<u64>,
+        output: Option<&File>,
     ) -> Result<()> {
         if key.is_empty()
             || !key
@@ -149,7 +156,11 @@ impl Store {
             None
         };
         let mut transfer = || {
-            process::capture(&mut cmd, config.as_bytes(), 4096)?;
+            if let Some(file) = output {
+                process::capture_to_file(&mut cmd, config.as_bytes(), file)?;
+            } else {
+                process::capture(&mut cmd, config.as_bytes(), 4096)?;
+            }
             if upload.is_some() {
                 metrics::global().transferred(Direction::Upload, fs::metadata(file)?.len());
             }
@@ -171,7 +182,7 @@ impl Store {
 
     fn download(&self, key: &str, destination: &Path, size: u64, hash: &str) -> Result<()> {
         metrics::measure(Metric::Dependency(Dependency::S3Get), || {
-            self.transfer(key, destination, None, false, Some(size))?;
+            self.transfer(key, destination, None, false, Some(size), None)?;
             self.verify(destination, size, hash)?;
             metrics::global().transferred(Direction::Download, size);
             Ok(())
@@ -186,23 +197,36 @@ impl Store {
         size: u64,
         destination: &Path,
         cache: &Cache,
-    ) -> Result<()> {
-        let cache_key = format!("{repo}:{key}:{hash}");
+    ) -> Result<Option<Arc<CachedFile>>> {
+        let cache_key = format!("{repo}:{key}:{hash}:{size}");
         let cached = cache.get_or_load(
             &cache_key,
             usize::try_from(size).unwrap_or(usize::MAX),
-            |buffer| {
-                self.download(key, destination, size, hash)?;
-                File::open(destination)?.read_exact(buffer)?;
-                Ok(())
+            |mut file| {
+                metrics::measure(Metric::Dependency(Dependency::S3Get), || {
+                    self.transfer(key, Path::new("-"), None, false, Some(size), Some(file))?;
+                    // Preallocation and size seals prevent growth, so length alone
+                    // cannot distinguish a short response from trailing zeroes.
+                    if file.stream_position()? != size {
+                        return Err(invalid("object integrity check failed"));
+                    }
+                    file.rewind()?;
+                    if digest_reader(file)? != hash {
+                        return Err(invalid("object integrity check failed"));
+                    }
+                    metrics::global().transferred(Direction::Download, size);
+                    Ok(())
+                })
             },
         )?;
-        if let Some(buffer) = cached {
-            File::create(destination)?.write_all(buffer.as_ref().as_ref())?;
+        if let Some(buffer) = &cached {
+            metrics::measure(Metric::Stage(Stage::CacheLink), || {
+                Ok(symlink(buffer.path(), destination)?)
+            })?;
         } else {
             self.download(key, destination, size, hash)?;
         }
-        Ok(())
+        Ok(cached)
     }
 
     pub fn upload(
@@ -241,6 +265,7 @@ impl Store {
             Some(&pack.pack_digest),
             false,
             None,
+            None,
         )?;
         crate::metadata::sql(&format!(
             "UPDATE staged_objects SET state='uploaded' WHERE object_key={};",
@@ -252,6 +277,7 @@ impl Store {
             Some(&pack.idx_digest),
             false,
             None,
+            None,
         )?;
         crate::metadata::sql(&format!(
             "UPDATE staged_objects SET state='uploaded' WHERE object_key={};",
@@ -261,7 +287,7 @@ impl Store {
     }
 
     pub fn delete_retired(&self, key: &str) -> Result<()> {
-        self.transfer(key, Path::new("/dev/null"), None, true, None)
+        self.transfer(key, Path::new("/dev/null"), None, true, None, None)
     }
 
     /// Physical reclamation currently supports only never-versioned buckets.

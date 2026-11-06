@@ -2,6 +2,7 @@
 """Dependency-failure regressions against real local PostgreSQL and S3 fixtures."""
 import argparse
 import concurrent.futures
+import hashlib
 import http.client
 import http.server
 import json
@@ -14,7 +15,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from integration import Fixture, ROOT, command, wait_for
+from integration import Fixture, ROOT, command, metric_value, wait_for
 
 
 class FaultGateway(http.server.ThreadingHTTPServer):
@@ -23,6 +24,8 @@ class FaultGateway(http.server.ThreadingHTTPServer):
     def __init__(self, upstream):
         self.upstream = urlsplit(upstream)
         self.mode = None
+        self.pack_gets = 0
+        self.lock = threading.Lock()
         self.reached = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
@@ -37,7 +40,9 @@ class FaultGateway(http.server.ThreadingHTTPServer):
         self.reached.clear()
         self.release.clear()
         self.finished.clear()
-        self.mode = mode
+        with self.lock:
+            self.pack_gets = 0
+            self.mode = mode
 
     def reset(self):
         self.mode = None
@@ -71,10 +76,15 @@ class FaultHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         mode = self.server.mode
         pack_get = self.command == "GET" and self.path.endswith(".pack")
+        second_pack = False
+        if mode == "pause-second-pack" and pack_get:
+            with self.server.lock:
+                self.server.pack_gets += 1
+                second_pack = self.server.pack_gets == 2
         if mode == "version-enabled" and "?versioning" in self.path:
             self.reply(200, b'<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>')
             return
-        if (mode == "pause-get" and pack_get) or (mode == "pause-put" and self.command == "PUT"):
+        if second_pack or (mode == "pause-get" and pack_get) or (mode == "pause-put" and self.command == "PUT"):
             self.server.reached.set()
             if not self.server.release.wait(30):
                 self.reply(504, b"test gate timed out\n")
@@ -98,6 +108,8 @@ class FaultHandler(http.server.BaseHTTPRequestHandler):
             self.reply(status, data[:-1] + bytes([data[-1] ^ 1]))
         elif mode == "oversize-get" and pack_get and status == 200:
             self.reply(status, data + b"unexpected excess bytes")
+        elif mode == "short-get" and pack_get and status == 200:
+            self.reply(status, data[:-1])
         else:
             self.reply(status, data)
         self.server.finished.set()
@@ -185,6 +197,78 @@ class CommitRelay(socketserver.BaseRequestHandler):
             return
 
 
+def cache_lifecycle_test(f, gateway, normal_url):
+    """A live request retains sealed pack/idx files after LRU eviction."""
+    print("request pins survive cache eviction through native Git", flush=True)
+    slug = "team/cache-lifecycle"
+    f.cli("create", slug, "alice")
+    source = f.base / "cache-source"
+    f.git(f.base, "init", "--initial-branch=main", source)
+    normal = normal_url.replace("team/project.git", slug + ".git")
+    for name, contents in [("initial.txt", "first synthetic object\n"),
+                           ("next.txt", "second synthetic object\n")]:
+        (source / name).write_text(contents)
+        f.git(source, "add", name)
+        f.git(source, "commit", "-m", "Add " + name)
+        f.git(source, "push", normal, "main")
+    assert f.sql("SELECT count(*) FROM git_rs.packs WHERE repo_id="
+                 "(SELECT id FROM git_rs.repositories WHERE slug='team/cache-lifecycle')") == "2"
+    expected = f.git(source, "ls-remote", normal).stdout
+    f.env["GIT_RS_CACHE_BYTES"] = "8192"
+    process, port = f.start("cache-pins")
+    f.env["GIT_RS_CACHE_BYTES"] = "0"
+    url = f"http://127.0.0.1:{port}/{slug}.git"
+    gateway.arm("pause-second-pack")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        reader = pool.submit(f.git, source, "ls-remote", url)
+        try:
+            assert gateway.reached.wait(10), "reader did not reach its second pack"
+            packs = [path for path in (f.base / "scratch").glob("instance-*/request-*/objects/pack/*.pack")
+                     if path.is_symlink()]
+            assert len(packs) == 1, packs
+            pack = packs[0]
+            index = pack.with_suffix(".idx")
+            assert index.is_symlink()
+            for path, column in [(pack, "pack_digest"), (index, "idx_digest")]:
+                target = path.readlink()
+                assert str(target).startswith(f"/proc/{process.pid}/fd/"), target
+                digest = f.sql(f"SELECT {column} FROM git_rs.packs WHERE native_hash='{pack.stem[5:]}' "
+                               "AND repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/cache-lifecycle')")
+                assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
+                assert path.stat().st_ino == target.stat().st_ino
+            assert metric_value(f.health("cache-pins", "/metrics")[1], "git_rs_cache_allocated_bytes") == 8192
+            f.git(pack.parents[2], "verify-pack", index)
+        finally:
+            gateway.reset()
+        assert reader.result(timeout=15).stdout == expected
+    wait_for(lambda: metric_value(f.health("cache-pins", "/metrics")[1],
+                                  "git_rs_cache_allocated_bytes") == 0, "evicted request pin release")
+    clone = f.base / "cache-clone"
+    f.git(source, "clone", url, clone)
+    f.git(clone, "fsck", "--strict", "--full")
+    assert (clone / "initial.txt").read_text() == "first synthetic object\n"
+    assert (clone / "next.txt").read_text() == "second synthetic object\n"
+
+    # Reusing the empty native template must not leak a previous request's HEAD.
+    branch = b"refs/heads/\xff"
+    f.git(source, "push", normal, "HEAD:" + branch.decode(errors="surrogateescape"))
+    f.sql("UPDATE git_rs.repositories SET default_ref=decode('" + branch.hex() + "','hex') "
+          "WHERE slug='team/cache-lifecycle'")
+    head = f.git(source, "ls-remote", "--symref", url, "HEAD").stdout
+    oid = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    assert head == b"ref: " + branch + b"\tHEAD\n" + oid + b"\tHEAD\n", head
+    f.cli("create", "team/cache-empty", "alice")
+    f.sql("UPDATE git_rs.repositories SET default_ref=decode('" + branch.hex() + "','hex') "
+          "WHERE slug='team/cache-empty'")
+    empty_clone = f.base / "unborn-cache-clone"
+    f.git(source, "clone", url.replace("cache-lifecycle.git", "cache-empty.git"), empty_clone)
+    assert (empty_clone / ".git/HEAD").read_bytes() == b"ref: " + branch + b"\n"
+    original = f.git(source, "ls-remote", "--symref", normal_url, "HEAD").stdout
+    assert original.startswith(b"ref: refs/heads/main\tHEAD\n")
+    assert f.git(source, "ls-remote", "--symref", url.replace("cache-lifecycle.git", "project.git"), "HEAD").stdout == original
+    f.results["shared_cache_pin_eviction_and_native_head"] = "passed"
+
+
 def exercise(f):
     f.cli("migrate")
     print("repeatable, concurrent schema initialization", flush=True)
@@ -232,12 +316,21 @@ def exercise(f):
         assert f.s3("HEAD", uncertain[0], ok=False).stdout == b"404"
 
         print("integrity, size limits and recovery from failed downloads", flush=True)
-        for mode in ["corrupt-get", "oversize-get"]:
-            gateway.arm(mode)
-            assert f.git(source, "ls-remote", faulty_url, ok=False).returncode, mode
-            gateway.reset()
-            assert f.git(source, "ls-remote", faulty_url).stdout == before
-        f.results["invalid_downloads_rejected"] = ["digest mismatch", "excess content length"]
+        for cache_bytes in ["0", "8192"]:
+            for mode in ["corrupt-get", "oversize-get", "short-get"]:
+                f.env["GIT_RS_CACHE_BYTES"] = cache_bytes
+                _, download_port = f.start(f"download-{cache_bytes}-{mode}")
+                f.env["GIT_RS_CACHE_BYTES"] = "0"
+                download_url = f"http://127.0.0.1:{download_port}/team/project.git"
+                gateway.arm(mode)
+                assert f.git(source, "ls-remote", download_url, ok=False).returncode, (cache_bytes, mode)
+                gateway.reset()
+                assert f.git(source, "ls-remote", download_url).stdout == before
+        f.results["invalid_downloads_rejected"] = {
+            "paths": ["bounded scratch", "sealed cache fill"],
+            "faults": ["digest mismatch", "excess content length", "short body"],
+        }
+        cache_lifecycle_test(f, gateway, url)
 
         print("durable reader fencing and failed physical DELETE", flush=True)
         epoch = f.sql("SELECT storage_epoch FROM git_rs.repositories WHERE slug='team/project'")

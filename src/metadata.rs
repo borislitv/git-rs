@@ -1,7 +1,7 @@
 use crate::protocol::{Oid, Update, hex, unhex};
 use crate::{
     Result, auth, database, invalid,
-    metrics::{self, Dependency, Metric},
+    metrics::{self, Dependency, Metric, Stage},
     process, scratch,
 };
 use std::collections::BTreeMap;
@@ -57,7 +57,10 @@ pub fn sql(query: &str) -> Result<String> {
 // as it arrives. Hex-encoded legal refs alone can exceed sql()'s 16 MiB capture
 // limit; pack catalogs also grow independently of the number of refs. The only
 // retained allocation is the decoded Snapshot, not a second full wire image.
-fn snapshot_rows(queries: &[&str], row: impl FnMut(&str) -> Result<()>) -> Result<()> {
+fn snapshot_rows(
+    queries: &[(&str, Option<Stage>)],
+    row: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
     metrics::measure(Metric::Dependency(Dependency::Sql), || {
         database::session_rows(queries, row)
     })
@@ -118,11 +121,13 @@ impl Drop for Barrier {
         // Releasing a hold must still work after request cancellation. This is a
         // separate, bounded metadata-only cleanup; failure leaves a safe expiry.
         let released = process::Operation::new(5).enter(|| {
-            sql(&format!(
-                "DELETE FROM repository_leases WHERE id={}::uuid AND repo_id={}::uuid;",
-                text(&self.id),
-                text(&self.repo)
-            ))
+            metrics::measure(Metric::Stage(Stage::LeaseRelease), || {
+                sql(&format!(
+                    "DELETE FROM repository_leases WHERE id={}::uuid AND repo_id={}::uuid;",
+                    text(&self.id),
+                    text(&self.repo)
+                ))
+            })
         });
         if released.is_err() {
             eprintln!("repository lease release failed; expiry will recover it");
@@ -179,7 +184,10 @@ pub fn snapshot(slug: &str, principal: &str, write: bool) -> Result<Snapshot> {
     auth::repository(slug)?;
     auth::principal(principal)?;
     read_snapshot(
-        &[&snapshot_query(slug, principal, write, None)],
+        &[(
+            &snapshot_query(slug, principal, write, None),
+            Some(Stage::CatalogRead),
+        )],
         None,
         &mut None,
     )?
@@ -201,7 +209,7 @@ fn snapshot_query(slug: &str, principal: &str, write: bool, lease: Option<&str>)
 }
 
 fn read_snapshot(
-    queries: &[&str],
+    queries: &[(&str, Option<Stage>)],
     lease_id: Option<&str>,
     lease: &mut Option<Barrier>,
 ) -> Result<Option<Snapshot>> {
@@ -314,7 +322,14 @@ pub fn leased_snapshot(slug: &str, principal: &str, write: bool) -> Result<(Snap
     let catalog = snapshot_query(slug, principal, write, Some(&id));
     loop {
         let mut lease = None;
-        let snapshot = read_snapshot(&[&query, &catalog], Some(&id), &mut lease)?;
+        let snapshot = read_snapshot(
+            &[
+                (&query, Some(Stage::LeaseCommit)),
+                (&catalog, Some(Stage::CatalogRead)),
+            ],
+            Some(&id),
+            &mut lease,
+        )?;
         if let Some(lease) = lease {
             let snapshot = snapshot.ok_or_else(|| invalid("repository unavailable"))?;
             if snapshot.id != lease.repo {

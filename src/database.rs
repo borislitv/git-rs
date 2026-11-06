@@ -1,6 +1,10 @@
 //! A bounded process-local Tokio PostgreSQL pool. Failed or interrupted sessions
 //! are destroyed, never recycled with an unfinished transaction or unread reply.
-use crate::{Result, invalid, process};
+use crate::{
+    Result, invalid,
+    metrics::{self, Metric, Stage},
+    process,
+};
 use deadpool_postgres::{Client, Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
 use native_tls::{Certificate, Identity, Protocol, TlsConnector};
@@ -134,7 +138,11 @@ impl Database {
         Ok(Self { runtime, pool, tls })
     }
 
-    fn rows(&self, queries: &[&str], mut consume: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    fn rows(
+        &self,
+        queries: &[(&str, Option<Stage>)],
+        mut consume: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         process::check_operation()?;
         let remaining = if process::Operation::current().is_some() {
             process::remaining()?
@@ -143,6 +151,7 @@ impl Database {
         };
         self.runtime.block_on(async {
             let work = async {
+                let acquire = metrics::Timer::start(Metric::Stage(Stage::SqlAcquire));
                 let connection = Checkout(
                     Some(
                         self.pool
@@ -152,7 +161,10 @@ impl Database {
                     ),
                     self.tls.clone(),
                 );
-                for query in queries {
+                acquire.finish(true);
+                for (query, stage) in queries {
+                    let stage = stage.map(|stage| metrics::Timer::start(Metric::Stage(stage)));
+                    let query_timer = metrics::Timer::start(Metric::Stage(Stage::SqlQuery));
                     let mut processed = 0;
                     let mut rows = pin!(
                         connection
@@ -182,14 +194,20 @@ impl Database {
                             }
                         }
                     }
+                    query_timer.finish(true);
+                    if let Some(stage) = stage {
+                        stage.finish(true);
+                    }
                 }
                 // Also protect callers that accidentally leave an explicit tx or
                 // session SET behind. RESET ALL restores our startup options.
+                let reset = metrics::Timer::start(Metric::Stage(Stage::SqlReset));
                 connection
                     .client()
                     .batch_execute("ROLLBACK; RESET ALL;")
                     .await
                     .map_err(sql_error)?;
+                reset.finish(true);
                 connection.recycle();
                 Ok(())
             };
@@ -224,16 +242,19 @@ fn sql_error(error: tokio_postgres::Error) -> Box<dyn std::error::Error + Send +
 }
 
 pub(crate) fn rows(query: &str, consume: impl FnMut(&str) -> Result<()>) -> Result<()> {
-    session_rows(&[query], consume)
+    session_rows(&[(query, None)], consume)
 }
 
 pub(crate) fn session_rows(
-    queries: &[&str],
+    queries: &[(&str, Option<Stage>)],
     consume: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     static DATABASE: OnceLock<std::result::Result<Database, String>> = OnceLock::new();
     let database = DATABASE
-        .get_or_init(|| Database::new().map_err(|_| "PostgreSQL configuration invalid".into()))
+        .get_or_init(|| {
+            metrics::measure(Metric::Stage(Stage::SqlInit), Database::new)
+                .map_err(|_| "PostgreSQL configuration invalid".into())
+        })
         .as_ref()
         .map_err(|message| invalid(message))?;
     database.rows(queries, consume)

@@ -5,7 +5,7 @@ use crate::{
     cache::Cache,
     hooks, invalid,
     metadata::{self, Snapshot},
-    metrics::{self, Metric, Phase},
+    metrics::{self, Metric, Phase, Stage},
     process,
     protocol::{Oid, Update},
     scratch::Scratch,
@@ -34,7 +34,7 @@ impl Engine {
     }
 
     fn materialize_inner(&self, snapshot: &Snapshot) -> Result<Scratch> {
-        let scratch = Scratch::new(&self.scratch_root)?;
+        let mut scratch = Scratch::new(&self.scratch_root)?;
         let total: u64 = snapshot
             .packs
             .iter()
@@ -45,23 +45,24 @@ impl Engine {
         }
         let directory = scratch.path.join("objects/pack");
         for pack in &snapshot.packs {
-            self.store.materialize(
+            scratch.retain(self.store.materialize(
                 &snapshot.id,
                 &pack.pack_key,
                 &pack.pack_digest,
                 pack.pack_size,
                 &directory.join(format!("pack-{}.pack", pack.hash)),
                 &self.cache,
-            )?;
-            self.store.materialize(
+            )?);
+            scratch.retain(self.store.materialize(
                 &snapshot.id,
                 &pack.idx_key,
                 &pack.idx_digest,
                 pack.idx_size,
                 &directory.join(format!("pack-{}.idx", pack.hash)),
                 &self.cache,
-            )?;
+            )?);
         }
+        let restore = metrics::Timer::start(Metric::Stage(Stage::RestoreRefs));
         let mut commands = Vec::new();
         for (name, oid) in &snapshot.refs {
             commands.extend_from_slice(b"create ");
@@ -80,15 +81,23 @@ impl Engine {
                 4096,
             )?;
         }
-        process::capture(
-            process::git()
-                .arg("-C")
-                .arg(&scratch.path)
-                .args(["symbolic-ref", "HEAD"])
-                .arg(OsStr::from_bytes(&snapshot.default_ref)),
-            b"",
-            4096,
-        )?;
+        restore.finish(true);
+        // The native template already points HEAD at main. Other defaults still
+        // go through Git; combining HEAD with its referent in update-ref's
+        // transaction is rejected by upstream Git as a duplicate update.
+        if snapshot.default_ref != b"refs/heads/main" {
+            let head = metrics::Timer::start(Metric::Stage(Stage::RestoreHead));
+            process::capture(
+                process::git()
+                    .arg("-C")
+                    .arg(&scratch.path)
+                    .args(["symbolic-ref", "HEAD"])
+                    .arg(OsStr::from_bytes(&snapshot.default_ref)),
+                b"",
+                4096,
+            )?;
+            head.finish(true);
+        }
         Ok(scratch)
     }
 
@@ -103,6 +112,7 @@ impl Engine {
         commands: &[Update],
         publish: bool,
     ) -> Result<()> {
+        let refs = metrics::Timer::start(Metric::Stage(Stage::RefValidate));
         for command in commands {
             process::capture(
                 process::git()
@@ -121,6 +131,7 @@ impl Engine {
                 return Err(invalid("stale expected ref"));
             }
         }
+        refs.finish(true);
         if !publish {
             return Ok(());
         }
@@ -129,6 +140,7 @@ impl Engine {
         }
         let mut fast_forward = Vec::new();
         let mut tips = Vec::new();
+        let tip_validation = metrics::Timer::start(Metric::Stage(Stage::TipValidate));
         for command in commands {
             if command.new != Oid::ZERO {
                 if command.name.starts_with(b"refs/heads/") {
@@ -152,7 +164,8 @@ impl Engine {
             } else if command.new == Oid::ZERO {
                 false
             } else if command.name.starts_with(b"refs/heads/") {
-                process::capture(
+                let ancestry = metrics::Timer::start(Metric::Stage(Stage::FastForward));
+                let result = process::capture(
                     process::git().arg("-C").arg(path).args([
                         "merge-base",
                         "--is-ancestor",
@@ -161,13 +174,17 @@ impl Engine {
                     ]),
                     b"",
                     4096,
-                )
-                .is_ok()
+                );
+                // Non-ancestor checks count as unsuccessful stages, like their
+                // native Git nonzero exit; authorization still owns the decision.
+                ancestry.finish(result.is_ok());
+                result.is_ok()
             } else {
                 command.old == command.new
             };
             fast_forward.push(ff);
         }
+        tip_validation.finish(true);
         if !tips.is_empty() {
             // fsck walks actual graph edges; normalized deltas alone are insufficient.
             metrics::measure(Metric::Phase(Phase::Graph), || {
@@ -289,6 +306,7 @@ impl Engine {
         })?;
         let scratch = self.materialize(&snapshot)?;
         let operation = crate::scratch::identifier()?;
+        let setup = metrics::Timer::start(Metric::Stage(Stage::HookSetup));
         let socket = hooks::PrivateSocket::new()?;
         let listener = socket.listener.try_clone()?;
         let nonce = crate::scratch::identifier()?;
@@ -332,6 +350,7 @@ impl Engine {
             command.env("GIT_PROTOCOL", protocol);
         }
         hooks::install(&scratch.path, &socket.path, &nonce, &mut command)?;
+        setup.finish(true);
         metrics::measure(Metric::Phase(Phase::Git), || {
             self.execute(
                 &scratch.path,
@@ -423,27 +442,34 @@ impl Engine {
             });
             let finished = &input_finished;
             let sender = scope.spawn(move || {
-                let result = process::forward_input(input, &mut stdin);
+                let result = budget.enter(|| {
+                    let timer = metrics::Timer::start(Metric::Stage(Stage::GitInput));
+                    let result = process::forward_input(input, &mut stdin);
+                    timer.finish(result.is_ok());
+                    result
+                });
                 let (state, ready) = finished;
                 *state.lock().expect("HTTP body state poisoned") = Some(result.is_ok());
                 ready.notify_all();
                 result
             });
             let mut stdout = BufReader::new(stdout);
-            let result = (|| -> Result<()> {
+            let result = metrics::measure(Metric::Stage(Stage::GitOutput), || -> Result<()> {
                 if cgi {
                     forward_cgi_headers(&mut stdout, output)?;
                 }
                 std::io::copy(&mut stdout, output)?;
                 output.flush()?;
                 Ok(())
-            })();
+            });
             if result.is_err() {
                 child.terminate();
             }
             cancel_input();
             budget.cancel();
+            let wait = metrics::Timer::start(Metric::Stage(Stage::GitWait));
             let status = child.wait()?;
+            wait.finish(status.success());
             stop.store(true, Ordering::Release);
             let sent = sender
                 .join()

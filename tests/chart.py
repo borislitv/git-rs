@@ -98,6 +98,7 @@ def main():
     env = {item["name"]: item for item in backend["env"]}
     assert env["GIT_RS_CACHE_BYTES"]["value"] == "67108864", env["GIT_RS_CACHE_BYTES"]
     assert env["PGSSLMODE"]["value"] == "verify-full"
+    assert "GIT_RS_DEBUG_TIMINGS" not in env
     assert env["PGTARGETSESSIONATTRS"]["value"] == "read-write"
     assert env["PGHOST"]["value"] == "contract-git-rs-pg-rw"
     assert "valueFrom" in env["GIT_RS_S3_BUCKET"]
@@ -169,7 +170,7 @@ def main():
         {"name": "http", "port": 2222, "targetPort": "http"}]
 
     customized = render(args.helm, {
-        "fullnameOverride": "isolated", "cacheBytes": 0,
+        "fullnameOverride": "isolated", "cacheBytes": 0, "debugTimings": True,
         "image": {"repository": "example.invalid/git-rs", "digest": "sha256:" + "a" * 64},
         "cnpg": {"name": "metadata-db"},
         "objectBucket": {"name": "packs-claim", "bucketName": "unique-packs", "storageClassName": "retained-buckets", "additionalConfig": {"maxObjects": "1000"}},
@@ -187,6 +188,7 @@ def main():
     assert resource(customized, "ObjectBucketClaim")["spec"]["storageClassName"] == "retained-buckets"
     env = {item["name"]: item for item in pod["containers"][0]["env"]}
     assert env["GIT_RS_CACHE_BYTES"]["value"] == "0"
+    assert env["GIT_RS_DEBUG_TIMINGS"]["value"] == "1"
     assert env["PGHOST"]["value"] == "metadata-db-rw"
     assert env["GIT_RS_S3_BUCKET"]["valueFrom"]["configMapKeyRef"]["name"] == "packs-claim"
 
@@ -207,6 +209,7 @@ def main():
         ({"cacheByte": 1}, "cacheByte"),
         ({"replicaCount": 0}, "replicaCount"),
         ({"operationSeconds": 121}, "operationSeconds"),
+        ({"debugTimings": "true"}, "debugTimings"),
         ({"image": {"digest": "sha256:bad"}}, "digest"),
         ({"s3": {"endpoint": "http://s3.example.invalid"}}, "endpoint"),
         ({"cnpg": {"enabled": False}}, "postgresql.host is required"),

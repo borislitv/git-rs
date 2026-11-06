@@ -19,11 +19,14 @@ restart. Scrapes do not perform SQL or S3 requests.
 | `git_rs_build_info` | Gauge | `version`, one per build |
 | `git_rs_process_start_time_seconds` | Gauge | Instrumentation initialization time since Unix epoch |
 | `git_rs_active_requests` | Gauge | Admitted Git transport connections; excludes health handlers |
-| `git_rs_cache_allocated_bytes` | Gauge | Cache reservations, entries and reader-pinned buffers; not total RSS |
+| `git_rs_cache_allocated_bytes` | Gauge | Cache reservations, entries and reader-pinned files, rounded to 4 KiB; not total RSS |
+| `git_rs_timing_logs_dropped_total` | Counter | Diagnostic records discarded by the bounded timing queue; not sink write errors |
 | `git_rs_requests_total` | Counter | `transport=ssh,http`; `outcome=success,error,unauthorized,bad_request` |
 | `git_rs_request_duration_seconds` | Histogram | `transport`; complete admitted connection lifetime including cleanup |
 | `git_rs_phase_duration_seconds` | Histogram | `phase=snapshot,materialize,scratch_init,git,pre_receive,validate,graph,upload,publish` |
 | `git_rs_phase_errors_total` | Counter | Failed phase outcomes, with the same `phase` labels |
+| `git_rs_stage_duration_seconds` | Histogram | Fixed `stage` labels detailed below |
+| `git_rs_stage_errors_total` | Counter | Unsuccessful completed/dropped stage spans, with the same `stage` labels |
 | `git_rs_dependency_duration_seconds` | Histogram | `operation=sql,s3_get,s3_put,s3_delete,s3_versioning` |
 | `git_rs_dependency_errors_total` | Counter | Failed dependency operations, with the same `operation` labels |
 | `git_rs_subprocess_duration_seconds` | Histogram | `program=git,curl,sha256sum,other`; SQL has no subprocess |
@@ -58,6 +61,68 @@ needed, complete response consumption and session reset. One observation may sen
 messages. Background readiness queries and lease cleanup also contribute, so the count is not
 simply the Git command count.
 
+## Detailed stages
+
+| `stage` | Inclusive wall-time boundary |
+| --- | --- |
+| `sql_init` | First process-local database configuration/runtime/pool initialization, not every checkout |
+| `sql_acquire` | Pool wait and complete connection establishment when needed |
+| `sql_query` | One protocol message, including complete stream consumption and row decoding/callbacks |
+| `sql_reset` | Successful-session `ROLLBACK; RESET ALL;` before recycling |
+| `lease_commit` | Serving snapshot's first SQL message through committed-lease response completion |
+| `catalog_read` | Consistent snapshot message through full catalog consumption and COMMIT completion |
+| `lease_release` | Bounded metadata cleanup, including its checkout/query/reset |
+| `cache_fill` | Admitted memfd setup, load/verification/sealing and cache publication |
+| `cache_link` | Link a verified, reader-pinned cached file into private request scratch |
+| `object_hash` | SHA-256 input reads and hashing; a digest mismatch is reported by its enclosing transfer/fill |
+| `restore_refs` | Build and execute native ref restoration, including an empty ref set |
+| `restore_head` | Native HEAD restoration for non-main defaults; main reuses the empty template |
+| `hook_setup` | Private hook socket/nonce and application-owned hook installation |
+| `git_input` | Client input forwarding, potentially waiting for EOF; overlaps output and hooks |
+| `git_output` | Native stdout/CGI forwarding and response flush |
+| `git_wait` | Final child wait after output EOF, not the whole native RPC lifetime |
+| `ref_validate` | Native ref-name and expected-old-OID checks, in both hook rounds |
+| `tip_validate` | Branch-tip type and fast-forward classification; excludes the separate graph phase |
+| `fast_forward` | Native ancestry checks; a non-ancestor's nonzero exit counts as unsuccessful |
+| `scratch_cleanup` | Private directory removal, before reader pins are released |
+| `process_spawn` | Application-owned child spawn only, separate from subprocess lifetime |
+
+Stages overlap phases, dependencies and other stages. They are not an additive CPU profile.
+An error, cancellation or unwind before a timer's successful finish counts as an error.
+Administrative commands, probes and cleanup may contribute independently of transport requests.
+The retained `program="sha256sum"` series is zero for current in-process hashing.
+
+## Opt-in correlated timing logs
+
+Set `GIT_RS_DEBUG_TIMINGS=1` before starting the process, or chart value `debugTimings: true`.
+The setting is initialized once; restart to change it. Prometheus instrumentation remains enabled
+without debug logs. Library callers must initialize `metrics::init_timing_logs()` at entry and
+retain its process-owned guard outside request paths.
+
+Timing records target stderr and have only these fixed fields:
+
+```text
+git_rs_timing level=debug pid=123 operation=42 kind=stage name=sql_acquire elapsed_ms=1.200 duration_ms=0.050 outcome=success
+```
+
+`pid` plus the process-local numeric `operation` correlates request, worker, hook and independent
+cleanup-budget spans. It is not a durable request identifier or a metric label. `operation=0`
+means no bounded operation context; separately bounded probes can have their own IDs without a
+transport request. `elapsed_ms` is the span's end relative to the operation origin, and
+`duration_ms` is its inclusive duration; values are rounded to three decimal places. No wall
+clock, repository, principal, ref, OID, object key, SQL, argv or raw error is recorded.
+
+The maintained `tracing-appender` writer has one background thread and a **1024-record lossy
+queue**. Request/drop/SQL paths never wait for sink capacity. Full or disconnected queues drop
+records and increment `git_rs_timing_logs_dropped_total`; it does not detect every sink write
+error. Crashes, shutdown or stalled sinks can lose records. At process shutdown a separate helper
+attempts guard destruction, with at most 1200 ms acknowledgement wait; no blocked worker is
+joined. The upstream appender may print a generic stdout shutdown notice when its queue is full.
+
+Keep debug-enabled diagnostic trials separate from scored performance cohorts: formatting,
+queueing and log collection add overhead. Use the histogram deltas, correlated span intervals
+and container CPU/throttling together; do not sum overlapping span durations.
+
 ## Scraping
 
 For a Prometheus installation supporting annotation-based pod discovery:
@@ -91,6 +156,14 @@ sum by (phase) (rate(git_rs_phase_duration_seconds_sum[5m]))
 sum by (phase) (rate(git_rs_phase_duration_seconds_count[5m]))
 
 sum(rate(git_rs_dependency_duration_seconds_count{operation="sql"}[5m]))
+```
+
+Separate pool/connect waits from query/reset costs:
+
+```promql
+sum by (stage) (rate(git_rs_stage_duration_seconds_sum{stage=~"sql_acquire|sql_query|sql_reset"}[5m]))
+/
+sum by (stage) (rate(git_rs_stage_duration_seconds_count{stage=~"sql_acquire|sql_query|sql_reset"}[5m]))
 ```
 
 Cache hit fraction and admission rejection rate:

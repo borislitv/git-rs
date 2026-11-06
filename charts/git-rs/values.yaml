@@ -32,6 +32,7 @@ scratch:
   sizeLimit: 16Gi
 cacheBytes: 67108864
 operationSeconds: 120
+debugTimings: false # Opt-in bounded, lossy diagnostic records on backend stderr.
 terminationGracePeriodSeconds: 150
 
 ssh:

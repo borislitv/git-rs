@@ -26,6 +26,7 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `GIT_RS_CACHE_BYTES` | reusable RAM cache capacity, default 67108864 bytes; `0` disables |
 | `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..120`, default 120 |
+| `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |
 
 The Helm chart obtains credentials from existing Secrets or bucket-claim outputs. Do not put
 credentials, private keys or real identity maps in values files, command-line flags or source
@@ -202,7 +203,12 @@ client clones, WAL and retained metadata backups can still contain old data.
 ## Resource and service checks
 
 - Default 64 MiB cache is shared by requests in one process, not replicas. Entries larger than
-  8 MiB bypass it. Reservations and evicted-but-pinned buffers remain accounted against capacity.
+  8 MiB bypass it. Reservations and evicted-but-pinned files remain accounted against capacity,
+  rounded to 4 KiB; at most 256 backing files may be live. Files are size-sealed before download,
+  checked for actual written length and SHA-256, then write-sealed before publication. Native Git
+  reopens request-local symlinks through `/proc/<serving-pid>/fd`; request pins outlive its children.
+  The supplied Linux container/security profile supports this path. Memfd pages can be swapped;
+  this accounting does not bound kernel metadata, total file descriptors or pod RSS.
 - Four admitted operations per process; native Git/curl children consume additional memory,
   CPU and process slots. A cache metric is not total pod RSS.
 - Absolute transport deadlines cover headers, SSH handshake and blocked response writes; the
@@ -215,10 +221,14 @@ client clones, WAL and retained metadata backups can still contain old data.
 - `/livez` checks process responsiveness; `/readyz` checks a reachable writable PostgreSQL primary.
   Readiness does not certify the current schema, S3 availability or replication health. Gate initial
   client exposure on successful migration and a native Git smoke test.
-- `/metrics` on the health listener exposes request/phase/dependency/subprocess histograms,
+- `/metrics` on the health listener exposes request/phase/stage/dependency/subprocess histograms,
   failures, cache outcomes, S3 object bytes and admission rejections, alongside the active/cache
   gauges. See [metrics and PromQL](docs/metrics.md). Monitor pod/child RSS, CPU throttling,
   ephemeral storage and database replication separately.
+- Enable `debugTimings: true` in the chart, or `GIT_RS_DEBUG_TIMINGS=1` before process start, for
+  correlated stage records. A 1024-record lossy queue separates sink writes from request and SQL
+  cleanup paths. Monitor `git_rs_timing_logs_dropped_total`; missing diagnostics never imply a
+  successful or absent operation. Timing logs add profiling overhead; disable them for scoring.
 
 Before production use, validate CNPG synchronous failover and unknown-commit behavior under the
 actual topology, Ceph/RGW durability and deletion semantics, clock/deadline margins, namespace

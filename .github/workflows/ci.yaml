@@ -25,7 +25,7 @@ jobs:
       - name: Rust checks and cache benchmark
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config gnu-coreutils
           make check
           make bench
       - name: Chart and pinned operator-schema contracts
@@ -71,7 +71,7 @@ jobs:
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$(command -v docker):/usr/bin/docker:ro" \
             --entrypoint /usr/bin/python3 git-rs:test \
-            tests/integration.py --provision --binary /usr/local/bin/git-rs --large-mib 64
+            tests/integration.py --provision --binary /usr/local/bin/git-rs --large-mib 64 --debug-timings
       - name: PostgreSQL/S3 failure and recovery contracts
         run: |
           docker run --rm --network host \

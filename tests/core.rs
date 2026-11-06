@@ -5,11 +5,18 @@ use git_rs::{
     http::Request,
     protocol::{self, Oid, Update},
 };
-use std::io::{Cursor, Read};
+use std::fs::{self, File};
+use std::io::{Cursor, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::sync::{
     Arc, Barrier,
     atomic::{AtomicUsize, Ordering},
 };
+
+fn fill(mut file: &File, bytes: &[u8]) -> git_rs::Result<()> {
+    file.write_all(bytes)?;
+    Ok(())
+}
 
 #[test]
 fn packet_framing_distinguishes_flush_truncation_and_invalid_length() {
@@ -134,12 +141,9 @@ fn http_streams_chunked_binary_and_rejects_ambiguous_framing() {
 
 #[test]
 fn eviction_does_not_forget_pinned_memory() {
-    let cache = Cache::new(8, 8);
+    let cache = Cache::new(4096, 8);
     let pinned = cache
-        .get_or_load("repo-a:pack", 8, |bytes| {
-            bytes.copy_from_slice(b"12345678");
-            Ok(())
-        })
+        .get_or_load("repo-a:pack", 8, |file| fill(file, b"12345678"))
         .unwrap()
         .unwrap();
     let bypass = cache
@@ -148,19 +152,16 @@ fn eviction_does_not_forget_pinned_memory() {
         })
         .unwrap();
     assert!(bypass.is_none());
-    assert_eq!(cache.allocated(), 8);
-    assert_eq!(pinned.as_ref().as_ref(), b"12345678");
+    assert_eq!(cache.allocated(), 4096);
+    assert_eq!(fs::read(pinned.path()).unwrap(), b"12345678");
     drop(pinned);
     assert_eq!(cache.allocated(), 0);
     let next = cache
-        .get_or_load("repo-b:pack", 8, |bytes| {
-            bytes.copy_from_slice(b"abcdefgh");
-            Ok(())
-        })
+        .get_or_load("repo-b:pack", 8, |file| fill(file, b"abcdefgh"))
         .unwrap()
         .unwrap();
-    assert_eq!(next.as_ref().as_ref(), b"abcdefgh");
-    assert_eq!(cache.allocated(), 8);
+    assert_eq!(fs::read(next.path()).unwrap(), b"abcdefgh");
+    assert_eq!(cache.allocated(), 4096);
 }
 
 #[test]
@@ -177,10 +178,9 @@ fn concurrent_misses_share_one_complete_immutable_load() {
             workers.push(scope.spawn(move || {
                 start.wait();
                 cache
-                    .get_or_load("repo:immutable:digest", 4096, |bytes| {
+                    .get_or_load("repo:immutable:digest", 4096, |file| {
                         loads.fetch_add(1, Ordering::SeqCst);
-                        bytes.fill(73);
-                        Ok(())
+                        fill(file, &[73; 4096])
                     })
                     .unwrap()
                     .unwrap()
@@ -190,7 +190,7 @@ fn concurrent_misses_share_one_complete_immutable_load() {
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         for buffer in &buffers {
             assert!(Arc::ptr_eq(&buffers[0], buffer));
-            assert_eq!(buffer.as_ref().as_ref(), [73; 4096]);
+            assert_eq!(fs::read(buffer.path()).unwrap(), [73; 4096]);
         }
     });
     assert_eq!(cache.allocated(), 4096);
@@ -198,7 +198,7 @@ fn concurrent_misses_share_one_complete_immutable_load() {
 
 #[test]
 fn failed_load_releases_reservation_and_does_not_poison_retry() {
-    let cache = Cache::new(8, 8);
+    let cache = Cache::new(4096, 8);
     assert!(
         cache
             .get_or_load("key", 8, |_| Err(git_rs::invalid("injected read failure")))
@@ -206,18 +206,267 @@ fn failed_load_releases_reservation_and_does_not_poison_retry() {
     );
     assert_eq!(cache.allocated(), 0);
     let result = cache
-        .get_or_load("key", 8, |bytes| {
-            bytes.fill(9);
-            Ok(())
-        })
+        .get_or_load("key", 8, |file| fill(file, &[9; 8]))
         .unwrap()
         .unwrap();
-    assert_eq!(result.as_ref().as_ref(), [9; 8]);
+    assert_eq!(fs::read(result.path()).unwrap(), [9; 8]);
     assert!(
         Cache::new(0, 8)
             .get_or_load("key", 8, |_| panic!("disabled cache must bypass"))
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn shared_cache_files_are_sealed_and_reopened_without_a_copy() {
+    use memfd::{FileSeal, Memfd};
+    let cache = Cache::new(8192, 8);
+    let entry = cache
+        .get_or_load("repo:shared", 8, |file| fill(file, b"abcdefgh"))
+        .unwrap()
+        .unwrap();
+    let hit = cache
+        .get_or_load("repo:shared", 8, |_| {
+            panic!("cached bytes must not be reloaded")
+        })
+        .unwrap()
+        .unwrap();
+    let mut left = File::open(entry.path()).unwrap();
+    let mut right = File::open(hit.path()).unwrap();
+    let mut sample = [0; 3];
+    left.read_exact(&mut sample).unwrap();
+    assert_eq!(&sample, b"abc");
+    right.read_exact(&mut sample).unwrap();
+    assert_eq!(
+        &sample, b"abc",
+        "each Git reader needs an independent offset"
+    );
+    assert_eq!(
+        left.metadata().unwrap().ino(),
+        right.metadata().unwrap().ino()
+    );
+    assert_eq!(
+        left.metadata().unwrap().dev(),
+        right.metadata().unwrap().dev()
+    );
+    let memory = Memfd::try_from_file(left).unwrap();
+    let seals = memory.seals().unwrap();
+    for seal in [
+        FileSeal::SealWrite,
+        FileSeal::SealGrow,
+        FileSeal::SealShrink,
+        FileSeal::SealSeal,
+    ] {
+        assert!(seals.contains(&seal), "shared bytes require {seal:?}");
+    }
+    // Reopening the parent descriptor after exec must work without inheriting
+    // unrelated serving-process file descriptors into native Git.
+    let output = std::process::Command::new("/usr/bin/dd")
+        .arg(format!("if={}", hit.path().display()))
+        .args(["bs=8", "count=1", "status=none"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"abcdefgh");
+    assert_eq!(cache.allocated(), 4096);
+}
+
+#[test]
+fn cache_fill_is_size_bounded_and_short_data_is_never_published() {
+    let cache = Cache::new(4096, 8);
+    assert!(
+        cache
+            .get_or_load("short", 8, |file| {
+                assert!(
+                    file.set_len(0).is_err(),
+                    "a fill must not shrink its reservation"
+                );
+                assert!(
+                    file.set_len(9).is_err(),
+                    "a fill must not grow its reservation"
+                );
+                fill(file, b"short")
+            })
+            .is_err()
+    );
+    assert_eq!(cache.allocated(), 0);
+    assert!(
+        cache
+            .get_or_load("long", 8, |file| fill(file, b"123456789"))
+            .is_err()
+    );
+    assert_eq!(cache.allocated(), 0);
+    let complete = cache
+        .get_or_load("short", 8, |file| fill(file, b"complete"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(complete.path()).unwrap(), b"complete");
+    assert_eq!(cache.allocated(), 4096);
+}
+
+#[test]
+fn cache_does_not_reuse_a_key_with_a_different_expected_size() {
+    let cache = Cache::new(8192, 8);
+    let entry = cache
+        .get_or_load("same-key", 8, |file| fill(file, b"complete"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        cache
+            .get_or_load("same-key", 7, |_| panic!(
+                "identity mismatch is not a refill"
+            ))
+            .is_err()
+    );
+    assert_eq!(fs::read(entry.path()).unwrap(), b"complete");
+}
+
+#[test]
+fn pinned_cache_files_exhaust_the_descriptor_budget_before_the_byte_budget() {
+    let cache = Cache::new(2 * 1024 * 1024, 8);
+    let mut pinned = Vec::new();
+    for number in 0..256 {
+        pinned.push(
+            cache
+                .get_or_load(&format!("key-{number}"), 8, |file| fill(file, b"complete"))
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(cache.allocated(), 1024 * 1024);
+    assert!(
+        cache
+            .get_or_load("overflow", 8, |_| panic!(
+                "pinned descriptors must force bypass"
+            ))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cache.allocated(),
+        1024 * 1024,
+        "eviction must retain pinned reservations"
+    );
+    pinned.pop();
+    let retry = cache
+        .get_or_load("overflow", 8, |file| fill(file, b"released"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(retry.path()).unwrap(), b"released");
+    assert_eq!(fs::read(pinned[0].path()).unwrap(), b"complete");
+    assert_eq!(cache.allocated(), 1024 * 1024);
+}
+
+#[test]
+fn waiting_for_another_cache_fill_obeys_the_request_deadline() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let cache = Cache::new(4096, 8);
+    let (started, filling) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let (finished, result) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let cache = &cache;
+        let loader = scope.spawn(move || {
+            cache.get_or_load("shared", 8, |file| {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                fill(file, b"complete")
+            })
+        });
+        filling.recv().unwrap();
+        scope.spawn(move || {
+            let operation = git_rs::process::Operation::new(1);
+            let timed_out = operation.enter(|| {
+                cache
+                    .get_or_load("shared", 8, |_| {
+                        panic!("waiting must not start a second fill")
+                    })
+                    .is_err()
+            });
+            finished.send(timed_out).unwrap();
+        });
+        let timed_out = result.recv_timeout(Duration::from_secs(3));
+        release.send(()).unwrap();
+        let entry = loader.join().unwrap().unwrap().unwrap();
+        assert!(
+            timed_out.unwrap(),
+            "the waiter must time out while the loader is still blocked"
+        );
+        assert_eq!(fs::read(entry.path()).unwrap(), b"complete");
+    });
+}
+
+#[test]
+fn reused_native_scratch_template_excludes_request_head_and_hooks() {
+    use git_rs::{hooks, process, scratch::Scratch};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    struct Root(PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    let path = std::env::temp_dir().join(format!(
+        "git-rs-template-{}",
+        git_rs::scratch::identifier().unwrap()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let root = Root(path);
+    let first = Scratch::new(&root.0).unwrap();
+    let changed = process::git()
+        .arg("-C")
+        .arg(&first.path)
+        .args(["symbolic-ref", "HEAD"])
+        .arg(OsStr::from_bytes(b"refs/heads/\xff"))
+        .output()
+        .unwrap();
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    hooks::install(
+        &first.path,
+        &root.0.join("unused.sock"),
+        "synthetic-nonce",
+        &mut process::git(),
+    )
+    .unwrap();
+    let first_path = first.path.clone();
+    let second = Scratch::new(&root.0).unwrap();
+    assert_ne!(first.path, second.path);
+    assert_eq!(
+        fs::read(first.path.join("HEAD")).unwrap(),
+        b"ref: refs/heads/\xff\n"
+    );
+    assert_eq!(
+        fs::read(second.path.join("HEAD")).unwrap(),
+        b"ref: refs/heads/main\n"
+    );
+    assert!(!second.path.join("hooks").exists());
+    assert_eq!(
+        fs::metadata(&second.path).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    drop(first);
+    assert!(!first_path.exists());
+    assert_eq!(
+        process::capture(
+            process::git()
+                .arg("-C")
+                .arg(&second.path)
+                .args(["rev-parse", "--is-bare-repository"]),
+            b"",
+            4096,
+        )
+        .unwrap(),
+        b"true\n"
     );
 }
 

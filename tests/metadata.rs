@@ -15,6 +15,54 @@ use std::time::{Duration, Instant};
 // deliberately exercise the public metadata API, without requiring S3 or Git RPCs.
 #[test]
 #[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn snapshot_stage_metrics_distinguish_committed_lease_catalog_and_failed_authorization() {
+    let count = |name: &str, stage: &str| -> u64 {
+        let text = git_rs::metrics::global().render(0, 0);
+        let prefix = format!("git_rs_stage_{name}{{stage=\"{stage}\"}} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let stages = ["lease_commit", "catalog_read", "lease_release"];
+    let before: Vec<_> = stages
+        .iter()
+        .map(|stage| {
+            (
+                count("duration_seconds_count", stage),
+                count("errors_total", stage),
+            )
+        })
+        .collect();
+    process::Operation::new(120).enter(|| {
+        metadata::migrate().unwrap();
+        let slug = format!("metadata/stages-{}", git_rs::scratch::identifier().unwrap());
+        metadata::create(&slug, "alice").unwrap();
+        assert!(metadata::leased_snapshot(&slug, "bob", false).is_err());
+        let (snapshot, lease) = metadata::leased_snapshot(&slug, "alice", false).unwrap();
+        assert!(snapshot.refs.is_empty());
+        assert_eq!(snapshot.default_ref, b"refs/heads/main");
+        drop(lease);
+    });
+    for ((stage, (calls, errors)), (expected_calls, expected_errors)) in
+        stages.iter().zip(before).zip([(2, 1), (1, 0), (1, 0)])
+    {
+        assert_eq!(
+            count("duration_seconds_count", stage) - calls,
+            expected_calls,
+            "{stage}"
+        );
+        assert_eq!(
+            count("errors_total", stage) - errors,
+            expected_errors,
+            "{stage}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
 fn snapshot_budget_rejects_growth_without_partial_data_or_leaked_holds() {
     if std::env::var("GIT_RS_METADATA_BYTES").as_deref() != Ok("4096") {
         let result = Command::new(std::env::current_exe().unwrap())
@@ -126,6 +174,7 @@ fn sql_connection_creation_bounds_stalled_authentication() {
 #[test]
 #[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
 fn sql_reuses_sessions_and_does_not_recycle_failed_transactions() {
+    let _timing_guard = git_rs::metrics::init_timing_logs();
     process::Operation::new(120).enter(|| {
         let mut sessions = std::collections::BTreeSet::new();
         for _ in 0..32 {
@@ -155,6 +204,7 @@ fn sql_reuses_sessions_and_does_not_recycle_failed_transactions() {
 #[test]
 #[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
 fn cancelled_sql_rolls_back_and_returns_pool_capacity() {
+    let _timing_guard = git_rs::metrics::init_timing_logs();
     metadata::migrate().unwrap();
     let name = format!(
         "cancel_{}",
@@ -216,6 +266,51 @@ fn cancelled_sql_rolls_back_and_returns_pool_capacity() {
     metadata::sql(&format!("DROP TABLE git_rs.{name};")).unwrap();
     for _ in 0..12 {
         assert_eq!(metadata::sql("SELECT 1;").unwrap().trim(), "1");
+    }
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn blocked_timing_sink_does_not_pin_sql_sessions() {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    for scenario in [
+        "sql_reuses_sessions_and_does_not_recycle_failed_transactions",
+        "cancelled_sql_rolls_back_and_returns_pool_capacity",
+    ] {
+        let (_unread, mut writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        loop {
+            match writer.write(&[b'x'; 8192]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill diagnostic sink: {error}"),
+            }
+        }
+        writer.set_nonblocking(false).unwrap();
+        let fd: OwnedFd = writer.into();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", scenario, "--nocapture"])
+            .env("GIT_RS_DEBUG_TIMINGS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(fd))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("blocked timings pinned SQL work: {scenario}");
+            }
+            std::thread::yield_now();
+        };
+        assert!(
+            status.success(),
+            "SQL reuse/cancellation must not depend on the timing sink: {scenario}"
+        );
     }
 }
 

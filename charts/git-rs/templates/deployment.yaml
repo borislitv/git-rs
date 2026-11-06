@@ -106,6 +106,10 @@ spec:
               value: {{ .Values.cacheBytes | int64 | quote }}
             - name: GIT_RS_OPERATION_SECONDS
               value: {{ .Values.operationSeconds | quote }}
+            {{- if .Values.debugTimings }}
+            - name: GIT_RS_DEBUG_TIMINGS
+              value: "1"
+            {{- end }}
           ports:
             - {name: health, containerPort: 8081}
             {{- if .Values.http.enabled }}

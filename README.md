@@ -34,7 +34,9 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
 - Readers/writers take durable database leases. Explicit maintenance requires an exclusive lease;
   connection loss leaves the lease until expiry rather than prematurely releasing a reader.
 - Concurrent requests share a bounded RAM LRU/singleflight cache. Request scratch is not reused as
-  a disk cache. Cold replicas reconstruct everything from PostgreSQL and S3.
+  a disk cache. Verified cache files are sealed Linux memfds, linked into private scratch and pinned
+  until native Git exits; cache hits do not copy pack/idx payloads. An empty native-generated bare
+  template is reused in RAM, before any request refs or hooks. Cold replicas reconstruct from SQL/S3.
 - Native `git bundle` backups and owner-only physical history truncation are available.
 - Supported fetch behavior includes Git protocol v0/v1/v2, shallow clones, tags and notes.
   Smart HTTP verifies Secret-backed credentials for each request and applies the same repository
@@ -101,13 +103,16 @@ The gateway terminates HTTPS, preserves `Authorization`, and connects over a tru
 path to the backend. The application HTTP listener is plaintext; HTTPRoute alone supplies neither
 authentication nor transport encryption. See [credential setup](OPERATIONS.md#authenticated-http).
 
-Prometheus request, phase, dependency, subprocess and cache metrics are available at `/metrics`
-on the internal health listener. See [metric semantics and scrape configuration](docs/metrics.md).
+Prometheus request, phase, detailed stage, dependency, subprocess and cache metrics are available
+at `/metrics` on the internal health listener. Opt-in correlated timing records use a bounded,
+lossy background writer. See [metrics, timing logs and scrape configuration](docs/metrics.md).
 
 ## Build and verify
 
 Requires Linux, Rust **1.99+**, OpenSSL development headers/pkg-config for builds, Git **2.56.0**,
-OpenSSH server/client, curl with AWS SigV4 support, GNU coreutils and `kill`.
+OpenSSH server/client, curl with AWS SigV4 support, GNU coreutils **`/usr/bin/gnutimeout`** and `kill`.
+Ubuntu's coinstallable `gnu-coreutils` package supplies that explicit entrypoint: its default
+uutils `timeout` rejects legal non-UTF-8 ref arguments before Git sees them.
 Build and runtime use Ubuntu **26.04**. The Dockerfile
 checks official Rust/Git archive hashes, upgrades distribution packages and records the installed
 runtime inventory. [Dependency qualification](docs/dependencies.md) distinguishes reproducibility
@@ -125,6 +130,7 @@ PostgreSQL/Versity containers. They require Docker, Python 3.11+ and the runtime
 
 ```sh
 make integration           # 64 MiB synthetic data, native Git/SSH and cold restart
+python3 tests/integration.py --provision --large-mib 64 --debug-timings
 make failures              # real S3/PostgreSQL transport and maintenance faults
 make bench                 # release-mode RAM-cache microbenchmark
 python3 -m pip install PyYAML==6.0.3 jsonschema==4.26.0
@@ -145,8 +151,10 @@ they use the same pinned Git version as the runtime.
   object filesystem or a substitute for repository sharding.
 - Git SHA-1 repositories only; four admitted requests per serving process; operation deadline
   up to 120 seconds; snapshot admission up to 12 GiB; incoming pack/body up to 4 GiB.
-- Default cache 64 MiB, maximum cacheable entry 8 MiB; process/subprocess RSS and scratch are
-  additional resources. Kubernetes resource/scratch limits must match the intended workload.
+- Default cache 64 MiB, maximum cacheable entry 8 MiB, 4 KiB accounting increments and at most
+  256 live cache files, including fills and evicted reader pins. Linux `/proc/<pid>/fd` must be
+  accessible to same-UID native Git children. Memfd is not a no-swap or total-RSS guarantee;
+  subprocesses, metadata and scratch need additional resource allowances.
 - Default branch `main` is protected from deletion/rewind, including owner pushes. Read access
   is repository-wide; ref write prefixes do not hide objects or branches from readers.
 - The current schema is initialized/verified and its publication function refreshed. Future schema

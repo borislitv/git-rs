@@ -1,14 +1,15 @@
 use crate::{
     Result, invalid,
-    metrics::{self, Metric, Program},
+    metrics::{self, Metric, Program, Stage},
 };
 use std::cell::RefCell;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -52,15 +53,28 @@ impl Drop for Permit {
 pub struct Operation {
     deadline: Instant,
     cancelled: AtomicBool,
+    timing: (u64, Instant),
 }
 thread_local! { static OPERATION: RefCell<Option<Arc<Operation>>> = const { RefCell::new(None) }; }
 
 impl Operation {
     pub fn new(seconds: u64) -> Arc<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let now = Instant::now();
+        // Independent cleanup budgets retain their parent's diagnostic context,
+        // without inheriting its deadline or cancellation state.
+        let timing = Self::current().map_or_else(
+            || (NEXT_ID.fetch_add(1, Ordering::Relaxed), now),
+            |parent| parent.timing,
+        );
         Arc::new(Self {
-            deadline: Instant::now() + Duration::from_secs(seconds),
+            deadline: now + Duration::from_secs(seconds),
             cancelled: AtomicBool::new(false),
+            timing,
         })
+    }
+    pub(crate) fn timing(&self) -> (u64, Instant) {
+        self.timing
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
@@ -141,7 +155,9 @@ pub(crate) fn remaining() -> Result<Duration> {
 }
 
 pub fn command(program: &str) -> Command {
-    let mut command = Command::new("/usr/bin/timeout");
+    // Ubuntu's uutils timeout rejects non-UTF-8 ref arguments before Git sees
+    // them. Use the explicit GNU entrypoint without changing system providers.
+    let mut command = Command::new("/usr/bin/gnutimeout");
     let remaining = OPERATION.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -176,7 +192,10 @@ impl Guard {
             _ => Program::Other,
         };
         let timer = metrics::Timer::start(Metric::Subprocess(program));
-        Ok(Self(command.spawn()?, false, Some(timer)))
+        let spawn = metrics::Timer::start(Metric::Stage(Stage::ProcessSpawn));
+        let child = command.spawn()?;
+        spawn.finish(true);
+        Ok(Self(child, false, Some(timer)))
     }
     pub fn terminate(&self) {
         if !self.1 {
@@ -244,6 +263,29 @@ pub fn capture(command: &mut Command, input: &[u8], limit: u64) -> Result<Vec<u8
         }
         Ok(bytes)
     })
+}
+
+/// Stream directly into a caller-owned, size-sealed RAM file. The child shares
+/// its write offset, so the caller can reject a short response before hashing.
+pub fn capture_to_file(command: &mut Command, input: &[u8], file: &File) -> Result<()> {
+    check_operation()?;
+    let mut child = Guard::spawn(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(file.try_clone()?))
+            .stderr(Stdio::null()),
+    )?;
+    let mut stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| invalid("missing child stdin"))?;
+    stdin.write_all(input)?;
+    drop(stdin);
+    if !child.wait()?.success() {
+        return Err(invalid("subprocess failed (details suppressed)"));
+    }
+    check_operation()
 }
 
 pub fn git() -> Command {

@@ -18,6 +18,13 @@ The timeout and budget regressions were observed failing before their fixes and 
 Disabling CancelRequest and discarding successful sessions also made the cancellation and session-
 reuse tests fail at their intended assertions; restoring the implementation passed all contracts.
 
+The shared-file/materialization work received separate ownership/cache and native-consumer review
+passes. Reviewers followed direct curl output through sealing, integrity checks, LRU eviction,
+request pins, `/proc` reopening and native Git. A separate observability/SQL review found blocking
+stderr writes and an upstream logging-guard stdout fallback; both were reproduced and fixed with
+a bounded lossy writer and off-thread, bounded-wait shutdown. Follow-up review found no remaining
+blocker in those changes. This does not establish production memory or latency bounds.
+
 ## Confirmed issues and resolutions
 
 | Issue | Resolution | Regression evidence |
@@ -35,6 +42,18 @@ reuse tests fail at their intended assertions; restoring the implementation pass
 | TCP connect timeout did not cover stalled PostgreSQL startup/TLS/authentication | Five-second deadpool create timeout, bounded by the remaining operation deadline | A TCP-accepting stalled startup fixture fails the prior implementation at ten seconds and passes with the five-second cap |
 | Per-row streaming limit did not bound retained snapshot allocations | Conservative per-snapshot budget checked before ref/pack retention | Empty snapshot fits the minimum budget; growth fails, returns no partial snapshot, releases its known hold and recovers after deletion |
 | Invisible uncommitted writes could falsely satisfy the cancellation regression | Capture the executing PID and require backend termination before checking rollback | Real PostgreSQL backend disappears before zero-row/readback and pool-capacity assertions |
+| Cache hits copied complete payloads into private scratch | Verified sealed memfds with request-owned pins and private symlinks | Native lifecycle pauses a second pack after eviction, verifies the first pinned pack/idx with Git, then checks pin release and clone/fsck |
+| Preallocated memfd length could conceal a short download | Check shared write offset before rewind/hash and before cache publication | Short, oversized and corrupt responses are rejected on cache and scratch paths, followed by successful recovery |
+| Default Ubuntu timeout rejected legal non-UTF-8 native arguments | Install coexisting GNU coreutils and use `/usr/bin/gnutimeout` explicitly | Direct native comparison plus non-UTF-8/default/unborn HEAD roundtrips |
+| Reused empty templates could leak request HEAD/hooks if captured too late | Capture only newly initialized application-owned bare state | A non-UTF-8 HEAD and installed hooks in one scratch do not affect another; removing template HEAD fails the regression |
+| Synchronous timing output could pin request admission and SQL sessions | Bounded lossy `tracing-appender` queue, one complete fixed-field record per write | A full unread sink fails the synchronous implementation; the fixed path releases admission and completes real session reuse/cancellation contracts |
+| Upstream logging guard could block on its stdout shutdown fallback | Process-owned guard destruction on a helper with 1200 ms acknowledgement wait | Handshake proves request completion first, then fills stdout and stderr; the former guard hangs and the bounded wrapper exits |
+
+Additional failure-sensitivity checks temporarily removed write seals, short-fill checking, the
+file cap and waiter deadline in one **combined** mutation run; all four corresponding regressions
+failed. Separate mutations removed scratch pins, template HEAD, cleanup correlation and the lease
+stage observation. Their intended assertions failed; every mutation was restored before final
+verification. These are targeted checks, not an exhaustive mutation score.
 
 The authenticated native-client test also found a fixture error: a shared credential store could
 return another actor's valid credential after Git's challenge/retry. Actor-specific stores now
@@ -55,9 +74,13 @@ The server did not accept a verified reader as an owner in this reproduction.
   certificate validation, authenticated native Git, restart readback, STRICT mTLS, gateway identity
   authorization, rejection of plaintext/non-mesh access, and effective retry-policy inspection.
 
-The Tokio migration repeated native integration/fault recovery and the real k3s Helm workflow,
-including positive PostgreSQL TLS and rejection of an untrusted CA or mismatched hostname.
-The isolated Istio routing qualification above predates the driver migration and was not repeated.
+The shared-file/observability changes passed 38 ordinary Rust tests and twelve opt-in PostgreSQL
+contracts, with focused reruns after logging-guard fixes. Native integration repeated with 64 MiB
+synthetic data and enabled timings; it verifies stage observations and request/worker/cleanup IDs
+through SSH and HTTP. The default-off fault suite also passed. Helm 3/4 rejected thirty invalid
+profiles and passed pinned operator schemas. Real k3s checked TLS PostgreSQL/S3, unknown SSH keys,
+authenticated HTTP, cold restart and upgrade. The final runtime also repeated the isolated Istio
+routing qualification above, including actual Envoy retry configuration and mTLS telemetry.
 
 `tests/istio.py` provisions its own disposable cluster and synthetic identities. It does not
 install or modify platform resources in an application's production environment.
@@ -79,6 +102,18 @@ install or modify platform resources in an application's production environment.
   confirm lease creation in a separate message before potentially blocked catalog streaming.
 - [Rust Vec guarantees](https://doc.rust-lang.org/std/vec/struct.Vec.html#guarantees): retained
   collection growth needs its own budget; bounded rows do not establish bounded consumer memory.
+- [Linux memfd](https://man7.org/linux/man-pages/man2/memfd_create.2.html) and
+  [proc file descriptors](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html): sealing and
+  descriptor ownership, plus runtime access checks, govern native reopening and reader lifetime.
+  [memfd 0.6.6](https://docs.rs/memfd/0.6.6/memfd/) supplies the maintained safe application API.
+- [File cloning](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_clone) shares the
+  write position; logical length on a preallocated, size-sealed file is not a completed transfer.
+- [Git 2.56 update-ref](https://github.com/git/git/blob/v2.56.0/Documentation/git-update-ref.adoc):
+  native transaction semantics rejected batching HEAD with its referent; the implementation keeps
+  native symbolic-ref for non-main defaults instead of inventing a reference-file shortcut.
+- [tracing-appender 0.2.5 source](https://docs.rs/tracing-appender/0.2.5/src/tracing_appender/non_blocking.rs.html):
+  lossy mode uses a bounded `try_send`; its guard's stdout fallback must not run on request or main
+  shutdown paths. The wrapper's worker transfer uses safe `ManuallyDrop` ownership and no join.
 - [Git hooks](https://git-scm.com/docs/githooks): pre-receive acceptance is not publication;
   proc-receive owns the intercepted updates. Unconditional multi-ref atomicity must be tested
   independently of client `--atomic`.

@@ -239,8 +239,8 @@ fn handle_with_auth(
     engine: &Engine,
     authentication: Authentication<'_>,
 ) -> Result<()> {
-    let mut request = RequestTimer::start(Transport::Http);
     let operation = crate::process::Operation::new(engine.operation_seconds);
+    let mut request = operation.enter(|| RequestTimer::start(Transport::Http));
     let interrupt = stream.try_clone()?;
     let result = operation.with_interrupt(
         || {

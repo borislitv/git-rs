@@ -377,6 +377,38 @@ def exercise(f, large_mib, skip_ssh):
         'git_rs_s3_transferred_bytes_total{direction="upload"}',
     ]:
         assert sum(metric_value(body, series) for body in scrapes) > 0, series
+    for stage in [
+        "sql_init", "sql_acquire", "sql_query", "sql_reset", "lease_commit", "catalog_read",
+        "lease_release", "cache_fill", "cache_link", "object_hash", "restore_refs", "hook_setup",
+        "git_input", "git_output", "git_wait", "ref_validate", "tip_validate", "fast_forward",
+        "scratch_cleanup", "process_spawn",
+    ]:
+        series = f'git_rs_stage_duration_seconds_count{{stage="{stage}"}}'
+        assert sum(metric_value(body, series) for body in scrapes) > 0, stage
+    assert all(metric_value(body, "git_rs_timing_logs_dropped_total") == 0 for body in scrapes)
+    if f.env.get("GIT_RS_DEBUG_TIMINGS") == "1":
+        def correlated_requests():
+            records = []
+            for name in ["a", "b"]:
+                for line in (f.base / f"{name}.log").read_text().splitlines():
+                    if line.startswith("git_rs_timing "):
+                        assert re.fullmatch(
+                            r"git_rs_timing level=debug pid=\d+ operation=\d+ kind=[a-z_]+ name=[a-z0-9_]+ "
+                            r"elapsed_ms=\d+\.\d{3} duration_ms=\d+\.\d{3} outcome=[a-z_]+", line), line
+                        records.append(dict(field.split("=", 1) for field in line.split()[1:]))
+            completed = set()
+            for request in records:
+                if request["kind"] != "request" or request["outcome"] != "success":
+                    continue
+                assert request["operation"] != "0"
+                stages = {row["name"] for row in records if row["kind"] == "stage"
+                          and (row["pid"], row["operation"]) == (request["pid"], request["operation"])}
+                if {"lease_commit", "catalog_read", "restore_refs", "hook_setup", "git_input",
+                    "git_output", "scratch_cleanup", "lease_release"} <= stages:
+                    completed.add(request["name"])
+            return {"http"} <= completed and (skip_ssh or "ssh" in completed)
+        wait_for(correlated_requests, "correlated native Git request/worker/cleanup timings")
+        f.results["correlated_native_timing_logs"] = "passed"
     if not skip_ssh:
         assert metric_value(scrapes[0], 'git_rs_requests_total{transport="ssh",outcome="success"}') > 0
     for process in [first, second]:
@@ -556,6 +588,8 @@ def main():
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/git-rs")
     parser.add_argument("--large-mib", type=int, default=16)
     parser.add_argument("--skip-ssh", action="store_true")
+    parser.add_argument("--debug-timings", action="store_true",
+                        help="verify opt-in timing logs through native Git requests")
     args = parser.parse_args()
     # OpenSSH StrictModes checks all parents of authorized_keys. A system /tmp
     # parent is world-writable, so keep this private fixture under the checkout.
@@ -565,6 +599,8 @@ def main():
         fixture = None
         try:
             fixture = Fixture(Path(directory), args.binary.resolve())
+            if args.debug_timings:
+                fixture.env["GIT_RS_DEBUG_TIMINGS"] = "1"
             fixture.setup(args.provision)
             exercise(fixture, args.large_mib, args.skip_ssh)
             authenticated_http_test(fixture)

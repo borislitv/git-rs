@@ -49,7 +49,7 @@ RUN curl --fail --show-error --location --max-time 180 --retry 3 \
 FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS runtime
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    curl ca-certificates coreutils openssh-server tini libcurl4t64 libexpat1 libssl3t64 zlib1g perl \
+    curl ca-certificates coreutils gnu-coreutils openssh-server tini libcurl4t64 libexpat1 libssl3t64 zlib1g perl \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/ssh/ssh_host_* \
     && mkdir -p /run/sshd /var/empty/git-rs \

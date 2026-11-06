@@ -93,8 +93,8 @@ fn field(socket: &mut UnixStream) -> Result<String> {
 }
 
 fn session(mut socket: UnixStream, engine: &Engine) -> Result<()> {
-    let mut request = RequestTimer::start(Transport::Ssh);
     let operation = git_rs::process::Operation::new(engine.operation_seconds);
+    let mut request = operation.enter(|| RequestTimer::start(Transport::Ssh));
     let interrupt = socket.try_clone()?;
     let result = operation.with_interrupt(
         || {
@@ -415,7 +415,10 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let timings = metrics::init_timing_logs();
+    let result = run();
+    drop(timings);
+    if let Err(error) = result {
         eprintln!("git-rs: {error}");
         std::process::exit(1);
     }

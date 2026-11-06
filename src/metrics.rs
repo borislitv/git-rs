@@ -2,11 +2,67 @@
 //! repository names, principals, object keys, SQL, commands or error messages.
 use crate::Result;
 use std::fmt::Write;
+use std::io::Write as _;
 use std::sync::{
     OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
+
+struct TimingLogs {
+    writer: NonBlocking,
+    origin: Instant,
+}
+static TIMING_LOGS: OnceLock<Option<TimingLogs>> = OnceLock::new();
+
+#[must_use]
+pub struct TimingGuard(Option<WorkerGuard>);
+
+impl Drop for TimingGuard {
+    fn drop(&mut self) {
+        let Some(worker) = self.0.take() else { return };
+        // tracing-appender 0.2.5 can print to stdout on a full shutdown queue.
+        // Run its destructor off-thread with a bounded wait, including when both
+        // process log sinks have stopped. Never join a blocked diagnostic sink.
+        let worker = std::mem::ManuallyDrop::new(worker);
+        let (done, finished) = std::sync::mpsc::sync_channel(1);
+        if std::thread::Builder::new()
+            .name("git-rs-timings-stop".into())
+            .spawn(move || {
+                drop(std::mem::ManuallyDrop::into_inner(worker));
+                let _ = done.send(());
+            })
+            .is_ok()
+        {
+            let _ = finished.recv_timeout(Duration::from_millis(1200));
+        }
+        // If a shutdown thread cannot be created, its closure's ManuallyDrop
+        // intentionally leaves this process-lifetime diagnostic worker behind.
+    }
+}
+
+/// Initialize opt-in diagnostics once at process entry. Keep the returned guard
+/// outside request paths until process shutdown; it performs bounded flushing.
+pub fn init_timing_logs() -> Option<TimingGuard> {
+    let mut guard = None;
+    TIMING_LOGS.get_or_init(|| {
+        if std::env::var("GIT_RS_DEBUG_TIMINGS").as_deref() != Ok("1") {
+            return None;
+        }
+        let (writer, worker) = NonBlockingBuilder::default()
+            .buffered_lines_limit(1024)
+            .lossy(true)
+            .thread_name("git-rs-timings")
+            .finish(std::io::stderr());
+        guard = Some(TimingGuard(Some(worker)));
+        Some(TimingLogs {
+            writer,
+            origin: Instant::now(),
+        })
+    });
+    guard
+}
 
 const BUCKETS: [(u64, &str); 15] = [
     (1_000_000, "0.001"),
@@ -67,6 +123,54 @@ const PHASES: [&str; 9] = [
 ];
 
 #[derive(Clone, Copy)]
+pub enum Stage {
+    SqlInit,
+    SqlAcquire,
+    SqlQuery,
+    SqlReset,
+    LeaseCommit,
+    CatalogRead,
+    LeaseRelease,
+    CacheFill,
+    CacheLink,
+    ObjectHash,
+    RestoreRefs,
+    RestoreHead,
+    HookSetup,
+    GitInput,
+    GitOutput,
+    GitWait,
+    RefValidate,
+    TipValidate,
+    FastForward,
+    ScratchCleanup,
+    ProcessSpawn,
+}
+const STAGES: [&str; 21] = [
+    "sql_init",
+    "sql_acquire",
+    "sql_query",
+    "sql_reset",
+    "lease_commit",
+    "catalog_read",
+    "lease_release",
+    "cache_fill",
+    "cache_link",
+    "object_hash",
+    "restore_refs",
+    "restore_head",
+    "hook_setup",
+    "git_input",
+    "git_output",
+    "git_wait",
+    "ref_validate",
+    "tip_validate",
+    "fast_forward",
+    "scratch_cleanup",
+    "process_spawn",
+];
+
+#[derive(Clone, Copy)]
 pub enum Dependency {
     Sql,
     S3Get,
@@ -111,6 +215,7 @@ const DIRECTIONS: [&str; 2] = ["download", "upload"];
 #[derive(Clone, Copy)]
 pub enum Metric {
     Phase(Phase),
+    Stage(Stage),
     Dependency(Dependency),
     Subprocess(Program),
     CacheWait,
@@ -173,6 +278,7 @@ pub struct Registry {
     requests: [[AtomicU64; OUTCOMES.len()]; TRANSPORTS.len()],
     request_durations: [Histogram; TRANSPORTS.len()],
     phases: [Histogram; PHASES.len()],
+    stages: [Histogram; STAGES.len()],
     dependencies: [Histogram; DEPENDENCIES.len()],
     subprocesses: [Histogram; PROGRAMS.len()],
     cache_wait: Histogram,
@@ -197,6 +303,7 @@ impl Registry {
             requests: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             request_durations: std::array::from_fn(|_| Histogram::new()),
             phases: std::array::from_fn(|_| Histogram::new()),
+            stages: std::array::from_fn(|_| Histogram::new()),
             dependencies: std::array::from_fn(|_| Histogram::new()),
             subprocesses: std::array::from_fn(|_| Histogram::new()),
             cache_wait: Histogram::new(),
@@ -209,6 +316,7 @@ impl Registry {
     fn histogram(&self, metric: Metric) -> &Histogram {
         match metric {
             Metric::Phase(phase) => &self.phases[phase as usize],
+            Metric::Stage(stage) => &self.stages[stage as usize],
             Metric::Dependency(dependency) => &self.dependencies[dependency as usize],
             Metric::Subprocess(program) => &self.subprocesses[program as usize],
             Metric::CacheWait => &self.cache_wait,
@@ -237,7 +345,7 @@ impl Registry {
     }
 
     pub fn render(&self, active: usize, cache_allocated: usize) -> String {
-        let mut output = String::with_capacity(48 * 1024);
+        let mut output = String::with_capacity(96 * 1024);
         header(
             &mut output,
             "git_rs_build_info",
@@ -273,6 +381,17 @@ impl Registry {
         writeln!(output, "git_rs_cache_allocated_bytes {cache_allocated}").unwrap();
         header(
             &mut output,
+            "git_rs_timing_logs_dropped_total",
+            "Diagnostic records discarded by the bounded timing queue; not sink write errors.",
+            "counter",
+        );
+        let dropped = TIMING_LOGS
+            .get()
+            .and_then(Option::as_ref)
+            .map_or(0, |logs| logs.writer.error_counter().dropped_lines());
+        writeln!(output, "git_rs_timing_logs_dropped_total {dropped}").unwrap();
+        header(
+            &mut output,
             "git_rs_requests_total",
             "Completed admitted transport requests, including parsing and authentication failures.",
             "counter",
@@ -302,6 +421,7 @@ impl Registry {
         }
         for (prefix, label, names, histograms) in [
             ("phase", "phase", PHASES.as_slice(), self.phases.as_slice()),
+            ("stage", "stage", STAGES.as_slice(), self.stages.as_slice()),
             (
                 "dependency",
                 "operation",
@@ -408,6 +528,7 @@ pub struct Timer {
     metric: Metric,
     start: Instant,
     success: bool,
+    timing: Option<(u64, Instant)>,
 }
 impl Timer {
     pub fn start(metric: Metric) -> Self {
@@ -415,6 +536,7 @@ impl Timer {
             metric,
             start: Instant::now(),
             success: false,
+            timing: timing_context(),
         }
     }
     pub fn finish(mut self, success: bool) {
@@ -423,7 +545,22 @@ impl Timer {
 }
 impl Drop for Timer {
     fn drop(&mut self) {
-        global().observe(self.metric, self.start.elapsed(), self.success);
+        let elapsed = self.start.elapsed();
+        global().observe(self.metric, elapsed, self.success);
+        let (kind, name) = match self.metric {
+            Metric::Phase(value) => ("phase", PHASES[value as usize]),
+            Metric::Stage(value) => ("stage", STAGES[value as usize]),
+            Metric::Dependency(value) => ("dependency", DEPENDENCIES[value as usize]),
+            Metric::Subprocess(value) => ("subprocess", PROGRAMS[value as usize]),
+            Metric::CacheWait => ("cache", "wait"),
+        };
+        timing_log(
+            self.timing,
+            kind,
+            name,
+            elapsed,
+            if self.success { "success" } else { "error" },
+        );
     }
 }
 
@@ -438,6 +575,7 @@ pub struct RequestTimer {
     transport: Transport,
     start: Instant,
     outcome: Outcome,
+    timing: Option<(u64, Instant)>,
 }
 impl RequestTimer {
     pub fn start(transport: Transport) -> Self {
@@ -445,6 +583,7 @@ impl RequestTimer {
             transport,
             start: Instant::now(),
             outcome: Outcome::Error,
+            timing: timing_context(),
         }
     }
     pub fn outcome(&mut self, outcome: Outcome) {
@@ -453,6 +592,44 @@ impl RequestTimer {
 }
 impl Drop for RequestTimer {
     fn drop(&mut self) {
-        global().request(self.transport, self.outcome, self.start.elapsed());
+        let elapsed = self.start.elapsed();
+        global().request(self.transport, self.outcome, elapsed);
+        timing_log(
+            self.timing,
+            "request",
+            TRANSPORTS[self.transport as usize],
+            elapsed,
+            OUTCOMES[self.outcome as usize],
+        );
+    }
+}
+
+fn timing_context() -> Option<(u64, Instant)> {
+    TIMING_LOGS
+        .get()?
+        .as_ref()
+        .map(|logs| crate::process::Operation::current().map_or((0, logs.origin), |op| op.timing()))
+}
+
+fn timing_log(
+    context: Option<(u64, Instant)>,
+    kind: &str,
+    name: &str,
+    elapsed: Duration,
+    outcome: &str,
+) {
+    if let Some((operation, origin)) = context {
+        let Some(Some(logs)) = TIMING_LOGS.get() else {
+            return;
+        };
+        // Enqueue one complete, fixed-label record. Lossy mode never waits for
+        // stderr capacity while a request owns a checkout, mutex or admission.
+        let line = format!(
+            "git_rs_timing level=debug pid={} operation={operation} kind={kind} name={name} elapsed_ms={:.3} duration_ms={:.3} outcome={outcome}\n",
+            std::process::id(),
+            origin.elapsed().as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0
+        );
+        let _ = logs.writer.clone().write_all(line.as_bytes());
     }
 }
