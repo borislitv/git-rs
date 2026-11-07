@@ -160,6 +160,10 @@ enum HttpIdentity {
 
 fn serve(args: &[String]) -> Result<()> {
     let pack_threads = pack_threads()?;
+    let blame = std::env::var_os("GIT_RS_BLAME_WORKER").map_or_else(
+        || Ok(git_rs::blame::Blame::default()),
+        |path| git_rs::blame::Blame::with_worker(PathBuf::from(path)),
+    )?;
     metrics::global();
     // Validate credentials before opening any serving listener. Production and
     // fixed-principal development HTTP can never be enabled in the same process.
@@ -213,6 +217,7 @@ fn serve(args: &[String]) -> Result<()> {
         .unwrap_or_else(|_| "67108864".into())
         .parse()?;
     let engine = Arc::new(Engine {
+        blame,
         store: Store::from_env()?,
         cache: Cache::new(cache_bytes, 8 * 1024 * 1024),
         scratch_root: own_root,
@@ -401,6 +406,7 @@ fn run() -> Result<()> {
         Some(action @ ("backup" | "truncate" | "cleanup")) if args.len() >= 4 => {
             let root = PathBuf::from(option(&args, "--scratch")?);
             let engine = Engine {
+                blame: git_rs::blame::Blame::default(),
                 store: Store::from_env()?,
                 cache: Cache::new(0, 0),
                 scratch_root: root,

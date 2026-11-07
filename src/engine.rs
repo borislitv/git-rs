@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
 pub struct Engine {
+    pub blame: crate::blame::Blame,
     pub store: Store,
     pub cache: Cache,
     pub scratch_root: PathBuf,

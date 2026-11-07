@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod blame;
 pub mod blob;
 pub mod cache;
 mod database;

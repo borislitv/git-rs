@@ -8,6 +8,8 @@ use crate::{
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub const MAX_BODY: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -15,9 +17,14 @@ pub struct Request {
     pub slug: String,
     pub service: Service,
     pub protocol: String,
-    pub cgi: Cgi,
+    pub action: Action,
     chunked: bool,
     authorization: Option<String>,
+}
+
+pub enum Action {
+    Git(Cgi),
+    Blame(crate::blame::Request),
 }
 
 fn line(input: &mut impl BufRead, max: usize) -> Result<String> {
@@ -75,14 +82,24 @@ impl Request {
             .and_then(|p| p.split_once(".git/"))
             .ok_or_else(|| invalid("invalid Git URL"))?;
         crate::auth::repository(slug)?;
-        let service =
+        let blame = if *method == "GET" {
+            tail.strip_prefix("blame/")
+                .map(|commit| crate::blame::Request::parse(commit, query))
+                .transpose()?
+        } else {
+            None
+        };
+        let service = if blame.is_some() {
+            Service::Upload
+        } else {
             match (*method, tail, query) {
                 ("GET", "info/refs", "service=git-upload-pack")
                 | ("POST", "git-upload-pack", "") => Service::Upload,
                 ("GET", "info/refs", "service=git-receive-pack")
                 | ("POST", "git-receive-pack", "") => Service::Receive,
                 _ => return Err(invalid("unsupported Smart HTTP route")),
-            };
+            }
+        };
         let length: Option<u64> = headers
             .get("content-length")
             .map(|value| {
@@ -115,18 +132,23 @@ impl Request {
         if !["", "gzip", "identity"].contains(&encoding.as_str()) {
             return Err(invalid("unsupported content encoding"));
         }
-        Ok(Self {
-            slug: slug.into(),
-            service,
-            protocol: headers.remove("git-protocol").unwrap_or_default(),
-            cgi: Cgi {
+        let action = if let Some(blame) = blame {
+            Action::Blame(blame)
+        } else {
+            Action::Git(Cgi {
                 path: format!("/{tail}"),
                 method: (*method).into(),
                 query: query.into(),
                 content_type,
                 encoding,
                 length,
-            },
+            })
+        };
+        Ok(Self {
+            slug: slug.into(),
+            service,
+            protocol: headers.remove("git-protocol").unwrap_or_default(),
+            action,
             chunked,
             authorization: headers.remove("authorization"),
         })
@@ -143,7 +165,10 @@ impl Request {
             remaining: if self.chunked {
                 0
             } else {
-                self.cgi.length.unwrap_or(0)
+                match &self.action {
+                    Action::Git(cgi) => cgi.length.unwrap_or(0),
+                    Action::Blame(_) => 0,
+                }
             },
             total: 0,
             done: false,
@@ -285,12 +310,18 @@ fn handle_bounded(
             }
         },
     };
+    if let Action::Blame(query) = &request.action {
+        return handle_blame(stream, engine, principal, &request.slug, query, timer);
+    }
+    let Action::Git(cgi) = &request.action else {
+        return Err(invalid("invalid Git HTTP action"));
+    };
     let result = engine.run(
         &request.slug,
         principal,
         request.service,
         &request.protocol,
-        Some(&request.cgi),
+        Some(cgi),
         &mut request.body(&mut input),
         stream,
         &|| {
@@ -301,6 +332,73 @@ fn handle_bounded(
         timer.outcome(Outcome::Success);
     }
     result
+}
+
+fn handle_blame(
+    stream: &mut TcpStream,
+    engine: &Engine,
+    principal: &str,
+    slug: &str,
+    query: &crate::blame::Request,
+    timer: &mut RequestTimer,
+) -> Result<()> {
+    let operation = crate::process::Operation::current()
+        .ok_or_else(|| invalid("blame requires a bounded operation"))?;
+    let mut peer = stream.try_clone()?;
+    peer.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let finished = AtomicBool::new(false);
+    let response = std::thread::scope(|scope| {
+        struct Finish<'a>(&'a AtomicBool);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        scope.spawn(|| {
+            let mut byte = [0];
+            while !finished.load(Ordering::Acquire) {
+                match peer.read(&mut byte) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    _ => {
+                        operation.cancel();
+                        break;
+                    }
+                }
+            }
+        });
+        let _finish = Finish(&finished);
+        engine.blame(slug, principal, query)
+    });
+    let (status, body) = match response {
+        Ok(crate::blame::Response::Complete(body)) => {
+            timer.outcome(Outcome::Success);
+            ("200 OK", body)
+        }
+        Ok(crate::blame::Response::Busy) => ("503 Service Unavailable", Vec::new()),
+        Ok(crate::blame::Response::NotFound) => ("404 Not Found", Vec::new()),
+        Ok(crate::blame::Response::TooLarge) => ("413 Content Too Large", Vec::new()),
+        Err(error) => {
+            timer.outcome(Outcome::Error);
+            stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n")?;
+            return Err(error);
+        }
+    };
+    if status != "200 OK" {
+        timer.outcome(Outcome::Error);
+    }
+    crate::process::check_operation()?;
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    Ok(())
 }
 
 pub fn loopback(address: &str) -> Result<SocketAddr> {

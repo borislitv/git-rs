@@ -135,6 +135,46 @@ fn git_worker_configuration_rejects_unbounded_or_invalid_parallelism() {
 }
 
 #[test]
+fn blame_worker_configuration_rejects_invalid_executables_before_serving() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "git-rs-blame-worker-options-{}",
+        git_rs::scratch::identifier().unwrap()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let not_executable = root.join("not-executable");
+    fs::write(&not_executable, b"synthetic, not an executable\n").unwrap();
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o600)).unwrap();
+    for path in [
+        PathBuf::from("relative-worker"),
+        root.join("missing"),
+        root.clone(),
+        not_executable,
+    ] {
+        let scratch = root.join("must-not-be-created");
+        let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+            .env_clear()
+            .env("GIT_RS_BLAME_WORKER", path)
+            .args(["serve", "--scratch"])
+            .arg(&scratch)
+            .arg("--socket")
+            .arg(root.join("absent/ssh.sock"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("GIT_RS_BLAME_WORKER must name an absolute executable file"),
+            "invalid executable must fail before serving state is created: {:?}",
+            output.stderr
+        );
+        assert!(!scratch.exists());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn operation_configuration_rejects_budgets_outside_the_hard_bound() {
     let root = std::env::temp_dir().join(format!(
         "git-rs-budget-options-{}",

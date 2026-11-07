@@ -27,6 +27,7 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..3600`, default 120 |
 | `GIT_RS_PACK_THREADS` | native Git `pack.threads` per request, integer `1..4`, default 1 |
+| `GIT_RS_BLAME_WORKER` | optional absolute operator-owned executable; unset uses native Git |
 | `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |
 
 The Helm chart obtains credentials from existing Secrets or bucket-claim outputs. Do not put
@@ -57,6 +58,12 @@ their key and the server-owned map selects their principal.
 For loopback testing only, `--dev-http 127.0.0.1:PORT --dev-principal NAME` sets one server-selected
 identity for an unauthenticated Smart HTTP listener. `GIT_RS_DEV_HTTP=1` permits loopback-only
 plaintext PostgreSQL/S3 fixtures. It is not a production authentication scheme.
+
+Complete immutable blame uses the authenticated HTTP identity and a leased, published read
+snapshot. It admits one computation per process, accepts at most 256 MiB of complete output, rejects
+blobs over 128 MiB and shares the operation deadline. An optional worker inherits no SQL/S3
+credentials and must keep descendants in its owned process group. See the
+[endpoint, output and worker contract](docs/blame.md).
 
 ## Authenticated HTTP
 

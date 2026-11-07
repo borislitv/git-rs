@@ -498,6 +498,7 @@ dependencies = [
  "memfd",
  "native-tls",
  "openssl",
+ "percent-encoding",
  "postgres-native-tls",
  "reqwest",
  "tokio",

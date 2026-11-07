@@ -297,6 +297,66 @@ fn every_git_route_challenges_before_accessing_metadata_or_body() {
 }
 
 #[test]
+fn immutable_blame_routes_challenge_before_repository_access() {
+    let backend = Backend::start();
+    let commit = "1234567890abcdef1234567890abcdef12345678";
+    for path in ["file.txt", "directory%2Ffile%20name.txt", "file%FF.txt"] {
+        let route = format!("blame/{commit}?path={path}");
+        for headers in [String::new(), format!("Authorization: {ALICE_WRONG}\r\n")] {
+            let mut response = String::new();
+            backend
+                .send(&request("GET", &route, &headers))
+                .read_to_string(&mut response)
+                .unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "immutable blame must authenticate before accessing metadata: {response:?}"
+            );
+            backend.assert_no_metadata_call();
+        }
+    }
+}
+
+#[test]
+fn invalid_blame_targets_fail_before_authentication_or_metadata() {
+    let backend = Backend::start();
+    let commit = "1234567890abcdef1234567890abcdef12345678";
+    let mut routes = vec![
+        "blame/main?path=file.txt".to_string(),
+        "blame/1234567?path=file.txt".to_string(),
+        format!("blame/{}?path=file.txt", "0".repeat(40)),
+        format!("blame/{commit}"),
+        format!("blame/{commit}?other=file.txt"),
+    ];
+    for path in [
+        "",
+        "/absolute",
+        "../outside",
+        "dir/../file",
+        "./file",
+        "a//b",
+        "a%00b",
+        "%",
+        "%GG",
+        "file&other=value",
+    ] {
+        routes.push(format!("blame/{commit}?path={path}"));
+    }
+    for route in routes {
+        let mut response = String::new();
+        backend
+            .send(&request("GET", &route, ""))
+            .read_to_string(&mut response)
+            .unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "accepted invalid route: {route}"
+        );
+        backend.assert_no_metadata_call();
+    }
+}
+
+#[test]
 fn verified_authentication_reaches_existing_metadata_authorization() {
     let backend = Backend::start();
     // The server owns an immutable startup snapshot, not a per-request file read.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Black-box native Git/SQL/S3 tests. All data and identities are synthetic."""
 import argparse
+import base64
 import concurrent.futures
 import hashlib
 import http.client
@@ -11,13 +12,16 @@ import pwd
 import random
 import re
 import select
+import signal
 import socket
 import socketserver
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+from urllib.parse import quote_from_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
 PG_IMAGE = "postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5"
@@ -210,7 +214,7 @@ def pkt(payload):
     return f"{len(payload) + 4:04x}".encode() + payload
 
 
-def raw_push(port, oid, names, *, missing=False, atomic=False, pack=None):
+def raw_push(port, oid, names, *, missing=False, atomic=False, pack=None, slug="team/project", headers=None):
     zero = b"0" * 40
     capabilities = b"report-status side-band-64k" + (b" atomic" if atomic else b"")
     body = b""
@@ -222,8 +226,8 @@ def raw_push(port, oid, names, *, missing=False, atomic=False, pack=None):
         pack = empty_pack + hashlib.sha1(empty_pack).digest()
     body += b"0000" + pack
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
-    conn.request("POST", "/team/project.git/git-receive-pack", body,
-                 {"Content-Type": "application/x-git-receive-pack-request"})
+    conn.request("POST", f"/{slug}.git/git-receive-pack", body,
+                 {"Content-Type": "application/x-git-receive-pack-request", **(headers or {})})
     response = conn.getresponse()
     payload = response.read()
     conn.close()
@@ -635,6 +639,291 @@ def authenticated_http_test(f):
     assert denied.returncode, "native Git without a credential must receive an authentication challenge"
     assert not any(token in log_path.read_text() for token in actors.values())
     f.results["authenticated_http_acl_roundtrip"] = "passed"
+    complete_blame_test(f, source, port, actors)
+
+
+def complete_blame_test(f, source, port, actors):
+    """Use a real authenticated snapshot, native annotations and unreachable objects."""
+    print("complete authenticated native blame and immutable reachability", flush=True)
+    path = b"folder/renamed name.txt"
+    (source / "folder").mkdir()
+    f.git(source, "mv", "synthetic.txt", os.fsdecode(path))
+    f.git(source, "commit", "-qm", "Synthetic rename")
+    (source / os.fsdecode(path)).write_bytes(b"authenticated HTTP fixture\nnew line\nunterminated")
+    raw_path = b"raw\xff.txt"
+    (source / os.fsdecode(raw_path)).write_bytes(b"raw bytes\x00\r\nlast\xff")
+    # Highly compressible native Git data exercises the uncompressed-blob bound
+    # without transferring a large fixture pack or constructing it in Python RAM.
+    with (source / "oversized.bin").open("wb") as large:
+        block = b"\0" * (1024 * 1024)
+        for _ in range(128):
+            large.write(block)
+        large.write(b"x")
+    with (source / "blocked-output.txt").open("wb") as large:
+        block = b"x" * (1024 * 1024)
+        for _ in range(32):
+            large.write(block)
+    f.git(source, "add", "-A")
+    f.git(source, "commit", "-qm", "Synthetic annotation ownership update")
+    oid = f.git(source, "rev-parse", "HEAD").stdout.strip()
+
+    def authorization(actor):
+        value = base64.b64encode(f"{actor}:{actors[actor]}".encode()).decode()
+        return {"Authorization": "Basic " + value}
+
+    helper = f"credential.helper=store --file={f.base}/http-client-alice-credentials"
+    f.git(source, "-c", helper, "push", f"http://alice@127.0.0.1:{port}/team/http-auth.git", "HEAD:refs/heads/main")
+    tree = f.git(source, "rev-parse", "HEAD^{tree}").stdout.strip()
+    identity = b"Fixture <fixture@example.invalid> 1577836800 +0000\n"
+    unreachable = command(["git", "-C", source, "hash-object", "-w", "-t", "commit", "--stdin"], env=f.env,
+                          data=b"tree " + tree + b"\nparent " + oid + b"\nauthor " + identity
+                          + b"committer " + identity + b"\nvalid unreachable fixture\n").stdout.strip()
+    pack = command(["git", "-C", source, "pack-objects", "--stdout"], env=f.env, data=unreachable + b"\n").stdout
+    report = raw_push(port, oid, [b"refs/heads/blame-reachability"], pack=pack,
+                      slug="team/http-auth", headers=authorization("alice"))
+    assert b"ok refs/heads/blame-reachability" in report, report
+    repo = "(SELECT id FROM git_rs.repositories WHERE slug='team/http-auth')"
+    before = f.sql(f"SELECT generation,(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}),"
+                   f"(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
+
+    def request(commit, filename, actor="bob", slug="team/http-auth"):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        connection.request("GET", f"/{slug}.git/blame/{commit.decode()}?path={quote_from_bytes(filename, safe='')}",
+                           headers=authorization(actor) if actor else {})
+        response = connection.getresponse()
+        result = response.status, response.read(), response.getheader("Cache-Control")
+        connection.close()
+        return result
+
+    for filename in [path, raw_path]:
+        expected = f.git(source, "--literal-pathspecs", "blame", "--root", "--line-porcelain",
+                         "--no-textconv", "--no-progress", oid.decode(), "--", os.fsdecode(filename)).stdout
+        status, payload, cache_control = request(oid, filename)
+        assert status == 200 and payload == expected, (status, payload, expected)
+        assert cache_control == "no-store"
+    blob = f.git(source, "rev-parse", "HEAD:" + os.fsdecode(path)).stdout.strip()
+    for commit, filename in [(unreachable, path), (blob, path), (b"f" * 40, path),
+                             (oid, b"missing.txt"), (oid, b"folder")]:
+        status, payload, _ = request(commit, filename)
+        assert status == 404 and payload == b"", (
+            "blame must reject invalid or unreachable targets", commit, filename, status, payload)
+    assert request(oid, b"oversized.bin")[0:2] == (413, b""), "oversized blobs must be rejected before annotation"
+    assert request(oid, path, actor=None)[0:2] == (401, b"")
+    assert request(oid, path, actor="carol")[0:2] == (500, b"")
+    after = f.sql(f"SELECT generation,(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}),"
+                  f"(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
+    assert after == before, "complete annotations must not publish refs, packs or operations"
+    wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
+             "complete-blame read hold cleanup")
+    f.results["complete_authenticated_blame"] = {
+        "native_line_porcelain": "byte exact", "renamed_path": "passed", "non_utf8_path_and_bytes": "passed",
+        "reader_acl": "passed", "unreachable_commit_in_published_pack": "rejected",
+        "blob_oid_missing_path_directory": "rejected", "publication_unchanged": True,
+        "oversized_uncompressed_blob": "rejected",
+    }
+    blame_worker_test(f, source, oid, path)
+    blame_blocked_output_test(f, oid)
+
+
+def blame_worker_test(f, source, oid, path):
+    """Exercise executable selection, buffered failure, busy admission and group cleanup."""
+    print("complete-blame worker admission, disconnect and absolute cancellation", flush=True)
+    state_file = f.base / "blame-worker-state.json"
+    worker_source = f'''#!{sys.executable}
+import json,os,signal,subprocess,sys
+from pathlib import Path
+assert not any(key.startswith(("PG", "AWS", "GIT_RS_S3")) for key in os.environ)
+assert 0 < int(os.environ["GIT_RS_BLAME_REMAINING_MILLIS"]) <= 30000
+mode = MODE
+if mode == "native":
+    os.execv("/usr/bin/git", ["git", "--literal-pathspecs", "-C", sys.argv[1], "blame", "--root", "--line-porcelain", "--no-textconv", "--no-progress", sys.argv[2], "--", sys.argv[3]])
+if mode == "failure":
+    sys.stdout.buffer.write(b"incomplete annotation must never escape\\n")
+    sys.stdout.buffer.flush()
+    sys.exit(7)
+if mode == "oversized-output":
+    block = b"x" * (1024 * 1024)
+    for _ in range(256):
+        sys.stdout.buffer.write(block)
+    sys.stdout.buffer.write(b"x")
+    sys.stdout.buffer.flush()
+    sys.exit(0)
+child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                         stdout=subprocess.DEVNULL if mode == "closed-output" else None)
+def identity(pid):
+    fields=Path("/proc/"+str(pid)+"/stat").read_text().rsplit(")",1)[1].split()
+    return {{"pid":pid,"startTicks":int(fields[19])}}
+sys.stdout.buffer.write(b"not a completed annotation\\n")
+sys.stdout.buffer.flush()
+if mode == "closed-output":
+    os.close(sys.stdout.fileno())
+ready=Path({str(state_file)!r})
+pending=ready.with_suffix(".pending")
+pending.write_text(json.dumps({{"leader":identity(os.getpgrp()),"parent":identity(os.getpid()),"child":identity(child.pid)}}))
+pending.replace(ready)
+signal.pause()
+'''
+
+    def start(name, mode, seconds):
+        worker = f.base / ("selected-" + name)
+        worker.write_text(worker_source.replace("mode = MODE", "mode = " + repr(mode)))
+        worker.chmod(0o700)
+        previous = dict(f.env)
+        f.env.update(GIT_RS_BLAME_WORKER=str(worker), GIT_RS_OPERATION_SECONDS=str(seconds))
+        try:
+            return f.start(name)
+        finally:
+            f.env.clear()
+            f.env.update(previous)
+
+    target = f"/team/http-auth.git/blame/{oid.decode()}?path={quote_from_bytes(path, safe='')}"
+    _, native_port = start("selected-blame-native", "native", 30)
+    connection = http.client.HTTPConnection("127.0.0.1", native_port, timeout=5)
+    connection.request("GET", target)
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+    expected = f.git(source, "--literal-pathspecs", "blame", "--root", "--line-porcelain",
+                     "--no-textconv", "--no-progress", oid.decode(), "--", os.fsdecode(path)).stdout
+    assert response.status == 200 and body == expected, "selected workers must return the complete native annotation"
+    _, failed_port = start("selected-blame-failure", "failure", 30)
+    connection = http.client.HTTPConnection("127.0.0.1", failed_port, timeout=5)
+    connection.request("GET", target)
+    response = connection.getresponse()
+    assert response.status == 500 and response.read() == b"", "failed workers must not return partial annotations"
+    connection.close()
+    oversized_daemon, oversized_port = start("selected-blame-oversized-output", "oversized-output", 30)
+    connection = http.client.HTTPConnection("127.0.0.1", oversized_port, timeout=15)
+    try:
+        connection.request("GET", target)
+        response = connection.getresponse()
+        assert response.status == 500 and response.read() == b"", "oversized output must not become a partial success"
+    finally:
+        connection.close()
+    status = Path(f"/proc/{oversized_daemon.pid}/status").read_text()
+    oversized_hwm = int(re.search(r"VmHWM:\s+(\d+)", status).group(1)) * 1024
+    assert oversized_hwm < 512 * 1024 * 1024, "bounded annotation output must fit its separate daemon memory allowance"
+    f.results["oversized_blame_output"] = {
+        "rejected_payload_bytes": 256 * 1024 * 1024 + 1,
+        "observed_daemon_hwm_bytes": oversized_hwm,
+        "test_daemon_memory_allowance_bytes": 512 * 1024 * 1024,
+    }
+    # This case deliberately fills a large annotation buffer. Qualify its HWM
+    # separately, then release it before the ordinary streaming Git memory tests.
+    oversized_daemon.terminate()
+    oversized_daemon.wait(timeout=5)
+
+    def owned(record):
+        try:
+            fields = Path(f"/proc/{record['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+            return int(fields[19]) == record["startTicks"]
+        except FileNotFoundError:
+            return False
+
+    def require_reaped(records):
+        deadline = time.monotonic() + 5
+        while any(owned(record) for record in records.values()):
+            assert time.monotonic() < deadline, "blame cancellation must reap the complete owned group promptly"
+            threading.Event().wait(0.02)
+
+    for label, seconds, disconnect, mode in [
+        ("disconnect", 30, True, "slow"),
+        ("deadline", 2, False, "slow"),
+        ("closed-output-disconnect", 30, True, "closed-output"),
+    ]:
+        if state_file.exists():
+            state_file.unlink()
+        _, port = start("blame-" + label, mode, seconds)
+        peer = socket.create_connection(("127.0.0.1", port), timeout=5)
+        records = None
+        try:
+            peer.sendall(f"GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+            wait_for(state_file.exists, "owned blocking blame worker and descendant")
+            records = json.loads(state_file.read_text())
+            assert not select.select([peer], [], [], 0)[0], "annotations must be complete before success headers or body"
+            assert f.health("blame-" + label, "/livez") == (200, b"live\n")
+            if disconnect:
+                busy = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                busy.request("GET", target)
+                response = busy.getresponse()
+                assert response.status == 503 and response.read() == b"", "only one blame worker may execute per daemon"
+                busy.close()
+                peer.close()
+            else:
+                peer.settimeout(5)
+                try:
+                    payload = peer.recv(4096)
+                except ConnectionResetError:
+                    payload = b""
+                assert not payload.startswith(b"HTTP/1.1 200"), "expired queries cannot return successful annotations"
+            require_reaped(records)
+            repo = "(SELECT id FROM git_rs.repositories WHERE slug='team/http-auth')"
+            wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
+                     "cancelled blame hold release")
+            instance = f.base / "scratch"
+            assert not list(instance.glob("instance-*/request-*")), "cancelled request scratch must be removed"
+            followup = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            followup.request("GET", target.split("?", 1)[0] + "?path=definitely-missing.txt")
+            response = followup.getresponse()
+            assert response.status == 404 and response.read() == b"", "cancellation must return blame admission"
+            followup.close()
+        finally:
+            peer.close()
+            if records and owned(records["leader"]):
+                os.killpg(records["leader"]["pid"], signal.SIGKILL)
+    f.results["complete_blame_worker_lifecycle"] = {
+        "server_owned_executable": "passed", "credentials_not_inherited": True,
+        "failed_output_not_returned": True, "one_executing_query": True,
+        "disconnect_and_deadline_reap_descendants": True, "read_holds_and_scratch_released": True,
+        "closed_output_wait_is_cancellable": True, "cancelled_capacity_reusable": True,
+        "oversized_output_not_returned": True,
+    }
+
+
+def blame_blocked_output_test(f, oid):
+    """A backpressured complete response must expire and count as an error."""
+    previous = f.env.get("GIT_RS_OPERATION_SECONDS")
+    f.env["GIT_RS_OPERATION_SECONDS"] = "2"
+    try:
+        daemon, port = f.start("blame-blocked-output")
+    finally:
+        if previous is None:
+            del f.env["GIT_RS_OPERATION_SECONDS"]
+        else:
+            f.env["GIT_RS_OPERATION_SECONDS"] = previous
+    peer = socket.socket()
+    peer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+    peer.settimeout(5)
+    try:
+        peer.connect(("127.0.0.1", port))
+        target = f"/team/http-auth.git/blame/{oid.decode()}?path=blocked-output.txt"
+        peer.sendall(f"GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+        headers = bytearray()
+        while not headers.endswith(b"\r\n\r\n"):
+            byte = peer.recv(1)
+            assert byte and len(headers) < 4096, "native blame must reach complete response writes"
+            headers.extend(byte)
+        assert headers.startswith(b"HTTP/1.1 200 OK\r\n"), headers
+        assert int(re.search(rb"Content-Length: (\d+)", headers).group(1)) > 32 * 1024 * 1024
+        # Stop reading only after response writes are observable. The small receive
+        # window then applies real TCP backpressure until the absolute deadline.
+        wait_for(lambda: metric_value(f.health("blame-blocked-output", "/metrics")[1],
+                                      "git_rs_active_requests") == 0, "blocked blame deadline")
+        metrics = f.health("blame-blocked-output", "/metrics")[1]
+        assert metric_value(metrics, 'git_rs_requests_total{transport="http",outcome="error"}') == 1, (
+            "blocked blame writes must be counted as errors")
+        assert metric_value(metrics, 'git_rs_requests_total{transport="http",outcome="success"}') == 0
+        status = Path(f"/proc/{daemon.pid}/status").read_text()
+        peak = int(re.search(r"VmHWM:\s+(\d+)", status).group(1)) * 1024
+        assert peak < 128 * 1024 * 1024, "complete-response buffering must fit its separate test allowance"
+        f.results["blocked_blame_output"] = {
+            "absolute_deadline_seconds": 2, "failed_response_counted_as_error": True,
+            "observed_daemon_hwm_bytes": peak, "test_daemon_memory_allowance_bytes": 128 * 1024 * 1024,
+        }
+    finally:
+        peer.close()
+        daemon.terminate()
+        daemon.wait(timeout=5)
 
 
 def long_operation_test(f, seconds=180):

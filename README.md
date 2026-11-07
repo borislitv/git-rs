@@ -106,6 +106,10 @@ The gateway terminates HTTPS, preserves `Authorization`, and connects over a tru
 path to the backend. The application HTTP listener is plaintext; HTTPRoute alone supplies neither
 authentication nor transport encryption. See [credential setup](OPERATIONS.md#authenticated-http).
 
+The same authenticated listener provides [complete immutable blame](docs/blame.md) for a
+published commit and literal file path. Native Git is the default worker; the response is
+complete line-porcelain output with bounded admission, payload size and operation lifetime.
+
 Prometheus request, phase, detailed stage, dependency, subprocess and cache metrics are available
 at `/metrics` on the internal health listener. Opt-in correlated timing records use a bounded,
 lossy background writer. See [metrics, timing logs and scrape configuration](docs/metrics.md).
@@ -166,6 +170,9 @@ they use the same pinned Git version as the runtime.
 - `GIT_RS_PACK_THREADS` sets native Git's per-request `pack.threads` to `1..4`, default 1.
   Choose it within the backend CPU/memory budget; four admitted requests can each use that many
   workers, and Git's per-thread delta-base cache and object buffers need separate allowances.
+- Blame executes one query per process, with a 128 MiB uncompressed-blob limit and a 256 MiB
+  complete-output limit. Annotation results are not cached; computation uses the same absolute
+  operation budget and private snapshot materialization as other reads.
 - Default cache 64 MiB, maximum cacheable entry 8 MiB, 4 KiB accounting increments and at most
   256 live cache files, including fills and evicted reader pins. Linux `/proc/<pid>/fd` must be
   accessible to same-UID native Git children. Memfd is not a no-swap or total-RSS guarantee;
