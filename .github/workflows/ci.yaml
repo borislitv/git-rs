@@ -64,9 +64,10 @@ jobs:
           docker build --target release -t git-rs:dev .
           docker build --target test -t git-rs:test .
           docker run --rm git-rs:dev --version
+      # The Python entrypoint replaces production tini; retain an orphan reaper.
       - name: Native Git integration with the runtime's pinned Git
         run: |
-          docker run --rm --network host \
+          docker run --rm --init --network host \
             --group-add "$(stat -c %g /var/run/docker.sock)" \
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$(command -v docker):/usr/bin/docker:ro" \
@@ -74,7 +75,7 @@ jobs:
             tests/integration.py --provision --binary /usr/local/bin/git-rs --large-mib 64 --debug-timings --long-operations
       - name: PostgreSQL/S3 failure and recovery contracts
         run: |
-          docker run --rm --network host \
+          docker run --rm --init --network host \
             --group-add "$(stat -c %g /var/run/docker.sock)" \
             --volume /var/run/docker.sock:/var/run/docker.sock \
             --volume "$(command -v docker):/usr/bin/docker:ro" \
