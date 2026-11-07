@@ -1,0 +1,6 @@
+/target/
+/dist/
+/.local/
+/.env
+*.private.md
+__pycache__/

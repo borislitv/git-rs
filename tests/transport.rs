@@ -1,0 +1,409 @@
+#![forbid(unsafe_code)]
+
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+struct Backend {
+    child: Child,
+    root: PathBuf,
+    health: String,
+    http: String,
+}
+
+impl Backend {
+    fn start() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "git-rs-transport-{}",
+            git_rs::scratch::identifier().unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("PGHOST", root.join("no-postgres"))
+            .env("PGSSLMODE", "verify-full")
+            .env("GIT_RS_S3_ENDPOINT", "https://unused.example.invalid")
+            .env("GIT_RS_S3_BUCKET", "synthetic")
+            .env("GIT_RS_S3_ACCESS_KEY", "synthetic")
+            .env("GIT_RS_S3_SECRET_KEY", "synthetic")
+            .env("GIT_RS_OPERATION_SECONDS", "1")
+            .args(["serve", "--scratch"])
+            .arg(&root)
+            .arg("--socket")
+            .arg(root.join("ssh.sock"))
+            .args([
+                "--health",
+                "127.0.0.1:0",
+                "--dev-http",
+                "127.0.0.1:0",
+                "--dev-principal",
+                "alice",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut backend = Self {
+            child,
+            root,
+            health: String::new(),
+            http: String::new(),
+        };
+        let stderr = backend.child.stderr.take().unwrap();
+        let (sent, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if sent.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        loop {
+            let line = received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("backend startup");
+            if let Some(address) = line.strip_prefix("health ") {
+                backend.health = address.into();
+            }
+            if let Some(address) = line.strip_prefix("development HTTP ") {
+                backend.http = address.into();
+            }
+            if line == "SSH bridge ready" {
+                break;
+            }
+        }
+        assert!(!backend.health.is_empty() && !backend.http.is_empty());
+        backend
+    }
+
+    fn health(&self, path: &str) -> String {
+        let mut stream = TcpStream::connect(&self.health).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("health must answer within probe timeout");
+        response
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn partial_health_request_does_not_starve_liveness() {
+    let backend = Backend::start();
+    let mut slow = TcpStream::connect(&backend.health).unwrap();
+    slow.write_all(b"GET /").unwrap();
+    assert!(backend.health("/livez").starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
+#[test]
+fn prometheus_scrape_reports_real_transport_and_dependency_failures_without_identity_labels() {
+    let backend = Backend::start();
+    for request in [
+        "GET /not-a-git-route HTTP/1.1\r\nHost: example.invalid\r\n\r\n",
+        "GET /private-project.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: example.invalid\r\n\r\n",
+    ] {
+        let mut stream = TcpStream::connect(&backend.http).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.read_to_end(&mut Vec::new()).unwrap();
+    }
+    let metrics = backend.health("/metrics");
+    assert!(metrics.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(metrics.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+    for expected in [
+        "git_rs_requests_total{transport=\"http\",outcome=\"bad_request\"} 1\n",
+        "git_rs_requests_total{transport=\"http\",outcome=\"error\"} 1\n",
+        "git_rs_request_duration_seconds_count{transport=\"http\"} 2\n",
+        "git_rs_phase_errors_total{phase=\"snapshot\"} 1\n",
+    ] {
+        assert!(metrics.contains(expected), "missing metric: {expected}");
+    }
+    let errors: u64 = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("git_rs_dependency_errors_total{operation=\"sql\"} "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(errors >= 1);
+    assert!(!metrics.contains("private-project"));
+    assert!(!metrics.contains("alice"));
+}
+
+#[test]
+fn trickled_health_request_has_an_absolute_lifetime() {
+    let backend = Backend::start();
+    let mut stream = TcpStream::connect(&backend.health).unwrap();
+    stream.write_all(b"GET /").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let (stop, stopped) = mpsc::channel();
+    let trickle = std::thread::spawn(move || {
+        while stopped.recv_timeout(Duration::from_millis(50))
+            == Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            if writer.write_all(b"a").is_err() {
+                break;
+            }
+        }
+    });
+    let result = stream.read_to_end(&mut Vec::new());
+    let _ = stop.send(());
+    trickle.join().unwrap();
+    assert!(
+        result.is_ok()
+            || result.is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset),
+        "trickling must not extend the absolute health deadline"
+    );
+    assert!(backend.health("/livez").starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
+#[test]
+fn health_admission_rejects_excess_partial_requests() {
+    let backend = Backend::start();
+    let mut streams = Vec::new();
+    for _ in 0..32 {
+        let mut stream = TcpStream::connect(&backend.health).unwrap();
+        let _ = stream.write_all(b"GET /");
+        stream.set_nonblocking(true).unwrap();
+        streams.push(stream);
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut rejected = 0;
+    while Instant::now() < deadline && rejected < 24 {
+        streams.retain_mut(|stream| match stream.read(&mut [0]) {
+            Ok(0) => {
+                rejected += 1;
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(_) => {
+                rejected += 1;
+                false
+            }
+            Ok(_) => panic!("partial request cannot have a response"),
+        });
+        std::thread::yield_now();
+    }
+    assert!(
+        rejected >= 24,
+        "at most eight health handlers may be admitted; rejected={rejected}"
+    );
+    drop(streams);
+}
+
+#[test]
+fn trickled_http_headers_release_request_admission_at_absolute_deadline() {
+    let backend = Backend::start();
+    let mut streams = Vec::new();
+    for _ in 0..4 {
+        let mut stream = TcpStream::connect(&backend.http).unwrap();
+        stream.write_all(b"GET /").unwrap();
+        streams.push(stream);
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !backend
+        .health("/metrics")
+        .contains("git_rs_active_requests 4\n")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "four partial requests must hold admission"
+        );
+        std::thread::yield_now();
+    }
+    let mut writers: Vec<_> = streams.iter().map(|s| s.try_clone().unwrap()).collect();
+    let (stop, stopped) = mpsc::channel();
+    let trickle = std::thread::spawn(move || {
+        while stopped
+            .recv_timeout(Duration::from_millis(50))
+            .is_err_and(|error| error == mpsc::RecvTimeoutError::Timeout)
+        {
+            for stream in &mut writers {
+                let _ = stream.write_all(b"a");
+            }
+        }
+    });
+    // Stop the heartbeat even if the assertion fails, so test failures do not leak it.
+    let mut result = Ok(());
+    for stream in &mut streams {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut response = Vec::new();
+        if let Err(error) = stream.read_to_end(&mut response) {
+            if error.kind() == std::io::ErrorKind::ConnectionReset {
+                continue;
+            }
+            result = Err(error);
+            break;
+        }
+    }
+    let _ = stop.send(());
+    trickle.join().unwrap();
+    result.expect("absolute one-second header budget must close trickling connections");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !backend
+        .health("/metrics")
+        .contains("git_rs_active_requests 0\n")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "expired requests must release admission"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn unread_output_deadline_reaps_child_and_restores_admission() {
+    use git_rs::process::{Admission, Guard, Operation};
+
+    let admission = Admission::new(1);
+    let permit = admission.try_admit().unwrap();
+    assert!(admission.try_admit().is_none());
+    let (mut output, _unread_peer) = UnixStream::pair().unwrap();
+    // A fallback bounds even the deliberately broken implementation in the red
+    // check. The absolute operation budget, not this idle timeout, must win.
+    output
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let interrupt = output.try_clone().unwrap();
+    let operation = Operation::new(1);
+    let (sent, received) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _permit = permit;
+        operation.with_interrupt(
+            || {
+                let _ = interrupt.shutdown(std::net::Shutdown::Both);
+            },
+            || {
+                let mut child = Guard::new(
+                    git_rs::process::command("/usr/bin/dd")
+                        .args(["if=/dev/zero", "bs=8192", "count=64", "status=none"])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                );
+                let pid = child.0.id();
+                let mut stdout = child.0.stdout.take().unwrap();
+                let mut framed = git_rs::protocol::Framed(&mut output);
+                let copied = std::io::copy(&mut stdout, &mut framed);
+                child.terminate();
+                let status = child.wait().unwrap();
+                let terminal = framed.finish(copied.is_ok());
+                (copied, pid, status, terminal)
+            },
+        )
+    });
+    // Observe completion without blocking the test forever on a failed watchdog.
+    let collector = std::thread::spawn(move || {
+        let _ = sent.send(worker.join().unwrap());
+    });
+    let outcome = received.recv_timeout(Duration::from_secs(2));
+    collector.join().unwrap();
+    let (copied, pid, status, terminal) =
+        outcome.expect("blocked output must end around the one-second deadline");
+    assert!(
+        copied.is_err(),
+        "a truncated SSH payload must never be reported as success"
+    );
+    assert!(
+        !status.success(),
+        "deadline must not leave a successful live producer"
+    );
+    assert!(
+        terminal.is_err(),
+        "expired transport cannot send terminal success"
+    );
+    assert!(
+        !PathBuf::from(format!("/proc/{pid}")).exists(),
+        "child must be reaped"
+    );
+    assert_eq!(admission.active(), 0);
+    assert!(
+        admission.try_admit().is_some(),
+        "the next request must be admitted"
+    );
+}
+
+#[test]
+fn completed_and_panicking_requests_join_watchers_without_interrupting() {
+    use git_rs::process::Operation;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let interrupted = AtomicBool::new(false);
+    let began = Instant::now();
+    assert_eq!(
+        Operation::new(1).with_interrupt(
+            || {
+                interrupted.store(true, Ordering::Release);
+            },
+            || 42,
+        ),
+        42
+    );
+    let panic = std::panic::catch_unwind(|| {
+        Operation::new(1).with_interrupt(
+            || {
+                interrupted.store(true, Ordering::Release);
+            },
+            || panic!("request failed"),
+        );
+    });
+    assert!(panic.is_err());
+    assert!(!interrupted.load(Ordering::Acquire));
+    assert!(
+        began.elapsed() < Duration::from_millis(500),
+        "watcher must be joined promptly on return and unwind"
+    );
+    assert!(
+        Operation::current().is_none(),
+        "request context must be restored on unwind"
+    );
+}
+
+#[test]
+fn completed_transport_preserves_explicit_terminal_success() {
+    let (mut output, mut input) = UnixStream::pair().unwrap();
+    input
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let interrupt = output.try_clone().unwrap();
+    git_rs::process::Operation::new(1).with_interrupt(
+        || {
+            let _ = interrupt.shutdown(std::net::Shutdown::Both);
+        },
+        || {
+            let mut framed = git_rs::protocol::Framed(&mut output);
+            framed.write_all(b"complete Git response").unwrap();
+            framed.finish(true).unwrap();
+        },
+    );
+    let mut response = Vec::new();
+    git_rs::protocol::receive_framed(&mut input, &mut response).unwrap();
+    assert_eq!(response, b"complete Git response");
+}

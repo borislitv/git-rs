@@ -1,0 +1,11 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!migrations/
+!migrations/**
+!benches/
+!benches/**
+!tests/
+!tests/*.py
