@@ -24,6 +24,7 @@ pub struct Engine {
     pub cache: Cache,
     pub scratch_root: PathBuf,
     pub operation_seconds: u64,
+    pub pack_threads: u8,
 }
 
 impl Engine {
@@ -34,7 +35,7 @@ impl Engine {
     }
 
     fn materialize_inner(&self, snapshot: &Snapshot) -> Result<Scratch> {
-        let mut scratch = Scratch::new(&self.scratch_root)?;
+        let mut scratch = Scratch::new(&self.scratch_root, self.pack_threads)?;
         let total: u64 = snapshot
             .packs
             .iter()

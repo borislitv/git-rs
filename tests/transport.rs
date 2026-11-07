@@ -105,6 +105,36 @@ impl Backend {
 }
 
 #[test]
+fn git_worker_configuration_rejects_unbounded_or_invalid_parallelism() {
+    let root = std::env::temp_dir().join(format!(
+        "git-rs-worker-options-{}",
+        git_rs::scratch::identifier().unwrap()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    for threads in ["0", "5", "255", "256", "auto", "-1"] {
+        let scratch = root.join("must-not-be-created");
+        let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+            .env_clear()
+            .env("GIT_RS_PACK_THREADS", threads)
+            .args(["serve", "--scratch"])
+            .arg(&scratch)
+            .arg("--socket")
+            .arg(root.join("absent/ssh.sock"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("GIT_RS_PACK_THREADS must be in 1..=4"),
+            "invalid worker budget must be rejected before creating serving state: {:?}",
+            output.stderr
+        );
+        assert!(!scratch.exists());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn operation_configuration_rejects_budgets_outside_the_hard_bound() {
     let root = std::env::temp_dir().join(format!(
         "git-rs-budget-options-{}",

@@ -129,6 +129,29 @@ content readback and hold-release checks. This is an opt-in wall-clock regressio
 extend the possible maintenance delay after a crash; they do not add graceful
 shutdown draining or establish comparative throughput or production HA.
 
+### Bounded native Git workers
+
+`GIT_RS_PACK_THREADS` and chart `packThreads` explicitly select one through four
+native pack workers per request, retaining the default of one. Invalid, automatic
+and out-of-range settings fail startup before creating serving state. The operator
+must include per-worker delta-base caches and object buffers in the backend budget
+and account for four admitted requests; this setting does not increase quotas.
+
+Each request writes its application-owned configuration after copying the pristine
+bare template. Native `git config --int --get pack.threads` verifies successive
+four/one/two-worker requests without leaking HEAD or hooks between them. The invalid
+startup regression failed before implementation; a restored single-worker mutation
+then failed the selected-budget assertion. The restored source passed formatting,
+strict all-targets Clippy/tests, fourteen real PostgreSQL contracts and optimized
+build. Helm 3/4 render checks reject zero, five and noninteger worker settings.
+
+The exact optimized binary passed the complete 64 MiB native integration and
+dependency-fault suites with four workers, including SSH, authenticated HTTP,
+strict malformed-object rejection, cross-pack links, concurrency and cold restart.
+The beyond-default publication test also queries the live native request's worker
+configuration before confirming both refs and native clone/fsck after 125 seconds.
+These are configuration and correctness checks, not comparative speed measurements.
+
 ## Qualification scope
 
 - Safe application Rust with Tokio and an in-process bounded PostgreSQL pool; complete hook command

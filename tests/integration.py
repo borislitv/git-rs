@@ -92,7 +92,7 @@ class Fixture:
                         GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Test Author",
                         GIT_AUTHOR_EMAIL="author@example.invalid", GIT_COMMITTER_NAME="Test Author",
                         GIT_COMMITTER_EMAIL="author@example.invalid", GIT_RS_CACHE_BYTES="1048576",
-                        GIT_RS_DEV_HTTP="1", GIT_RS_S3_ACCESS_KEY="test-access",
+                         GIT_RS_DEV_HTTP="1", GIT_RS_PACK_THREADS="4", GIT_RS_S3_ACCESS_KEY="test-access",
                         GIT_RS_S3_SECRET_KEY="synthetic-secret-key", GIT_RS_S3_BUCKET="git-test",
                         PGHOST="127.0.0.1", PGUSER="postgres", PGDATABASE="git_rs",
                         PGPASSWORD="development-only", PGSSLMODE="disable", PGCONNECT_TIMEOUT="2",
@@ -664,6 +664,7 @@ def long_operation_test(f, seconds=180):
         else:
             f.env["GIT_RS_OPERATION_SECONDS"] = previous
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=180)
+    previous_requests = set((f.base / "scratch").glob("instance-*/request-*"))
     started = time.monotonic()
     try:
         connection.putrequest("POST", f"/{slug}.git/git-receive-pack")
@@ -675,6 +676,17 @@ def long_operation_test(f, seconds=180):
         wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "1",
                  "committed long-operation hold")
         assert f.sql(f"SELECT count(*) FROM git_rs.refs WHERE repo_id={repo}") == "0"
+
+        def configured_requests():
+            return [path for path in (f.base / "scratch").glob("instance-*/request-*")
+                    if path not in previous_requests and (path / "config").is_file()
+                    and b"[pack]\n" in (path / "config").read_bytes()]
+
+        wait_for(configured_requests, "native request configuration")
+        requests = configured_requests()
+        assert len(requests) == 1, requests
+        assert f.git(requests[0], "config", "--int", "--get", "pack.threads").stdout == b"4\n", (
+            "native receive-pack must use the configured worker budget")
         # This is an intentional wall-clock boundary test, not a sleep used to
         # guess worker ordering: the committed hold above proves request admission.
         threading.Event().wait(max(0, 125 - (time.monotonic() - started)))
@@ -703,7 +715,8 @@ def long_operation_test(f, seconds=180):
     wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
              "completed long-operation hold release")
     f.results["long_native_publication"] = {"budget_seconds": seconds, "elapsed_seconds": round(elapsed, 3),
-                                             "refs": len(names), "native_clone_fsck": "passed"}
+                                             "refs": len(names), "native_clone_fsck": "passed",
+                                             "native_pack_threads": 4}
     f.record_memory()
 
 

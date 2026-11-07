@@ -32,6 +32,7 @@ scratch:
   sizeLimit: 16Gi
 cacheBytes: 67108864
 operationSeconds: 120 # Absolute Git request budget, configurable from 1 to 3600 seconds.
+packThreads: 1 # Native Git workers per request, configurable from 1 to 4.
 debugTimings: false # Opt-in bounded, lossy diagnostic records on backend stderr.
 terminationGracePeriodSeconds: 150
 

@@ -37,6 +37,16 @@ fn operation_seconds() -> Result<u64> {
     Ok(seconds)
 }
 
+fn pack_threads() -> Result<u8> {
+    std::env::var_os("GIT_RS_PACK_THREADS").map_or(Ok(1), |value| {
+        value
+            .to_str()
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|threads| (1..=4).contains(threads))
+            .ok_or_else(|| invalid("GIT_RS_PACK_THREADS must be in 1..=4"))
+    })
+}
+
 fn bridge(args: &[String]) -> Result<()> {
     let principal = option(args, "--principal")?;
     auth::principal(&principal)?;
@@ -149,6 +159,7 @@ enum HttpIdentity {
 }
 
 fn serve(args: &[String]) -> Result<()> {
+    let pack_threads = pack_threads()?;
     metrics::global();
     // Validate credentials before opening any serving listener. Production and
     // fixed-principal development HTTP can never be enabled in the same process.
@@ -206,6 +217,7 @@ fn serve(args: &[String]) -> Result<()> {
         cache: Cache::new(cache_bytes, 8 * 1024 * 1024),
         scratch_root: own_root,
         operation_seconds: operation_seconds()?,
+        pack_threads,
     });
     let active = Admission::new(4);
     if let Ok(address) = option(args, "--health") {
@@ -393,6 +405,7 @@ fn run() -> Result<()> {
                 cache: Cache::new(0, 0),
                 scratch_root: root,
                 operation_seconds: operation_seconds()?,
+                pack_threads: pack_threads()?,
             };
             git_rs::process::Operation::new(engine.operation_seconds).enter(|| match action {
                 "backup" => history::backup(

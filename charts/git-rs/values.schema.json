@@ -36,6 +36,7 @@
     "scratch": {"type": "object", "additionalProperties": false, "properties": {"sizeLimit": {"type": "string", "minLength": 1}}},
     "cacheBytes": {"type": "integer", "minimum": 0, "maximum": 1073741824},
     "operationSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "packThreads": {"type": "integer", "minimum": 1, "maximum": 4},
     "debugTimings": {"type": "boolean"},
     "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
     "ssh": {

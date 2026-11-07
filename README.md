@@ -146,6 +146,7 @@ python3 tests/chart.py --operator-schemas  # opt-in network check of public pinn
 The opt-in long-operation regression holds back a native-generated pack's final byte for
 125 seconds, then requires confirmed two-ref publication, native clone/fsck and lease release
 within a configured 180-second budget. CI includes this wall-clock deadline check.
+Native integration and dependency-fault fixtures exercise the maximum four-worker Git setting.
 
 `tests/kubernetes.py --cluster-container NAME --image git-rs:dev` uses an explicitly selected
 disposable Docker k3s cluster. It imports images and creates/deletes its own isolated namespace,
@@ -162,6 +163,9 @@ they use the same pinned Git version as the runtime.
   defaults to 120 seconds and is configurable from 1 to 3600 seconds; snapshot admission up to
   12 GiB; incoming pack/body up to 4 GiB. Durable holds cover the remaining operation plus a
   30-second cleanup margin; longer operations also extend crash-recovery maintenance delays.
+- `GIT_RS_PACK_THREADS` sets native Git's per-request `pack.threads` to `1..4`, default 1.
+  Choose it within the backend CPU/memory budget; four admitted requests can each use that many
+  workers, and Git's per-thread delta-base cache and object buffers need separate allowances.
 - Default cache 64 MiB, maximum cacheable entry 8 MiB, 4 KiB accounting increments and at most
   256 live cache files, including fills and evicted reader pins. Linux `/proc/<pid>/fd` must be
   accessible to same-UID native Git children. Memfd is not a no-swap or total-RSS guarantee;

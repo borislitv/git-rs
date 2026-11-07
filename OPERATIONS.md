@@ -26,6 +26,7 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `GIT_RS_CACHE_BYTES` | reusable RAM cache capacity, default 67108864 bytes; `0` disables |
 | `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..3600`, default 120 |
+| `GIT_RS_PACK_THREADS` | native Git `pack.threads` per request, integer `1..4`, default 1 |
 | `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |
 
 The Helm chart obtains credentials from existing Secrets or bucket-claim outputs. Do not put
@@ -220,6 +221,10 @@ client clones, WAL and retained metadata backups can still contain old data.
   this accounting does not bound kernel metadata, total file descriptors or pod RSS.
 - Four admitted operations per process; native Git/curl children consume additional memory,
   CPU and process slots. A cache metric is not total pod RSS.
+- Native pack workers default to one per request. Explicitly set `GIT_RS_PACK_THREADS=2`, `3`
+  or `4` only within the backend's CPU and memory allowance. Native Git's delta-base cache limit
+  applies per worker, with object buffers in addition; up to four requests can run concurrently.
+  This setting does not raise admission, container quotas, pack sizes or validation limits.
 - Absolute transport deadlines cover headers, SSH handshake and blocked response writes; the
   operation budget is not reset after parsing. Health has a separate eight-request admission cap
   and one-second absolute connection budget, so a single trickling client cannot starve probes.

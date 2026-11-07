@@ -418,7 +418,7 @@ fn reused_native_scratch_template_excludes_request_head_and_hooks() {
     ));
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     let root = Root(path);
-    let first = Scratch::new(&root.0).unwrap();
+    let first = Scratch::new(&root.0, 4).unwrap();
     let changed = process::git()
         .arg("-C")
         .arg(&first.path)
@@ -439,7 +439,25 @@ fn reused_native_scratch_template_excludes_request_head_and_hooks() {
     )
     .unwrap();
     let first_path = first.path.clone();
-    let second = Scratch::new(&root.0).unwrap();
+    let second = Scratch::new(&root.0, 1).unwrap();
+    let third = Scratch::new(&root.0, 2).unwrap();
+    for (scratch, threads) in [(&first, b"4\n"), (&second, b"1\n"), (&third, b"2\n")] {
+        assert_eq!(
+            process::capture(
+                process::git().arg("-C").arg(&scratch.path).args([
+                    "config",
+                    "--int",
+                    "--get",
+                    "pack.threads"
+                ]),
+                b"",
+                4096,
+            )
+            .unwrap(),
+            threads,
+            "native Git must use each request's selected worker budget"
+        );
+    }
     assert_ne!(first.path, second.path);
     assert_eq!(
         fs::read(first.path.join("HEAD")).unwrap(),

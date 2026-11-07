@@ -97,6 +97,7 @@ def main():
     backend = next(c for c in pod["containers"] if c["name"] == "backend")
     env = {item["name"]: item for item in backend["env"]}
     assert env["GIT_RS_CACHE_BYTES"]["value"] == "67108864", env["GIT_RS_CACHE_BYTES"]
+    assert env["GIT_RS_PACK_THREADS"]["value"] == "1"
     assert env["PGSSLMODE"]["value"] == "verify-full"
     assert "GIT_RS_DEBUG_TIMINGS" not in env
     assert env["PGTARGETSESSIONATTRS"]["value"] == "read-write"
@@ -170,7 +171,7 @@ def main():
         {"name": "http", "port": 2222, "targetPort": "http"}]
 
     customized = render(args.helm, {
-        "fullnameOverride": "isolated", "cacheBytes": 0, "debugTimings": True,
+        "fullnameOverride": "isolated", "cacheBytes": 0, "debugTimings": True, "packThreads": 4,
         "image": {"repository": "example.invalid/git-rs", "digest": "sha256:" + "a" * 64},
         "cnpg": {"name": "metadata-db"},
         "objectBucket": {"name": "packs-claim", "bucketName": "unique-packs", "storageClassName": "retained-buckets", "additionalConfig": {"maxObjects": "1000"}},
@@ -188,6 +189,7 @@ def main():
     assert resource(customized, "ObjectBucketClaim")["spec"]["storageClassName"] == "retained-buckets"
     env = {item["name"]: item for item in pod["containers"][0]["env"]}
     assert env["GIT_RS_CACHE_BYTES"]["value"] == "0"
+    assert env["GIT_RS_PACK_THREADS"]["value"] == "4"
     assert env["GIT_RS_DEBUG_TIMINGS"]["value"] == "1"
     assert env["PGHOST"]["value"] == "metadata-db-rw"
     assert env["GIT_RS_S3_BUCKET"]["valueFrom"]["configMapKeyRef"]["name"] == "packs-claim"
@@ -216,6 +218,9 @@ def main():
         ({"replicaCount": 0}, "replicaCount"),
         ({"operationSeconds": 0}, "operationSeconds"),
         ({"operationSeconds": 3601}, "operationSeconds"),
+        ({"packThreads": 0}, "packThreads"),
+        ({"packThreads": 5}, "packThreads"),
+        ({"packThreads": "auto"}, "packThreads"),
         ({"debugTimings": "true"}, "debugTimings"),
         ({"image": {"digest": "sha256:bad"}}, "digest"),
         ({"s3": {"endpoint": "http://s3.example.invalid"}}, "endpoint"),

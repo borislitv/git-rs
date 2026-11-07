@@ -85,6 +85,12 @@ one-second lifetime. Align gateway timeouts with an explicitly increased request
 termination remains a crash-safe stop rather than graceful request draining. Per-object S3 and
 PostgreSQL limits are documented in [operations](../../OPERATIONS.md).
 
+`packThreads` defaults to one and accepts integers 1–4. It sets native Git's per-request
+`pack.threads` through `GIT_RS_PACK_THREADS`; zero/automatic host-CPU detection is not accepted.
+Choose a value within the backend's CPU and memory budget, accounting for up to four admitted
+requests and per-worker delta-base caches/object buffers. It does not increase container quotas
+or the sidecar/dependency budget. Strict incoming validation and publication semantics still apply.
+
 `debugTimings: true` sets `GIT_RS_DEBUG_TIMINGS=1` only on the backend and rolls its pods. It is
 disabled by default. The bounded lossy writer emits correlated fixed-field diagnostics; monitor
 its dropped-record counter and keep enabled profiling trials separate from scored benchmarks.

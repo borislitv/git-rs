@@ -65,8 +65,26 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    pub fn new(root: &Path) -> Result<Self> {
-        metrics::measure(Metric::Phase(Phase::ScratchInit), || Self::create(root))
+    pub fn new(root: &Path, pack_threads: u8) -> Result<Self> {
+        metrics::measure(Metric::Phase(Phase::ScratchInit), || {
+            let scratch = Self::create(root)?;
+            // Write configuration after copying the template: it must reflect
+            // this engine's operator-selected budget, not the first request's.
+            fs::write(
+                scratch.path.join("config"),
+                format!(
+                    concat!(
+                        "[core]\nrepositoryformatversion = 0\nbare = true\nfilemode = true\n",
+                        "[receive]\nprocReceiveRefs = refs\nunpackLimit = 0\nfsckObjects = true\nmaxInputSize = 4294967296\nshallowUpdate = false\nautoGC = false\n",
+                        "[transfer]\nfsckObjects = true\n[gc]\nauto = 0\n[maintenance]\nauto = false\n",
+                        "[uploadpack]\nallowAnySHA1InWant = false\n[http]\nreceivepack = true\n",
+                        "[pack]\nthreads = {}\nwindowMemory = 32m\ndeltaCacheSize = 16m\n"
+                    ),
+                    pack_threads
+                ),
+            )?;
+            Ok(scratch)
+        })
     }
 
     fn create(root: &Path) -> Result<Self> {
@@ -92,18 +110,6 @@ impl Scratch {
                 .arg(&scratch.path),
             b"",
             4096,
-        )?;
-        // This is entirely application-owned configuration in a new bare repo.
-        // One write avoids spawning a Git process for each constant setting.
-        fs::write(
-            scratch.path.join("config"),
-            concat!(
-                "[core]\nrepositoryformatversion = 0\nbare = true\nfilemode = true\n",
-                "[receive]\nprocReceiveRefs = refs\nunpackLimit = 0\nfsckObjects = true\nmaxInputSize = 4294967296\nshallowUpdate = false\nautoGC = false\n",
-                "[transfer]\nfsckObjects = true\n[gc]\nauto = 0\n[maintenance]\nauto = false\n",
-                "[uploadpack]\nallowAnySHA1InWant = false\n[http]\nreceivepack = true\n",
-                "[pack]\nthreads = 1\nwindowMemory = 32m\ndeltaCacheSize = 16m\n"
-            ),
         )?;
         // Capture only this freshly initialized, application-owned repository.
         // Racing first requests may each initialize once; no failed/cancelled

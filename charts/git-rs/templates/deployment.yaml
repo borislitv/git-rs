@@ -106,6 +106,8 @@ spec:
               value: {{ .Values.cacheBytes | int64 | quote }}
             - name: GIT_RS_OPERATION_SECONDS
               value: {{ .Values.operationSeconds | quote }}
+            - name: GIT_RS_PACK_THREADS
+              value: {{ .Values.packThreads | quote }}
             {{- if .Values.debugTimings }}
             - name: GIT_RS_DEBUG_TIMINGS
               value: "1"
