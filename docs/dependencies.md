@@ -42,6 +42,25 @@ Builds need OpenSSL development headers and pkg-config. Fetch locked crates once
 before an offline build; production images contain no PostgreSQL CLI or libpq.
 The test-only image installs psql for independent fixture administration.
 
+S3 uses reqwest 0.13.5 with native TLS and the official AWS request signer,
+aws-sigv4 1.6.4 with aws-credential-types 1.3.1. No S3 subprocess is started.
+The process-local Tokio runtime has two workers and at most four blocking workers;
+eight active transfers share a client with at most four idle HTTP/1 connections per host,
+retained for thirty seconds. Ordinary serving admission is still four Git requests.
+Uploads use tokio-util's 64 KiB ReaderStream; downloads stream directly into private scratch
+or a size-sealed cache fill and must pass exact length and SHA-256 checks before publication.
+The five-second connection timeout and 110-second transfer cap (thirty seconds for bucket
+policy) are bounded by the remaining absolute operation deadline, including admission wait.
+Cancellation is checked at most every twenty milliseconds while awaiting network I/O and
+between response chunks. Local filesystem I/O and TLS initialization remain synchronous work;
+these timeouts are not a hard CPU scheduling guarantee.
+
+The HTTP client disables proxies, redirects, automatic retries and transparent decompression.
+Native TLS verifies certificate chains and hostnames using the system trust store and the
+OpenSSL `SSL_CERT_FILE`/`SSL_CERT_DIR` overrides. Endpoint credentials, query strings and
+fragments are rejected. Signing headers are sensitive values, and transport errors suppress
+URLs and credentials. The fixture's curl client remains an independent S3 administration tool.
+
 The RAM cache uses `memfd` 0.6.6 for Linux anonymous, sealable backing files. SHA-256 uses the
 existing OpenSSL crate in-process, with a bounded read buffer; it no longer starts `sha256sum`.
 Same-UID native Git children must be able to reopen `/proc/<serving-pid>/fd` paths. This removes

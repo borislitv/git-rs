@@ -28,6 +28,9 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
 - Safe Rust with Tokio, tokio-postgres and a bounded SQL pool; `unsafe_code` is forbidden.
   SQL runs in-process, with verified TLS and no SQL subprocess. Upstream Git handles wire protocols,
   pack/delta normalization and graph validation.
+- S3 uses a shared in-process HTTP client and the official AWS SigV4 signer. Pack transfers stream
+  through bounded buffers; connections are reused, and cancellation drops partial responses.
+  HTTPS verifies the certificate chain and hostname; requests do not follow redirects or retry.
 - A push uploads immutable objects, then publishes the complete ref update and pack catalog in
   one SQL transaction with authorization and old-OID compare-and-swap. Every push is all-or-nothing,
   including clients that do not request `--atomic`.
@@ -110,7 +113,7 @@ lossy background writer. See [metrics, timing logs and scrape configuration](doc
 ## Build and verify
 
 Requires Linux, Rust **1.99+**, OpenSSL development headers/pkg-config for builds, Git **2.56.0**,
-OpenSSH server/client, curl with AWS SigV4 support, GNU coreutils **`/usr/bin/gnutimeout`** and `kill`.
+OpenSSH server/client, GNU coreutils **`/usr/bin/gnutimeout`** and `kill`.
 Ubuntu's coinstallable `gnu-coreutils` package supplies that explicit entrypoint: its default
 uutils `timeout` rejects legal non-UTF-8 ref arguments before Git sees them.
 Build and runtime use Ubuntu **26.04**. The Dockerfile
@@ -126,7 +129,8 @@ docker build --target release -t git-rs:dev .
 ```
 
 Black-box tests use only generated identities, synthetic repositories and disposable local
-PostgreSQL/Versity containers. They require Docker, Python 3.11+ and the runtime programs above:
+PostgreSQL/Versity containers. They require Docker, Python 3.11+, curl with AWS SigV4 support for
+independent fixture administration, and the runtime programs above:
 
 ```sh
 make integration           # 64 MiB synthetic data, native Git/SSH and cold restart

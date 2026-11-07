@@ -29,7 +29,7 @@ restart. Scrapes do not perform SQL or S3 requests.
 | `git_rs_stage_errors_total` | Counter | Unsuccessful completed/dropped stage spans, with the same `stage` labels |
 | `git_rs_dependency_duration_seconds` | Histogram | `operation=sql,s3_get,s3_put,s3_delete,s3_versioning` |
 | `git_rs_dependency_errors_total` | Counter | Failed dependency operations, with the same `operation` labels |
-| `git_rs_subprocess_duration_seconds` | Histogram | `program=git,curl,sha256sum,other`; SQL has no subprocess |
+| `git_rs_subprocess_duration_seconds` | Histogram | `program=git,curl,sha256sum,other`; SQL, S3 and SHA-256 run in-process |
 | `git_rs_subprocess_errors_total` | Counter | Failed spawn or nonzero exit, with the same `program` labels |
 | `git_rs_cache_lookups_total` | Counter | `result=hit,miss,bypass`; miss means this caller attempted a fill |
 | `git_rs_cache_wait_duration_seconds` | Histogram | Time waiting for another caller's single-flight fill; `_count` counts waits |
@@ -46,6 +46,9 @@ catalog on the same SQL connection. `git` includes the native RPC and its hooks;
 `validate` includes graph checks, uploads and publication. `s3_get` includes size
 and SHA-256 verification. Cache hits do not add S3 bytes. Failed, partial or
 unknown-outcome transfers are not a wire-byte accounting mechanism.
+The historical `curl` and `sha256sum` subprocess label values remain in the fixed metric schema;
+the current S3 and hashing paths do not increment those subprocess series. S3 connection reuse
+and signing remain included in the existing dependency observations.
 
 HTTP discovery and each RPC are separate requests; one Git command can create
 multiple requests. HTTP 400/401 responses have their own outcomes. Other parsing,

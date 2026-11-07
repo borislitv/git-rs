@@ -13,6 +13,11 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::sync::Arc;
 
+mod transport;
+
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone)]
 pub struct Store {
     endpoint: String,
@@ -20,16 +25,6 @@ pub struct Store {
     region: String,
     access: String,
     secret: String,
-}
-
-fn quote(value: &str) -> Result<String> {
-    if value.chars().any(char::is_control) {
-        return Err(invalid("control character in curl configuration"));
-    }
-    Ok(format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
 }
 
 pub fn digest(path: &Path) -> Result<String> {
@@ -55,16 +50,27 @@ fn digest_reader(mut input: impl Read) -> Result<String> {
 impl Store {
     pub fn from_env() -> Result<Self> {
         let endpoint = std::env::var("GIT_RS_S3_ENDPOINT")?;
+        let url = reqwest::Url::parse(&endpoint).map_err(|_| invalid("invalid S3 endpoint"))?;
         let local_http = std::env::var("GIT_RS_DEV_HTTP").as_deref() == Ok("1")
-            && (endpoint.starts_with("http://127.0.0.1:")
-                || endpoint.starts_with("http://localhost:"));
-        if !endpoint.starts_with("https://") && !local_http {
+            && url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost"));
+        if url.scheme() != "https" && !local_http {
             return Err(invalid(
                 "S3 requires HTTPS (loopback development opt-in only)",
             ));
         }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || endpoint.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "S3 endpoint must not contain credentials, query or fragment",
+            ));
+        }
         let store = Self {
-            endpoint: endpoint.trim_end_matches('/').into(),
+            endpoint: url.as_str().trim_end_matches('/').into(),
             bucket: std::env::var("GIT_RS_S3_BUCKET")?,
             region: std::env::var("GIT_RS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
             access: std::env::var("GIT_RS_S3_ACCESS_KEY")?,
@@ -78,6 +84,12 @@ impl Store {
         {
             return Err(invalid("invalid S3 bucket"));
         }
+        for value in [&store.region, &store.access, &store.secret] {
+            if value.is_empty() || value.chars().any(char::is_control) {
+                return Err(invalid("invalid S3 signing configuration"));
+            }
+        }
+        transport::initialize()?;
         Ok(store)
     }
 
@@ -98,56 +110,6 @@ impl Store {
         {
             return Err(invalid("invalid object key"));
         }
-        let mut config = format!(
-            "url = {}\naws-sigv4 = {}\nuser = {}\n",
-            quote(&format!("{}/{}/{}", self.endpoint, self.bucket, key))?,
-            quote(&format!("aws:amz:{}:s3", self.region))?,
-            quote(&format!("{}:{}", self.access, self.secret))?
-        );
-        match upload {
-            Some(hash) => config.push_str(&format!(
-                "upload-file = {}\nheader = {}\noutput = \"/dev/null\"\n",
-                quote(
-                    file.to_str()
-                        .ok_or_else(|| invalid("non UTF-8 scratch path"))?
-                )?,
-                quote(&format!("x-amz-content-sha256: {hash}"))?
-            )),
-            None => config.push_str(&format!(
-                "output = {}\n",
-                quote(
-                    file.to_str()
-                        .ok_or_else(|| invalid("non UTF-8 scratch path"))?
-                )?
-            )),
-        }
-        if delete {
-            config.push_str("request = \"DELETE\"\n");
-        }
-        if let Some(limit) = max_download {
-            config.push_str(&format!("max-filesize = {limit}\n"));
-        }
-        let mut cmd = process::command("/usr/bin/curl");
-        cmd.args([
-            "--disable",
-            "--silent",
-            "--fail",
-            "--proto",
-            "=http,https",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "110",
-            "--config",
-            "-",
-        ]);
-        // Credentials go through stdin, not argv or child environment. No redirects,
-        // retries, proxy inheritance, or certificate-verification bypass.
-        for name in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
-            if let Some(value) = std::env::var_os(name) {
-                cmd.env(name, value);
-            }
-        }
         let operation = if delete {
             Some(Dependency::S3Delete)
         } else if upload.is_some() {
@@ -155,11 +117,39 @@ impl Store {
         } else {
             None
         };
-        let mut transfer = || {
-            if let Some(file) = output {
-                process::capture_to_file(&mut cmd, config.as_bytes(), file)?;
+        let transfer = || {
+            let method = if delete {
+                reqwest::Method::DELETE
+            } else if upload.is_some() {
+                reqwest::Method::PUT
             } else {
-                process::capture(&mut cmd, config.as_bytes(), 4096)?;
+                reqwest::Method::GET
+            };
+            let url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
+            let input = upload.map(|_| File::open(file)).transpose()?;
+            let limit = max_download.unwrap_or(4096);
+            if let Some(file) = output {
+                self.request(method, &url, upload, input, &mut &*file, limit, 110)?;
+            } else if max_download.is_some() {
+                self.request(
+                    method,
+                    &url,
+                    upload,
+                    input,
+                    &mut File::create(file)?,
+                    limit,
+                    110,
+                )?;
+            } else {
+                self.request(
+                    method,
+                    &url,
+                    upload,
+                    input,
+                    &mut std::io::sink(),
+                    limit,
+                    110,
+                )?;
             }
             if upload.is_some() {
                 metrics::global().transferred(Direction::Upload, fs::metadata(file)?.len());
@@ -293,33 +283,17 @@ impl Store {
     /// Physical reclamation currently supports only never-versioned buckets.
     /// Enabled/suspended/unknown policies require a version-aware GC instead.
     pub fn require_unversioned(&self) -> Result<()> {
-        let config = format!(
-            "url = {}\naws-sigv4 = {}\nuser = {}\n",
-            quote(&format!("{}/{}?versioning", self.endpoint, self.bucket))?,
-            quote(&format!("aws:amz:{}:s3", self.region))?,
-            quote(&format!("{}:{}", self.access, self.secret))?
-        );
-        let mut cmd = process::command("/usr/bin/curl");
-        cmd.args([
-            "--disable",
-            "--silent",
-            "--fail",
-            "--proto",
-            "=http,https",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "30",
-            "--config",
-            "-",
-        ]);
-        for name in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
-            if let Some(value) = std::env::var_os(name) {
-                cmd.env(name, value);
-            }
-        }
-        let response = metrics::measure(Metric::Dependency(Dependency::S3Versioning), || {
-            process::capture(&mut cmd, config.as_bytes(), 16384)
+        let mut response = Vec::new();
+        metrics::measure(Metric::Dependency(Dependency::S3Versioning), || {
+            self.request(
+                reqwest::Method::GET,
+                &format!("{}/{}?versioning", self.endpoint, self.bucket),
+                None,
+                None,
+                &mut response,
+                16384,
+                30,
+            )
         })?;
         let mut xml = std::str::from_utf8(&response)?.trim();
         if xml.starts_with("<?xml ") {

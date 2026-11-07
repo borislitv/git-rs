@@ -61,6 +61,27 @@ return another actor's valid credential after Git's challenge/retry. Actor-speci
 verify credential selection and require every remote ref to remain unchanged after a denied push.
 The server did not accept a verified reader as an owner in this reproduction.
 
+### In-process S3 follow-up
+
+The shared HTTP transport replaces per-object curl processes with reqwest and the official
+AWS SigV4 signer. The connection-reuse and cancellation regressions were first observed
+failing on the subprocess path: three sequential calls opened three connections, and a
+cancelled fill waited for the peer. Both pass with the shared client. Additional real-socket
+tests cover redirect refusal, oversized bucket policy, failed-fill recovery and isolated
+certificate trust/hostname verification. Deliberately permitting a redirect, increasing the
+policy budget and disabling hostname verification made the corresponding regressions fail;
+a separate digest-check mutation accepted corrupt bytes and failed its rejection assertion.
+All mutations were restored. The complete native integration and dependency-fault
+suites passed with 64 MiB synthetic data, signature verification by the real S3 fixture,
+SSH/authenticated HTTP, cold reconstruction and unknown PUT/COMMIT behavior. These are
+correctness observations, not comparative GitLab timings or a new HA qualification.
+
+The final optimized binary repeated the 64 MiB integration and fault suites with
+timing diagnostics disabled. The exact test image also passed the real Helm/k3s
+smoke with two replicas, verified TLS PostgreSQL/S3, SSH and authenticated HTTP,
+identity rejection, cold restart and migration on upgrade. This disposable smoke
+uses a direct Docker bridge; it is not a new gateway/mesh or HA qualification.
+
 ## Qualification scope
 
 - Safe application Rust with Tokio and an in-process bounded PostgreSQL pool; complete hook command
