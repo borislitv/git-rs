@@ -102,6 +102,33 @@ the full 64 MiB Git/SSH/authenticated HTTP suite, including malformed ingestion,
 concurrent publication, bundle restore and cold restart, followed by the complete
 dependency-fault suite. These correctness runs are not throughput scores.
 
+### Bounded long operations
+
+Operation configuration retains its 120-second default and accepts an explicit
+budget of 1 through 3600 seconds. Transport parsing, native Git, private hooks and
+publication use the same absolute operation lifetime. Independent health probes
+keep their one-second deadline. S3 and SQL dependency caps remain in force.
+
+Committed shared/exclusive holds and leased snapshots cover the rounded-up
+remaining operation budget plus the existing 30-second cleanup margin. Real
+PostgreSQL contracts check 1, 120, 121 and 3600 seconds, reject a larger budget,
+retain a committed hold after its owner exits without destructors, recover after
+forced expiry, and reject publication through an expired hold without changing
+refs, generation or the operations table. Separate mutations restored a fixed
+150-second lease, removed the lease bound, disabled the SQL expiry check and
+accepted an out-of-range configuration value; each failed its intended assertion.
+All mutations were restored before the complete Rust/PostgreSQL checks and
+optimized build passed.
+
+The native integration suite also withholds the final byte of a Git-generated
+pack for 125 seconds. The default 120-second control fails to publish; a configured
+180-second request publishes both refs, then passes native clone/fsck, exact
+content readback and hold-release checks. This is an opt-in wall-clock regression
+(`--long-operations`) and runs in CI. The optimized binary passed the complete
+64 MiB Git/SSH/authenticated HTTP suite and dependency-fault suite. Long operations
+extend the possible maintenance delay after a crash; they do not add graceful
+shutdown draining or establish comparative throughput or production HA.
+
 ## Qualification scope
 
 - Safe application Rust with Tokio and an in-process bounded PostgreSQL pool; complete hook command

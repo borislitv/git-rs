@@ -31,7 +31,7 @@ resources:
 scratch:
   sizeLimit: 16Gi
 cacheBytes: 67108864
-operationSeconds: 120
+operationSeconds: 120 # Absolute Git request budget, configurable from 1 to 3600 seconds.
 debugTimings: false # Opt-in bounded, lossy diagnostic records on backend stderr.
 terminationGracePeriodSeconds: 150
 

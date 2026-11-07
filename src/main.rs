@@ -31,8 +31,8 @@ fn operation_seconds() -> Result<u64> {
     let seconds = std::env::var("GIT_RS_OPERATION_SECONDS")
         .unwrap_or_else(|_| git_rs::process::DEADLINE.to_string())
         .parse()?;
-    if !(1..=git_rs::process::DEADLINE).contains(&seconds) {
-        return Err(invalid("GIT_RS_OPERATION_SECONDS must be in 1..=120"));
+    if !(1..=git_rs::process::MAX_OPERATION_SECONDS).contains(&seconds) {
+        return Err(invalid("GIT_RS_OPERATION_SECONDS must be in 1..=3600"));
     }
     Ok(seconds)
 }
@@ -43,8 +43,11 @@ fn bridge(args: &[String]) -> Result<()> {
     let original = std::env::var("SSH_ORIGINAL_COMMAND")?;
     let (service, slug) = auth::ssh_command(&original)?;
     let mut socket = UnixStream::connect(option(args, "--socket")?)?;
-    socket.set_read_timeout(Some(Duration::from_secs(git_rs::process::DEADLINE)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(git_rs::process::DEADLINE)))?;
+    // The backend enforces its configured absolute budget. The independent
+    // bridge must admit any supported backend budget, even without its config.
+    let maximum = Duration::from_secs(git_rs::process::MAX_OPERATION_SECONDS);
+    socket.set_read_timeout(Some(maximum))?;
+    socket.set_write_timeout(Some(maximum))?;
     for field in [
         "git-rs-ssh-1",
         &principal,
@@ -111,8 +114,9 @@ fn session(mut socket: UnixStream, engine: &Engine) -> Result<()> {
 }
 
 fn session_bounded(socket: &mut UnixStream, engine: &Engine) -> Result<()> {
-    socket.set_read_timeout(Some(Duration::from_secs(git_rs::process::DEADLINE)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(git_rs::process::DEADLINE)))?;
+    let timeout = Duration::from_secs(engine.operation_seconds);
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
     if field(socket)? != "git-rs-ssh-1" {
         return Err(invalid("unsupported SSH bridge version"));
     }

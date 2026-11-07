@@ -637,6 +637,76 @@ def authenticated_http_test(f):
     f.results["authenticated_http_acl_roundtrip"] = "passed"
 
 
+def long_operation_test(f, seconds=180):
+    """Cross the real default deadline while native receive-pack awaits its pack trailer."""
+    print("native publication after the default 120-second deadline", flush=True)
+    slug = "team/long-operation"
+    f.cli("create", slug, "alice")
+    source = f.base / "long-operation-source"
+    f.git(f.base, "init", "--initial-branch=main", source)
+    (source / "synthetic.txt").write_text("bounded long-operation fixture\n")
+    f.git(source, "add", "synthetic.txt")
+    f.git(source, "commit", "-qm", "Synthetic long-operation fixture")
+    oid = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    pack = command(["git", "-C", source, "pack-objects", "--stdout", "--revs"],
+                   env=f.env, data=oid + b"\n").stdout
+    names = [b"refs/heads/main", b"refs/heads/long-copy"]
+    body = b"".join(pkt(b"0" * 40 + b" " + oid + b" " + name
+                        + (b"\0report-status side-band-64k" if index == 0 else b""))
+                    for index, name in enumerate(names)) + b"0000" + pack
+    previous = f.env.get("GIT_RS_OPERATION_SECONDS")
+    f.env["GIT_RS_OPERATION_SECONDS"] = str(seconds)
+    try:
+        _, port = f.start("long-operation")
+    finally:
+        if previous is None:
+            del f.env["GIT_RS_OPERATION_SECONDS"]
+        else:
+            f.env["GIT_RS_OPERATION_SECONDS"] = previous
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=180)
+    started = time.monotonic()
+    try:
+        connection.putrequest("POST", f"/{slug}.git/git-receive-pack")
+        connection.putheader("Content-Type", "application/x-git-receive-pack-request")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders()
+        connection.send(body[:-1])
+        repo = "(SELECT id FROM git_rs.repositories WHERE slug='team/long-operation')"
+        wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "1",
+                 "committed long-operation hold")
+        assert f.sql(f"SELECT count(*) FROM git_rs.refs WHERE repo_id={repo}") == "0"
+        # This is an intentional wall-clock boundary test, not a sleep used to
+        # guess worker ordering: the committed hold above proves request admission.
+        threading.Event().wait(max(0, 125 - (time.monotonic() - started)))
+        assert f.health("long-operation", "/livez") == (200, b"live\n")
+        assert f.sql(f"SELECT count(*) FROM git_rs.refs WHERE repo_id={repo}") == "0"
+        try:
+            connection.send(body[-1:])
+            response = connection.getresponse()
+            payload = response.read()
+        except (OSError, http.client.HTTPException) as error:
+            raise AssertionError("a configured long operation must complete native publication") from error
+        assert response.status == 200 and all(b"ok " + name in payload for name in names), (
+            "a configured long operation must publish both refs", response.status, payload)
+    finally:
+        connection.close()
+    elapsed = time.monotonic() - started
+    assert 125 <= elapsed < seconds, elapsed
+    url = f"http://127.0.0.1:{port}/{slug}.git"
+    expected = b"".join(oid + b"\t" + name + b"\n" for name in sorted(names))
+    assert f.git(source, "ls-remote", "--refs", url).stdout == expected
+    mirror = f.base / "long-operation-mirror.git"
+    f.git(source, "clone", "--mirror", url, mirror)
+    f.git(mirror, "fsck", "--strict", "--full")
+    assert f.git(mirror, "show", "main:synthetic.txt").stdout == b"bounded long-operation fixture\n"
+    assert f.sql(f"SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}") == "1"
+    wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
+             "completed long-operation hold release")
+    f.results["long_native_publication"] = {"budget_seconds": seconds, "elapsed_seconds": round(elapsed, 3),
+                                             "refs": len(names), "native_clone_fsck": "passed"}
+    f.record_memory()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--provision", action="store_true", help="create and remove private local Docker PostgreSQL/S3 fixtures")
@@ -645,6 +715,8 @@ def main():
     parser.add_argument("--skip-ssh", action="store_true")
     parser.add_argument("--debug-timings", action="store_true",
                         help="verify opt-in timing logs through native Git requests")
+    parser.add_argument("--long-operations", action="store_true",
+                        help="also run the 125-second native publication deadline regression")
     args = parser.parse_args()
     # OpenSSH StrictModes checks all parents of authorized_keys. A system /tmp
     # parent is world-writable, so keep this private fixture under the checkout.
@@ -659,6 +731,8 @@ def main():
             fixture.setup(args.provision)
             exercise(fixture, args.large_mib, args.skip_ssh)
             authenticated_http_test(fixture)
+            if args.long_operations:
+                long_operation_test(fixture)
             print(json.dumps({"status": "passed", **fixture.results}, indent=2))
         except Exception:
             if fixture:

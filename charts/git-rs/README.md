@@ -78,6 +78,13 @@ one CPU, shared by all SSH connections, authentication helpers and bridge proces
 Tune backend and sidecar quotas together; idle quota cannot be borrowed between
 containers. Raising this limit also raises the configured aggregate CPU ceiling.
 
+`operationSeconds` defaults to 120 and accepts 1–3600 seconds. Committed repository holds cover
+the remaining request budget plus a 30-second cleanup margin; a crashed long-running request
+can delay exclusive maintenance until that hold expires. Health probes retain their independent
+one-second lifetime. Align gateway timeouts with an explicitly increased request budget; pod
+termination remains a crash-safe stop rather than graceful request draining. Per-object S3 and
+PostgreSQL limits are documented in [operations](../../OPERATIONS.md).
+
 `debugTimings: true` sets `GIT_RS_DEBUG_TIMINGS=1` only on the backend and rolls its pods. It is
 disabled by default. The bounded lossy writer emits correlated fixed-field diagnostics; monitor
 its dropped-record counter and keep enabled profiling trials separate from scored benchmarks.

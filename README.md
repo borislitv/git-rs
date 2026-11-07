@@ -135,12 +135,17 @@ independent fixture administration, and the runtime programs above:
 ```sh
 make integration           # 64 MiB synthetic data, native Git/SSH and cold restart
 python3 tests/integration.py --provision --large-mib 64 --debug-timings
+python3 tests/integration.py --provision --binary target/release/git-rs --long-operations
 make failures              # real S3/PostgreSQL transport and maintenance faults
 make bench                 # release-mode RAM-cache microbenchmark
 python3 -m pip install PyYAML==6.0.3 jsonschema==4.26.0
 make chart                 # Helm 4.3.1 and 3.22.1 compatibility in CI
 python3 tests/chart.py --operator-schemas  # opt-in network check of public pinned CRD schemas
 ```
+
+The opt-in long-operation regression holds back a native-generated pack's final byte for
+125 seconds, then requires confirmed two-ref publication, native clone/fsck and lease release
+within a configured 180-second budget. CI includes this wall-clock deadline check.
 
 `tests/kubernetes.py --cluster-container NAME --image git-rs:dev` uses an explicitly selected
 disposable Docker k3s cluster. It imports images and creates/deletes its own isolated namespace,
@@ -154,7 +159,9 @@ they use the same pinned Git version as the runtime.
 - Each request materializes the complete live pack catalog; this is a prototype, not a lazy
   object filesystem or a substitute for repository sharding.
 - Git SHA-1 repositories only; four admitted requests per serving process; operation deadline
-  up to 120 seconds; snapshot admission up to 12 GiB; incoming pack/body up to 4 GiB.
+  defaults to 120 seconds and is configurable from 1 to 3600 seconds; snapshot admission up to
+  12 GiB; incoming pack/body up to 4 GiB. Durable holds cover the remaining operation plus a
+  30-second cleanup margin; longer operations also extend crash-recovery maintenance delays.
 - Default cache 64 MiB, maximum cacheable entry 8 MiB, 4 KiB accounting increments and at most
   256 live cache files, including fills and evicted reader pins. Linux `/proc/<pid>/fd` must be
   accessible to same-UID native Git children. Memfd is not a no-swap or total-RSS guarantee;

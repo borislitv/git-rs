@@ -14,6 +14,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub const DEADLINE: u64 = 120;
+pub const MAX_OPERATION_SECONDS: u64 = 3600;
 
 pub struct Admission {
     active: AtomicUsize,

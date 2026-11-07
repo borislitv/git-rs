@@ -19,6 +19,10 @@ struct Backend {
 
 impl Backend {
     fn start() -> Self {
+        Self::with_timeout(1)
+    }
+
+    fn with_timeout(seconds: u64) -> Self {
         let root = std::env::temp_dir().join(format!(
             "git-rs-transport-{}",
             git_rs::scratch::identifier().unwrap()
@@ -33,7 +37,7 @@ impl Backend {
             .env("GIT_RS_S3_BUCKET", "synthetic")
             .env("GIT_RS_S3_ACCESS_KEY", "synthetic")
             .env("GIT_RS_S3_SECRET_KEY", "synthetic")
-            .env("GIT_RS_OPERATION_SECONDS", "1")
+            .env("GIT_RS_OPERATION_SECONDS", seconds.to_string())
             .args(["serve", "--scratch"])
             .arg(&root)
             .arg("--socket")
@@ -66,10 +70,12 @@ impl Backend {
                 }
             }
         });
+        let mut startup = Vec::new();
         loop {
             let line = received
                 .recv_timeout(Duration::from_secs(5))
-                .expect("backend startup");
+                .unwrap_or_else(|error| panic!("backend startup {error}: {startup:?}"));
+            startup.push(line.clone());
             if let Some(address) = line.strip_prefix("health ") {
                 backend.health = address.into();
             }
@@ -95,6 +101,107 @@ impl Backend {
             .read_to_string(&mut response)
             .expect("health must answer within probe timeout");
         response
+    }
+}
+
+#[test]
+fn operation_configuration_rejects_budgets_outside_the_hard_bound() {
+    let root = std::env::temp_dir().join(format!(
+        "git-rs-budget-options-{}",
+        git_rs::scratch::identifier().unwrap()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    for seconds in ["3601", "0", "18446744073709551615"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("PGHOST", root.join("no-postgres"))
+            .env("PGSSLMODE", "verify-full")
+            .env("GIT_RS_S3_ENDPOINT", "https://unused.example.invalid")
+            .env("GIT_RS_S3_BUCKET", "synthetic")
+            .env("GIT_RS_S3_ACCESS_KEY", "synthetic")
+            .env("GIT_RS_S3_SECRET_KEY", "synthetic")
+            .env("GIT_RS_OPERATION_SECONDS", seconds)
+            .args(["backup", "team/project", "alice", "--scratch"])
+            .arg(&root)
+            .arg("--output")
+            .arg(root.join("backup.bundle"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("GIT_RS_OPERATION_SECONDS must be in 1..=3600"),
+            "invalid budget must be rejected before dependency access: {:?}",
+            output.stderr
+        );
+        assert!(!root.join("backup.bundle").exists());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn long_operation_budgets_preserve_independent_health_deadlines() {
+    for seconds in [121, 3600] {
+        let backend = Backend::with_timeout(seconds);
+        assert!(backend.health("/livez").starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(
+            backend
+                .health("/readyz")
+                .starts_with("HTTP/1.1 503 Service Unavailable\r\n")
+        );
+        let mut partial = TcpStream::connect(&backend.health).unwrap();
+        partial
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        partial.write_all(b"GET /").unwrap();
+        let started = Instant::now();
+        let mut byte = [0];
+        assert_eq!(
+            partial.read(&mut byte).unwrap(),
+            0,
+            "health deadline must close stalled input"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(backend.health("/livez").starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+}
+
+#[test]
+fn private_hook_broker_stops_for_expired_or_cancelled_operation_budgets() {
+    use git_rs::{hooks, process::Operation};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let cancelled = Operation::new(3600);
+    cancelled.cancel();
+    for operation in [Operation::new(0), cancelled] {
+        let socket = hooks::PrivateSocket::new().unwrap();
+        let stop = AtomicBool::new(false);
+        let (finished, received) = mpsc::channel();
+        let started = Instant::now();
+        let result = std::thread::scope(|scope| {
+            // Bound the regression even if the broker ignores its operation.
+            let stop = &stop;
+            scope.spawn(move || {
+                let _ = received.recv_timeout(Duration::from_secs(2));
+                stop.store(true, Ordering::Release);
+            });
+            let result = operation.enter(|| {
+                hooks::broker(
+                    socket.listener.try_clone().unwrap(),
+                    "synthetic-nonce",
+                    stop,
+                    |_, _| panic!("an expired operation cannot publish"),
+                )
+            });
+            let _ = finished.send(());
+            result
+        });
+        result.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the broker must stop with its operation"
+        );
     }
 }
 

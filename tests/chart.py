@@ -192,6 +192,12 @@ def main():
     assert env["PGHOST"]["value"] == "metadata-db-rw"
     assert env["GIT_RS_S3_BUCKET"]["valueFrom"]["configMapKeyRef"]["name"] == "packs-claim"
 
+    long_operations = render(args.helm, {"operationSeconds": 3600})
+    pod = resource(long_operations, "Deployment")["spec"]["template"]["spec"]
+    backend = next(container for container in pod["containers"] if container["name"] == "backend")
+    env = {item["name"]: item for item in backend["env"]}
+    assert env["GIT_RS_OPERATION_SECONDS"]["value"] == "3600"
+
     backup = {"enabled": True, "spec": {"configuration": {
         "destinationPath": "s3://git-rs-backup/metadata", "s3Credentials": {
             "accessKeyId": {"name": "backup-creds", "key": "access"},
@@ -208,7 +214,8 @@ def main():
     invalid = [
         ({"cacheByte": 1}, "cacheByte"),
         ({"replicaCount": 0}, "replicaCount"),
-        ({"operationSeconds": 121}, "operationSeconds"),
+        ({"operationSeconds": 0}, "operationSeconds"),
+        ({"operationSeconds": 3601}, "operationSeconds"),
         ({"debugTimings": "true"}, "debugTimings"),
         ({"image": {"digest": "sha256:bad"}}, "digest"),
         ({"s3": {"endpoint": "http://s3.example.invalid"}}, "endpoint"),

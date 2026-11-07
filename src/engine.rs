@@ -424,11 +424,9 @@ impl Engine {
                                 .lock()
                                 .map_err(|_| invalid("HTTP body state poisoned"))?;
                             let (completed, _) = ready
-                                .wait_timeout_while(
-                                    completed,
-                                    std::time::Duration::from_secs(process::DEADLINE),
-                                    |value| value.is_none(),
-                                )
+                                .wait_timeout_while(completed, process::remaining()?, |value| {
+                                    value.is_none()
+                                })
                                 .map_err(|_| invalid("HTTP body state poisoned"))?;
                             if *completed != Some(true) {
                                 return Err(invalid("HTTP body incomplete"));

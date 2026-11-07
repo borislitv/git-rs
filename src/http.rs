@@ -8,7 +8,6 @@ use crate::{
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
 
 pub const MAX_BODY: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -260,8 +259,9 @@ fn handle_bounded(
     authentication: Authentication<'_>,
     timer: &mut RequestTimer,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
+    let remaining = crate::process::remaining()?;
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
     let mut input = BufReader::new(stream.try_clone()?);
     let interrupt = stream.try_clone()?;
     let request = match Request::parse(&mut input) {

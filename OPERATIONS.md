@@ -25,7 +25,7 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `SSL_CERT_FILE`, `SSL_CERT_DIR` | custom S3 TLS trust roots passed to curl |
 | `GIT_RS_CACHE_BYTES` | reusable RAM cache capacity, default 67108864 bytes; `0` disables |
 | `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
-| `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..120`, default 120 |
+| `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..3600`, default 120 |
 | `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |
 
 The Helm chart obtains credentials from existing Secrets or bucket-claim outputs. Do not put
@@ -130,10 +130,19 @@ Inspect remote refs and `git_rs.operations` after reconnecting; do not infer rol
 connection or blindly repeat a destructive maintenance command. Ordinary push retries use native
 Git old-OID checks. SQL commit durability still depends on PostgreSQL/CNPG and storage configuration.
 
-Leases live for 150 seconds; application operations are bounded by 120 seconds plus termination
-margin. A crashed holder can delay maintenance until expiry. Do not increase the hard application
-deadline without redesigning/revalidating the lease protocol. Maintenance waits at most five
-seconds for admission, then reports busy; retry after active operations/crashed leases finish.
+Committed leases cover the remaining absolute operation budget, rounded up to a second, plus
+a 30-second subprocess-termination/cleanup margin. Both shared requests and exclusive maintenance
+use that rule; no heartbeat or live database connection is required to retain a hold. Operations
+default to 120 seconds and may be explicitly configured up to 3600 seconds. A crashed holder can
+therefore delay maintenance for up to its remaining budget plus the margin. Maintenance waits at
+most five seconds for admission, then reports busy; retry after active operations/crashed leases
+finish. Expired leases cannot authorize publication, even if their process is still alive.
+
+SSH, private hooks and HTTP share the request's absolute lifetime; periodic client traffic cannot
+extend it. Health retains its independent one-second budget. PostgreSQL connection/statement/lock
+limits and the 110-second per-object S3 transfer limit still apply within a longer request budget.
+Configure gateway timeouts consistently when opting into longer operations. Pod termination is
+still a crash-safe stop, not application-level request draining.
 
 Serving never deletes objects. Interrupted or rejected uploads are tracked as staged objects;
 explicit owner cleanup reclaims uncatalogued objects. A PUT with an unknown outcome leaves a

@@ -31,8 +31,11 @@ pub fn helper(kind: &str) -> Result<()> {
     let mut socket = UnixStream::connect(
         std::env::var_os("GIT_RS_HOOK_SOCKET").ok_or_else(|| invalid("missing hook context"))?,
     )?;
-    socket.set_read_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(crate::process::DEADLINE)))?;
+    // Native Git's parent timeout enforces the actual request budget; a private
+    // helper must not expire early during a supported long publication.
+    let maximum = Duration::from_secs(crate::process::MAX_OPERATION_SECONDS);
+    socket.set_read_timeout(Some(maximum))?;
+    socket.set_write_timeout(Some(maximum))?;
     protocol::write_packet(&mut socket, std::env::var("GIT_RS_HOOK_NONCE")?.as_bytes())?;
     protocol::write_packet(&mut socket, kind.as_bytes())?;
     let mut input = std::io::stdin().lock();
@@ -122,10 +125,18 @@ pub fn broker(
     mut validate: impl FnMut(bool, &[Update]) -> Result<()>,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
-    let deadline = Instant::now() + Duration::from_secs(crate::process::DEADLINE);
+    // Completion also cancels the operation before joining this worker. Stop
+    // without reporting a failed publication when there is no work left to do.
+    let Ok(remaining) = crate::process::remaining() else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + remaining;
     let mut original = None;
     let mut published = false;
     while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        if crate::process::check_operation().is_err() {
+            break;
+        }
         let (mut socket, _) = match listener.accept() {
             Ok(connection) => connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

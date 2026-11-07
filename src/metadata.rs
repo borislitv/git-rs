@@ -66,9 +66,17 @@ fn snapshot_rows(
     })
 }
 
-/// A committed lease survives connection loss. Operations have at most 120 s;
-/// the database grants 150 s, including subprocess termination margin. A crash
-/// delays maintenance until expiry rather than releasing a live reader's hold.
+fn lease_seconds(remaining: Duration) -> Result<u64> {
+    if remaining > Duration::from_secs(process::MAX_OPERATION_SECONDS) {
+        return Err(invalid("operation exceeds repository lease budget"));
+    }
+    // Round up the remaining request budget and retain the existing 30-second
+    // subprocess-termination/cleanup margin, including after connection loss.
+    Ok(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0) + 30)
+}
+
+/// A committed lease covers the remaining bounded operation and cleanup margin.
+/// A crash delays maintenance until expiry rather than releasing a live reader.
 pub struct Barrier {
     pub(crate) id: String,
     repo: String,
@@ -77,14 +85,12 @@ pub struct Barrier {
 impl Barrier {
     pub fn acquire(id: &str, exclusive: bool) -> Result<Self> {
         let remaining = process::remaining()?;
-        if remaining > Duration::from_secs(process::DEADLINE) {
-            return Err(invalid("operation exceeds repository lease budget"));
-        }
+        let lifetime = lease_seconds(remaining)?;
         let lease = scratch::identifier()?;
         let deadline = Instant::now() + remaining.min(Duration::from_secs(5));
         loop {
             let result = sql(&format!(
-                "BEGIN; DO $body$ BEGIN PERFORM 1 FROM repositories WHERE id={}::uuid FOR UPDATE; IF NOT FOUND THEN RAISE EXCEPTION 'repository unavailable'; END IF; DELETE FROM repository_leases WHERE repo_id={}::uuid AND expires_at <= clock_timestamp(); END $body$; INSERT INTO repository_leases SELECT {}::uuid,{}::uuid,{},clock_timestamp()+interval '150 seconds' WHERE NOT EXISTS(SELECT 1 FROM repository_leases WHERE repo_id={}::uuid AND (exclusive OR {})) RETURNING 1; COMMIT;",
+                "BEGIN; DO $body$ BEGIN PERFORM 1 FROM repositories WHERE id={}::uuid FOR UPDATE; IF NOT FOUND THEN RAISE EXCEPTION 'repository unavailable'; END IF; DELETE FROM repository_leases WHERE repo_id={}::uuid AND expires_at <= clock_timestamp(); END $body$; INSERT INTO repository_leases SELECT {}::uuid,{}::uuid,{},clock_timestamp()+interval '{lifetime} seconds' WHERE NOT EXISTS(SELECT 1 FROM repository_leases WHERE repo_id={}::uuid AND (exclusive OR {})) RETURNING 1; COMMIT;",
                 text(id),
                 text(id),
                 text(&lease),
@@ -303,14 +309,12 @@ pub fn leased_snapshot(slug: &str, principal: &str, write: bool) -> Result<(Snap
     auth::repository(slug)?;
     auth::principal(principal)?;
     let remaining = process::remaining()?;
-    if remaining > Duration::from_secs(process::DEADLINE) {
-        return Err(invalid("operation exceeds repository lease budget"));
-    }
+    let lifetime = lease_seconds(remaining)?;
     let deadline = Instant::now() + remaining.min(Duration::from_secs(5));
     let id = scratch::identifier()?;
     let role = if write { "AND p.role <> 'reader'" } else { "" };
     let query = format!(
-        "BEGIN; DO $body$ DECLARE repo uuid; BEGIN SELECT r.id INTO STRICT repo FROM repositories r JOIN permissions p ON r.id=p.repo_id WHERE r.slug={} AND p.principal={} {role} FOR UPDATE OF r; DELETE FROM repository_leases WHERE repo_id=repo AND expires_at <= clock_timestamp(); END $body$; INSERT INTO repository_leases SELECT {}::uuid,r.id,false,clock_timestamp()+interval '150 seconds' FROM repositories r WHERE r.slug={} AND NOT EXISTS(SELECT 1 FROM repository_leases WHERE repo_id=r.id AND exclusive); SELECT 'lease',repo_id FROM repository_leases WHERE id={}::uuid; COMMIT;",
+        "BEGIN; DO $body$ DECLARE repo uuid; BEGIN SELECT r.id INTO STRICT repo FROM repositories r JOIN permissions p ON r.id=p.repo_id WHERE r.slug={} AND p.principal={} {role} FOR UPDATE OF r; DELETE FROM repository_leases WHERE repo_id=repo AND expires_at <= clock_timestamp(); END $body$; INSERT INTO repository_leases SELECT {}::uuid,r.id,false,clock_timestamp()+interval '{lifetime} seconds' FROM repositories r WHERE r.slug={} AND NOT EXISTS(SELECT 1 FROM repository_leases WHERE repo_id=r.id AND exclusive); SELECT 'lease',repo_id FROM repository_leases WHERE id={}::uuid; COMMIT;",
         text(slug),
         text(principal),
         text(&id),

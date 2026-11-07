@@ -590,3 +590,172 @@ fn leased_snapshot_never_reads_through_exclusive_maintenance() {
         lease.check().unwrap();
     });
 }
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn durable_holds_cover_the_configured_remaining_operation_budget() {
+    metadata::migrate().unwrap();
+    let slug = format!(
+        "metadata/budgets-{}",
+        git_rs::scratch::identifier().unwrap()
+    );
+    metadata::create(&slug, "alice").unwrap();
+    let initial = metadata::snapshot(&slug, "alice", true).unwrap();
+    for seconds in [3600, 121, 120, 1] {
+        process::Operation::new(seconds).enter(|| {
+            for exclusive in [false, true] {
+                let hold = Barrier::acquire(&initial.id, exclusive)
+                    .expect("a bounded operation must acquire a duration-aligned durable hold");
+                assert_eq!(
+                    metadata::sql(&format!(
+                        "SELECT expires_at > clock_timestamp() + interval '{seconds} seconds' \
+                         AND expires_at <= clock_timestamp() + interval '{} seconds' \
+                         FROM repository_leases WHERE repo_id={}::uuid;",
+                        seconds + 30,
+                        metadata::text(&initial.id)
+                    ))
+                    .unwrap()
+                    .trim(),
+                    "t",
+                    "hold must cover the operation plus cleanup, without a fixed oversized lease"
+                );
+                drop(hold);
+            }
+            let (_, hold) = metadata::leased_snapshot(&slug, "alice", true)
+                .expect("serving snapshots must support the same bounded operation budget");
+            assert_eq!(
+                metadata::sql(&format!(
+                    "SELECT expires_at > clock_timestamp() + interval '{seconds} seconds' \
+                     AND expires_at <= clock_timestamp() + interval '{} seconds' \
+                     FROM repository_leases WHERE repo_id={}::uuid;",
+                    seconds + 30,
+                    metadata::text(&initial.id)
+                ))
+                .unwrap()
+                .trim(),
+                "t",
+                "the committed serving hold must remain valid throughout its operation"
+            );
+            drop(hold);
+        });
+    }
+    for acquire_snapshot in [false, true] {
+        process::Operation::new(3601).enter(|| {
+            let result = if acquire_snapshot {
+                metadata::leased_snapshot(&slug, "alice", false).map(|_| ())
+            } else {
+                Barrier::acquire(&initial.id, false).map(|_| ())
+            };
+            assert!(
+                result.is_err(),
+                "operations beyond the hard budget must fail closed"
+            );
+        });
+    }
+    assert_eq!(
+        metadata::sql(&format!(
+            "SELECT count(*) FROM repository_leases WHERE repo_id={}::uuid;",
+            metadata::text(&initial.id)
+        ))
+        .unwrap()
+        .trim(),
+        "0"
+    );
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn long_holds_survive_owner_exit_and_fence_expired_publications() {
+    const TEST: &str = "long_holds_survive_owner_exit_and_fence_expired_publications";
+    const CHILD_REPO: &str = "GIT_RS_TEST_ABANDONED_LEASE_REPOSITORY";
+    if let Ok(slug) = std::env::var(CHILD_REPO) {
+        process::Operation::new(3600).enter(|| {
+            let (_, hold) = metadata::leased_snapshot(&slug, "alice", true).unwrap();
+            hold.check().unwrap();
+            // Model a process disappearing without running the lease destructor.
+            std::process::exit(0);
+        });
+    }
+    process::Operation::new(3600).enter(|| {
+        metadata::migrate().unwrap();
+        let slug = format!(
+            "metadata/abandoned-{}",
+            git_rs::scratch::identifier().unwrap()
+        );
+        metadata::create(&slug, "alice").unwrap();
+        let initial = metadata::snapshot(&slug, "alice", true).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", TEST])
+            .env(CHILD_REPO, &slug)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "the child must commit its hold before exiting"
+        );
+        let repo = metadata::text(&initial.id);
+        assert_eq!(
+            metadata::sql(&format!(
+                "SELECT count(*) FROM repository_leases WHERE repo_id={repo}::uuid \
+             AND expires_at > clock_timestamp() + interval '3500 seconds';"
+            ))
+            .unwrap()
+            .trim(),
+            "1",
+            "connection/process loss must not release a live hold"
+        );
+        assert!(
+            process::Operation::new(1)
+                .enter(|| Barrier::acquire(&initial.id, true))
+                .is_err()
+        );
+
+        let expire = format!(
+            "UPDATE repository_leases SET expires_at=clock_timestamp()-interval '1 second' \
+             WHERE repo_id={repo}::uuid;"
+        );
+        metadata::sql(&expire).unwrap();
+        let maintenance = Barrier::acquire(&initial.id, true)
+            .expect("expired abandoned holds must allow maintenance to recover");
+        maintenance.check().unwrap();
+        drop(maintenance);
+
+        let (before, hold) = metadata::leased_snapshot(&slug, "alice", true).unwrap();
+        metadata::sql(&expire).unwrap();
+        assert!(hold.check().is_err());
+        assert!(
+            metadata::publish(
+                &before,
+                &hold,
+                &git_rs::scratch::identifier().unwrap(),
+                "alice",
+                &[Update {
+                    old: Oid::ZERO,
+                    new: Oid([1; 20]),
+                    name: b"refs/heads/stale".to_vec()
+                }],
+                &[true],
+                &[],
+            )
+            .is_err(),
+            "an active operation cannot publish through an expired hold"
+        );
+        let after = metadata::snapshot(&slug, "alice", true).unwrap();
+        assert_eq!(after.refs, before.refs);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(
+            metadata::sql(&format!(
+                "SELECT count(*) FROM operations WHERE repo_id={repo}::uuid;"
+            ))
+            .unwrap()
+            .trim(),
+            "0"
+        );
+        drop(hold);
+        Barrier::acquire(&initial.id, true)
+            .unwrap()
+            .check()
+            .unwrap();
+    });
+}
