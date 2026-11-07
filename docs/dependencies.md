@@ -17,6 +17,19 @@ source provenance; release automation exports both records and observes the Git
 version inside the built image. Git updates require requalifying the native
 proc-receive/pre-receive, HTTP and SSH contracts, not merely changing a version.
 
+Ingestion keeps `receive.fsckObjects=true` and `receive.unpackLimit=0` in the
+application-owned repository template. Native receive-pack therefore invokes
+strict index-pack validation for the entire incoming pack, including unreachable
+objects, before either hook. Native connectivity checks precede proc-receive;
+the broker additionally requires its complete command list to match pre-receive.
+The publication graph check uses `git fsck --connectivity-only --strict` over the
+new tips. It does not re-inflate every blob in previously validated immutable
+packs. This relies on authenticated catalog digests, exact download verification
+and preserving strict ingestion; connectivity alone is not content validation.
+See the upstream [receive configuration](https://git-scm.com/docs/git-config#Documentation/git-config.txt-receivefsckObjects),
+[index-pack](https://git-scm.com/docs/git-index-pack) and
+[fsck](https://git-scm.com/docs/git-fsck) contracts.
+
 Rust 1.99.1 uses official `static.rust-lang.org/dist` component archives, with
 the independently published `.sha256` values pinned in the Dockerfile. Components
 are installed without rustup or shell download pipelines.

@@ -82,6 +82,26 @@ smoke with two replicas, verified TLS PostgreSQL/S3, SSH and authenticated HTTP,
 identity rejection, cold restart and migration on upgrade. This disposable smoke
 uses a direct Docker bridge; it is not a new gateway/mesh or HA qualification.
 
+### Incremental native validation
+
+Publication no longer repeats full blob-content validation for the complete
+immutable catalog. Native receive-pack still strictly validates every incoming
+object, followed by native graph connectivity and the complete two-hook command
+list check. Publication retains an explicit connectivity-only graph check.
+
+The real Git/SQL/S3 regression sends native-generated packs containing malformed
+unreachable commits/tags, a wrong-type tree link and a missing parent. Each must
+leave refs, the pack catalog and staged objects unchanged. A valid incoming commit
+whose tree and parent live in an existing pack must publish and fetch correctly.
+Disabling strict receive validation deliberately made the malformed-author case
+publish both refs, failing its rejection assertion. That mutation was restored.
+
+The restored implementation passed formatting, strict all-targets Clippy/tests
+and an optimized image build. That exact image, with native Git 2.56.0, passed
+the full 64 MiB Git/SSH/authenticated HTTP suite, including malformed ingestion,
+concurrent publication, bundle restore and cold restart, followed by the complete
+dependency-fault suite. These correctness runs are not throughput scores.
+
 ## Qualification scope
 
 - Safe application Rust with Tokio and an in-process bounded PostgreSQL pool; complete hook command

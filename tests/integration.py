@@ -210,15 +210,17 @@ def pkt(payload):
     return f"{len(payload) + 4:04x}".encode() + payload
 
 
-def raw_push(port, oid, names, *, missing=False, atomic=False):
+def raw_push(port, oid, names, *, missing=False, atomic=False, pack=None):
     zero = b"0" * 40
     capabilities = b"report-status side-band-64k" + (b" atomic" if atomic else b"")
     body = b""
     for index, name in enumerate(names):
         new = b"f" * 40 if missing and index else oid
         body += pkt(zero + b" " + new + b" " + name + (b"\0" + capabilities if index == 0 else b""))
-    empty_pack = b"PACK" + struct.pack(">II", 2, 0)
-    body += b"0000" + empty_pack + hashlib.sha1(empty_pack).digest()
+    if pack is None:
+        empty_pack = b"PACK" + struct.pack(">II", 2, 0)
+        pack = empty_pack + hashlib.sha1(empty_pack).digest()
+    body += b"0000" + pack
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
     conn.request("POST", "/team/project.git/git-receive-pack", body,
                  {"Content-Type": "application/x-git-receive-pack-request"})
@@ -227,6 +229,58 @@ def raw_push(port, oid, names, *, missing=False, atomic=False):
     conn.close()
     assert response.status == 200, (response.status, payload)
     return payload
+
+
+def strict_ingestion_test(f, source, port, url):
+    """Native Git must validate every incoming object, including unreachable ones."""
+    tip = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    tree = f.git(source, "rev-parse", "HEAD^{tree}").stdout.strip()
+    blob = command(["git", "-C", source, "hash-object", "-w", "--stdin"], env=f.env,
+                   data=b"native object type boundary\n").stdout.strip()
+    identity = b"Fixture <fixture@example.invalid> 1577836800 +0000\n"
+    good = (b"tree " + tree + b"\nparent " + tip + b"\nauthor " + identity
+            + b"committer " + identity + b"\nvalid cross-pack commit\n")
+
+    def packed(kind, data, *, literal=False):
+        args = ["git", "-C", source, "hash-object", "-w", "-t", kind, "--stdin"]
+        if literal:
+            args.append("--literally")
+        oid = command(args, env=f.env, data=data).stdout.strip()
+        # Git owns object encoding, compression, checksums and pack framing.
+        pack = command(["git", "-C", source, "pack-objects", "--stdout"], env=f.env,
+                       data=oid + b"\n").stdout
+        return oid, pack
+
+    before = f.git(source, "ls-remote", url).stdout
+    packs_before = f.sql("SELECT count(*) FROM git_rs.packs")
+    staged_before = f.sql("SELECT count(*) FROM git_rs.staged_objects")
+    for name, kind, contents in [
+        ("unreachable-bad-author", "commit", good.replace(b"author " + identity, b"author invalid\n")),
+        ("wrong-tree-type", "commit", good.replace(b"tree " + tree, b"tree " + blob)),
+        ("missing-parent", "commit", good.replace(b"parent " + tip, b"parent " + b"f" * 40)),
+        ("unreachable-bad-tag", "tag", b"object " + tip + b"\ntype invalid\ntag broken\n\ninvalid\n"),
+    ]:
+        malformed, pack = packed(kind, contents, literal=True)
+        # The malformed semantic object need not be reachable from either valid
+        # ref: strict ingestion must reject it before uploads or publication.
+        report = raw_push(port, tip, [f"refs/heads/{name}-a".encode(),
+                                     f"refs/heads/{name}-b".encode()], pack=pack)
+        assert b"ok refs/heads/" not in report, (name, malformed, report)
+        assert f.git(source, "ls-remote", url).stdout == before, name
+        assert f.sql("SELECT count(*) FROM git_rs.packs") == packs_before, name
+        assert f.sql("SELECT count(*) FROM git_rs.staged_objects") == staged_before, name
+
+    valid, pack = packed("commit", good)
+    name = b"refs/heads/native-cross-pack"
+    report = raw_push(port, valid, [name], pack=pack)
+    assert b"ok " + name in report, report
+    assert valid + b"\t" + name + b"\n" in f.git(source, "ls-remote", url).stdout
+    assert int(f.sql("SELECT count(*) FROM git_rs.packs")) == int(packs_before) + 1
+    f.git(source, "fetch", url, name.decode())
+    assert f.git(source, "rev-parse", "FETCH_HEAD").stdout.strip() == valid
+    f.git(source, "push", url, ":" + name.decode())
+    assert f.git(source, "ls-remote", url).stdout == before
+    f.results["strict_native_ingestion_and_cross_pack_links"] = "passed"
 
 
 def generate(path, mib, seed):
@@ -304,6 +358,7 @@ def exercise(f, large_mib, skip_ssh):
     blob_oid = f.git(source, "hash-object", "-w", "hello.txt").stdout.strip().decode()
     assert f.git(source, "push", "--atomic", url, "HEAD:refs/heads/valid", f"{blob_oid}:refs/heads/blob", ok=False).returncode != 0
     assert f.git(source, "ls-remote", url).stdout == before
+    strict_ingestion_test(f, source, p1, url)
     # Delete-only and no-new-object pushes must not require an incoming pack.
     packs_before = f.sql("SELECT count(*) FROM git_rs.packs")
     f.git(source, "push", url, "HEAD:refs/heads/disposable")

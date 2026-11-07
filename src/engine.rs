@@ -186,13 +186,22 @@ impl Engine {
         }
         tip_validation.finish(true);
         if !tips.is_empty() {
-            // fsck walks actual graph edges; normalized deltas alone are insufficient.
+            // receive.fsckObjects makes native index-pack strictly validate every
+            // incoming object before either hook. Existing packs are immutable,
+            // authenticated catalog entries and were validated on ingestion.
+            // Check graph connectivity here without re-inflating all old blobs.
             metrics::measure(Metric::Phase(Phase::Graph), || {
                 process::capture(
                     process::git()
                         .arg("-C")
                         .arg(path)
-                        .args(["fsck", "--strict", "--no-reflogs", "--no-dangling"])
+                        .args([
+                            "fsck",
+                            "--connectivity-only",
+                            "--strict",
+                            "--no-reflogs",
+                            "--no-dangling",
+                        ])
                         .args(&tips),
                     b"",
                     64 * 1024,
