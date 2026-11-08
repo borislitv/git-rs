@@ -39,6 +39,12 @@ worker cannot publish a partial successful annotation. A single query may annota
 allocation capacity, native processes, materialization and snapshot metadata need additional
 memory and scratch allowances.
 
+Commit-kind and uncompressed blob-size checks use physical Rust library headers,
+without inflating complete object bodies or spawning `cat-file`. This includes
+loose objects and delta-compressed objects in verified, request-pinned RAM packs.
+These checks do not grant reachability or authorization: the leased published
+snapshot, native reachability and literal path checks still precede annotation.
+
 Only one blame computation executes per serving process; another returns 503 rather than
 queuing behind it. It also occupies one of the four ordinary request admissions. Health has
 independent admission. The absolute `GIT_RS_OPERATION_SECONDS` deadline covers the request,
@@ -95,4 +101,8 @@ content, rejection of a valid unreachable commit in a stored pack, the uncompres
 and unchanged publication state. Separate worker cases check native output equivalence,
 credential isolation, failed/oversized output, occupied admission, client disconnect, deadline,
 closed-output cancellation, descendant reaping, read-hold/scratch release and admission reuse.
+An intermediate migration contract permits at most three native Git commands for
+a valid annotation and two for an oversized blob; header type/size probes do not
+consume a native subprocess. Library tests compare physical headers with native
+Git and read 128 MiB loose/ref-delta blobs under a 96 MiB address-space limit.
 These contracts do not establish a full-repository performance score or production HA behavior.

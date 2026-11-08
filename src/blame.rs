@@ -100,16 +100,10 @@ impl Engine {
         let (snapshot, barrier) = metadata::leased_snapshot(slug, principal, false)?;
         let scratch = self.materialize(&snapshot)?;
         let commit = query.commit.hex();
-        let kind = capture(
-            process::git().arg("-C").arg(&scratch.path).args([
-                "cat-file",
-                "--batch-check=%(objecttype)",
-                "-Z",
-            ]),
-            &[commit.as_bytes(), b"\0"].concat(),
-            128,
-        )?;
-        if kind != b"commit\0" {
+        if !scratch
+            .object_header(query.commit)?
+            .is_some_and(|header| header.kind() == gix::objs::Kind::Commit)
+        {
             return Ok(Response::NotFound);
         }
         let reachable = capture(
@@ -147,15 +141,11 @@ impl Engine {
         if entry[tab + 1..].strip_suffix(b"\0") != Some(query.path.as_slice()) {
             return Ok(Response::NotFound);
         }
-        let size = capture(
-            process::git()
-                .arg("-C")
-                .arg(&scratch.path)
-                .args(["cat-file", "-s", blob]),
-            b"",
-            64,
-        )?;
-        if std::str::from_utf8(&size)?.trim().parse::<u64>()? > MAX_BLOB {
+        let header = scratch
+            .object_header(Oid::parse(blob.as_bytes())?)?
+            .filter(|header| header.kind() == gix::objs::Kind::Blob)
+            .ok_or_else(|| invalid("blame path must resolve to a physical blob"))?;
+        if header.size() > MAX_BLOB {
             return Ok(Response::TooLarge);
         }
         let mut command = if let Some(worker) = &self.blame.worker {

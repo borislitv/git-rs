@@ -584,7 +584,8 @@ def authenticated_http_test(f):
     f.logs.append(log)
     process = subprocess.Popen([f.binary, "serve", "--scratch", str(f.base / "scratch"),
                                 "--socket", str(f.base / "authenticated-http.sock"),
-                                "--http", "127.0.0.1:0", "--http-credentials", str(server_credentials)],
+                                "--http", "127.0.0.1:0", "--health", "127.0.0.1:0",
+                                "--http-credentials", str(server_credentials)],
                                env=f.env, stdout=log, stderr=log)
     f.processes.append(process)
 
@@ -595,6 +596,7 @@ def authenticated_http_test(f):
 
     wait_for(ready, "authenticated HTTP listener")
     port = int(ready().group(1))
+    f.health_ports["authenticated-http"] = int(re.search(r"health 127.0.0.1:(\d+)", log_path.read_text()).group(1))
     helpers = {}
     for actor, token in actors.items():
         # Git can clear a URL username after an initial 401 and ask its helper
@@ -695,19 +697,34 @@ def complete_blame_test(f, source, port, actors):
         connection.close()
         return result
 
+    def native_calls():
+        status, body = f.health("authenticated-http", "/metrics")
+        assert status == 200
+        return metric_value(body, 'git_rs_subprocess_duration_seconds_count{program="git"}')
+
+    annotation_calls = []
     for filename in [path, raw_path]:
         expected = f.git(source, "--literal-pathspecs", "blame", "--root", "--line-porcelain",
                          "--no-textconv", "--no-progress", oid.decode(), "--", os.fsdecode(filename)).stdout
+        before_calls = native_calls()
         status, payload, cache_control = request(oid, filename)
         assert status == 200 and payload == expected, (status, payload, expected)
         assert cache_control == "no-store"
+        calls = native_calls() - before_calls
+        assert calls <= 3, (
+            "blame type/size preflight must use library headers; at most reachability, literal path and annotation remain native",
+            calls)
+        annotation_calls.append(calls)
     blob = f.git(source, "rev-parse", "HEAD:" + os.fsdecode(path)).stdout.strip()
     for commit, filename in [(unreachable, path), (blob, path), (b"f" * 40, path),
                              (oid, b"missing.txt"), (oid, b"folder")]:
         status, payload, _ = request(commit, filename)
         assert status == 404 and payload == b"", (
             "blame must reject invalid or unreachable targets", commit, filename, status, payload)
+    before_calls = native_calls()
     assert request(oid, b"oversized.bin")[0:2] == (413, b""), "oversized blobs must be rejected before annotation"
+    oversized_calls = native_calls() - before_calls
+    assert oversized_calls <= 2, ("oversized blob header checks must not invoke cat-file or an annotation worker", oversized_calls)
     assert request(oid, path, actor=None)[0:2] == (401, b"")
     assert request(oid, path, actor="carol")[0:2] == (500, b"")
     after = f.sql(f"SELECT generation,(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}),"
@@ -720,6 +737,7 @@ def complete_blame_test(f, source, port, actors):
         "reader_acl": "passed", "unreachable_commit_in_published_pack": "rejected",
         "blob_oid_missing_path_directory": "rejected", "publication_unchanged": True,
         "oversized_uncompressed_blob": "rejected",
+        "native_calls_per_annotation": annotation_calls, "native_calls_for_oversized_blob": oversized_calls,
     }
     blame_worker_test(f, source, oid, path)
     blame_blocked_output_test(f, oid)

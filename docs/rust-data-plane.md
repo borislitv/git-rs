@@ -20,7 +20,8 @@ does not by itself give it a hard cancellation boundary.
 | Empty request repository | `gix` bare initialization with isolated configuration | Native-readable SHA-1 layout; private cleanup; no copied hooks or request state |
 | Snapshot refs and HEAD | `gix-ref` transactions and validated byte-exact HEAD; PostgreSQL remains authoritative | Exact byte-oriented refs, arbitrary default branch, empty/unborn repository, no reflogs |
 | Ref-name validation | `gix` reference validation at command parsing and validation | Native-compatible valid and invalid names, including non-UTF-8 names |
-| Object, path, metadata and ancestry reads | Native Git commands | Library reads with exact object identity, literal paths and complete graph semantics |
+| Snapshot/blame object kind and size | `gix-pack`/`gix-odb` physical header-only reads | Native-exact loose/ref-delta headers, sealed RAM links, missing-object and cancellation checks, bounded-memory regression |
+| Path, metadata and ancestry reads | Native Git commands | Library reads with exact object identity, literal paths and complete graph semantics |
 | Push ingestion and validation | Native receive-pack/index-pack/fsck | Streaming Rust ingestion; strict validation of every incoming object; authenticated existing bases; complete graph closure |
 | Fetch and negotiation | Native upload-pack/http-backend | Ordinary clients over HTTP/SSH; protocol versions, tags, notes and shallow behavior qualified explicitly |
 | Complete blame | Native default or an operator-selected worker | General graph/path behavior, exact owners/positions/metadata/content, bounded complete response and cancellation |
@@ -45,6 +46,15 @@ RAM cache entries and their request-lifetime pins. Library header decoding check
 physical existence and branch target types without inflating complete blobs;
 loose objects and delta bases remain supported. These checks do not replace the
 strict ingestion and graph validation required before publication.
+
+Blame uses the same physical header reader for its commit-kind and uncompressed
+blob-size preflight; those checks no longer execute `cat-file`. A synthetic test
+reads loose and sealed-RAM ref-delta blobs around the 128 MiB payload limit in a
+child with a 96 MiB address-space limit, so replacing a header probe with full
+body inflation fails. This test limit is not a serving-process RSS or hard
+cancellation guarantee. Published reachability, literal path resolution and the
+default annotation computation still use their explicit native boundaries.
+Push tip checks remain part of the native ingestion/validation boundary.
 
 Newly migrated paths must not invoke Git as a hidden fallback. Existing native
 paths remain explicit migration debt; they are not evidence that the final

@@ -413,3 +413,222 @@ fn snapshot_refs_resolve_ref_delta_commits_in_sealed_ram_packs() -> Result<()> {
     native(&target.path, &["fsck", "--strict", "--full"], b"")?;
     Ok(())
 }
+
+#[test]
+fn physical_object_headers_match_native_types_and_sizes() -> Result<()> {
+    let root = Root::new()?;
+    let scratch = Scratch::new(&root.0, 1)?;
+    let blob = native(
+        &scratch.path,
+        &["hash-object", "-w", "--stdin"],
+        b"a\0\r\n\xff",
+    )?;
+    let blob = std::str::from_utf8(&blob)?.trim();
+    let empty_blob = native(&scratch.path, &["hash-object", "-w", "--stdin"], b"")?;
+    let empty_blob = std::str::from_utf8(&empty_blob)?.trim();
+    let tree = native(
+        &scratch.path,
+        &["mktree"],
+        format!("100644 blob {blob}\tfile.txt\n").as_bytes(),
+    )?;
+    let tree = std::str::from_utf8(&tree)?.trim();
+    let commit = native(&scratch.path, &["commit-tree", tree], b"header fixture\n")?;
+    let commit = std::str::from_utf8(&commit)?.trim();
+    let tag = native(
+        &scratch.path,
+        &["mktag"],
+        format!(
+            "object {commit}\ntype commit\ntag synthetic\ntagger Synthetic Author <author@example.invalid> 946684800 +0000\n\nheader fixture\n"
+        )
+        .as_bytes(),
+    )?;
+    let tag = std::str::from_utf8(&tag)?.trim();
+    for (id, kind) in [
+        (blob, gix::objs::Kind::Blob),
+        (empty_blob, gix::objs::Kind::Blob),
+        (tree, gix::objs::Kind::Tree),
+        (commit, gix::objs::Kind::Commit),
+        (tag, gix::objs::Kind::Tag),
+    ] {
+        let native_size = native(&scratch.path, &["cat-file", "-s", id], b"")?;
+        let native_size = std::str::from_utf8(&native_size)?.trim().parse::<u64>()?;
+        let header = scratch
+            .object_header(Oid::parse(id.as_bytes())?)?
+            .expect("physical native fixture must exist");
+        assert_eq!(header.kind(), kind, "header type for {id}");
+        assert_eq!(header.size(), native_size, "header size for {id}");
+    }
+    assert!(scratch.object_header(Oid::ZERO)?.is_none());
+    assert!(
+        scratch
+            .object_header(Oid::parse(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?)?
+            .is_none(),
+        "a missing empty tree must not be synthesized"
+    );
+    let operation = git_rs::process::Operation::new(30);
+    operation.cancel();
+    assert!(
+        operation
+            .enter(|| scratch.object_header(Oid::parse(blob.as_bytes()).expect("fixture OID")))
+            .is_err(),
+        "cancelled header reads must fail rather than return cached object metadata"
+    );
+    assert!(
+        git_rs::process::Operation::new(0)
+            .enter(|| scratch.object_header(Oid::ZERO))
+            .is_err(),
+        "expired missing-object reads must fail rather than report a successful miss"
+    );
+    Ok(())
+}
+
+#[test]
+fn large_loose_and_ref_delta_headers_fit_a_small_address_space() -> Result<()> {
+    const SOURCE: &str = "GIT_RS_LARGE_HEADER_SOURCE";
+    const CASES: &str = "GIT_RS_LARGE_HEADER_CASES";
+    if let Some(source) = std::env::var_os(SOURCE) {
+        let root = Root::new()?;
+        let scratch = Scratch::new(&root.0, 1)?;
+        fs::remove_dir_all(scratch.path.join("objects"))?;
+        std::os::unix::fs::symlink(
+            Path::new(&source).join("objects"),
+            scratch.path.join("objects"),
+        )?;
+        for case in std::env::var(CASES)?.split(',') {
+            let (oid, size) = case.split_once(':').expect("expected native fixture case");
+            let header = scratch
+                .object_header(Oid::parse(oid.as_bytes())?)?
+                .expect("large physical blob must exist");
+            assert_eq!(header.kind(), gix::objs::Kind::Blob);
+            assert_eq!(header.size(), size.parse::<u64>()?, "large blob {oid}");
+        }
+        return Ok(());
+    }
+
+    let root = Root::new()?;
+    let source = Scratch::new(&root.0, 1)?;
+    let mut cases = Vec::new();
+    for size in [
+        git_rs::blame::MAX_BLOB - 1,
+        git_rs::blame::MAX_BLOB,
+        git_rs::blame::MAX_BLOB + 1,
+        git_rs::blame::MAX_BLOB + 4096,
+    ] {
+        let path = root.0.join(format!("synthetic-{size}.bin"));
+        fs::File::create(&path)?.set_len(size)?;
+        let oid = native(
+            &source.path,
+            &["hash-object", "-w", path.to_str().expect("fixture path")],
+            b"",
+        )?;
+        let oid = std::str::from_utf8(&oid)?.trim().to_owned();
+        assert_eq!(
+            native(&source.path, &["cat-file", "-s", &oid], b"")?,
+            format!("{size}\n").as_bytes()
+        );
+        cases.push((oid, size));
+        fs::remove_file(path)?;
+    }
+    let expected = cases
+        .iter()
+        .map(|(oid, size)| format!("{oid}:{size}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let check = |workspace: &Scratch| -> Result<()> {
+        let result = Command::new("/usr/bin/prlimit")
+            .args(["--as=100663296", "--core=0", "--"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "large_loose_and_ref_delta_headers_fit_a_small_address_space",
+                "--test-threads=1",
+            ])
+            .env("MALLOC_ARENA_MAX", "1")
+            .env(SOURCE, &workspace.path)
+            .env(CASES, &expected)
+            .output()?;
+        assert!(
+            result.status.success(),
+            "headers must fit a 96 MiB address space without inflating 128 MiB blobs: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Ok(())
+    };
+    check(&source)?;
+
+    let ids = cases
+        .iter()
+        .map(|(oid, _)| oid.clone() + "\n")
+        .collect::<String>();
+    let pack = native(
+        &source.path,
+        &[
+            "-c",
+            "pack.windowMemory=512m",
+            "pack-objects",
+            "--stdout",
+            "--window=4",
+            "--depth=8",
+            "--no-delta-base-offset",
+        ],
+        ids.as_bytes(),
+    )?;
+    native(&source.path, &["index-pack", "--stdin"], &pack)?;
+    let cache = git_rs::cache::Cache::new(1024 * 1024, 1024 * 1024);
+    let target = Scratch::new(&root.0, 1)?;
+    let mut pins = Vec::new();
+    for entry in fs::read_dir(source.path.join("objects/pack"))? {
+        let path = entry?.path();
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("pack" | "idx")
+        ) {
+            continue;
+        }
+        if path.extension().is_some_and(|ext| ext == "idx") {
+            let inventory = native(
+                &source.path,
+                &["verify-pack", "-v", path.to_str().expect("fixture index")],
+                b"",
+            )?;
+            assert!(
+                inventory.split(|byte| *byte == b'\n').any(|line| {
+                    let fields = line
+                        .split(|byte| *byte == b' ')
+                        .filter(|field| !field.is_empty())
+                        .collect::<Vec<_>>();
+                    fields.len() == 7 && fields[0] == cases[2].0.as_bytes() && fields[1] == b"blob"
+                }),
+                "the oversized target must actually be a native ref-delta, not an undeltified base"
+            );
+        }
+        let bytes = fs::read(&path)?;
+        let mut input = bytes.as_slice();
+        let pin = cache
+            .get_or_load(
+                path.to_str().expect("fixture pack"),
+                bytes.len(),
+                |mut output| {
+                    std::io::copy(&mut input, &mut output)?;
+                    Ok(())
+                },
+            )?
+            .expect("compressed fixture must fit sealed RAM");
+        std::os::unix::fs::symlink(
+            pin.path(),
+            target
+                .path
+                .join("objects/pack")
+                .join(path.file_name().expect("pack filename")),
+        )?;
+        pins.push(pin);
+    }
+    assert_eq!(
+        pins.len(),
+        2,
+        "keep both verified pack/index mappings pinned"
+    );
+    check(&target)?;
+    Ok(())
+}

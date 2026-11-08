@@ -125,6 +125,18 @@ impl Scratch {
         Ok(scratch)
     }
 
+    /// Read a physical object's kind and uncompressed size without decoding its body.
+    /// The workspace and its verified pack/index cache pins stay alive during lookup.
+    pub fn object_header(&self, id: Oid) -> Result<Option<gix::odb::find::Header>> {
+        use gix::odb::Header;
+
+        process::check_operation()?;
+        let header = repository::ObjectHeaders::open(self)?
+            .try_header(gix::ObjectId::from(id.0).as_ref())?;
+        process::check_operation()?;
+        Ok(header)
+    }
+
     /// Restore one leased snapshot into this request-private workspace.
     pub fn restore_refs(&self, refs: &BTreeMap<Vec<u8>, Oid>, default_ref: &[u8]) -> Result<()> {
         use gix::odb::HeaderExt;

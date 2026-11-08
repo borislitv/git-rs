@@ -28,6 +28,8 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
 - Safe Rust with Tokio, tokio-postgres and a bounded SQL pool; `unsafe_code` is forbidden.
   SQL runs in-process, with verified TLS and no SQL subprocess. Request initialization,
   ref restoration and ref-name validation use isolated `gix` library operations.
+  Snapshot and blame object kind/size checks use physical library headers
+  without inflating full blobs or spawning Git.
   Wire protocols, pack/delta normalization and graph validation still use upstream Git.
   The required [Rust server data plane](docs/rust-data-plane.md) records replacement gates;
   native Git remains the compatibility client and test oracle in the target design.
@@ -123,6 +125,7 @@ Requires Linux, Rust **1.99+**, OpenSSL development headers/pkg-config for build
 OpenSSH server/client, GNU coreutils **`/usr/bin/gnutimeout`** and `kill`.
 Ubuntu's coinstallable `gnu-coreutils` package supplies that explicit entrypoint: its default
 uutils `timeout` rejects legal non-UTF-8 ref arguments before Git sees them.
+Bounded-memory Rust tests also require util-linux **`/usr/bin/prlimit`**.
 Build and runtime use Ubuntu **26.04**. The Dockerfile
 checks official Rust/Git archive hashes, upgrades distribution packages and records the installed
 runtime inventory. [Dependency qualification](docs/dependencies.md) distinguishes reproducibility
