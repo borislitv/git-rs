@@ -26,8 +26,11 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
 ```
 
 - Safe Rust with Tokio, tokio-postgres and a bounded SQL pool; `unsafe_code` is forbidden.
-  SQL runs in-process, with verified TLS and no SQL subprocess. Upstream Git handles wire protocols,
-  pack/delta normalization and graph validation.
+  SQL runs in-process, with verified TLS and no SQL subprocess. Request initialization,
+  ref restoration and ref-name validation use isolated `gix` library operations.
+  Wire protocols, pack/delta normalization and graph validation still use upstream Git.
+  The required [Rust server data plane](docs/rust-data-plane.md) records replacement gates;
+  native Git remains the compatibility client and test oracle in the target design.
 - S3 uses a shared in-process HTTP client and the official AWS SigV4 signer. Pack transfers stream
   through bounded buffers; connections are reused, and cancellation drops partial responses.
   HTTPS verifies the certificate chain and hostname; requests do not follow redirects or retry.
@@ -38,8 +41,8 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
   connection loss leaves the lease until expiry rather than prematurely releasing a reader.
 - Concurrent requests share a bounded RAM LRU/singleflight cache. Request scratch is not reused as
   a disk cache. Verified cache files are sealed Linux memfds, linked into private scratch and pinned
-  until native Git exits; cache hits do not copy pack/idx payloads. An empty native-generated bare
-  template is reused in RAM, before any request refs or hooks. Cold replicas reconstruct from SQL/S3.
+  until the request finishes; cache hits do not copy pack/idx payloads. An empty library-generated
+  bare template is reused in RAM, before any request refs or hooks. Cold replicas reconstruct from SQL/S3.
 - Native `git bundle` backups and owner-only physical history truncation are available.
 - Supported fetch behavior includes Git protocol v0/v1/v2, shallow clones, tags and notes.
   Smart HTTP verifies Secret-backed credentials for each request and applies the same repository

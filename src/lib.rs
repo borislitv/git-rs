@@ -13,6 +13,7 @@ pub mod metadata;
 pub mod metrics;
 pub mod process;
 pub mod protocol;
+mod repository;
 pub mod scratch;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

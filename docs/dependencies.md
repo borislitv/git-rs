@@ -55,6 +55,13 @@ Builds need OpenSSL development headers and pkg-config. Fetch locked crates once
 before an offline build; production images contain no PostgreSQL CLI or libpq.
 The test-only image installs psql for independent fixture administration.
 
+Request repository initialization, ref restoration and ref-name validation use
+`gix` 0.90.0 with default features disabled and SHA-1 enabled. Repository opens use
+isolated, strict configuration: no Git binary discovery, external configuration,
+includes or environment overrides. The lockfile retains SHA1_DC (`sha1dc`) support.
+See the [Rust data-plane migration](rust-data-plane.md) for remaining native server
+boundaries and the byte-exact symbolic-HEAD workaround for `gix-ref` 0.69.1.
+
 S3 uses reqwest 0.13.5 with native TLS and the official AWS request signer,
 aws-sigv4 1.6.4 with aws-credential-types 1.3.1. No S3 subprocess is started.
 The process-local Tokio runtime has two workers and at most four blocking workers;

@@ -4,8 +4,13 @@
   tokio-postgres and a bounded connection pool; never execute a SQL subprocess.
 - Prefer established, maintained Rust crates for standard functionality over
   custom implementations. This is not a restriction to the Rust standard library.
-- Use upstream Git for protocols, packs, deltas and object validation. Never execute a shell
-  with client input, check out client trees, or load client hooks/configuration.
+- The target server data plane uses maintained Rust libraries for protocols, packs,
+  deltas, graph validation and blame. Native Git is an external compatibility client
+  and test oracle, not the target server implementation. Existing native server
+  boundaries are migration debt documented in docs/rust-data-plane.md; do not add
+  new ones or remove their guarantees without a verified library replacement.
+- Never execute a shell with client input, check out client trees, or load client
+  hooks/configuration. Open application-owned repositories with isolated library options.
 - PostgreSQL owns refs and the pack catalog; immutable S3 objects own pack/idx bytes.
 - A successful push requires uploads followed by one confirmed SQL transaction.
   Compare complete pre-receive and proc-receive command lists. Never fall through.

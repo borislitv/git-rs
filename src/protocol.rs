@@ -47,6 +47,7 @@ impl Update {
         {
             return Err(invalid("invalid ref namespace"));
         }
+        crate::repository::ref_name(&name)?;
         Ok(Self {
             old: Oid::parse(&line[..OID_HEX])?,
             new: Oid::parse(&line[OID_HEX + 1..OID_HEX * 2 + 1])?,

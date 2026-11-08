@@ -13,7 +13,6 @@ use crate::{
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,42 +63,7 @@ impl Engine {
                 &self.cache,
             )?);
         }
-        let restore = metrics::Timer::start(Metric::Stage(Stage::RestoreRefs));
-        let mut commands = Vec::new();
-        for (name, oid) in &snapshot.refs {
-            commands.extend_from_slice(b"create ");
-            commands.extend_from_slice(name);
-            commands.push(0);
-            commands.extend_from_slice(oid.hex().as_bytes());
-            commands.push(0);
-        }
-        if !commands.is_empty() {
-            process::capture(
-                process::git()
-                    .arg("-C")
-                    .arg(&scratch.path)
-                    .args(["update-ref", "--stdin", "-z"]),
-                &commands,
-                4096,
-            )?;
-        }
-        restore.finish(true);
-        // The native template already points HEAD at main. Other defaults still
-        // go through Git; combining HEAD with its referent in update-ref's
-        // transaction is rejected by upstream Git as a duplicate update.
-        if snapshot.default_ref != b"refs/heads/main" {
-            let head = metrics::Timer::start(Metric::Stage(Stage::RestoreHead));
-            process::capture(
-                process::git()
-                    .arg("-C")
-                    .arg(&scratch.path)
-                    .args(["symbolic-ref", "HEAD"])
-                    .arg(OsStr::from_bytes(&snapshot.default_ref)),
-                b"",
-                4096,
-            )?;
-            head.finish(true);
-        }
+        scratch.restore_refs(&snapshot.refs, &snapshot.default_ref)?;
         Ok(scratch)
     }
 
@@ -116,13 +80,7 @@ impl Engine {
     ) -> Result<()> {
         let refs = metrics::Timer::start(Metric::Stage(Stage::RefValidate));
         for command in commands {
-            process::capture(
-                process::git()
-                    .args(["check-ref-format"])
-                    .arg(OsStr::from_bytes(&command.name)),
-                b"",
-                4096,
-            )?;
+            crate::repository::ref_name(&command.name)?;
             if snapshot
                 .refs
                 .get(&command.name)

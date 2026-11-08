@@ -3,7 +3,11 @@ use crate::{
     cache::CachedFile,
     metrics::{self, Metric, Phase, Stage},
     process,
+    protocol::Oid,
+    repository,
 };
+use gix::bstr::ByteSlice;
+use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File};
 use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
@@ -27,7 +31,7 @@ impl Template {
                 } else if entry.file_type()?.is_file() {
                     template.files.push((path, fs::read(entry.path())?));
                 } else {
-                    return Err(crate::invalid("unexpected native Git template entry"));
+                    return Err(crate::invalid("unexpected repository template entry"));
                 }
             }
             Ok(())
@@ -98,24 +102,84 @@ impl Scratch {
             template.write(&scratch.path)?;
             return Ok(scratch);
         }
-        process::capture(
-            process::git()
-                .args([
-                    "init",
-                    "--bare",
-                    "--object-format=sha1",
-                    "--initial-branch=main",
-                    "--template=",
-                ])
-                .arg(&scratch.path),
-            b"",
-            4096,
+        process::check_operation()?;
+        gix::ThreadSafeRepository::init_opts(
+            &scratch.path,
+            gix::create::Kind::Bare,
+            gix::create::Options {
+                object_hash: Some(gix::hash::Kind::Sha1),
+                ..Default::default()
+            },
+            gix::open::Options::isolated()
+                .strict_config(true)
+                .config_overrides(["init.defaultBranch=main"]),
         )?;
+        // gix includes built-in sample hooks. The request template must contain
+        // no hook directory; only our later, operation-owned broker may add one.
+        fs::remove_dir_all(scratch.path.join("hooks"))?;
+        process::check_operation()?;
         // Capture only this freshly initialized, application-owned repository.
         // Racing first requests may each initialize once; no failed/cancelled
         // initialization is retained. The reusable template lives only in RAM.
         let _ = TEMPLATE.set(Template::read(&scratch.path)?);
         Ok(scratch)
+    }
+
+    /// Restore one leased snapshot into this request-private workspace.
+    pub fn restore_refs(&self, refs: &BTreeMap<Vec<u8>, Oid>, default_ref: &[u8]) -> Result<()> {
+        use gix::odb::HeaderExt;
+        use gix::refs::transaction::{PreviousValue, RefEdit};
+
+        process::check_operation()?;
+        // Validate the complete set before modifying this private workspace.
+        let edits = refs
+            .iter()
+            .map(|(name, oid)| {
+                Ok(RefEdit::update(
+                    repository::ref_name(name)?,
+                    gix::ObjectId::from(oid.0),
+                    PreviousValue::MustNotExist,
+                    "",
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let default_ref = repository::ref_name(default_ref)?;
+        let mut repo = gix::open_opts(
+            &self.path,
+            gix::open::Options::isolated()
+                .strict_config(true)
+                .open_path_as_is(true),
+        )?;
+        repo.refs.write_reflog = gix::refs::store::WriteReflog::Disable;
+        let restore = metrics::Timer::start(Metric::Stage(Stage::RestoreRefs));
+        if !edits.is_empty() {
+            let objects = repository::ObjectHeaders::open(self)?;
+            for (name, oid) in refs {
+                process::check_operation()?;
+                // Match update-ref's physical existence/type checks without
+                // inflating blobs or synthesizing the absent empty tree.
+                let header = objects.header(gix::ObjectId::from(oid.0))?;
+                if name.starts_with(b"refs/heads/") && header.kind() != gix::objs::Kind::Commit {
+                    return Err(crate::invalid("branch must point directly to a commit"));
+                }
+            }
+            repo.edit_references_as(edits, None)?;
+        }
+        process::check_operation()?;
+        restore.finish(true);
+        if default_ref.as_bstr() != b"refs/heads/main".as_bstr() {
+            let head = metrics::Timer::start(Metric::Stage(Stage::RestoreHead));
+            // gix-ref 0.69.1 formats symbolic targets through Display, which
+            // replaces non-UTF-8 bytes. This validated HEAD belongs exclusively
+            // to the unexposed request workspace, so write its bytes directly.
+            let mut bytes = b"ref: ".to_vec();
+            bytes.extend_from_slice(default_ref.as_bstr());
+            bytes.push(b'\n');
+            fs::write(self.path.join("HEAD"), bytes)?;
+            process::check_operation()?;
+            head.finish(true);
+        }
+        Ok(())
     }
 
     pub(crate) fn retain(&mut self, file: Option<Arc<CachedFile>>) {

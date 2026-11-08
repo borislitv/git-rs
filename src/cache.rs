@@ -33,8 +33,8 @@ impl Drop for Reservation {
     }
 }
 
-/// Immutable RAM-only backing shared by native Git readers. Every request that
-/// links this path must retain the handle until its Git children have exited.
+/// Immutable RAM-only backing shared by native and library readers. Every
+/// request linking this path retains the handle until all its readers finish.
 pub struct CachedFile {
     _file: Memfd,
     path: PathBuf,
