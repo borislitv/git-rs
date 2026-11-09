@@ -327,6 +327,228 @@ impl Drop for Backend {
     }
 }
 
+fn blocked_stderr_backend(timings: bool) -> (Backend, UnixStream) {
+    use std::os::fd::OwnedFd;
+    let root = std::env::temp_dir().join(format!(
+        "git-rs-diagnostics-{}",
+        git_rs::scratch::identifier().unwrap()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let stderr: OwnedFd = writer.try_clone().unwrap().into();
+    let child = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("PGHOST", root.join("no-postgres"))
+        .env("PGUSER", "postgres")
+        .env("PGDATABASE", "synthetic")
+        .env("PGSSLMODE", "verify-full")
+        .env("GIT_RS_S3_ENDPOINT", "https://unused.example.invalid")
+        .env("GIT_RS_S3_BUCKET", "synthetic")
+        .env("GIT_RS_S3_ACCESS_KEY", "synthetic")
+        .env("GIT_RS_S3_SECRET_KEY", "synthetic")
+        .env("GIT_RS_OPERATION_SECONDS", "1")
+        .env("GIT_RS_DEBUG_TIMINGS", if timings { "1" } else { "0" })
+        .args(["serve", "--scratch"])
+        .arg(&root)
+        .arg("--socket")
+        .arg(root.join("ssh.sock"))
+        .args([
+            "--health",
+            "127.0.0.1:0",
+            "--dev-http",
+            "127.0.0.1:0",
+            "--dev-principal",
+            "alice",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .unwrap();
+    let mut backend = Backend {
+        child,
+        root,
+        health: String::new(),
+        http: String::new(),
+    };
+    let mut startup = BufReader::new(reader);
+    loop {
+        let mut line = String::new();
+        assert!(
+            startup.read_line(&mut line).unwrap() > 0,
+            "missing startup status"
+        );
+        if let Some(address) = line.trim().strip_prefix("health ") {
+            backend.health = address.into();
+        }
+        if let Some(address) = line.trim().strip_prefix("development HTTP ") {
+            backend.http = address.into();
+        }
+        if line.trim() == "SSH bridge ready" {
+            break;
+        }
+    }
+    writer.set_nonblocking(true).unwrap();
+    loop {
+        match writer.write(&[b'x'; 8192]) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("fill service diagnostic sink: {error}"),
+        }
+    }
+    writer.set_nonblocking(false).unwrap();
+    // Keep the reader alive but never consume it until the backend has exited.
+    (backend, startup.into_inner())
+}
+
+fn scrape_value(backend: &Backend, name: &str) -> u64 {
+    backend
+        .health("/metrics")
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("missing metric {name}"))
+        .parse()
+        .unwrap()
+}
+
+fn failing_request(backend: &Backend, ssh: bool) {
+    if ssh {
+        let mut stream = UnixStream::connect(backend.root.join("ssh.sock")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        for field in [
+            "git-rs-ssh-1",
+            "alice",
+            "team/synthetic",
+            "git-upload-pack",
+            "",
+        ] {
+            git_rs::protocol::write_packet(&mut stream, field.as_bytes()).unwrap();
+        }
+        assert!(git_rs::protocol::receive_framed(&mut stream, &mut Vec::new()).is_err());
+    } else {
+        let mut stream = TcpStream::connect(&backend.http).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream.write_all(b"GET /team/synthetic.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: example.invalid\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(
+            response.is_empty(),
+            "dependency failure cannot return Git success"
+        );
+    }
+}
+
+fn blocked_stderr_releases_failed_requests(ssh: bool) {
+    for timings in [false, true] {
+        let (backend, _unread) = blocked_stderr_backend(timings);
+        for _ in 0..4 {
+            failing_request(&backend, ssh);
+        }
+        let until = Instant::now() + Duration::from_secs(3);
+        while scrape_value(&backend, "git_rs_active_requests") != 0 {
+            assert!(
+                Instant::now() < until,
+                "blocked stderr retained failed request admission (ssh={ssh}, timings={timings})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let transport = if ssh { "ssh" } else { "http" };
+        assert_eq!(
+            scrape_value(
+                &backend,
+                &format!("git_rs_requests_total{{transport=\"{transport}\",outcome=\"error\"}}")
+            ),
+            4
+        );
+        // Reuse real admissions while the diagnostic sink remains full. More
+        // records than the fixed queue can retain must be dropped, not spawned.
+        let baseline_threads = fs::read_dir(format!("/proc/{}/task", backend.child.id()))
+            .unwrap()
+            .count();
+        for _ in 0..1100 {
+            failing_request(&backend, ssh);
+            // A terminal SSH failure frame can arrive before the serving
+            // closure drops its permit. Wait for actual ownership release,
+            // rather than accidentally testing legitimate transient overload.
+            let until = Instant::now() + Duration::from_secs(3);
+            while scrape_value(&backend, "git_rs_active_requests") != 0 {
+                assert!(
+                    Instant::now() < until,
+                    "diagnostic overflow retained admission"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            scrape_value(
+                &backend,
+                &format!("git_rs_requests_total{{transport=\"{transport}\",outcome=\"error\"}}")
+            ),
+            1104
+        );
+        assert!(scrape_value(&backend, "git_rs_service_logs_dropped_total") > 0);
+        assert_eq!(scrape_value(&backend, "git_rs_cache_allocated_bytes"), 0);
+        assert_eq!(
+            scrape_value(
+                &backend,
+                &format!("git_rs_admission_rejections_total{{listener=\"{transport}\"}}")
+            ),
+            0
+        );
+        let threads = fs::read_dir(format!("/proc/{}/task", backend.child.id()))
+            .unwrap()
+            .count();
+        assert!(
+            threads <= baseline_threads + 4,
+            "diagnostics must not accumulate blocked request threads: {baseline_threads} -> {threads}"
+        );
+    }
+}
+
+#[test]
+fn blocked_stderr_http_dependency_errors_release_admission() {
+    blocked_stderr_releases_failed_requests(false);
+}
+
+#[test]
+fn blocked_stderr_ssh_dependency_errors_release_admission() {
+    blocked_stderr_releases_failed_requests(true);
+}
+
+#[test]
+fn cli_and_startup_errors_remain_visible_with_or_without_timing_logs() {
+    for timings in ["0", "1"] {
+        for (args, message) in [
+            (
+                vec!["create", "team/synthetic", "alice"],
+                "PostgreSQL configuration invalid",
+            ),
+            (vec!["serve"], "missing --scratch"),
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+                .env_clear()
+                .env("GIT_RS_DEBUG_TIMINGS", timings)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains(&format!("git-rs: {message}")), "{stderr}");
+            assert!(
+                output.stdout.is_empty(),
+                "CLI diagnostics must not become stdout data"
+            );
+        }
+    }
+}
+
 #[test]
 fn partial_health_request_does_not_starve_liveness() {
     let backend = Backend::start();

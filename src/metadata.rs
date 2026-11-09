@@ -135,7 +135,7 @@ impl Drop for Barrier {
                 ))
             })
         });
-        if released.is_err() {
+        if released.is_err() && !metrics::service_event(metrics::ServiceEvent::LeaseReleaseFailed) {
             eprintln!("repository lease release failed; expiry will recover it");
         }
     }

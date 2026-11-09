@@ -15,6 +15,77 @@ struct TimingLogs {
     origin: Instant,
 }
 static TIMING_LOGS: OnceLock<Option<TimingLogs>> = OnceLock::new();
+static SERVICE_LOGS: OnceLock<std::result::Result<NonBlocking, &'static str>> = OnceLock::new();
+
+/// Closed, request-independent diagnostics. Never enqueue formatted errors,
+/// client identities, paths or other unbounded request data.
+pub enum ServiceEvent {
+    HttpOperationFailed,
+    SshOperationFailed,
+    HttpAcceptFailed,
+    HookRejected,
+    HookSocketCleanupFailed,
+    ServingSocketCleanupFailed,
+    LeaseReleaseFailed,
+    ScratchCleanupFailed,
+}
+
+impl ServiceEvent {
+    fn record(self) -> &'static [u8] {
+        match self {
+            Self::HttpOperationFailed => b"git_rs_error event=http_operation_failed\n",
+            Self::SshOperationFailed => b"git_rs_error event=ssh_operation_failed\n",
+            Self::HttpAcceptFailed => b"git_rs_error event=http_accept_failed\n",
+            Self::HookRejected => b"git_rs_error event=hook_rejected\n",
+            Self::HookSocketCleanupFailed => b"git_rs_error event=hook_socket_cleanup_failed\n",
+            Self::ServingSocketCleanupFailed => {
+                b"git_rs_error event=serving_socket_cleanup_failed\n"
+            }
+            Self::LeaseReleaseFailed => b"git_rs_error event=lease_release_failed\n",
+            Self::ScratchCleanupFailed => b"git_rs_error event=scratch_cleanup_failed\n",
+        }
+    }
+}
+
+/// Initialize once at serving startup, independently of optional timing logs.
+/// The process/serve owner, never a request, retains the shutdown guard. The
+/// queue holds at most 1024 fixed-size records and one worker owns sink I/O.
+pub fn init_service_logs() -> Result<Option<TimingGuard>> {
+    use std::os::fd::AsFd;
+    let mut guard = None;
+    SERVICE_LOGS
+        .get_or_init(|| {
+            // An owned descriptor avoids holding Rust's global stderr mutex
+            // while the sink is blocked. Do not change its shared file flags.
+            let sink = std::fs::File::from(
+                std::io::stderr()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_err(|_| "cannot initialize service diagnostics")?,
+            );
+            let (writer, worker) = NonBlockingBuilder::default()
+                .buffered_lines_limit(1024)
+                .lossy(true)
+                .thread_name("git-rs-errors")
+                .finish(sink);
+            guard = Some(TimingGuard(Some(worker)));
+            Ok(writer)
+        })
+        .as_ref()
+        .map_err(|message| crate::invalid(message))?;
+    Ok(guard)
+}
+
+/// True means serving owns this diagnostic, even if its bounded queue drops it.
+/// CLI/library callers without serving initialization keep their existing error
+/// reporting; requests must never fall back to synchronous stderr on overflow.
+pub fn service_event(event: ServiceEvent) -> bool {
+    let Some(Ok(writer)) = SERVICE_LOGS.get() else {
+        return false;
+    };
+    let _ = writer.clone().write_all(event.record());
+    true
+}
 
 #[must_use]
 pub struct TimingGuard(Option<WorkerGuard>);
@@ -390,6 +461,17 @@ impl Registry {
             .and_then(Option::as_ref)
             .map_or(0, |logs| logs.writer.error_counter().dropped_lines());
         writeln!(output, "git_rs_timing_logs_dropped_total {dropped}").unwrap();
+        header(
+            &mut output,
+            "git_rs_service_logs_dropped_total",
+            "Fixed service diagnostics discarded by the bounded queue; not sink write errors.",
+            "counter",
+        );
+        let dropped = SERVICE_LOGS
+            .get()
+            .and_then(|logs| logs.as_ref().ok())
+            .map_or(0, |logs| logs.error_counter().dropped_lines());
+        writeln!(output, "git_rs_service_logs_dropped_total {dropped}").unwrap();
         header(
             &mut output,
             "git_rs_requests_total",

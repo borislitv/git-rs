@@ -21,6 +21,7 @@ restart. Scrapes do not perform SQL or S3 requests.
 | `git_rs_active_requests` | Gauge | Admitted Git transport connections; excludes health handlers |
 | `git_rs_cache_allocated_bytes` | Gauge | Cache reservations, entries and reader-pinned files, rounded to 4 KiB; not total RSS |
 | `git_rs_timing_logs_dropped_total` | Counter | Diagnostic records discarded by the bounded timing queue; not sink write errors |
+| `git_rs_service_logs_dropped_total` | Counter | Fixed service error records discarded by the bounded service queue; not sink write errors |
 | `git_rs_requests_total` | Counter | `transport=ssh,http`; `outcome=success,error,unauthorized,bad_request` |
 | `git_rs_request_duration_seconds` | Histogram | `transport`; complete admitted connection lifetime including cleanup |
 | `git_rs_phase_duration_seconds` | Histogram | `phase=snapshot,materialize,scratch_init,git,pre_receive,validate,graph,upload,publish` |
@@ -94,6 +95,19 @@ Stages overlap phases, dependencies and other stages. They are not an additive C
 An error, cancellation or unwind before a timer's successful finish counts as an error.
 Administrative commands, probes and cleanup may contribute independently of transport requests.
 The retained `program="sha256sum"` series is zero for current in-process hashing.
+
+## Bounded service diagnostics
+
+Serving startup always initializes a separate `tracing-appender` worker with a
+1024-record lossy queue, even without debug timing logs. Request errors, hook
+rejections and cleanup failures enqueue only fixed `git_rs_error event=...`
+records, never formatted errors, credentials or request data. A stalled stderr
+sink cannot retain request admission, cleanup owners or an unbounded number of
+logging threads. Queue overflow drops records and increments
+`git_rs_service_logs_dropped_total`; request/dependency metrics remain available.
+The queue and its single sink worker are process-owned, not request-owned.
+Its shutdown guard uses the same bounded flushing policy as timing logs below.
+Startup status and CLI errors retain their ordinary synchronous stderr behavior.
 
 ## Opt-in correlated timing logs
 

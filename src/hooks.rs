@@ -1,5 +1,8 @@
 use crate::protocol::{self, Update};
-use crate::{Result, invalid};
+use crate::{
+    Result, invalid,
+    metrics::{self, ServiceEvent},
+};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -175,7 +178,9 @@ pub fn broker(
             if result.is_ok() { b"ok" } else { b"rejected" },
         )?;
         socket.flush()?;
-        if let Err(error) = result {
+        if let Err(error) = result
+            && !metrics::service_event(ServiceEvent::HookRejected)
+        {
             eprintln!("hook rejected: {error}");
         }
     }
@@ -215,7 +220,9 @@ impl PrivateSocket {
 }
 impl Drop for PrivateSocket {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.directory) {
+        if let Err(error) = fs::remove_dir_all(&self.directory)
+            && !metrics::service_event(ServiceEvent::HookSocketCleanupFailed)
+        {
             eprintln!("hook socket cleanup failed: {error}");
         }
     }
@@ -284,7 +291,9 @@ impl ServingSocket {
 }
 impl Drop for ServingSocket {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.path) {
+        if let Err(error) = fs::remove_file(&self.path)
+            && !metrics::service_event(ServiceEvent::ServingSocketCleanupFailed)
+        {
             eprintln!("serving socket cleanup failed: {error}");
         }
     }

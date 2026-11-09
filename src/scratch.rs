@@ -206,7 +206,9 @@ impl Drop for Scratch {
         let timer = metrics::Timer::start(Metric::Stage(Stage::ScratchCleanup));
         let result = fs::remove_dir_all(&self.path);
         timer.finish(result.is_ok());
-        if let Err(error) = result {
+        if let Err(error) = result
+            && !metrics::service_event(metrics::ServiceEvent::ScratchCleanupFailed)
+        {
             eprintln!("scratch cleanup failed: {error}");
         }
     }

@@ -198,8 +198,8 @@ class CommitRelay(socketserver.BaseRequestHandler):
 
 
 def cache_lifecycle_test(f, gateway, normal_url):
-    """A live request retains sealed pack/idx files after LRU eviction."""
-    print("request pins survive cache eviction through native Git", flush=True)
+    """Pinned files remain reusable; unpinned files retire under real pressure."""
+    print("request pins remain reusable through native Git cache pressure", flush=True)
     slug = "team/cache-lifecycle"
     f.cli("create", slug, "alice")
     source = f.base / "cache-source"
@@ -219,6 +219,7 @@ def cache_lifecycle_test(f, gateway, normal_url):
     f.env["GIT_RS_CACHE_BYTES"] = "0"
     url = f"http://127.0.0.1:{port}/{slug}.git"
     gateway.arm("pause-second-pack")
+    backing = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         reader = pool.submit(f.git, source, "ls-remote", url)
         try:
@@ -236,18 +237,43 @@ def cache_lifecycle_test(f, gateway, normal_url):
                                "AND repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/cache-lifecycle')")
                 assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
                 assert path.stat().st_ino == target.stat().st_ino
+                backing.append((target, (target.stat().st_dev, target.stat().st_ino)))
             assert metric_value(f.health("cache-pins", "/metrics")[1], "git_rs_cache_allocated_bytes") == 8192
             f.git(pack.parents[2], "verify-pack", index)
         finally:
             gateway.reset()
         assert reader.result(timeout=15).stdout == expected
     wait_for(lambda: metric_value(f.health("cache-pins", "/metrics")[1],
-                                  "git_rs_cache_allocated_bytes") == 0, "evicted request pin release")
+                                  "git_rs_active_requests") == 0, "completed cache reader")
+    assert metric_value(f.health("cache-pins", "/metrics")[1],
+                        "git_rs_cache_allocated_bytes") == 8192, "cache retains its reusable ownership"
+    hits = metric_value(f.health("cache-pins", "/metrics")[1],
+                        'git_rs_cache_lookups_total{result="hit"}')
     clone = f.base / "cache-clone"
     f.git(source, "clone", url, clone)
     f.git(clone, "fsck", "--strict", "--full")
     assert (clone / "initial.txt").read_text() == "first synthetic object\n"
     assert (clone / "next.txt").read_text() == "second synthetic object\n"
+    assert metric_value(f.health("cache-pins", "/metrics")[1],
+                        'git_rs_cache_lookups_total{result="hit"}') >= hits + 2, "pack and index must be reused"
+
+    # After readers finish, a different tiny repository must be able to evict
+    # both cache-owned files without exceeding the same two-page reservation.
+    f.cli("create", "team/cache-pressure", "alice")
+    pressure = f.base / "cache-pressure-source"
+    f.git(f.base, "init", "--initial-branch=main", pressure)
+    (pressure / "pressure.txt").write_text("independent synthetic pressure\n")
+    f.git(pressure, "add", ".")
+    f.git(pressure, "commit", "-m", "Synthetic cache pressure")
+    pressure_normal = normal_url.replace("team/project.git", "team/cache-pressure.git")
+    f.git(pressure, "push", pressure_normal, "main")
+    pressure_url = url.replace("cache-lifecycle.git", "cache-pressure.git")
+    assert f.git(pressure, "ls-remote", pressure_url).stdout == f.git(pressure, "ls-remote", pressure_normal).stdout
+    wait_for(lambda: metric_value(f.health("cache-pins", "/metrics")[1],
+                                  "git_rs_active_requests") == 0, "completed pressure reader")
+    assert metric_value(f.health("cache-pins", "/metrics")[1], "git_rs_cache_allocated_bytes") == 8192
+    for target, identity in backing:
+        assert not target.exists() or (target.stat().st_dev, target.stat().st_ino) != identity, "unpinned backing must retire"
 
     # Reusing the empty native template must not leak a previous request's HEAD.
     branch = b"refs/heads/\xff"

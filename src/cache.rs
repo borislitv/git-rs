@@ -156,6 +156,10 @@ impl Cache {
             let Some(oldest) = state
                 .entries
                 .iter()
+                // Removing a reader-pinned entry cannot free its reservation.
+                // Keep it discoverable so other requests can reuse the same file
+                // rather than bypassing to another download of the same bytes.
+                .filter(|(_, (_, buffer))| Arc::strong_count(buffer) == 1)
                 .min_by_key(|(_, (tick, _))| tick)
                 .map(|(key, _)| key.clone())
             else {

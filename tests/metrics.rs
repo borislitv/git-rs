@@ -197,6 +197,11 @@ fn timing_log_fixture() {
         return;
     }
     let _timing_guard = git_rs::metrics::init_timing_logs();
+    let service_guard = if std::env::var("GIT_RS_TIMING_BACKPRESSURE").as_deref() == Ok("1") {
+        git_rs::metrics::init_service_logs().unwrap()
+    } else {
+        None
+    };
     use git_rs::{
         metrics::{self, RequestTimer, Timer},
         process::Operation,
@@ -265,13 +270,35 @@ fn timing_log_fixture() {
     assert!(Operation::current().is_none());
     metrics::measure(Metric::Phase(Phase::Materialize), || Ok(())).unwrap();
     if std::env::var("GIT_RS_TIMING_BACKPRESSURE").as_deref() == Ok("1") {
+        use std::fs;
+        use std::os::unix::fs::DirBuilderExt;
+        // External deletion is a reachable cleanup failure. Exercise the real
+        // public RAII owners, not a mocked log call, with the sink already full.
+        let root = std::env::temp_dir().join(format!(
+            "git-rs-cleanup-{}",
+            git_rs::scratch::identifier().unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let scratch = git_rs::scratch::Scratch::new(&root, 1).unwrap();
+        fs::remove_dir_all(&scratch.path).unwrap();
+        let hook = git_rs::hooks::PrivateSocket::new().unwrap();
+        fs::remove_dir_all(hook.path.parent().unwrap()).unwrap();
+        let socket_path = root.join("serve.sock");
+        let serving = git_rs::hooks::ServingSocket::bind(&socket_path).unwrap();
+        fs::remove_file(&socket_path).unwrap();
         let admission = git_rs::process::Admission::new(1);
         let permit = admission.try_admit().unwrap();
         Operation::new(1).with_interrupt(
             || {},
             || {
                 let _permit = permit;
+                drop(scratch);
+                drop(hook);
+                drop(serving);
                 for _ in 0..8192 {
+                    assert!(metrics::service_event(
+                        metrics::ServiceEvent::LeaseReleaseFailed
+                    ));
                     metrics::measure(
                         Metric::Stage(Stage::GitWait),
                         git_rs::process::check_operation,
@@ -282,18 +309,71 @@ fn timing_log_fixture() {
         );
         assert_eq!(admission.active(), 0);
         assert!(admission.try_admit().is_some());
+        fs::remove_dir_all(root).unwrap();
+        assert!(sample("git_rs_service_logs_dropped_total") > 0);
         assert!(
             sample("git_rs_timing_logs_dropped_total") > 0,
             "the full diagnostic queue must drop records rather than block"
         );
         // Let the parent fill stdout after the test harness startup output. Exit
         // directly after guard destruction so harness output cannot mask a hang.
-        println!("timing_fixture_ready");
+        // With one test thread, libtest leaves its test-name prefix on this line.
+        // Keep the control marker separate from harness output for the parent.
+        println!("\ntiming_fixture_ready");
         std::io::stdout().flush().unwrap();
         use std::io::Read;
         std::io::stdin().read_exact(&mut [0]).unwrap();
         drop(_timing_guard);
+        drop(service_guard);
         std::process::exit(0);
+    }
+}
+
+#[test]
+fn service_log_fixture() {
+    if std::env::var("GIT_RS_SERVICE_LOG_FIXTURE").as_deref() != Ok("1") {
+        return;
+    }
+    let _timings = git_rs::metrics::init_timing_logs();
+    let _service = git_rs::metrics::init_service_logs().unwrap();
+    use git_rs::metrics::{ServiceEvent::*, service_event};
+    for event in [
+        HttpOperationFailed,
+        SshOperationFailed,
+        HttpAcceptFailed,
+        HookRejected,
+        HookSocketCleanupFailed,
+        ServingSocketCleanupFailed,
+        LeaseReleaseFailed,
+        ScratchCleanupFailed,
+    ] {
+        assert!(service_event(event));
+    }
+}
+
+#[test]
+fn service_diagnostics_have_only_fixed_records_with_or_without_timing_logs() {
+    for timings in ["0", "1"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "service_log_fixture", "--nocapture"])
+            .env("GIT_RS_SERVICE_LOG_FIXTURE", "1")
+            .env("GIT_RS_DEBUG_TIMINGS", timings)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            concat!(
+                "git_rs_error event=http_operation_failed\n",
+                "git_rs_error event=ssh_operation_failed\n",
+                "git_rs_error event=http_accept_failed\n",
+                "git_rs_error event=hook_rejected\n",
+                "git_rs_error event=hook_socket_cleanup_failed\n",
+                "git_rs_error event=serving_socket_cleanup_failed\n",
+                "git_rs_error event=lease_release_failed\n",
+                "git_rs_error event=scratch_cleanup_failed\n",
+            )
+        );
     }
 }
 

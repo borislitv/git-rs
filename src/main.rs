@@ -7,7 +7,7 @@ use git_rs::{
     cache::Cache,
     engine::Engine,
     history, hooks, http, invalid, metadata,
-    metrics::{self, Listener, Outcome, RequestTimer, Transport},
+    metrics::{self, Listener, Outcome, RequestTimer, ServiceEvent, Transport},
     process::Admission,
     protocol,
 };
@@ -179,6 +179,7 @@ fn serve(args: &[String]) -> Result<()> {
             blame_capacity("GIT_RS_BLAME_WAITERS", 0)?,
         )?;
     metrics::global();
+    let _diagnostics = metrics::init_service_logs()?;
     // Validate credentials before opening any serving listener. Production and
     // fixed-principal development HTTP can never be enabled in the same process.
     let production_http = args
@@ -269,16 +270,16 @@ fn serve(args: &[String]) -> Result<()> {
                                         http::handle_authenticated(stream, &engine, credentials)
                                     }
                                 };
-                                if let Err(error) = result {
-                                    eprintln!("HTTP operation failed: {error}");
+                                if result.is_err() {
+                                    metrics::service_event(ServiceEvent::HttpOperationFailed);
                                 }
                             });
                         } else {
                             metrics::global().reject(Listener::Http);
                         }
                     }
-                    Err(error) => {
-                        eprintln!("HTTP accept failed: {error}");
+                    Err(_) => {
+                        metrics::service_event(ServiceEvent::HttpAcceptFailed);
                         break;
                     }
                 }
@@ -292,8 +293,8 @@ fn serve(args: &[String]) -> Result<()> {
             let engine = engine.clone();
             std::thread::spawn(move || {
                 let _slot = slot;
-                if let Err(error) = session(socket, &engine) {
-                    eprintln!("SSH operation failed: {error}");
+                if session(socket, &engine).is_err() {
+                    metrics::service_event(ServiceEvent::SshOperationFailed);
                 }
             });
         } else {

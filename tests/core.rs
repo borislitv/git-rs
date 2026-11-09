@@ -155,13 +155,52 @@ fn eviction_does_not_forget_pinned_memory() {
     assert_eq!(cache.allocated(), 4096);
     assert_eq!(fs::read(pinned.path()).unwrap(), b"12345678");
     drop(pinned);
-    assert_eq!(cache.allocated(), 0);
+    assert_eq!(cache.allocated(), 4096, "the cache still owns the entry");
     let next = cache
         .get_or_load("repo-b:pack", 8, |file| fill(file, b"abcdefgh"))
         .unwrap()
         .unwrap();
     assert_eq!(fs::read(next.path()).unwrap(), b"abcdefgh");
     assert_eq!(cache.allocated(), 4096);
+}
+
+#[test]
+fn cache_pressure_keeps_pinned_entries_reusable() {
+    let cache = Cache::new(8192, 8);
+    let pinned = cache
+        .get_or_load("pinned", 8, |file| fill(file, b"12345678"))
+        .unwrap()
+        .unwrap();
+    drop(
+        cache
+            .get_or_load("evictable", 8, |file| fill(file, b"abcdefgh"))
+            .unwrap()
+            .unwrap(),
+    );
+    let replacement = cache
+        .get_or_load("replacement", 8, |file| fill(file, b"replaced"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cache.allocated(), 8192);
+    let hit = cache
+        .get_or_load("pinned", 8, |_| panic!("a live pin must remain reusable"))
+        .unwrap()
+        .expect("pressure must evict only entries that can release their reservation");
+    assert!(Arc::ptr_eq(&pinned, &hit));
+    assert_eq!(fs::read(hit.path()).unwrap(), b"12345678");
+    assert_eq!(fs::read(replacement.path()).unwrap(), b"replaced");
+    assert!(
+        cache
+            .get_or_load("overflow", 8, |_| panic!("all pinned must bypass"))
+            .unwrap()
+            .is_none()
+    );
+    let after_bypass = cache
+        .get_or_load("replacement", 8, |_| panic!("bypass must not discard pins"))
+        .unwrap()
+        .expect("bypass must preserve reusable pinned entries");
+    assert!(Arc::ptr_eq(&replacement, &after_bypass));
+    assert_eq!(cache.allocated(), 8192);
 }
 
 #[test]
