@@ -9,9 +9,10 @@ The current implementation is partway through this migration; the runtime image
 still requires Git until every remaining boundary below is replaced and qualified.
 
 Safe Rust, byte-oriented Git names, request cancellation and bounded resources
-remain requirements. A Rust implementation may use isolated Rust worker processes
-for CPU, memory and crash isolation. Moving an algorithm into the serving process
-does not by itself give it a hard cancellation boundary.
+remain requirements. The target is one shared Rust core with cooperative checks
+inside long-running algorithms. The existing external blame executable is migration
+debt, not a permanent second backend. Moving work into the serving process does not
+by itself give it a hard cancellation boundary.
 
 ## Current replacement map
 
@@ -76,6 +77,33 @@ catalog digests, object closure and memory limits. Repository-level graph/index
 work should not be rebuilt independently for each queried file.
 
 ## Storage and failure semantics
+
+`derived_cache` provides independently migrated opaque artifacts before the Git
+engine refactor. It is not yet connected to serving/blame. `cache-migrate` initializes
+logged `git_rs_cache` tables through an independent, bounded PostgreSQL pool. The
+metadata text-row limit remains 8,192 bytes; artifacts use parameterized binary
+transport. Keys include repository, security scope, object format, ordered inputs,
+options, representation and producer version. Only raw payload encoding is currently
+supported, so there is no implicit decompression or unbounded expansion.
+
+The caller supplies an `Access` implementation retaining an independently owned
+source hold and checking authorization/fences. A cache claim cannot replace it.
+Claims use fresh tokens, increasing generations, database-clock leases and a hard
+job lifetime. Publication is conditional; ambiguous publication is confirmed using
+its exact key/payload/digest. This is optional derivation, not a source transaction.
+
+Inline payloads and S3 GETs are bounded and verified before immutable RAM ownership.
+The S3 upload uses sealed memfd staging, never a persistent local cache. Cache S3
+configuration is explicit and separate from source storage. Durable upload intents,
+read holds, irreversible retirement and never-reused keys protect reclamation.
+`CacheMaintenance` is a library interface using its own cache-database claim; the
+elected source-maintenance Deployment is a later integration.
+
+The opaque-artifact `Coordinator` coalesces local requests, owns actual-work permits
+and source holds after waiter cancellation, and uses a finite independent operation
+budget. Its trusted computation callback must poll `Derivation::check()` inside
+bounded loops. This is not a general hard-stop guarantee for arbitrary callbacks;
+the later Git-core executor must qualify every inner algorithm separately.
 
 PostgreSQL remains authoritative for refs, authorization, catalog and fencing;
 immutable S3 objects hold pack/index bytes. Computation changing from Git CLI to

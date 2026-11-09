@@ -49,7 +49,16 @@ fn digest_reader(mut input: impl Read) -> Result<String> {
 
 impl Store {
     pub fn from_env() -> Result<Self> {
-        let endpoint = std::env::var("GIT_RS_S3_ENDPOINT")?;
+        Self::from_env_prefix("GIT_RS_S3_")
+    }
+
+    pub(crate) fn from_cache_env() -> Result<Self> {
+        Self::from_env_prefix("GIT_RS_CACHE_S3_")
+    }
+
+    fn from_env_prefix(prefix: &str) -> Result<Self> {
+        let setting = |name: &str| std::env::var(format!("{prefix}{name}"));
+        let endpoint = setting("ENDPOINT")?;
         let url = reqwest::Url::parse(&endpoint).map_err(|_| invalid("invalid S3 endpoint"))?;
         let local_http = std::env::var("GIT_RS_DEV_HTTP").as_deref() == Ok("1")
             && url.scheme() == "http"
@@ -71,10 +80,10 @@ impl Store {
         }
         let store = Self {
             endpoint: url.as_str().trim_end_matches('/').into(),
-            bucket: std::env::var("GIT_RS_S3_BUCKET")?,
-            region: std::env::var("GIT_RS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            access: std::env::var("GIT_RS_S3_ACCESS_KEY")?,
-            secret: std::env::var("GIT_RS_S3_SECRET_KEY")?,
+            bucket: setting("BUCKET")?,
+            region: setting("REGION").unwrap_or_else(|_| "us-east-1".into()),
+            access: setting("ACCESS_KEY")?,
+            secret: setting("SECRET_KEY")?,
         };
         if store.bucket.is_empty()
             || !store
@@ -91,6 +100,51 @@ impl Store {
         }
         transport::initialize()?;
         Ok(store)
+    }
+
+    pub(crate) fn put_cache_bytes(&self, key: &str, bytes: &[u8], hash: &str) -> Result<()> {
+        use std::io::Write;
+        let file = memfd::MemfdOptions::default()
+            .allow_sealing(true)
+            .create("git-rs-cache-upload")?;
+        let mut writer = file.as_file();
+        for chunk in bytes.chunks(65536) {
+            process::check_operation()?;
+            writer.write_all(chunk)?;
+        }
+        file.add_seals(&[
+            memfd::FileSeal::SealWrite,
+            memfd::FileSeal::SealGrow,
+            memfd::FileSeal::SealShrink,
+            memfd::FileSeal::SealSeal,
+        ])?;
+        writer.rewind()?;
+        self.request(
+            reqwest::Method::PUT,
+            &format!("{}/{}/{}", self.endpoint, self.bucket, key),
+            Some(hash),
+            Some(writer.try_clone()?),
+            &mut std::io::sink(),
+            4096,
+            30,
+        )
+    }
+
+    pub(crate) fn get_cache_bytes(&self, key: &str, size: usize) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(size);
+        self.request(
+            reqwest::Method::GET,
+            &format!("{}/{}/{}", self.endpoint, self.bucket, key),
+            None,
+            None,
+            &mut bytes,
+            size as u64,
+            30,
+        )?;
+        if bytes.len() != size {
+            return Err(invalid("cache object size mismatch"));
+        }
+        Ok(bytes)
     }
 
     fn transfer(

@@ -7,18 +7,14 @@ use crate::{
 };
 use deadpool_postgres::{Client, Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
-use native_tls::{Certificate, Identity, Protocol, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
-use std::{env, fs, pin::pin, sync::OnceLock, time::Duration};
+use std::{pin::pin, sync::OnceLock, time::Duration};
 use tokio::runtime::{Builder, Runtime};
-use tokio_postgres::{
-    Config, SimpleQueryMessage,
-    config::{SslMode, TargetSessionAttrs},
-};
+use tokio_postgres::SimpleQueryMessage;
+
+pub(crate) mod config;
 
 const CONNECTIONS: usize = 8;
-const OPTIONS: &str =
-    "-c statement_timeout=30000 -c lock_timeout=5000 -c search_path=git_rs,pg_catalog";
 
 struct Database {
     runtime: Runtime,
@@ -28,12 +24,12 @@ struct Database {
 
 // ClientWrapper aborts its connection task when destroyed. Returning an object
 // to deadpool is allowed only after complete response consumption and reset.
-struct Checkout(Option<Client>, MakeTlsConnector);
+pub(crate) struct Checkout(pub Option<Client>, pub MakeTlsConnector);
 impl Checkout {
-    fn client(&self) -> &Client {
+    pub(crate) fn client(&self) -> &Client {
         self.0.as_ref().expect("owned PostgreSQL checkout")
     }
-    fn recycle(mut self) {
+    pub(crate) fn recycle(mut self) {
         drop(self.0.take());
     }
 }
@@ -55,70 +51,7 @@ impl Drop for Checkout {
 
 impl Database {
     fn new() -> Result<Self> {
-        let host = env::var("PGHOST").map_err(|_| invalid("PGHOST is required"))?;
-        let mode = env::var("PGSSLMODE").unwrap_or_default();
-        let plaintext = mode == "disable"
-            && env::var("GIT_RS_DEV_HTTP").as_deref() == Ok("1")
-            && matches!(host.as_str(), "127.0.0.1" | "localhost");
-        if mode != "verify-full" && !plaintext {
-            return Err(invalid(
-                "PostgreSQL requires PGSSLMODE=verify-full outside loopback development",
-            ));
-        }
-        let mut config = Config::new();
-        config
-            .host(&host)
-            .port(
-                env::var("PGPORT")
-                    .unwrap_or_else(|_| "5432".into())
-                    .parse()?,
-            )
-            .user(&env::var("PGUSER").map_err(|_| invalid("PGUSER is required"))?)
-            .dbname(&env::var("PGDATABASE").map_err(|_| invalid("PGDATABASE is required"))?)
-            .application_name("git-rs")
-            .connect_timeout(Duration::from_secs(5))
-            .options(OPTIONS)
-            .ssl_mode(if plaintext {
-                SslMode::Disable
-            } else {
-                SslMode::Require
-            });
-        if let Ok(password) = env::var("PGPASSWORD") {
-            config.password(password);
-        }
-        match env::var("PGTARGETSESSIONATTRS").as_deref() {
-            Ok("read-write") => {
-                config.target_session_attrs(TargetSessionAttrs::ReadWrite);
-            }
-            Ok("any") | Err(_) => {}
-            _ => return Err(invalid("unsupported PGTARGETSESSIONATTRS")),
-        }
-        let mut tls = TlsConnector::builder();
-        tls.min_protocol_version(Some(Protocol::Tlsv12));
-        if let Ok(path) = env::var("PGSSLROOTCERT") {
-            tls.disable_built_in_roots(true);
-            let roots = openssl::x509::X509::stack_from_pem(&fs::read(path)?)?;
-            if roots.is_empty() {
-                return Err(invalid("PostgreSQL CA bundle is empty"));
-            }
-            for root in roots {
-                tls.add_root_certificate(Certificate::from_der(&root.to_der()?)?);
-            }
-        }
-        match (env::var("PGSSLCERT"), env::var("PGSSLKEY")) {
-            (Ok(cert), Ok(key)) => {
-                tls.identity(Identity::from_pkcs8(&fs::read(cert)?, &fs::read(key)?)?);
-            }
-            (Err(_), Err(_)) => {}
-            _ => {
-                return Err(invalid(
-                    "PGSSLCERT and PGSSLKEY must be configured together",
-                ));
-            }
-        }
-        // native-tls verifies the hostname and certificate chain by default.
-        // Never enable its invalid-certificate/invalid-hostname bypasses.
-        let tls = MakeTlsConnector::new(tls.build()?);
+        let config::ConnectionConfig { config, tls } = config::ConnectionConfig::from_env(false)?;
         let manager = Manager::from_config(
             config,
             tls.clone(),
@@ -229,7 +162,7 @@ impl Database {
     }
 }
 
-fn sql_error(error: tokio_postgres::Error) -> Box<dyn std::error::Error + Send + Sync> {
+pub(crate) fn sql_error(error: tokio_postgres::Error) -> Box<dyn std::error::Error + Send + Sync> {
     // Database messages may contain identities, values or SQL. Publish SQLSTATE
     // only; transport/configuration failures never include connection secrets.
     match error.code() {

@@ -414,6 +414,8 @@ fn run() -> Result<()> {
         Some("ssh") => bridge(&args),
         Some("authorized-keys") => authorized_keys(&args),
         Some("migrate") => metadata::migrate(),
+        Some("cache-migrate") if args.len() == 2 => git_rs::process::Operation::new(30)
+            .enter(|| git_rs::derived_cache::DerivedCache::from_env()?.migrate()),
         Some("create") if args.len() == 4 => metadata::create(&args[2], &args[3]),
         Some("grant") if args.len() == 7 => {
             metadata::grant(&args[2], &args[3], &args[4], &args[5], args[6].as_bytes())
@@ -447,7 +449,7 @@ fn run() -> Result<()> {
             })
         }
         _ => Err(invalid(
-            "usage: git-rs serve --scratch DIR --socket PATH [--http ADDRESS --http-credentials FILE | --dev-http 127.0.0.1:PORT --dev-principal NAME] | ssh --socket PATH --principal NAME | migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX",
+            "usage: git-rs serve --scratch DIR --socket PATH [--http ADDRESS --http-credentials FILE | --dev-http 127.0.0.1:PORT --dev-principal NAME] | ssh --socket PATH --principal NAME | migrate | cache-migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX",
         )),
     }
 }

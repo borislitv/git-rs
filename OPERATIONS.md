@@ -65,7 +65,61 @@ blobs over 128 MiB and shares the operation deadline. An optional worker inherit
 credentials and must keep descendants in its owned process group. See the
 [endpoint, output and worker contract](docs/blame.md).
 
-## Authenticated HTTP
+## Independently configured derived artifacts
+
+The `derived_cache` library is currently an opaque-artifact foundation; serving and
+blame do not yet consume it. Run `git-rs cache-migrate` independently of source
+`migrate`. Both namespaces use logged tables; no transaction spans their databases.
+
+Supply `GIT_RS_CACHE_NAMESPACE` and `GIT_RS_CACHE_OWNER` as stable, canonical
+lowercase UUIDs. They bind an explicitly owned namespace and its immutable
+`cache/<namespace>/` object prefix. Namespace creation records the database role
+and quotas; reopening it with another owner/role or different quotas is rejected.
+Create the dedicated `git_rs_cache` login with permission to create its schema,
+then revoke database-wide CREATE permission after migration. It needs no access
+to `git_rs` source tables. Migration and serving currently use the same cache role.
+The owner UUID is an identity, not an authentication credential.
+
+| Environment | Default / requirement |
+| --- | --- |
+| `GIT_RS_CACHE_DSN` | Optional independent PostgreSQL DSN; never log its value |
+| `GIT_RS_CACHE_PGHOST`, `PGPORT`, `PGDATABASE` (all with `GIT_RS_CACHE_` prefix) | Fall back to source host/port/database |
+| `GIT_RS_CACHE_PGUSER` | `git_rs_cache`; source username is not inherited |
+| `GIT_RS_CACHE_PGPASSWORD` | Dedicated cache password; source password is not inherited |
+| `GIT_RS_CACHE_PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGTARGETSESSIONATTRS` (all with prefix) | Inherit source TLS policy when omitted; verified hostname/chain required outside loopback development |
+| `GIT_RS_CACHE_CONNECTIONS` | 4; range 1–8, independent of source pool |
+| `GIT_RS_CACHE_INLINE_BYTES` | 262144, provisional; raise up to maximum payload for bounded all-PG comparison |
+| `GIT_RS_CACHE_MAX_PAYLOAD_BYTES` | 8388608, hard maximum 8 MiB |
+| `GIT_RS_CACHE_MEMORY_BYTES` | 67108864; includes payload capacity and conservative transient reservations, not total process RSS |
+| `GIT_RS_CACHE_NAMESPACE_BYTES`, `GIT_RS_CACHE_NAMESPACE_ROWS` | 1073741824 / 10000; fail closed on quota exhaustion |
+| `GIT_RS_CACHE_TTL_SECONDS` | 3600; range 1–86400 |
+| `GIT_RS_CACHE_LEASE_SECONDS`, `GIT_RS_CACHE_JOB_SECONDS` | 15 / 60; job hard lifetime at most 120 seconds |
+| `GIT_RS_CACHE_READ_SECONDS`, `GIT_RS_CACHE_GRACE_SECONDS` | 30 / 30; separate reader lifetime and retirement grace |
+| `GIT_RS_CACHE_BATCH_ROWS` | 64; maximum 100 per maintenance batch |
+| `GIT_RS_CACHE_S3_ENDPOINT`, `GIT_RS_CACHE_S3_BUCKET`, `GIT_RS_CACHE_S3_REGION`, `GIT_RS_CACHE_S3_ACCESS_KEY`, `GIT_RS_CACHE_S3_SECRET_KEY` | Explicit cache-only storage; no fallback to source S3 configuration |
+
+Configure cache S3 credentials restricted to the cache bucket/prefix, without
+access to authoritative `repos/` objects. With no cache S3 configuration, oversized
+inline artifacts bypass publication. The coordinator keeps a bounded local result
+or reports overload; cache failure does not authorize changing source commit status.
+Separate schema/database/pool does not isolate shared-cluster CPU, I/O or WAL.
+
+No serving path calls cache deletion. Maintenance closes admission by irreversible
+retirement, then waits for valid read holds and grace. Object deletion requires a
+never-versioned bucket. Retained tombstones are reconsidered after late PUTs; no
+guessed network-settlement TTL permits deleting their identities. S3 reservations
+and tombstone rows remain charged, even after physical deletion, so exhaustion is
+bounded and explicit. Namespace rotation requires a fresh UUID/prefix and explicit
+old-writer/reader quiescence; an empty replacement database cannot authorize purge.
+
+Pool creation is capped at five seconds; cache statement/lock timeouts are 5/1
+seconds and calls share the caller's remaining operation budget. Interrupted binary
+responses destroy their sessions. Successful sessions are fully consumed/reset.
+RAM accounting excludes allocator/runtime/TLS overhead; provision additional
+headroom. Payload callbacks must buffer complete success and validate source/read
+authority before returning it, rather than stream a result before the final check.
+
+## Authenticated HTTP listener
 
 `serve --http 0.0.0.0:8080 --http-credentials /etc/git-rs/http/credentials` enables the authenticated
 Smart HTTP listener. It is mutually exclusive with `--dev-http`. Supply a read-only Secret file

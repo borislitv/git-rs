@@ -15,7 +15,10 @@
 - A successful push requires uploads followed by one confirmed SQL transaction.
   Compare complete pre-receive and proc-receive command lists. Never fall through.
 - All pushes are all-or-nothing, including pushes without `--atomic`.
-- Caches live only in the serving process's memory. Scratch is private to one request.
+- Local caches are RAM-only by default. Optional derived artifacts use an independently
+  migrated PostgreSQL schema/pool and explicitly separate cache S3 credentials/namespace.
+  They never authorize source access or participate in authoritative publication.
+  Cache claims do not replace source holds. Scratch is private to one request.
 - Serving never deletes objects. Explicit owner-only history truncation requires a verified
   native bundle backup, reader/writer fencing and durable retirement before object cleanup.
 - Test native Git behavior, concurrent publications, dependency failures and cold restarts.

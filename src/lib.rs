@@ -5,6 +5,7 @@ pub mod blame;
 pub mod blob;
 pub mod cache;
 mod database;
+pub mod derived_cache;
 pub mod engine;
 pub mod history;
 pub mod hooks;
