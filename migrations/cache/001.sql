@@ -130,6 +130,11 @@ LANGUAGE plpgsql AS $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM namespaces WHERE id = n AND max_rows = r AND max_bytes = b) THEN
         RAISE EXCEPTION 'cache namespace configuration mismatch';
     END IF;
+    -- This fixed authority slot is separate from the artifact-row budget.
+    -- A completely full namespace must still be able to run reclamation. Never
+    -- reset an existing token/generation when the migrator is run again.
+    INSERT INTO maintenance_claims(namespace, token, generation, lease_until)
+        VALUES(n, o, 1, '-infinity') ON CONFLICT DO NOTHING;
 END $$;
 
 CREATE OR REPLACE FUNCTION claim(n uuid, o uuid, k bytea, c bytea, t uuid, seconds integer, hard_seconds integer)
@@ -284,7 +289,8 @@ BEGIN
         UPDATE maintenance_claims SET token = t, generation = generation + 1, lease_until = clock_timestamp() + make_interval(secs => seconds)
             WHERE namespace = n RETURNING * INTO m;
     ELSE
-        PERFORM charge(n, 1, 0);
+        -- Compatibility with a namespace registered before the reserved slot
+        -- was introduced. Its artifact quota must not block this singleton.
         INSERT INTO maintenance_claims VALUES(n, t, 1, clock_timestamp() + make_interval(secs => seconds)) RETURNING * INTO m;
     END IF;
     RETURN QUERY SELECT true, m.generation;

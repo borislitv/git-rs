@@ -10,6 +10,39 @@ permissions:
   contents: read
 
 jobs:
+  cache:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.99.1
+      - name: Build cache gate executables
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config postgresql-client curl
+          make cache-build
+      - name: Independent PostgreSQL cache, failure and storage-cost gates
+        run: |
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo systemd-run --wait --pipe --unit="git-rs-cache-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --property="User=$(id -un)" --property="Group=$(id -gn)" \
+            --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+            --property=KillMode=control-group --property=MemorySwapMax=0 \
+            --property=CPUQuota=100% --property=MemoryMax=768M --property=TasksMax=64 \
+            --property="AllowedCPUs=$cpus" \
+            --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/cache_gate.py cleanup" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/cache_gate.py" run --target-dir "$GITHUB_WORKSPACE/target"
+      - name: Remove owned cache fixtures
+        if: always()
+        run: |
+          unit="git-rs-cache-${{ github.run_id }}-${{ github.run_attempt }}.service"
+          if [ "$(systemctl show "$unit" --property=LoadState --value)" != not-found ]; then
+            sudo systemctl stop "$unit"
+          fi
   verify:
     runs-on: ubuntu-26.04
     timeout-minutes: 35

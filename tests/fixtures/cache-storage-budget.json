@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "policy": "Synthetic local functional/resource rejection limits, not a crossover, throughput SLA, HA proof or blame benchmark. Fixed before qualification; failed limits must not be retuned against results.",
+  "sizes": [16384, 262144, 1048576, 4194304],
+  "profiles": ["random", "repeated-block"],
+  "writes_per_cell": 4,
+  "reuse_reads_per_artifact": 3,
+  "minimum_cell_seconds": 5,
+  "minimum_source_samples": 30,
+  "operation_ms_max": 10000,
+  "source_p99_ms_max": 2000,
+  "source_p99_baseline_factor": 10,
+  "source_p99_baseline_allowance_ms": 250,
+  "source_errors_max": 0,
+  "replica_lag_bytes_max": 67108864,
+  "replica_catchup_seconds_max": 10,
+  "wal_per_artifact_byte_max": 8,
+  "wal_fixed_allowance_bytes": 8388608,
+  "relation_per_artifact_byte_max": 4,
+  "relation_fixed_allowance_bytes": 8388608,
+  "wire_per_logical_byte_max": 16,
+  "wire_fixed_allowance_bytes": 8388608,
+  "estimated_dead_tuples_max": 5000,
+  "primary_memory_headroom_fraction_min": 0.1,
+  "rationale": {
+    "latency": "Generous finite local deadlines reject hangs and severe source interference, not small performance differences.",
+    "storage": "Allow full-page WAL, TOAST, indexes, read holds and four small transactions; cap amplification without requiring S3 to win.",
+    "replication": "Require an actual healthy streaming standby, bounded observed lag and replay of the final primary WAL fence.",
+    "headroom": "Sample primary memory and CPU under its declared cap. Memory headroom is gated; CPU headroom is diagnostic because a half-core primary may briefly saturate. Source tails/errors are separately gated.",
+    "copies": "Count fixture file materialization and verified digest input; count actual forwarded TCP bytes. Driver, allocator, kernel and TLS copies are not fully observable and no zero-copy claim follows."
+  }
+}

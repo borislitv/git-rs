@@ -1,4 +1,4 @@
-.PHONY: check integration failures chart kubernetes istio image bench
+.PHONY: check cache-build cache-check integration failures chart kubernetes istio image bench
 
 HELM ?= helm
 K3S_CONTAINER ?= git-rs-k3s-test
@@ -7,6 +7,14 @@ check:
 	cargo fmt -- --check
 	cargo clippy --all-targets -- -D warnings
 	cargo test --locked --all-targets
+
+cache-build:
+	cargo build --locked --bin git-rs --example cache-process
+	cargo test --locked --test cache_contract --test cache_coordinator --test cache_budget --no-run
+
+# Prebuild outside the bounded measurement unit with make cache-build.
+cache-check:
+	python3 -B tests/cache_gate.py run --target-dir "$${CARGO_TARGET_DIR:-target}"
 
 integration:
 	cargo build --locked

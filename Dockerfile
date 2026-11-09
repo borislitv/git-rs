@@ -31,6 +31,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY benches ./benches
+COPY tests/support/cache_process.rs ./tests/support/cache_process.rs
 RUN cargo fetch --locked && cargo build --release --offline --locked
 
 FROM toolchain AS git-build

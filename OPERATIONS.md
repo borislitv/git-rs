@@ -91,7 +91,7 @@ The owner UUID is an identity, not an authentication credential.
 | `GIT_RS_CACHE_INLINE_BYTES` | 262144, provisional; raise up to maximum payload for bounded all-PG comparison |
 | `GIT_RS_CACHE_MAX_PAYLOAD_BYTES` | 8388608, hard maximum 8 MiB |
 | `GIT_RS_CACHE_MEMORY_BYTES` | 67108864; includes payload capacity and conservative transient reservations, not total process RSS |
-| `GIT_RS_CACHE_NAMESPACE_BYTES`, `GIT_RS_CACHE_NAMESPACE_ROWS` | 1073741824 / 10000; fail closed on quota exhaustion |
+| `GIT_RS_CACHE_NAMESPACE_BYTES`, `GIT_RS_CACHE_NAMESPACE_ROWS` | 1073741824 / 10000 artifact rows; fail closed on quota exhaustion; one fixed maintenance-authority row is reserved separately |
 | `GIT_RS_CACHE_TTL_SECONDS` | 3600; range 1–86400 |
 | `GIT_RS_CACHE_LEASE_SECONDS`, `GIT_RS_CACHE_JOB_SECONDS` | 15 / 60; job hard lifetime at most 120 seconds |
 | `GIT_RS_CACHE_READ_SECONDS`, `GIT_RS_CACHE_GRACE_SECONDS` | 30 / 30; separate reader lifetime and retirement grace |

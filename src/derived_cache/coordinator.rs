@@ -76,15 +76,29 @@ impl Coordinator {
     ) -> Result<Payload> {
         process::remaining()?;
         access.check(&key)?;
+        let completed = {
+            let mut flights = self.flights.lock().expect("cache flights poisoned");
+            let keys: Vec<_> = flights
+                .iter()
+                .filter(|(_, flight)| {
+                    flight
+                        .result
+                        .lock()
+                        .expect("cache result poisoned")
+                        .is_some()
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| flights.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        // A completed hit can own the last read hold. Its destructor performs
+        // bounded PostgreSQL cleanup; never serialize other keys behind that I/O.
+        drop(completed);
+        process::check_operation()?;
         let flight = {
             let mut flights = self.flights.lock().expect("cache flights poisoned");
-            flights.retain(|_, flight| {
-                flight
-                    .result
-                    .lock()
-                    .expect("cache result poisoned")
-                    .is_none()
-            });
             if let Some(flight) = flights.get(&key) {
                 flight.clone()
             } else {
@@ -130,10 +144,13 @@ impl Coordinator {
                 flight
             }
         };
-        let mut result = flight.result.lock().expect("cache result poisoned");
         loop {
             process::check_operation()?;
+            // Source checks may perform I/O. Neither result publication nor
+            // unrelated-key admission may depend on a waiter's source latency.
             access.check(&key)?;
+            process::check_operation()?;
+            let result = flight.result.lock().expect("cache result poisoned");
             if let Some(result) = result.as_ref() {
                 let shared = result.as_ref().map_err(|e| invalid(e))?;
                 return Ok(Payload {
@@ -143,11 +160,12 @@ impl Coordinator {
                     key,
                 });
             }
-            result = flight
-                .changed
-                .wait_timeout(result, Duration::from_millis(10))
-                .expect("cache result poisoned")
-                .0;
+            drop(
+                flight
+                    .changed
+                    .wait_timeout(result, Duration::from_millis(10))
+                    .expect("cache result poisoned"),
+            );
         }
     }
 
@@ -186,28 +204,29 @@ impl Coordinator {
             }
         };
         let _working = cache.inner.budget.reserve(context.limit)?;
-        let derive = || -> Result<Arc<OwnedBytes>> {
+        let derive_and_publish = || -> Result<Shared> {
             context.check()?;
             let bytes = compute(&context)?;
             context.check()?;
             if bytes.len() > context.limit || bytes.capacity() > context.limit {
                 return Err(invalid("derived artifact exceeds RAM/payload limit"));
             }
-            OwnedBytes::new(bytes, &cache.inner.budget)
+            let data = OwnedBytes::new(bytes, &cache.inner.budget)?;
+            if let Some(claim) = &claim
+                && cache.publish(claim, access.as_ref(), &data.bytes).is_err()
+            {
+                *breaker.lock().expect("cache circuit poisoned") =
+                    Instant::now() + Duration::from_secs(1);
+            }
+            context.check()?;
+            Ok(Shared { data, hold: None })
         };
-        let data = if let Some(claim) = &claim {
-            Self::with_renewal(cache, claim, derive)?
+        if let Some(claim) = &claim {
+            // Upload and descriptor confirmation are part of the owned job too.
+            Self::with_renewal(cache, claim, derive_and_publish)
         } else {
-            derive()?
-        };
-        if let Some(claim) = claim
-            && cache.publish(&claim, access.as_ref(), &data.bytes).is_err()
-        {
-            *breaker.lock().expect("cache circuit poisoned") =
-                Instant::now() + Duration::from_secs(1);
+            derive_and_publish()
         }
-        context.check()?;
-        Ok(Shared { data, hold: None })
     }
 
     fn with_renewal<T: Send>(

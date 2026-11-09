@@ -105,6 +105,26 @@ budget. Its trusted computation callback must poll `Derivation::check()` inside
 bounded loops. This is not a general hard-stop guarantee for arbitrary callbacks;
 the later Git-core executor must qualify every inner algorithm separately.
 
+Build first with `make cache-build` (or set `CARGO_TARGET_DIR` to a fresh build
+directory). The cache qualification target is `make cache-check`, using those
+prebuilt executables without invoking Cargo during measurement. Run it inside a
+systemd unit with `RuntimeMaxSec=900`, `TimeoutStopSec=40`, `KillMode=control-group`,
+`CPUQuota=100%`, `MemoryMax=768M`, `MemorySwapMax=0`, `TasksMax=64`, and
+`AllowedCPUs` set to the first two CPUs in the invoking process's affinity. Set
+`ExecStopPost=/usr/bin/python3 -B <absolute-checkout>/tests/cache_gate.py cleanup`
+and the unit working directory to the checkout; run as a user with Docker access.
+The CI cache job provides this invocation. The controller requires systemd's
+32-hex `INVOCATION_ID`, labels only its owned Docker fixtures, and retains fresh
+logs in `.local/cache-gate-<INVOCATION_ID>/`; independent `ExecStopPost` cleanup
+also handles a killed controller. A direct unguarded invocation is rejected.
+The controller explicitly runs the
+otherwise-ignored PostgreSQL contracts, independent-process and protocol fault
+fixtures, and the versioned synthetic PG/S3 storage-cost gate. The latter uses an
+owned streaming standby and concurrent authoritative metadata reads. Its budget
+file is `tests/fixtures/cache-storage-budget.json`; startup-independent reuse,
+wire accounting and copy-coverage limitations are recorded in each report.
+These checks do not qualify general Git derivation, serving integration or HA.
+
 PostgreSQL remains authoritative for refs, authorization, catalog and fencing;
 immutable S3 objects hold pack/index bytes. Computation changing from Git CLI to
 Rust must preserve these invariants:

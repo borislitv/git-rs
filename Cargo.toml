@@ -32,3 +32,7 @@ strip = true
 [[bench]]
 name = "cache"
 harness = false
+
+[[example]]
+name = "cache-process"
+path = "tests/support/cache_process.rs"

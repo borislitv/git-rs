@@ -9,3 +9,8 @@
 !benches/**
 !tests/
 !tests/*.py
+!tests/support/
+!tests/support/cache_process.rs
+!tests/support/cache_faults.py
+!tests/fixtures/
+!tests/fixtures/cache-storage-budget.json
