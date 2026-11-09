@@ -22,6 +22,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config postgresql-client curl
+          python3 -B tests/cache_gate_test.py
           make cache-build
       - name: Independent PostgreSQL cache, failure and storage-cost gates
         run: |
@@ -43,6 +44,21 @@ jobs:
           if [ "$(systemctl show "$unit" --property=LoadState --value)" != not-found ]; then
             sudo systemctl stop "$unit"
           fi
+      - name: Preserve synthetic cache gate diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cache-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            .local/cache-gate-*/report.json
+            .local/cache-gate-*/*.log
+            .local/derived-cache-*/report.json
+            .local/derived-cache-*/*.log
+            .local/derived-cache-*/*.stderr
   verify:
     runs-on: ubuntu-26.04
     timeout-minutes: 35

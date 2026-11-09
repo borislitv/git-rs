@@ -11,6 +11,30 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+FAILURE_EXCERPT_BYTES = 16 * 1024
+
+
+def failed_child_excerpt(log, env, error, elapsed):
+    """Only expose this synthetic gate's bounded log tail, never its environment."""
+    print(f"Cache gate child failed: log={log} elapsed={elapsed:.3f}s "
+          f"exception={type(error).__name__}", flush=True)
+    try:
+        with log.open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, size - FAILURE_EXCERPT_BYTES))
+            text = stream.read(FAILURE_EXCERPT_BYTES).decode("utf-8", errors="replace")
+        for key, value in env.items():
+            if len(value) >= 8 and re.search(r"TOKEN|PASSWORD|SECRET|CREDENTIAL|AUTH|ACCESS_KEY", key, re.I):
+                text = text.replace(value, "[REDACTED]")
+        # Escape terminal controls and workflow-command syntax onto one prefixed
+        # line. Cap the encoded excerpt too, including pathological binary logs.
+        escaped = json.dumps(text, ensure_ascii=True)
+        excerpt = escaped[-FAILURE_EXCERPT_BYTES:]
+        print(f"Cache gate log tail (last {min(size, FAILURE_EXCERPT_BYTES)} of {size} bytes; "
+              f"escaped excerpt <= {FAILURE_EXCERPT_BYTES} bytes):", flush=True)
+        print("cache-gate | " + excerpt, flush=True)
+    except OSError as diagnostic_error:
+        print(f"Cache gate log unavailable: {type(diagnostic_error).__name__}", flush=True)
 
 
 def owner_label():
@@ -49,23 +73,28 @@ def contracts(debug, name):
 
 
 def child(command, env, log, deadline):
+    started = time.monotonic()
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("cache gate absolute deadline expired")
-    with log.open("xb") as output:
-        process = subprocess.Popen(command, env=env, cwd=ROOT, stdout=output,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            status = process.wait(timeout=remaining)
-            if status:
-                raise RuntimeError(f"cache gate exited {status}; see {log}")
-        finally:
-            # Also reap descendants left behind by an exited controller child.
+    try:
+        with log.open("xb") as output:
+            process = subprocess.Popen(command, env=env, cwd=ROOT, stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=5)
+                status = process.wait(timeout=remaining)
+                if status:
+                    raise RuntimeError(f"cache gate exited {status}; see {log}")
+            finally:
+                # Also reap descendants left behind by an exited controller child.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+    except BaseException as error:
+        failed_child_excerpt(log, env, error, time.monotonic() - started)
+        raise
 
 
 def run(args, label):
@@ -87,10 +116,20 @@ def run(args, label):
         [sys.executable, "-B", str(ROOT / "tests/cache_storage_cost_test.py")],
         [sys.executable, "-B", str(ROOT / "tests/cache_storage_cost.py"), *common],
     ]
-    report = {"completed": False, "owner_label": label, "commands": commands}
+    report = {"completed": False, "owner_label": label, "commands": commands, "stages": []}
     try:
         for index, command in enumerate(commands):
-            child(command, env, directory / f"{index}.log", deadline)
+            stage = {"script": Path(command[2]).name, "log": f"{index}.log", "completed": False}
+            report["stages"].append(stage)
+            started = time.monotonic()
+            try:
+                child(command, env, directory / stage["log"], deadline)
+                stage["completed"] = True
+            except BaseException as error:
+                stage["exception"] = type(error).__name__
+                raise
+            finally:
+                stage["elapsed_seconds"] = time.monotonic() - started
         report["completed"] = True
     finally:
         (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n")
