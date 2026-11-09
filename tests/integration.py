@@ -1028,6 +1028,8 @@ def long_operation_test(f, seconds=180):
 
 
 def main():
+    from blame_concurrency import exercise as blame_concurrency_test
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--provision", action="store_true", help="create and remove private local Docker PostgreSQL/S3 fixtures")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/git-rs")
@@ -1037,11 +1039,15 @@ def main():
                         help="verify opt-in timing logs through native Git requests")
     parser.add_argument("--long-operations", action="store_true",
                         help="also run the 125-second native publication deadline regression")
+    parser.add_argument("--blame-concurrency-only", action="store_true",
+                        help="run only the tiny synthetic blame concurrency contract")
     args = parser.parse_args()
     # OpenSSH StrictModes checks all parents of authorized_keys. A system /tmp
     # parent is world-writable, so keep this private fixture under the checkout.
-    local = ROOT / ".local"
-    local.mkdir(mode=0o700, exist_ok=True)
+    # The focused HTTP-only contract can use /tmp to keep Unix socket paths short.
+    local = None if args.blame_concurrency_only else ROOT / ".local"
+    if local is not None:
+        local.mkdir(mode=0o700, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="grs-", dir=local) as directory:
         fixture = None
         try:
@@ -1049,10 +1055,14 @@ def main():
             if args.debug_timings:
                 fixture.env["GIT_RS_DEBUG_TIMINGS"] = "1"
             fixture.setup(args.provision)
-            exercise(fixture, args.large_mib, args.skip_ssh)
-            authenticated_http_test(fixture)
-            if args.long_operations:
-                long_operation_test(fixture)
+            if args.blame_concurrency_only:
+                fixture.cli("migrate")
+            else:
+                exercise(fixture, args.large_mib, args.skip_ssh)
+                authenticated_http_test(fixture)
+                if args.long_operations:
+                    long_operation_test(fixture)
+            blame_concurrency_test(fixture)
             print(json.dumps({"status": "passed", **fixture.results}, indent=2))
         except Exception:
             if fixture:

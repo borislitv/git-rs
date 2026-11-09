@@ -45,12 +45,27 @@ loose objects and delta-compressed objects in verified, request-pinned RAM packs
 These checks do not grant reachability or authorization: the leased published
 snapshot, native reachability and literal path checks still precede annotation.
 
-Only one blame computation executes per serving process; another returns 503 rather than
-queuing behind it. It also occupies one of the four ordinary request admissions. Health has
-independent admission. The absolute `GIT_RS_OPERATION_SECONDS` deadline covers the request,
+By default only one blame computation executes per serving process and another returns 503.
+Operators may set `GIT_RS_BLAME_CONCURRENCY` (1..=4, default 1) and
+`GIT_RS_BLAME_WAITERS` (0..=3, default 0); their sum must not exceed 4. For example,
+concurrency 2 and waiters 1 permits two independent queries to execute and one to wait.
+Excess queries return 503, without materialization or a SQL reader lease. Waiting occupies
+an ordinary request admission but acquires no scratch, cache pins, reader lease or worker;
+it honors cancellation and the original absolute deadline, without a fresh execution budget.
+There is no FIFO guarantee. All queries still share the four ordinary request admissions;
+health has independent admission. The absolute `GIT_RS_OPERATION_SECONDS` deadline covers the request,
 materialization, computation and response writes. Client disconnection cancels the owned native
 process group. Successful and failed requests release their read hold and private scratch;
 a crashed server's committed hold instead remains until its bounded expiry.
+
+Increasing concurrency does not increase the process-private RAM cache budget, SQL pool,
+Tokio threads or per-worker thread settings. It is not a memory/CPU isolation mechanism.
+Choose it against the pod's aggregate CPU/memory/scratch limits and the selected worker's
+own bounded CPU/memory settings, not the host core count. Each executing query can still
+materialize a snapshot up to the existing 12 GiB scratch admission limit and buffer up to
+256 MiB of output, in addition to worker memory. Completed response buffers can coexist
+until their ordinary request admissions finish. Defaults deliberately preserve the old
+resource envelope; do not multiply large-worker budgets without aggregate headroom.
 
 | Status | Meaning |
 | --- | --- |
@@ -60,7 +75,7 @@ a crashed server's committed hold instead remains until its bounded expiry.
 | 404 | Missing/non-commit/unreachable object, missing path or non-blob path |
 | 413 | Uncompressed blob exceeds 128 MiB |
 | 500 | Repository authorization/dependency/worker failure or output limit |
-| 503 | Request admission or the single blame slot is occupied |
+| 503 | Request admission or configured executing-plus-waiting blame capacity is occupied |
 
 A deadline or broken connection may close the transport without an HTTP error body. Clients
 must require a complete 200 response, not interpret a truncated body as an annotation.
@@ -106,3 +121,15 @@ a valid annotation and two for an oversized blob; header type/size probes do not
 consume a native subprocess. Library tests compare physical headers with native
 Git and read 128 MiB loose/ref-delta blobs under a 96 MiB address-space limit.
 These contracts do not establish a full-repository performance score or production HA behavior.
+
+The existing `make integration` and native integration CI job run the concurrency contract
+using their already-provisioned disposable SQL/S3 fixtures. For a focused run without the
+large integration fixture, use `python3 tests/integration.py --provision --binary
+target/debug/git-rs --blame-concurrency-only`. Omit `--provision` to use disposable endpoints
+configured as for the integration harness (`PGPORT` and `GIT_RS_S3_ENDPOINT`, with the
+synthetic bucket already created). The contract creates its own tiny synthetic repository.
+A socket-controlled worker proves two distinct HTTP queries overlap, a third waits without
+materialization, overflow returns 503, and success, worker failure, execution disconnect,
+queued disconnect and queued absolute expiry return capacity. Native Git independently
+supplies the expected complete annotations. The synchronization socket is test-only;
+the serving executable boundary and environment remain unchanged.

@@ -135,6 +135,50 @@ fn git_worker_configuration_rejects_unbounded_or_invalid_parallelism() {
 }
 
 #[test]
+fn blame_capacity_rejects_invalid_settings_before_serving() {
+    let root = std::env::temp_dir().join(format!(
+        "git-rs-blame-capacity-{}",
+        git_rs::scratch::identifier().unwrap()
+    ));
+    for (concurrency, waiters) in [
+        ("0", "0"),
+        ("5", "0"),
+        ("2", "3"),
+        ("1", "4"),
+        ("auto", "0"),
+        ("2", "-1"),
+        ("", "0"),
+        ("18446744073709551615", "0"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+            .env_clear()
+            .env("GIT_RS_BLAME_CONCURRENCY", concurrency)
+            .env("GIT_RS_BLAME_WAITERS", waiters)
+            .args(["serve", "--scratch"])
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("blame capacity") || error.contains("GIT_RS_BLAME_"),
+            "{error}"
+        );
+        assert!(
+            !root.exists(),
+            "invalid capacity must not create serving state"
+        );
+    }
+    for (concurrency, waiters) in [(1, 0), (1, 3), (2, 1), (4, 0)] {
+        assert!(
+            git_rs::blame::Blame::default()
+                .with_capacity(concurrency, waiters)
+                .is_ok()
+        );
+    }
+}
+
+#[test]
 fn blame_worker_configuration_rejects_invalid_executables_before_serving() {
     use std::os::unix::fs::PermissionsExt;
 

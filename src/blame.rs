@@ -53,6 +53,30 @@ impl Request {
 pub struct Blame {
     worker: Option<PathBuf>,
     admission: Arc<process::Admission>,
+    execution: Arc<Execution>,
+}
+
+struct Execution {
+    active: Mutex<usize>,
+    changed: Condvar,
+    limit: usize,
+}
+
+struct Executing {
+    execution: Arc<Execution>,
+    _admission: process::Permit,
+}
+
+impl Drop for Executing {
+    fn drop(&mut self) {
+        let mut active = self
+            .execution
+            .active
+            .lock()
+            .expect("blame execution poisoned");
+        *active -= 1;
+        self.execution.changed.notify_one();
+    }
 }
 
 impl Default for Blame {
@@ -60,11 +84,62 @@ impl Default for Blame {
         Self {
             worker: None,
             admission: process::Admission::new(1),
+            execution: Arc::new(Execution {
+                active: Mutex::new(0),
+                changed: Condvar::new(),
+                limit: 1,
+            }),
         }
     }
 }
 
 impl Blame {
+    /// Bound executing and waiting queries within the four ordinary admissions.
+    /// Default remains one executing query and no queue; larger budgets are opt-in.
+    pub fn with_capacity(mut self, concurrency: usize, waiters: usize) -> Result<Self> {
+        if !(1..=4).contains(&concurrency) || waiters > 3 || concurrency + waiters > 4 {
+            return Err(invalid(
+                "blame capacity requires concurrency in 1..=4, waiters in 0..=3 and total <=4",
+            ));
+        }
+        self.admission = process::Admission::new(concurrency + waiters);
+        self.execution = Arc::new(Execution {
+            active: Mutex::new(0),
+            changed: Condvar::new(),
+            limit: concurrency,
+        });
+        Ok(self)
+    }
+
+    fn admit(&self) -> Result<Option<Executing>> {
+        process::check_operation()?;
+        let Some(admission) = self.admission.try_admit() else {
+            return Ok(None);
+        };
+        let mut active = self
+            .execution
+            .active
+            .lock()
+            .expect("blame execution poisoned");
+        while *active >= self.execution.limit {
+            // Cancellation has no condition-variable notification. Poll only the
+            // bounded wait, as the RAM cache does, never resetting the deadline.
+            let remaining = process::remaining()?;
+            active = self
+                .execution
+                .changed
+                .wait_timeout(active, remaining.min(Duration::from_millis(10)))
+                .expect("blame execution poisoned")
+                .0;
+        }
+        process::check_operation()?;
+        *active += 1;
+        Ok(Some(Executing {
+            execution: self.execution.clone(),
+            _admission: admission,
+        }))
+    }
+
     /// Select a server-owned executable, never a client-supplied command line.
     pub fn with_worker(path: PathBuf) -> Result<Self> {
         if !path.is_absolute()
@@ -92,7 +167,7 @@ pub enum Response {
 
 impl Engine {
     pub fn blame(&self, slug: &str, principal: &str, query: &Request) -> Result<Response> {
-        let Some(_permit) = self.blame.admission.try_admit() else {
+        let Some(_permit) = self.blame.admit()? else {
             return Ok(Response::Busy);
         };
         crate::auth::repository(slug)?;

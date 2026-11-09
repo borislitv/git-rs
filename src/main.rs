@@ -47,6 +47,15 @@ fn pack_threads() -> Result<u8> {
     })
 }
 
+fn blame_capacity(name: &str, default: usize) -> Result<usize> {
+    std::env::var_os(name).map_or(Ok(default), |value| {
+        value
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| invalid(&format!("{name} must be an unsigned integer")))
+    })
+}
+
 fn bridge(args: &[String]) -> Result<()> {
     let principal = option(args, "--principal")?;
     auth::principal(&principal)?;
@@ -160,10 +169,15 @@ enum HttpIdentity {
 
 fn serve(args: &[String]) -> Result<()> {
     let pack_threads = pack_threads()?;
-    let blame = std::env::var_os("GIT_RS_BLAME_WORKER").map_or_else(
-        || Ok(git_rs::blame::Blame::default()),
-        |path| git_rs::blame::Blame::with_worker(PathBuf::from(path)),
-    )?;
+    let blame = std::env::var_os("GIT_RS_BLAME_WORKER")
+        .map_or_else(
+            || Ok(git_rs::blame::Blame::default()),
+            |path| git_rs::blame::Blame::with_worker(PathBuf::from(path)),
+        )?
+        .with_capacity(
+            blame_capacity("GIT_RS_BLAME_CONCURRENCY", 1)?,
+            blame_capacity("GIT_RS_BLAME_WAITERS", 0)?,
+        )?;
     metrics::global();
     // Validate credentials before opening any serving listener. Production and
     // fixed-principal development HTTP can never be enabled in the same process.
