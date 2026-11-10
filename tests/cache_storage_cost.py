@@ -7,6 +7,7 @@ read is process-cold, not an OS/PG buffer-cache flush. Input scratch is test-onl
 Use an externally bounded owned systemd unit with label-scoped container cleanup.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import http.client
 import json
@@ -16,6 +17,7 @@ from pathlib import Path
 import signal
 import socket
 import socketserver
+import subprocess
 import threading
 import time
 import uuid
@@ -123,8 +125,9 @@ class WireProxy:
 
 
 class SourceProbe:
-    def __init__(self, process, expected):
+    def __init__(self, process, expected, observations=None):
         self.process, self.expected = process, expected
+        self.observations = observations
         self.samples, self.errors = [], []
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.work)
@@ -133,7 +136,8 @@ class SourceProbe:
         while not self.stop.is_set():
             start = time.monotonic()
             try:
-                require(self.process.ask("source") == self.expected, "source snapshot changed")
+                reply = self.process.ask("source")
+                require(reply == self.expected, "source snapshot changed: " + repr(reply)[:1024])
                 self.samples.append((time.monotonic() - start) * 1000)
             except Exception as error:
                 self.errors.append(str(error))
@@ -147,6 +151,11 @@ class SourceProbe:
     def __exit__(self, *_):
         self.stop.set()
         self.thread.join(timeout=30)
+        if self.observations is not None:
+            # Preserve evidence even when there are no successful samples or a
+            # different exception is already leaving the measured cache block.
+            self.observations["source_errors"] = list(self.errors)
+            self.observations["source_sample_count"] = len(self.samples)
         require(not self.thread.is_alive(), "source probe did not stop")
 
 
@@ -170,11 +179,18 @@ class ResourceProbe:
         self.thread.start()
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, exception_type, exception, traceback):
         self.stop.set()
         self.thread.join(timeout=15)
-        require(not self.thread.is_alive() and not self.errors,
-                f"resource probe failed: {self.errors}")
+        errors = list(self.errors)
+        if self.thread.is_alive():
+            errors.append("resource probe did not stop")
+        self.result["resource_probe_errors"] = errors
+        if exception is None:
+            require(not errors, f"resource probe failed: {errors}")
+        # Do not mask a publication/read assertion. Related monitor failures are
+        # still in the fixture journal; an otherwise healthy block still rejects.
+        return False
 
 
 class CostFixture(Fixture):
@@ -184,6 +200,8 @@ class CostFixture(Fixture):
             self.cpus = args.service_cpus
         self.budget = json.loads(args.budget.read_text())
         self.proxies = []
+        self.started = time.monotonic()
+        self.results["phases"] = []
         self.results["provenance"] = {
             "git_head": run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.decode().strip(),
             "binary_sha256": hashlib.sha256(Path(self.binary).read_bytes()).hexdigest(),
@@ -205,6 +223,48 @@ class CostFixture(Fixture):
                 "source": "Real metadata::snapshot concurrent with cache IO; synthetic callback authorization only; serving authorization deferred",
                 "storage": "Fresh cache database per cell, logged tables, default TOAST policy; no cache maintenance deletion during measurement",
             })
+
+    @contextmanager
+    def phase(self, name):
+        event = {"name": name, "started_seconds": time.monotonic() - self.started,
+                 "state": "running"}
+        self.results["phases"].append(event)
+        print("cache-cost phase " + json.dumps(event), flush=True)
+        try:
+            yield
+        except BaseException as error:
+            event.update(state="failed", error=repr(error)[:2048])
+            raise
+        else:
+            event["state"] = "passed"
+        finally:
+            event["ended_seconds"] = time.monotonic() - self.started
+            print("cache-cost phase " + json.dumps(event), flush=True)
+
+    def failure_state(self):
+        """Best-effort, bounded evidence only; never replace the original error."""
+        states = []
+        for cid in self.containers:
+            try:
+                value = json.loads(run(["docker", "inspect", cid], timeout=3).stdout)[0]
+                states.append({"container": cid, "state": value["State"],
+                    "actual_host_config": {key: value["HostConfig"].get(key) for key in (
+                        "NanoCpus", "CpuQuota", "CpuPeriod", "CpusetCpus", "Memory",
+                        "MemorySwap", "PidsLimit")}})
+            except Exception as error:
+                states.append({"container": cid, "inspection_error": repr(error)[:2048]})
+        self.results["failure_container_states"] = states
+        controller = {"cpu_affinity": sorted(os.sched_getaffinity(0))}
+        try:
+            group = next(line.split(":", 2)[2] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                         if line.startswith("0::"))
+            directory = Path("/sys/fs/cgroup") / group.lstrip("/")
+            for name in ("cpu.max", "cpu.stat", "cpuset.cpus.effective", "memory.max",
+                         "memory.current", "memory.events", "pids.max", "pids.current", "pids.events"):
+                controller[name] = (directory / name).read_text()[:4096].strip()
+        except Exception as error:
+            controller["inspection_error"] = repr(error)[:2048]
+        self.results["failure_controller_policy"] = controller
 
     def setup_standby(self):
         # The independent-cluster correctness fixture is not used by this harness.
@@ -231,20 +291,56 @@ class CostFixture(Fixture):
             "pg_basebackup -D /standby/data -R -X stream --checkpoint=fast; "
             "exec postgres -D /standby/data -c shared_buffers=16MB "
             "-c listen_addresses='' -c hba_file=/standby/data/pg_hba.conf"])
-        wait_until(lambda: self.sql("SELECT count(*) FROM pg_stat_replication WHERE "
-                                   "application_name='cache-cost-standby' AND state='streaming'") == "1",
-                   "actual streaming standby", seconds=45)
+        self.wait_for_standby()
         self.results["postgres_version"] = self.sql("SHOW server_version")
+
+    def wait_for_standby(self, seconds=45):
+        # pg_basebackup -X stream itself has a streaming WAL-sender connection
+        # under PGAPPNAME, before a standby postmaster/socket even exists. Its
+        # replay_lsn is NULL. Require real replay feedback AND SQL recovery mode.
+        started = time.monotonic()
+        deadline = started + seconds
+        state = self.results["standby_readiness"] = {"attempts": 0, "timeout_seconds": seconds}
+        query = ("SELECT count(*) FROM pg_stat_replication WHERE "
+                 "application_name='cache-cost-standby' AND state='streaming' "
+                 "AND replay_lsn IS NOT NULL")
+        while time.monotonic() < deadline:
+            state["attempts"] += 1
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                primary = run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+                              env=self.env, data=query.encode(), timeout=min(3, remaining), ok=False)
+                state["last_primary"] = {"returncode": primary.returncode,
+                    "stdout": primary.stdout.decode(errors="replace")[-1024:],
+                    "stderr": primary.stderr.decode(errors="replace")[-1024:]}
+                if primary.returncode == 0 and primary.stdout.strip() == b"1":
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    answer = self.standby_sql("SELECT pg_is_in_recovery()", timeout=min(3, remaining))
+                    state["last_standby_reply"] = answer[:1024]
+                    if answer == "t":
+                        state["elapsed_seconds"] = time.monotonic() - started
+                        return
+            except (AssertionError, OSError, subprocess.TimeoutExpired) as error:
+                state["last_error"] = repr(error)[:2048]
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(.02, remaining))
+        state["elapsed_seconds"] = time.monotonic() - started
+        raise AssertionError("deadline: actual streaming standby SQL readiness")
 
     def source_state(self):
         return [self.sql(f"SELECT COALESCE(json_agg(t ORDER BY row_to_json(t)::text),'[]'::json) "
                          f"FROM git_rs.{table} t")
                 for table in ("repositories", "permissions", "refs", "packs")]
 
-    def standby_sql(self, sql):
+    def standby_sql(self, sql, *, timeout=30):
         return run(["docker", "exec", "--user", "postgres", "-e", "PGHOST=/var/run/postgresql",
                     "-e", "PGDATABASE=postgres", self.standby, "psql", "-XqAt",
-                    "-v", "ON_ERROR_STOP=1", "-c", sql]).stdout.decode().strip()
+                    "-v", "ON_ERROR_STOP=1", "-c", sql], timeout=timeout).stdout.decode().strip()
 
     def replica_fault_check(self):
         """A real paused replay must fail the same finite acceptance fence."""
@@ -374,7 +470,7 @@ SELECT json_build_object(
         writes, cold, reuse, restart, sustained = [], [], [], [], []
         expected = "source 0 0"
         start = time.monotonic()
-        with ResourceProbe(self, result), SourceProbe(source, expected) as probe:
+        with ResourceProbe(self, result), SourceProbe(source, expected, result) as probe:
             for index in range(b["writes_per_cell"]):
                 # Stable synthetic PRNG stream, independent of mode; no source corpus.
                 seed = f"cache-cost-v1/{profile}/{size}/{index}".encode()
@@ -536,24 +632,32 @@ def main():
     signal.signal(signal.SIGALRM, interrupted)
     signal.alarm(args.deadline_seconds)
     try:
-        fixture.setup()
-        fixture.setup_standby()
-        fixture.initial_source_state = fixture.source_state()
-        fixture.replica_fault_check()
-        env = fixture.environment()
-        source = fixture.process(env, "baseline-source")
-        with SourceProbe(source, "source 0 0") as baseline:
-            baseline.stop.wait(fixture.budget["minimum_cell_seconds"])
-        require(not baseline.errors, "source-only baseline failed")
-        fixture.results["source_baseline_ms"] = distribution(baseline.samples)
-        source.close()
+        with fixture.phase("provision"):
+            fixture.setup()
+        with fixture.phase("standby-startup"):
+            fixture.setup_standby()
+        with fixture.phase("source-state"):
+            fixture.initial_source_state = fixture.source_state()
+        with fixture.phase("replica-failure-sensitivity"):
+            fixture.replica_fault_check()
+        with fixture.phase("source-baseline"):
+            env = fixture.environment()
+            source = fixture.process(env, "baseline-source")
+            observations = fixture.results["source_baseline_observations"] = {}
+            with SourceProbe(source, "source 0 0", observations) as baseline:
+                baseline.stop.wait(fixture.budget["minimum_cell_seconds"])
+            require(not baseline.errors, "source-only baseline failed")
+            fixture.results["source_baseline_ms"] = distribution(baseline.samples)
+            source.close()
         for profile in fixture.budget["profiles"]:
             for size in fixture.budget["sizes"]:
                 for mode in ("all-pg", "pg-s3"):
-                    fixture.cell(mode, profile, size, fixture.results["source_baseline_ms"])
+                    with fixture.phase(f"cell/{mode}/{profile}/{size}"):
+                        fixture.cell(mode, profile, size, fixture.results["source_baseline_ms"])
         fixture.results["completed"] = True
     except BaseException as error:
         fixture.results["error"] = str(error)
+        fixture.failure_state()
         raise
     finally:
         signal.alarm(0)
