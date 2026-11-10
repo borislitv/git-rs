@@ -46,6 +46,15 @@ def wait_for(check, description):
     raise AssertionError(f"timed out: {description}")
 
 
+def process_owned(record):
+    """Keep PID reuse distinct from the original worker's lifetime."""
+    try:
+        fields = Path(f"/proc/{record['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19]) == record["startTicks"]
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
 def metric_value(body, series):
     prefix = series.encode() + b" "
     values = [float(line[len(prefix):]) for line in body.splitlines() if line.startswith(prefix)]
@@ -831,16 +840,9 @@ signal.pause()
     oversized_daemon.terminate()
     oversized_daemon.wait(timeout=5)
 
-    def owned(record):
-        try:
-            fields = Path(f"/proc/{record['pid']}/stat").read_text().rsplit(")", 1)[1].split()
-            return int(fields[19]) == record["startTicks"]
-        except FileNotFoundError:
-            return False
-
     def require_reaped(records):
         deadline = time.monotonic() + 5
-        while any(owned(record) for record in records.values()):
+        while any(process_owned(record) for record in records.values()):
             assert time.monotonic() < deadline, "blame cancellation must reap the complete owned group promptly"
             threading.Event().wait(0.02)
 
@@ -887,7 +889,7 @@ signal.pause()
             followup.close()
         finally:
             peer.close()
-            if records and owned(records["leader"]):
+            if records and process_owned(records["leader"]):
                 os.killpg(records["leader"]["pid"], signal.SIGKILL)
     f.results["complete_blame_worker_lifecycle"] = {
         "server_owned_executable": "passed", "credentials_not_inherited": True,

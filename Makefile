@@ -11,6 +11,7 @@ core-source-check:
 	python3 -B tests/core_source_test.py
 
 check: core-source-check
+	python3 -B tests/integration_process_test.py
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --locked --workspace --all-targets
