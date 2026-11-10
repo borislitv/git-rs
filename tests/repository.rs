@@ -410,6 +410,69 @@ fn snapshot_refs_resolve_ref_delta_commits_in_sealed_ram_packs() -> Result<()> {
         native(&target.path, &["rev-parse", "HEAD"], b"")?,
         format!("{}\n", commits[15].hex()).as_bytes()
     );
+    let limits = git_rs_core::ReadLimits {
+        max_decode_bytes: 128 * 1024,
+        ..Default::default()
+    };
+    let capacity = git_rs_core::CapacityBudget::new(2 * 1024 * 1024);
+    let control =
+        git_rs_core::Control::new(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let identity = git_rs_core::SnapshotIdentity {
+        source: b"synthetic-sealed-snapshot".to_vec(),
+        generation: b"one".to_vec(),
+        object_hash: gix::hash::Kind::Sha1,
+    };
+    let hold = std::sync::Arc::new(());
+    let weak_hold = std::sync::Arc::downgrade(&hold);
+    let odb = target.snapshot_odb(identity, hold, control.clone(), capacity.clone(), limits)?;
+    assert!(weak_hold.upgrade().is_some());
+    let id = gix::ObjectId::from(commits[15].0);
+    assert!(
+        odb.pack_location(&id)?.is_some(),
+        "full reader must see symlinked sealed-RAM indexes"
+    );
+    let body = odb.object(&id)?.expect("physical packed commit");
+    assert_eq!(body.kind, gix::objs::Kind::Commit);
+    assert_eq!(
+        body.data.as_slice(),
+        native(
+            &source.path,
+            &["cat-file", "commit", &commits[15].hex()],
+            b""
+        )?
+    );
+    let (_, content) = odb
+        .lookup_blob(&id, b"file.txt")?
+        .expect("packed byte-path lookup");
+    assert_eq!(content.data.as_slice(), b"shared content\n");
+    assert!(odb.is_ancestor(gix::ObjectId::from(commits[0].0).as_ref(), &id)?);
+    assert_eq!(
+        odb.reachable_from_refs([(b"refs/heads/main".as_slice(), id)])?
+            .len(),
+        16
+    );
+    let mut output = odb.find_buffer(body.data.as_slice().len())?;
+    let found = odb
+        .find_in(&id, &mut output)?
+        .expect("verified Find interface");
+    assert_eq!(found.data, body.data.as_slice());
+    control.cancel();
+    assert!(odb.object(&id).is_err());
+    assert!(
+        weak_hold.upgrade().is_some(),
+        "cancel does not prematurely release the opaque source hold"
+    );
+    assert_eq!(
+        pins.len(),
+        2,
+        "cancellation does not release caller-held cache pins"
+    );
+    drop(output);
+    drop(content);
+    drop(body);
+    drop(odb);
+    assert!(weak_hold.upgrade().is_none());
+    assert_eq!(capacity.used(), 0);
     native(&target.path, &["fsck", "--strict", "--full"], b"")?;
     Ok(())
 }
@@ -479,6 +542,83 @@ fn physical_object_headers_match_native_types_and_sizes() -> Result<()> {
             .is_err(),
         "expired missing-object reads must fail rather than report a successful miss"
     );
+    Ok(())
+}
+
+#[test]
+fn full_snapshot_loose_reads_use_byte_paths_and_ignore_config_and_alternates() -> Result<()> {
+    let root = Root::new()?;
+    let foreign = Scratch::new(&root.0, 1)?;
+    let foreign_blob = native(
+        &foreign.path,
+        &["hash-object", "-w", "--stdin"],
+        b"foreign\n",
+    )?;
+    let scratch = Scratch::new(&root.0, 1)?;
+    let bytes = b"a\0\r\n\xff";
+    let blob = native(&scratch.path, &["hash-object", "-w", "--stdin"], bytes)?;
+    let blob_text = std::str::from_utf8(&blob)?.trim();
+    let mut entry = format!("100644 blob {blob_text}\t").into_bytes();
+    entry.extend_from_slice(b"byte-\xff\0");
+    let tree = native(&scratch.path, &["mktree", "-z"], &entry)?;
+    let tree_text = std::str::from_utf8(&tree)?.trim();
+    let commit = native(&scratch.path, &["commit-tree", tree_text], b"byte paths\n")?;
+    fs::write(scratch.path.join("config"), b"[invalid configuration\n")?;
+    fs::write(
+        scratch.path.join("objects/info/alternates"),
+        format!("{}\n", foreign.path.join("objects").display()),
+    )?;
+    let control =
+        git_rs_core::Control::new(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let identity = git_rs_core::SnapshotIdentity {
+        source: b"synthetic-loose".to_vec(),
+        generation: b"one".to_vec(),
+        object_hash: gix::hash::Kind::Sha1,
+    };
+    let capacity = git_rs_core::CapacityBudget::new(64 * 1024);
+    let odb = scratch.snapshot_odb(
+        identity,
+        (),
+        control,
+        capacity.clone(),
+        git_rs_core::ReadLimits::default(),
+    )?;
+    let id = gix::ObjectId::from_hex(commit.trim_ascii())?;
+    let (found, object) = odb
+        .lookup_blob(&id, b"byte-\xff")?
+        .expect("physical byte-path blob");
+    assert_eq!(found, gix::ObjectId::from_hex(blob.trim_ascii())?);
+    assert_eq!(object.data.as_slice(), bytes);
+    assert_eq!(
+        odb.header(&found)?.expect("physical header").size,
+        bytes.len() as u64
+    );
+    let mut buffer = odb.find_buffer(bytes.len())?;
+    assert_eq!(
+        odb.find_in(&found, &mut buffer)?
+            .expect("Find loose bytes")
+            .data,
+        bytes
+    );
+    let mut undersized = Vec::new();
+    assert!(gix::objs::Find::try_find(&odb, &found, &mut undersized).is_err());
+    assert_eq!(
+        undersized.capacity(),
+        0,
+        "Find never secretly grows caller-owned storage"
+    );
+    assert!(
+        odb.object(gix::ObjectId::from_hex(foreign_blob.trim_ascii())?.as_ref())?
+            .is_none(),
+        "alternates are never consulted"
+    );
+    let empty_tree = gix::ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?;
+    assert!(odb.object(&empty_tree)?.is_none());
+    assert!(gix::objs::FindHeader::try_header(&odb, &empty_tree)?.is_none());
+    drop(buffer);
+    drop(object);
+    drop(odb);
+    assert_eq!(capacity.used(), 0);
     Ok(())
 }
 

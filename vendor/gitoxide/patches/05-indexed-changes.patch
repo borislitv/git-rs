@@ -1,0 +1,316 @@
+diff --git a/gix-blame/src/file/function.rs b/gix-blame/src/file/function.rs
+index 8f0406f..c002053 100644
+--- a/gix-blame/src/file/function.rs
++++ b/gix-blame/src/file/function.rs
+@@ -11,7 +11,7 @@ use gix_object::{
+ use gix_traverse::commit::find as find_commit;
+ use smallvec::SmallVec;
+ 
+-use super::{Change, UnblamedHunk, prepared::PreparedInput, process_changes};
++use super::{Change, UnblamedHunk, prepared::PreparedInput, process_changes, process_changes_indexed};
+ use crate::{
+     BlameEntry, Options, Outcome, Statistics,
+     types::{BlamePathEntry, Start},
+@@ -27,6 +27,8 @@ struct DiagnosticPhases {
+     prepared_pairs: usize,
+     git_tail_pairs: usize,
+     reused_run_lines: usize,
++    indexed_change_pairs: usize,
++    skipped_changes: usize,
+ }
+ 
+ impl DiagnosticPhases {
+@@ -40,12 +42,14 @@ impl DiagnosticPhases {
+             prepared_pairs: 0,
+             git_tail_pairs: 0,
+             reused_run_lines: 0,
++            indexed_change_pairs: 0,
++            skipped_changes: 0,
+         }
+     }
+ 
+     fn report(&self, stats: &Statistics, pending: usize, finished: usize) {
+         eprintln!(
+-            "blameProgress elapsedSeconds={:.3} commits={} diffs={} pendingHunks={} finishedHunks={} loadSeconds={:.3} prepareSeconds={:.3} diffSeconds={:.3} attributionSeconds={:.3} preparedPairs={} gitTailTrimmedPairs={} reusedRunLines={}",
++            "blameProgress elapsedSeconds={:.3} commits={} diffs={} pendingHunks={} finishedHunks={} loadSeconds={:.3} prepareSeconds={:.3} diffSeconds={:.3} attributionSeconds={:.3} preparedPairs={} gitTailTrimmedPairs={} reusedRunLines={} indexedChangePairs={} skippedChanges={}",
+             self.started.elapsed().as_secs_f64(),
+             stats.commits_traversed,
+             stats.blobs_diffed,
+@@ -58,6 +62,8 @@ impl DiagnosticPhases {
+             self.prepared_pairs,
+             self.git_tail_pairs,
+             self.reused_run_lines,
++            self.indexed_change_pairs,
++            self.skipped_changes,
+         );
+     }
+ }
+@@ -182,6 +188,7 @@ pub fn file(
+     });
+     let mut diagnostic = std::env::var_os("GIX_BLAME_DIAGNOSTIC_PROGRESS").map(|_| DiagnosticPhases::new());
+     let bounded_resource_cache = prepared.is_some() || std::env::var_os("GIX_BLAME_BOUNDED_RESOURCE_CACHE").is_some();
++    let index_changes = std::env::var_os("GIX_BLAME_INDEX_CHANGES").is_some();
+     'outer: while let Some(suspect) = queue.pop_value() {
+         // Each revision sets both resources again. The NxM diff cache must not
+         // retain every historical fulltext for the entire blame traversal.
+@@ -404,11 +411,14 @@ pub fn file(
+                         &mut prepared,
+                         &mut diagnostic,
+                     )?;
+-                    let started = diagnostic.as_ref().map(|_| std::time::Instant::now());
+-                    hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, *parent_id);
+-                    if let (Some(diagnostic), Some(started)) = (&mut diagnostic, started) {
+-                        diagnostic.attribution += started.elapsed();
+-                    }
++                    hunks_to_blame = attribute_changes(
++                        hunks_to_blame,
++                        changes.clone(),
++                        suspect,
++                        *parent_id,
++                        index_changes,
++                        &mut diagnostic,
++                    );
+                     if let Some(ref mut blame_path) = blame_path {
+                         let has_blame_been_passed = hunks_to_blame.iter().any(|hunk| hunk.has_suspect(parent_id));
+ 
+@@ -442,11 +452,14 @@ pub fn file(
+                         &mut prepared,
+                         &mut diagnostic,
+                     )?;
+-                    let started = diagnostic.as_ref().map(|_| std::time::Instant::now());
+-                    hunks_to_blame = process_changes(hunks_to_blame, changes, suspect, *parent_id);
+-                    if let (Some(diagnostic), Some(started)) = (&mut diagnostic, started) {
+-                        diagnostic.attribution += started.elapsed();
+-                    }
++                    hunks_to_blame = attribute_changes(
++                        hunks_to_blame,
++                        changes,
++                        suspect,
++                        *parent_id,
++                        index_changes,
++                        &mut diagnostic,
++                    );
+ 
+                     let mut has_blame_been_passed = false;
+ 
+@@ -909,6 +922,28 @@ fn blob_changes(
+     })
+ }
+ 
++fn attribute_changes(
++    hunks: Vec<UnblamedHunk>,
++    changes: Vec<Change>,
++    suspect: ObjectId,
++    parent: ObjectId,
++    indexed: bool,
++    diagnostic: &mut Option<DiagnosticPhases>,
++) -> Vec<UnblamedHunk> {
++    let started = diagnostic.as_ref().map(|_| std::time::Instant::now());
++    let (hunks, skipped) = if indexed {
++        process_changes_indexed(hunks, changes, suspect, parent)
++    } else {
++        (process_changes(hunks, changes, suspect, parent), 0)
++    };
++    if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), started) {
++        diagnostic.attribution += started.elapsed();
++        diagnostic.indexed_change_pairs += usize::from(indexed);
++        diagnostic.skipped_changes += skipped;
++    }
++    hunks
++}
++
+ fn blob_changes_from_data(
+     old_data: &[u8],
+     new_data: &[u8],
+@@ -1173,3 +1208,54 @@ fn initial_state(
+         }
+     }
+ }
++
++#[cfg(test)]
++mod indexed_change_tests {
++    use super::*;
++
++    #[test]
++    fn indexed_attribution_matches_every_short_diff_and_source_range() {
++        let suspect = ObjectId::from_bytes_or_panic(&[0; 20]);
++        let parent = ObjectId::from_bytes_or_panic(&[1; 20]);
++        let unrelated = ObjectId::from_bytes_or_panic(&[2; 20]);
++        let inputs: Vec<Vec<u8>> = (0..=4)
++            .flat_map(|len| {
++                (0..1 << len).map(move |bits| {
++                    (0..len)
++                        .flat_map(|bit| if bits & (1 << bit) == 0 { *b"a\n" } else { *b"b\n" })
++                        .collect()
++                })
++            })
++            .collect();
++        for before in &inputs {
++            for after in &inputs {
++                for algorithm in [
++                    gix_diff::blob::Algorithm::Myers,
++                    gix_diff::blob::Algorithm::MyersMinimal,
++                    gix_diff::blob::Algorithm::Histogram,
++                ] {
++                    let changes = blob_changes_from_data(before, after, algorithm, &mut Statistics::default());
++                    for start in 0..after.len() as u32 / 2 {
++                        for end in start + 1..=after.len() as u32 / 2 {
++                            let make_hunks = || {
++                                vec![UnblamedHunk {
++                                    range_in_blamed_file: 0..end - start,
++                                    suspects: [(suspect, start..end), (unrelated, 7..7 + end - start)]
++                                        .into_iter()
++                                        .collect(),
++                                    source_file_name: Some("previous.txt".into()),
++                                }]
++                            };
++                            let expected = process_changes(make_hunks(), changes.clone(), suspect, parent);
++                            let (actual, _) = process_changes_indexed(make_hunks(), changes.clone(), suspect, parent);
++                            assert_eq!(
++                                actual, expected,
++                                "complete ownership/source positions differ for {before:?} -> {after:?}, {start}..{end}, {algorithm:?}"
++                            );
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/gix-blame/src/file/mod.rs b/gix-blame/src/file/mod.rs
+index f6a55ed..29f8ee3 100644
+--- a/gix-blame/src/file/mod.rs
++++ b/gix-blame/src/file/mod.rs
+@@ -334,12 +334,62 @@ fn process_changes(
+     suspect: ObjectId,
+     parent: ObjectId,
+ ) -> Vec<UnblamedHunk> {
+-    let mut new_hunks_to_blame = Vec::new();
++    process_changes_from_prefix(hunks_to_blame, changes, suspect, parent, None).0
++}
+ 
+-    for mut hunk in hunks_to_blame.into_iter().map(Some) {
+-        let mut offset_in_destination = Offset::Added(0);
++/// Skip only changes entirely before each hunk, retaining independent offsets
++/// for overlapping or nonmonotonic source ranges. Changes themselves are ordered
++/// by the diff, even when the hunks are not.
++fn process_changes_indexed(
++    hunks_to_blame: Vec<UnblamedHunk>,
++    changes: Vec<Change>,
++    suspect: ObjectId,
++    parent: ObjectId,
++) -> (Vec<UnblamedHunk>, usize) {
++    let mut offsets = Vec::with_capacity(changes.len() + 1);
++    let mut offset = Offset::Added(0);
++    offsets.push(offset);
++    for change in &changes {
++        match change {
++            Change::Unchanged(_) => {}
++            Change::AddedOrReplaced(added, deleted) => {
++                offset += added.end - added.start;
++                offset -= *deleted;
++            }
++            Change::Deleted(_, deleted) => offset -= *deleted,
++        }
++        offsets.push(offset);
++    }
++    process_changes_from_prefix(hunks_to_blame, changes, suspect, parent, Some(&offsets))
++}
+ 
+-        let mut changes_iter = changes.iter().cloned();
++fn process_changes_from_prefix(
++    hunks_to_blame: Vec<UnblamedHunk>,
++    changes: Vec<Change>,
++    suspect: ObjectId,
++    parent: ObjectId,
++    prefix_offsets: Option<&[Offset]>,
++) -> (Vec<UnblamedHunk>, usize) {
++    let mut new_hunks_to_blame = Vec::new();
++    let mut skipped_changes = 0;
++
++    for hunk in hunks_to_blame {
++        let first_change = if prefix_offsets.is_some() {
++            hunk.get_range(&suspect).map_or(0, |range| {
++                changes.partition_point(|change| match change {
++                    Change::Unchanged(unchanged) => unchanged.end <= range.start,
++                    Change::AddedOrReplaced(added, _) => added.end <= range.start,
++                    Change::Deleted(position, _) => *position < range.start,
++                })
++            })
++        } else {
++            0
++        };
++        skipped_changes += first_change;
++        let mut offset_in_destination = prefix_offsets.map_or(Offset::Added(0), |offsets| offsets[first_change]);
++        let mut hunk = Some(hunk);
++
++        let mut changes_iter = changes[first_change..].iter().cloned();
+         let mut change = changes_iter.next();
+ 
+         loop {
+@@ -359,7 +409,7 @@ fn process_changes(
+             }
+         }
+     }
+-    new_hunks_to_blame
++    (new_hunks_to_blame, skipped_changes)
+ }
+ 
+ impl UnblamedHunk {
+diff --git a/gix-blame/src/file/tests.rs b/gix-blame/src/file/tests.rs
+index 84dd21a..1b7a316 100644
+--- a/gix-blame/src/file/tests.rs
++++ b/gix-blame/src/file/tests.rs
+@@ -985,6 +985,52 @@ mod process_changes {
+     }
+ }
+ 
++#[test]
++fn indexed_changes_retain_overlapping_source_ranges_and_offsets() {
++    use crate::file::{Change, process_changes_indexed};
++
++    let suspect = zero_sha();
++    let parent = one_sha();
++    let unrelated = ObjectId::from_bytes_or_panic(&[2; 20]);
++    let hunks = vec![
++        (0..2, suspect, 14..16).into(),
++        (2..4, suspect, 8..10).into(),
++        (4..6, suspect, 4..6).into(),
++        (6..8, suspect, 1..3).into(),
++        (8..10, unrelated, 1..3).into(),
++        (10..12, suspect, 8..10).into(),
++        (12..14, suspect, 20..22).into(),
++    ];
++    let changes = vec![
++        Change::Unchanged(0..3),
++        Change::AddedOrReplaced(3..5, 1),
++        Change::Unchanged(5..8),
++        Change::Deleted(8, 3),
++        Change::Unchanged(8..10),
++        Change::AddedOrReplaced(10..11, 0),
++        Change::Unchanged(11..24),
++    ];
++    let (actual, skipped) = process_changes_indexed(hunks, changes, suspect, parent);
++    assert_eq!(
++        actual,
++        [
++            (0..2, parent, 15..17).into(),
++            (2..4, parent, 10..12).into(),
++            (4..5, suspect, 4..5).into(),
++            (5..6, parent, 4..5).into(),
++            (6..8, parent, 1..3).into(),
++            (8..10, unrelated, 1..3).into(),
++            (10..12, parent, 10..12).into(),
++            (12..14, parent, 21..23).into(),
++        ],
++        "prefix offsets preserve repeated/nonmonotonic source ranges and unrelated suspects"
++    );
++    assert_eq!(
++        skipped, 19,
++        "irrelevant change prefixes are not replayed for every hunk"
++    );
++}
++
+ mod blame_ranges {
+     use crate::BlameRanges;
+ 

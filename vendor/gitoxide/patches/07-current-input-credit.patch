@@ -1,0 +1,267 @@
+diff --git a/gix-blame/src/file/function.rs b/gix-blame/src/file/function.rs
+index c002053..384e85a 100644
+--- a/gix-blame/src/file/function.rs
++++ b/gix-blame/src/file/function.rs
+@@ -29,6 +29,9 @@ struct DiagnosticPhases {
+     reused_run_lines: usize,
+     indexed_change_pairs: usize,
+     skipped_changes: usize,
++    prepared_resets: usize,
++    peak_dictionary_weight: usize,
++    current_input_credit_pairs: usize,
+ }
+ 
+ impl DiagnosticPhases {
+@@ -44,12 +47,15 @@ impl DiagnosticPhases {
+             reused_run_lines: 0,
+             indexed_change_pairs: 0,
+             skipped_changes: 0,
++            prepared_resets: 0,
++            peak_dictionary_weight: 0,
++            current_input_credit_pairs: 0,
+         }
+     }
+ 
+     fn report(&self, stats: &Statistics, pending: usize, finished: usize) {
+         eprintln!(
+-            "blameProgress elapsedSeconds={:.3} commits={} diffs={} pendingHunks={} finishedHunks={} loadSeconds={:.3} prepareSeconds={:.3} diffSeconds={:.3} attributionSeconds={:.3} preparedPairs={} gitTailTrimmedPairs={} reusedRunLines={} indexedChangePairs={} skippedChanges={}",
++            "blameProgress elapsedSeconds={:.3} commits={} diffs={} pendingHunks={} finishedHunks={} loadSeconds={:.3} prepareSeconds={:.3} diffSeconds={:.3} attributionSeconds={:.3} preparedPairs={} gitTailTrimmedPairs={} reusedRunLines={} indexedChangePairs={} skippedChanges={} preparedResets={} peakDictionaryWeightedBytes={} currentInputCreditPairs={}",
+             self.started.elapsed().as_secs_f64(),
+             stats.commits_traversed,
+             stats.blobs_diffed,
+@@ -64,6 +70,9 @@ impl DiagnosticPhases {
+             self.reused_run_lines,
+             self.indexed_change_pairs,
+             self.skipped_changes,
++            self.prepared_resets,
++            self.peak_dictionary_weight,
++            self.current_input_credit_pairs,
+         );
+     }
+ }
+@@ -180,6 +189,11 @@ pub fn file(
+         && resource_cache.filter.roots.new_root.is_none())
+     .then(|| {
+         let prepared = PreparedInput::default();
++        let prepared = if std::env::var_os("GIX_BLAME_RETAIN_CURRENT_INPUT_TOKENS").is_some() {
++            prepared.with_current_input_credit()
++        } else {
++            prepared
++        };
+         if std::env::var_os("GIX_BLAME_REUSE_UNCHANGED_RUNS").is_some() {
+             prepared.with_unchanged_runs()
+         } else {
+@@ -911,6 +925,9 @@ fn blob_changes(
+             if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), started) {
+                 diagnostic.diff += started.elapsed();
+                 diagnostic.reused_run_lines += prepared.reused_run_lines();
++                diagnostic.prepared_resets = prepared.resets();
++                diagnostic.peak_dictionary_weight = diagnostic.peak_dictionary_weight.max(prepared.dictionary_weight());
++                diagnostic.current_input_credit_pairs = prepared.credited_pairs();
+             }
+             changes
+         }
+diff --git a/gix-blame/src/file/prepared.rs b/gix-blame/src/file/prepared.rs
+index 77eec34..646641a 100644
+--- a/gix-blame/src/file/prepared.rs
++++ b/gix-blame/src/file/prepared.rs
+@@ -1,6 +1,9 @@
+ use gix_diff::blob::{InternedInput, sources::byte_lines};
+ use gix_hash::ObjectId;
+ 
++const HISTORY_TOKEN_BUDGET_BYTES: usize = 64 * 1024 * 1024;
++const LINE_WEIGHT_OVERHEAD_BYTES: usize = 64;
++
+ /// Query-local preparation retaining complete byte-identical lines for reuse.
+ /// The diff view separately matches Git's zero-context common-tail trimming.
+ #[derive(Default)]
+@@ -12,9 +15,18 @@ pub(super) struct PreparedInput {
+     retained_bytes: usize,
+     reuse_runs: bool,
+     reused_run_lines: usize,
++    current_input_credit: bool,
++    current_pair_weight: usize,
++    resets: usize,
++    credited_pairs: usize,
+ }
+ 
+ impl PreparedInput {
++    pub(super) fn with_current_input_credit(mut self) -> Self {
++        self.current_input_credit = true;
++        self
++    }
++
+     pub(super) fn with_unchanged_runs(mut self) -> Self {
+         self.reuse_runs = true;
+         self
+@@ -24,6 +36,18 @@ impl PreparedInput {
+         self.reused_run_lines
+     }
+ 
++    pub(super) fn resets(&self) -> usize {
++        self.resets
++    }
++
++    pub(super) fn dictionary_weight(&self) -> usize {
++        self.retained_bytes
++    }
++
++    pub(super) fn credited_pairs(&self) -> usize {
++        self.credited_pairs
++    }
++
+     pub(super) fn invalidate(&mut self) {
+         self.parent_id = None;
+     }
+@@ -38,7 +62,21 @@ impl PreparedInput {
+         self.reused_run_lines = 0;
+         // Bound history retention, allowing the current pair's actual input on
+         // top of this budget. A merge, rename or traversal jump may miss reuse.
+-        if self.parent_id != Some(suspect_id) || self.retained_bytes > 64 * 1024 * 1024 {
++        let current_weight = if self.current_input_credit {
++            self.current_pair_weight
++        } else {
++            0
++        };
++        if self.parent_id == Some(suspect_id)
++            && self.retained_bytes > HISTORY_TOKEN_BUDGET_BYTES
++            && self.retained_bytes.saturating_sub(current_weight) <= HISTORY_TOKEN_BUDGET_BYTES
++        {
++            self.credited_pairs += 1;
++        }
++        if self.parent_id != Some(suspect_id)
++            || self.retained_bytes.saturating_sub(current_weight) > HISTORY_TOKEN_BUDGET_BYTES
++        {
++            self.resets += 1;
+             self.input.clear();
+             self.retained_bytes = 0;
+             self.offsets.clear();
+@@ -146,6 +184,17 @@ impl PreparedInput {
+         );
+         std::mem::swap(&mut self.offsets, &mut self.spare_offsets);
+         self.parent_id = Some(parent_id);
++        // The current pair is already required for diffing. Its conservative
++        // line-data/entry weight must not force history eviction on every edge
++        // when a single input exceeds the historical-retention budget. Recheck
++        // the remaining history at the next edge, before interning its parent.
++        self.current_pair_weight = parent.len().saturating_add(suspect.len()).saturating_add(
++            self.input
++                .before
++                .len()
++                .saturating_add(self.input.after.len())
++                .saturating_mul(LINE_WEIGHT_OVERHEAD_BYTES),
++        );
+ 
+         // Git's xdi_diff() removes equal 1024-byte tail blocks, then recovers
+         // through the first LF. Using a longest common suffix instead changes
+@@ -169,7 +218,9 @@ impl PreparedInput {
+         let token = self.input.interner.intern(line.to_vec());
+         if token.0 == previous_count {
+             // Account for owned line data, its Vec, allocator and table entry.
+-            self.retained_bytes = self.retained_bytes.saturating_add(line.len().saturating_add(64));
++            self.retained_bytes = self
++                .retained_bytes
++                .saturating_add(line.len().saturating_add(LINE_WEIGHT_OVERHEAD_BYTES));
+         }
+         token
+     }
+@@ -273,7 +324,14 @@ mod tests {
+         }
+         for suspect in &texts {
+             for parent in &texts {
+-                for mut prepared in [PreparedInput::default(), PreparedInput::default().with_unchanged_runs()] {
++                for mut prepared in [
++                    PreparedInput::default(),
++                    PreparedInput::default().with_unchanged_runs(),
++                    PreparedInput::default().with_current_input_credit(),
++                    PreparedInput::default()
++                        .with_unchanged_runs()
++                        .with_current_input_credit(),
++                ] {
+                     check(&mut prepared, parent, suspect)?;
+                     // Traverse the same edge backwards to exercise identity-bound
+                     // token reuse, not just the first pair's initialization.
+@@ -286,7 +344,14 @@ mod tests {
+ 
+     #[test]
+     fn long_lines_repeated_context_jumps_and_budget_reset_match_full_preparation() -> gix_error::TestResult {
+-        for mut prepared in [PreparedInput::default(), PreparedInput::default().with_unchanged_runs()] {
++        for mut prepared in [
++            PreparedInput::default(),
++            PreparedInput::default().with_unchanged_runs(),
++            PreparedInput::default().with_current_input_credit(),
++            PreparedInput::default()
++                .with_unchanged_runs()
++                .with_current_input_credit(),
++        ] {
+             for size in [255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049] {
+                 let mut before = vec![b'x'; size];
+                 before.extend_from_slice(b"\r\na\na\n\xff\nlast");
+@@ -294,7 +359,7 @@ mod tests {
+                 after.splice(size / 2..size / 2 + 1, b"\nnew\n".iter().copied());
+                 check(&mut prepared, &before, &after)?;
+                 check(&mut prepared, &after, &before)?;
+-                prepared.retained_bytes = 64 * 1024 * 1024 + 1;
++                prepared.retained_bytes = HISTORY_TOKEN_BUDGET_BYTES + prepared.current_pair_weight + 1;
+                 check(&mut prepared, &before, &after)?;
+                 check(&mut prepared, b"unrelated\n", b"branch\n")?;
+             }
+@@ -358,4 +423,58 @@ mod tests {
+         }
+         Ok(())
+     }
++
++    #[test]
++    fn a_current_file_larger_than_the_history_budget_retains_its_line_tokens() -> gix_error::TestResult {
++        let mut shared = vec![b'x'; 64 * 1024 * 1024];
++        shared.extend_from_slice(b"\nend\n");
++        let mut parent = b"new header\n".to_vec();
++        parent.extend_from_slice(&shared);
++        let mut older = b"old header\n".to_vec();
++        older.extend_from_slice(&shared);
++        let id = |bytes: &[u8]| gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Blob, bytes);
++        let mut prepared = PreparedInput::default().with_current_input_credit();
++        let shared_id = id(&shared)?;
++        let parent_id = id(&parent)?;
++        let older_id = id(&older)?;
++        let (input, _) = prepared.prepare(parent_id, &parent, shared_id, &shared);
++        let shared_token = input.before[1];
++        let (input, _) = prepared.prepare(older_id, &older, parent_id, &parent);
++        assert_eq!(
++            input.after[1], shared_token,
++            "the immutable current input must not consume the historical retention budget"
++        );
++        assert_eq!(input.before[1], shared_token);
++        assert_eq!((input.before.len(), input.after.len()), (3, 3));
++        assert_eq!(input.interner[shared_token].as_slice(), &shared[..shared.len() - 4]);
++        assert_eq!(
++            prepared.resets(),
++            1,
++            "the current pair is reused rather than repeatedly cleared"
++        );
++        assert_eq!(
++            prepared.credited_pairs(),
++            1,
++            "current input credit prevents the second reset"
++        );
++        let small = b"only\n";
++        let root = b"root\n";
++        let first = b"first\n";
++        let small_id = id(small)?;
++        let root_id = id(root)?;
++        prepared.prepare(small_id, small, older_id, &older);
++        prepared.prepare(root_id, root, small_id, small);
++        let (input, _) = prepared.prepare(id(first)?, first, root_id, root);
++        assert_eq!(
++            input.interner.num_tokens(),
++            2,
++            "old large-file tokens are evicted after the current pair becomes small"
++        );
++        assert_eq!(
++            prepared.resets(),
++            2,
++            "input credit cannot retain a past large file indefinitely"
++        );
++        Ok(())
++    }
+ }

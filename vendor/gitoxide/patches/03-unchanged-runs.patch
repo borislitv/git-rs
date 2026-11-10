@@ -1,0 +1,243 @@
+diff --git a/gix-blame/src/file/function.rs b/gix-blame/src/file/function.rs
+index c854822..8f0406f 100644
+--- a/gix-blame/src/file/function.rs
++++ b/gix-blame/src/file/function.rs
+@@ -26,6 +26,7 @@ struct DiagnosticPhases {
+     attribution: std::time::Duration,
+     prepared_pairs: usize,
+     git_tail_pairs: usize,
++    reused_run_lines: usize,
+ }
+ 
+ impl DiagnosticPhases {
+@@ -38,12 +39,13 @@ impl DiagnosticPhases {
+             attribution: std::time::Duration::ZERO,
+             prepared_pairs: 0,
+             git_tail_pairs: 0,
++            reused_run_lines: 0,
+         }
+     }
+ 
+     fn report(&self, stats: &Statistics, pending: usize, finished: usize) {
+         eprintln!(
+-            "blameProgress elapsedSeconds={:.3} commits={} diffs={} pendingHunks={} finishedHunks={} loadSeconds={:.3} prepareSeconds={:.3} diffSeconds={:.3} attributionSeconds={:.3} preparedPairs={} gitTailTrimmedPairs={}",
++            "blameProgress elapsedSeconds={:.3} commits={} diffs={} pendingHunks={} finishedHunks={} loadSeconds={:.3} prepareSeconds={:.3} diffSeconds={:.3} attributionSeconds={:.3} preparedPairs={} gitTailTrimmedPairs={} reusedRunLines={}",
+             self.started.elapsed().as_secs_f64(),
+             stats.commits_traversed,
+             stats.blobs_diffed,
+@@ -55,6 +57,7 @@ impl DiagnosticPhases {
+             self.attribution.as_secs_f64(),
+             self.prepared_pairs,
+             self.git_tail_pairs,
++            self.reused_run_lines,
+         );
+     }
+ }
+@@ -169,7 +172,14 @@ pub fn file(
+         && resource_cache.filter_mode == gix_diff::blob::pipeline::Mode::ToGit
+         && resource_cache.filter.roots.old_root.is_none()
+         && resource_cache.filter.roots.new_root.is_none())
+-    .then(PreparedInput::default);
++    .then(|| {
++        let prepared = PreparedInput::default();
++        if std::env::var_os("GIX_BLAME_REUSE_UNCHANGED_RUNS").is_some() {
++            prepared.with_unchanged_runs()
++        } else {
++            prepared
++        }
++    });
+     let mut diagnostic = std::env::var_os("GIX_BLAME_DIAGNOSTIC_PROGRESS").map(|_| DiagnosticPhases::new());
+     let bounded_resource_cache = prepared.is_some() || std::env::var_os("GIX_BLAME_BOUNDED_RESOURCE_CACHE").is_some();
+     'outer: while let Some(suspect) = queue.pop_value() {
+@@ -887,6 +897,7 @@ fn blob_changes(
+             let changes = changes_from_input(input, limits, diff_algorithm, stats);
+             if let (Some(diagnostic), Some(started)) = (diagnostic.as_mut(), started) {
+                 diagnostic.diff += started.elapsed();
++                diagnostic.reused_run_lines += prepared.reused_run_lines();
+             }
+             changes
+         }
+diff --git a/gix-blame/src/file/prepared.rs b/gix-blame/src/file/prepared.rs
+index e6ec237..77eec34 100644
+--- a/gix-blame/src/file/prepared.rs
++++ b/gix-blame/src/file/prepared.rs
+@@ -10,9 +10,20 @@ pub(super) struct PreparedInput {
+     offsets: Vec<usize>,
+     spare_offsets: Vec<usize>,
+     retained_bytes: usize,
++    reuse_runs: bool,
++    reused_run_lines: usize,
+ }
+ 
+ impl PreparedInput {
++    pub(super) fn with_unchanged_runs(mut self) -> Self {
++        self.reuse_runs = true;
++        self
++    }
++
++    pub(super) fn reused_run_lines(&self) -> usize {
++        self.reused_run_lines
++    }
++
+     pub(super) fn invalidate(&mut self) {
+         self.parent_id = None;
+     }
+@@ -24,6 +35,7 @@ impl PreparedInput {
+         suspect_id: ObjectId,
+         suspect: &[u8],
+     ) -> (&InternedInput<Vec<u8>>, (usize, usize)) {
++        self.reused_run_lines = 0;
+         // Bound history retention, allowing the current pair's actual input on
+         // top of this budget. A merge, rename or traversal jump may miss reuse.
+         if self.parent_id != Some(suspect_id) || self.retained_bytes > 64 * 1024 * 1024 {
+@@ -78,7 +90,8 @@ impl PreparedInput {
+         self.spare_offsets.extend_from_slice(&self.offsets[..=prefix_lines]);
+         let mut position = prefix_bytes;
+         let mut nearby = prefix_lines;
+-        for line in byte_lines(&parent[prefix_bytes..parent_suffix]) {
++        let mut lines = byte_lines(&parent[prefix_bytes..parent_suffix]);
++        while let Some(line) = lines.next() {
+             // Small separated edits need not re-intern the unchanged lines
+             // between them. This is only a lookup hint: reuse requires exact
+             // byte equality, and the complete diff still chooses attribution.
+@@ -87,7 +100,35 @@ impl PreparedInput {
+                 .iter()
+                 .position(|&token| self.input.interner[token].as_slice() == line);
+             let token = if let Some(offset) = found {
+-                nearby += offset + 1;
++                let first = nearby + offset;
++                if self.reuse_runs {
++                    // Confirm a whole byte-identical run in the immutable
++                    // source, then reuse only complete upstream line tokens.
++                    let source_start = self.offsets[first];
++                    let matched = common_prefix(
++                        &parent[position..parent_suffix],
++                        &suspect[source_start..self.offsets[suffix_line]],
++                    );
++                    let mut end = self.offsets.partition_point(|&end| end <= source_start + matched) - 1;
++                    if end == self.input.after.len()
++                        && position + matched < parent_suffix
++                        && suspect.last() != Some(&b'\n')
++                    {
++                        end -= 1;
++                    }
++                    self.input.before.extend_from_slice(&self.input.after[first..end]);
++                    self.spare_offsets.extend(
++                        self.offsets[first + 1..=end]
++                            .iter()
++                            .map(|&end| position + (end - source_start)),
++                    );
++                    position += self.offsets[end] - source_start;
++                    self.reused_run_lines += end - first;
++                    nearby = end;
++                    lines = byte_lines(&parent[position..parent_suffix]);
++                    continue;
++                }
++                nearby = first + 1;
+                 self.input.after[nearby - 1]
+             } else {
+                 self.intern(line)
+@@ -206,6 +247,14 @@ mod tests {
+                 "full-input {algorithm:?} diff and sliders must be unchanged"
+             );
+         }
++        let mut expected_offsets = vec![0];
++        for line in byte_lines(parent) {
++            expected_offsets.push(expected_offsets.last().copied().expect("the zero offset is present") + line.len());
++        }
++        assert_eq!(
++            prepared.offsets, expected_offsets,
++            "reused offsets retain complete parent line boundaries"
++        );
+         Ok(())
+     }
+ 
+@@ -224,11 +273,12 @@ mod tests {
+         }
+         for suspect in &texts {
+             for parent in &texts {
+-                let mut prepared = PreparedInput::default();
+-                check(&mut prepared, parent, suspect)?;
+-                // Traverse the same edge backwards to exercise identity-bound
+-                // token reuse, not just the first pair's initialization.
+-                check(&mut prepared, suspect, parent)?;
++                for mut prepared in [PreparedInput::default(), PreparedInput::default().with_unchanged_runs()] {
++                    check(&mut prepared, parent, suspect)?;
++                    // Traverse the same edge backwards to exercise identity-bound
++                    // token reuse, not just the first pair's initialization.
++                    check(&mut prepared, suspect, parent)?;
++                }
+             }
+         }
+         Ok(())
+@@ -236,17 +286,18 @@ mod tests {
+ 
+     #[test]
+     fn long_lines_repeated_context_jumps_and_budget_reset_match_full_preparation() -> gix_error::TestResult {
+-        let mut prepared = PreparedInput::default();
+-        for size in [255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049] {
+-            let mut before = vec![b'x'; size];
+-            before.extend_from_slice(b"\r\na\na\n\xff\nlast");
+-            let mut after = before.clone();
+-            after.splice(size / 2..size / 2 + 1, b"\nnew\n".iter().copied());
+-            check(&mut prepared, &before, &after)?;
+-            check(&mut prepared, &after, &before)?;
+-            prepared.retained_bytes = 64 * 1024 * 1024 + 1;
+-            check(&mut prepared, &before, &after)?;
+-            check(&mut prepared, b"unrelated\n", b"branch\n")?;
++        for mut prepared in [PreparedInput::default(), PreparedInput::default().with_unchanged_runs()] {
++            for size in [255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049] {
++                let mut before = vec![b'x'; size];
++                before.extend_from_slice(b"\r\na\na\n\xff\nlast");
++                let mut after = before.clone();
++                after.splice(size / 2..size / 2 + 1, b"\nnew\n".iter().copied());
++                check(&mut prepared, &before, &after)?;
++                check(&mut prepared, &after, &before)?;
++                prepared.retained_bytes = 64 * 1024 * 1024 + 1;
++                check(&mut prepared, &before, &after)?;
++                check(&mut prepared, b"unrelated\n", b"branch\n")?;
++            }
+         }
+         Ok(())
+     }
+@@ -271,4 +322,40 @@ mod tests {
+         check(&mut prepared, &suspect, &parent)?;
+         Ok(())
+     }
++
++    #[test]
++    fn separated_edits_reuse_complete_runs_without_extending_an_unterminated_line() -> gix_error::TestResult {
++        let mut context = Vec::new();
++        for index in 0..1024 {
++            context.extend_from_slice(format!("same-{index}\r\nrepeat\n").as_bytes());
++            context.extend_from_slice(b"\xff\n");
++        }
++        for terminated in [false, true] {
++            let mut suspect = b"new header\n".to_vec();
++            suspect.extend_from_slice(&context);
++            suspect.extend_from_slice(b"last");
++            let mut parent = b"old header\n".to_vec();
++            parent.extend_from_slice(&context);
++            parent.extend_from_slice(b"last-extended");
++            if terminated {
++                suspect.push(b'\n');
++                parent.push(b'\n');
++            }
++
++            let mut prepared = PreparedInput::default().with_unchanged_runs();
++            check(&mut prepared, &parent, &suspect)?;
++            assert_eq!(
++                prepared.reused_run_lines(),
++                3072,
++                "the separated edit reuses every complete context line, but not the changed final line"
++            );
++            check(&mut prepared, &suspect, &parent)?;
++            assert_eq!(
++                prepared.reused_run_lines(),
++                3072,
++                "reverse traversal reuses the same complete run"
++            );
++        }
++        Ok(())
++    }
+ }

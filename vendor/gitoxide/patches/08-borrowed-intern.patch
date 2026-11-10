@@ -1,0 +1,170 @@
+diff --git a/gix-blame/src/file/prepared.rs b/gix-blame/src/file/prepared.rs
+index 646641a..d276489 100644
+--- a/gix-blame/src/file/prepared.rs
++++ b/gix-blame/src/file/prepared.rs
+@@ -215,7 +215,7 @@ impl PreparedInput {
+ 
+     fn intern(&mut self, line: &[u8]) -> gix_diff::blob::Token {
+         let previous_count = self.input.interner.num_tokens();
+-        let token = self.input.interner.intern(line.to_vec());
++        let token = self.input.interner.intern_ref(line);
+         if token.0 == previous_count {
+             // Account for owned line data, its Vec, allocator and table entry.
+             self.retained_bytes = self
+diff --git a/gix-imara-diff/src/intern.rs b/gix-imara-diff/src/intern.rs
+index caf9665..d3df8f7 100644
+--- a/gix-imara-diff/src/intern.rs
++++ b/gix-imara-diff/src/intern.rs
+@@ -1,6 +1,7 @@
+ // Modified for gitoxide from the upstream imara-diff crate.
+ // Upstream source: git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/intern.rs
+ 
++use std::borrow::Borrow;
+ use std::hash::{BuildHasher as _, Hash};
+ use std::ops::Index;
+ 
+@@ -189,6 +190,31 @@ impl<T> Interner<T> {
+ }
+ 
+ impl<T: Hash + Eq> Interner<T> {
++    /// Intern a borrowed token, acquiring ownership only when it is new.
++    ///
++    /// The borrowed and owned forms must have matching hash and equality
++    /// implementations, as required by [`Borrow`].
++    pub fn intern_ref<Q>(&mut self, token: &Q) -> Token
++    where
++        T: Borrow<Q>,
++        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
++    {
++        let hash = self.hasher.hash_one(token);
++        match self.table.entry(
++            hash,
++            |&it| self.tokens[it.0 as usize].borrow() == token,
++            |&it| self.hasher.hash_one(&self.tokens[it.0 as usize]),
++        ) {
++            Entry::Occupied(entry) => *entry.get(),
++            Entry::Vacant(entry) => {
++                let interned = Token(self.tokens.len() as u32);
++                entry.insert(interned);
++                self.tokens.push(token.to_owned());
++                interned
++            }
++        }
++    }
++
+     /// Create an Interner with an initial capacity calculated by calling
+     /// [`estimate_tokens`](TokenSource::estimate_tokens) methods of `before` and `after`
+     pub fn reserve_for_token_source<S: TokenSource<Token = T>>(&mut self, before: &S, after: &S) {
+diff --git a/gix-imara-diff/tests/integration/interner.rs b/gix-imara-diff/tests/integration/interner.rs
+new file mode 100644
+index 0000000..e0e432c
+--- /dev/null
++++ b/gix-imara-diff/tests/integration/interner.rs
+@@ -0,0 +1,94 @@
++use std::cell::Cell;
++use std::hash::{Hash, Hasher};
++use std::rc::Rc;
++
++use gix_imara_diff::Interner;
++
++#[test]
++fn borrowed_hits_do_not_acquire_another_owned_token() {
++    struct CountedToken {
++        text: &'static str,
++        copies: Rc<Cell<usize>>,
++    }
++
++    impl Clone for CountedToken {
++        fn clone(&self) -> Self {
++            self.copies.set(self.copies.get() + 1);
++            Self {
++                text: self.text,
++                copies: Rc::clone(&self.copies),
++            }
++        }
++    }
++
++    impl Hash for CountedToken {
++        fn hash<H: Hasher>(&self, state: &mut H) {
++            self.text.hash(state);
++        }
++    }
++
++    impl PartialEq for CountedToken {
++        fn eq(&self, other: &Self) -> bool {
++            self.text == other.text
++        }
++    }
++
++    impl Eq for CountedToken {}
++
++    let copies = Rc::new(Cell::new(0));
++    let input = CountedToken {
++        text: "repeated line\n",
++        copies: Rc::clone(&copies),
++    };
++    let mut interner = Interner::new(0);
++    let token = interner.intern_ref(&input);
++    assert_eq!(copies.get(), 1, "a new token needs one owned value");
++    for _ in 0..64 {
++        assert_eq!(interner.intern_ref(&input), token);
++    }
++    assert_eq!(copies.get(), 1, "existing tokens must not be cloned on lookup");
++    assert_eq!(interner.num_tokens(), 1);
++    assert_eq!(interner[token].text, "repeated line\n");
++}
++
++#[test]
++fn borrowed_and_owned_byte_tokens_share_identity_after_growth_and_erasure() {
++    let mut interner = Interner::<Vec<u8>>::new(0);
++    let empty = interner.intern_ref(&b""[..]);
++    let binary = interner.intern(b"\xff\0\r\n".to_vec());
++    assert_eq!(interner.intern_ref(&b"\xff\0\r\n"[..]), binary);
++    for value in 0..512u32 {
++        interner.intern_ref(&value.to_le_bytes()[..]);
++    }
++    interner.reserve(1024);
++    assert_eq!(interner.intern_ref(&b""[..]), empty);
++    assert_eq!(interner.intern(b"\xff\0\r\n".to_vec()), binary);
++    let suffix = interner.intern_ref(&b"last\n"[..]);
++    interner.erase_tokens_after(suffix);
++    assert_eq!(interner.intern_ref(&b"last\n"[..]), suffix);
++    assert_eq!(interner[binary], b"\xff\0\r\n");
++    interner.clear();
++    assert_eq!(interner.num_tokens(), 0);
++    assert_eq!(interner.intern_ref(&b"last\n"[..]).0, 0);
++}
++
++#[test]
++fn borrowed_tokens_with_equal_hashes_still_require_equal_content() {
++    #[derive(Clone, PartialEq, Eq)]
++    struct Colliding(u32);
++
++    impl Hash for Colliding {
++        fn hash<H: Hasher>(&self, state: &mut H) {
++            0u8.hash(state);
++        }
++    }
++
++    let mut interner = Interner::new(0);
++    let first = interner.intern_ref(&Colliding(1));
++    let second = interner.intern_ref(&Colliding(2));
++    assert_ne!(first, second, "hash equality must not merge distinct tokens");
++    assert_eq!(interner.intern(Colliding(1)), first);
++    assert_eq!(interner.intern_ref(&Colliding(2)), second);
++    assert_eq!(interner[first].0, 1);
++    assert_eq!(interner[second].0, 2);
++}
+diff --git a/gix-imara-diff/tests/integration/main.rs b/gix-imara-diff/tests/integration/main.rs
+index b4cade6..9dca6fd 100644
+--- a/gix-imara-diff/tests/integration/main.rs
++++ b/gix-imara-diff/tests/integration/main.rs
+@@ -11,6 +11,8 @@ use gix_imara_diff::{Algorithm, Diff, UnifiedDiffConfig};
+ 
+ const ALL_ALGORITHMS: [Algorithm; 2] = [Algorithm::Histogram, Algorithm::Myers];
+ 
++mod interner;
++
+ mod fuzzed {
+     use std::time::{Duration, Instant};
+ 

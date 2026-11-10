@@ -1,9 +1,15 @@
 //! Library-only operations on an application-owned request repository.
 
 use crate::{Result, invalid, process, protocol::MAX_REF, scratch::Scratch};
+use git_rs_core::pack::{PackLocation, PackSet};
+use git_rs_core::{
+    CapacityBudget, Control, Object, ReadLimits, SnapshotIdentity, SnapshotOdb,
+    VerifiedObjectProvider,
+};
 use gix::bstr::ByteSlice;
 use gix::odb::{find::Header, pack};
 use std::fs;
+use std::io::Read;
 
 const MAX_BASE_RECURSION: usize = 32;
 
@@ -92,5 +98,222 @@ impl<'a> ObjectHeaders<'a> {
 impl gix::odb::Header for ObjectHeaders<'_> {
     fn try_header(&self, id: &gix::hash::oid) -> gix::error::Result<Option<Header>> {
         self.try_header_at(id, 0)
+    }
+}
+
+/// Full physical reads for one already authorized, held snapshot. No gix
+/// repository open/discovery occurs here. Borrowing Scratch preserves every
+/// sealed-RAM cache pin until all mappings and synchronous reads finish.
+pub(crate) struct PhysicalSnapshot<'a, G> {
+    packs: PackSet<(&'a Scratch, G)>,
+    workspace: &'a Scratch,
+    identity: SnapshotIdentity,
+    capacity: CapacityBudget,
+    limits: ReadLimits,
+}
+
+pub(crate) fn open_snapshot<'a, G: 'a>(
+    workspace: &'a Scratch,
+    identity: SnapshotIdentity,
+    source_hold: G,
+    control: Control,
+    capacity: CapacityBudget,
+    limits: ReadLimits,
+) -> Result<SnapshotOdb<PhysicalSnapshot<'a, G>>> {
+    if identity.object_hash != gix::hash::Kind::Sha1 {
+        return Err(invalid("snapshot object format must be SHA-1"));
+    }
+    let mut indexes = Vec::new();
+    for entry in fs::read_dir(workspace.path.join("objects/pack"))? {
+        control.check()?;
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "idx") {
+            if indexes.len() >= limits.max_graph_objects {
+                return Err(invalid("snapshot pack count limit exceeded"));
+            }
+            indexes.push(path);
+        }
+    }
+    let packs = PackSet::open(
+        indexes,
+        (workspace, source_hold),
+        identity.object_hash,
+        &control,
+        limits,
+    )?;
+    let expected = identity.clone();
+    SnapshotOdb::open(
+        PhysicalSnapshot {
+            packs,
+            workspace,
+            identity,
+            capacity: capacity.clone(),
+            limits,
+        },
+        &expected,
+        control,
+        capacity,
+        limits,
+    )
+}
+
+impl<G> PhysicalSnapshot<'_, G> {
+    fn loose(
+        &self,
+        id: &gix::hash::oid,
+        control: &Control,
+        budget: &CapacityBudget,
+        limits: ReadLimits,
+    ) -> Result<Option<Object>> {
+        control.check()?;
+        let hex = id.to_hex().to_string();
+        let path = self
+            .workspace
+            .path
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(invalid("loose snapshot object is not a regular file"));
+        }
+        let length = usize::try_from(metadata.len())?;
+        if length > limits.max_decode_bytes {
+            return Err(invalid("compressed loose object byte limit exceeded"));
+        }
+        let mut compressed = budget.buffer(length)?;
+        while compressed.as_slice().len() < length {
+            control.check()?;
+            let start = compressed.as_slice().len();
+            let end = length.min(start.saturating_add(32 * 1024));
+            compressed.resize(end, 0)?;
+            file.read_exact(&mut compressed.as_mut_slice()[start..end])?;
+        }
+        let mut extra = [0];
+        if file.read(&mut extra)? != 0 {
+            return Err(invalid("loose object changed during snapshot read"));
+        }
+        control.check()?;
+        let (kind, size, header) = loose_header(compressed.as_slice(), control)?;
+        let size = usize::try_from(size)?;
+        if size > limits.max_object_bytes {
+            return Err(invalid("loose object byte limit exceeded"));
+        }
+        let total = size
+            .checked_add(header)
+            .filter(|total| *total <= limits.max_decode_bytes)
+            .ok_or_else(|| invalid("loose decoded-byte limit exceeded"))?;
+        let mut decoded = budget.buffer(total)?;
+        while decoded.as_slice().len() < total {
+            control.check()?;
+            decoded.resize(
+                total.min(decoded.as_slice().len().saturating_add(32 * 1024)),
+                0,
+            )?;
+        }
+        let check = || {
+            control
+                .check()
+                .map_err(|error| gix::error::Error::from_boxed(Box::new(error)))
+        };
+        let (_, read, _) = gix::zlib::Inflate::default().once_controlled(
+            compressed.as_slice(),
+            decoded.as_mut_slice(),
+            &check,
+        )?;
+        if read != compressed.as_slice().len() {
+            return Err(invalid("trailing compressed loose object bytes"));
+        }
+        let actual = gix::objs::decode::loose_header(decoded.as_slice())?;
+        if actual != (kind, size as u64, header) {
+            return Err(invalid("inconsistent loose object header"));
+        }
+        let mut data = budget.buffer(size)?;
+        for chunk in decoded.as_slice()[header..].chunks(32 * 1024) {
+            control.check()?;
+            let start = data.as_slice().len();
+            data.resize(start + chunk.len(), 0)?;
+            data.as_mut_slice()[start..].copy_from_slice(chunk);
+        }
+        let mut hash = gix::hash::hasher(id.kind());
+        hash.update(&gix::objs::encode::loose_header(kind, size as u64));
+        for chunk in data.as_slice().chunks(32 * 1024) {
+            control.check()?;
+            hash.update(chunk);
+        }
+        if hash.try_finalize()?.as_ref() != id {
+            return Err(invalid("physical loose object hash mismatch"));
+        }
+        control.check()?;
+        Ok(Some(Object { kind, data }))
+    }
+}
+
+fn loose_header(input: &[u8], control: &Control) -> Result<(gix::objs::Kind, u64, usize)> {
+    let mut decoder = gix::zlib::Decompress::default();
+    let mut bytes = [0u8; 64];
+    let (mut read, mut written) = (0usize, 0usize);
+    loop {
+        control.check()?;
+        let before_in = decoder.total_in();
+        let before_out = decoder.total_out();
+        let end = input.len().min(read.saturating_add(32 * 1024));
+        let status = decoder.decompress(
+            &input[read..end],
+            &mut bytes[written..],
+            gix::zlib::FlushDecompress::None,
+        )?;
+        let consumed = usize::try_from(decoder.total_in() - before_in)?;
+        let produced = usize::try_from(decoder.total_out() - before_out)?;
+        read += consumed;
+        written += produced;
+        if bytes[..written].contains(&0) {
+            return Ok(gix::objs::decode::loose_header(&bytes[..written])?);
+        }
+        if written == bytes.len()
+            || status == gix::zlib::Status::StreamEnd
+            || (consumed == 0 && produced == 0)
+        {
+            return Err(invalid("invalid physical loose object header"));
+        }
+    }
+}
+
+impl<G> VerifiedObjectProvider for PhysicalSnapshot<'_, G> {
+    fn identity(&self) -> &SnapshotIdentity {
+        &self.identity
+    }
+    fn header(&self, id: &gix::hash::oid, control: &Control) -> Result<Option<gix::objs::Header>> {
+        self.object(id, control, &self.capacity, self.limits)
+            .map(|object| {
+                object.map(|object| gix::objs::Header {
+                    kind: object.kind,
+                    size: object.data.as_slice().len() as u64,
+                })
+            })
+    }
+    fn object(
+        &self,
+        id: &gix::hash::oid,
+        control: &Control,
+        capacity: &CapacityBudget,
+        limits: ReadLimits,
+    ) -> Result<Option<Object>> {
+        if let Some(object) = self.packs.decode(id, control, capacity, limits)? {
+            return Ok(Some(object));
+        }
+        self.loose(id, control, capacity, limits)
+    }
+    fn pack_location(
+        &self,
+        id: &gix::hash::oid,
+        control: &Control,
+    ) -> Result<Option<PackLocation>> {
+        self.packs.locate(id, control)
     }
 }

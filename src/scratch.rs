@@ -194,6 +194,17 @@ impl Scratch {
         Ok(())
     }
 
+    pub fn snapshot_odb<'a, G: 'a>(
+        &'a self,
+        identity: git_rs_core::SnapshotIdentity,
+        source_hold: G,
+        control: git_rs_core::Control,
+        capacity: git_rs_core::CapacityBudget,
+        limits: git_rs_core::ReadLimits,
+    ) -> Result<git_rs_core::SnapshotOdb<impl git_rs_core::VerifiedObjectProvider + 'a>> {
+        repository::open_snapshot(self, identity, source_hold, control, capacity, limits)
+    }
+
     pub(crate) fn retain(&mut self, file: Option<Arc<CachedFile>>) {
         if let Some(file) = file {
             self.packs.push(file);

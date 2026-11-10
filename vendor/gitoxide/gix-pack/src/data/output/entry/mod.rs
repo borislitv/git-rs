@@ -1,0 +1,270 @@
+use gix_error::Result;
+use std::io::Write;
+
+use gix_error::{ErrorExt, ResultExt, bail, message};
+use gix_hash::ObjectId;
+
+use crate::{data, data::output, find};
+
+///
+pub mod iter_from_counts;
+pub use iter_from_counts::function::iter_from_counts;
+
+/// Generate controlled base entries lazily without sorting or nested workers.
+/// The provider must enforce the same request's limits/checks on object lookup.
+/// Unlike the legacy optimizing iterator this does not copy existing packed
+/// deltas; it emits equivalent full objects, one bounded entry per iteration.
+pub fn iter_from_counts_controlled<'a, Find: gix_object::Find, Counts>(
+    counts: Counts,
+    db: &'a Find,
+    compression: gix_zlib::Compression,
+    max_compressed_bytes: usize,
+    check: &'a dyn Fn() -> Result,
+) -> impl Iterator<Item = Result<Vec<output::Entry>>> + 'a
+where
+    Counts: IntoIterator<Item = output::Count>,
+    Counts::IntoIter: 'a,
+{
+    let mut buffer = Vec::new();
+    let mut failed = false;
+    counts.into_iter().scan((), move |_, count| {
+        if failed {
+            return None;
+        }
+        let result = (|| {
+            check()?;
+            let obj = db
+                .try_find(&count.id, &mut buffer)?
+                .ok_or_else(|| gix_error::Error::from(gix_error::not_found("Object missing while generating pack")))?;
+            check()?;
+            let entry = output::Entry::from_data_controlled(&count, &obj, compression, max_compressed_bytes, check)?;
+            Ok(vec![entry])
+        })();
+        failed = result.is_err();
+        Some(result)
+    })
+}
+
+/// The kind of pack entry to be written
+#[derive(PartialEq, Eq, Debug, Hash, Ord, PartialOrd, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Kind {
+    /// A complete base object, including its kind
+    Base(gix_object::Kind),
+    /// A delta against the object with the given index. It's always an index that was already encountered to refer only
+    /// to object we have written already.
+    DeltaRef {
+        /// The absolute index to the object to serve as base. It's up to the writer to maintain enough state to allow producing
+        /// a packed delta object from it.
+        object_index: usize,
+    },
+    /// A delta against the given object as identified by its `ObjectId`.
+    /// This is the case for thin packs only, i.e. those that are sent over the wire.
+    /// Note that there is the option of the `ObjectId` being used to refer to an object within
+    /// the same pack, but it's a discontinued practice which won't be encountered here.
+    DeltaOid {
+        /// The object serving as base for this delta
+        id: ObjectId,
+    },
+}
+
+impl output::Entry {
+    /// Encode a base object with request-local checks inside compression. The
+    /// compressed buffer cannot exceed `max_compressed_bytes`. Object data is
+    /// borrowed; its allocation and lifetime remain owned by the caller.
+    pub fn from_data_controlled(
+        count: &output::Count,
+        obj: &gix_object::Data<'_>,
+        compression: gix_zlib::Compression,
+        max_compressed_bytes: usize,
+        check: &dyn Fn() -> Result,
+    ) -> Result<Self> {
+        struct BoundedOutput {
+            data: Vec<u8>,
+            limit: usize,
+        }
+        impl std::io::Write for BoundedOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.limit.saturating_sub(self.data.len()) {
+                    return Err(std::io::Error::other("Compressed pack entry exceeds output limit"));
+                }
+                self.data
+                    .try_reserve_exact(bytes.len())
+                    .map_err(std::io::Error::other)?;
+                self.data.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        check()?;
+        let mut out = BoundedOutput {
+            data: Vec::new(),
+            limit: max_compressed_bytes,
+        };
+        let mut compressor = gix_zlib::stream::deflate::Compress::new(compression);
+        compressor.write_all_controlled(obj.data, &mut out, check)?;
+        check()?;
+        Ok(Self {
+            id: count.id.to_owned(),
+            kind: Kind::Base(obj.kind),
+            decompressed_size: obj.data.len(),
+            compressed_data: out.data,
+        })
+    }
+
+    /// An object which can be identified as invalid easily which happens if objects didn't exist even if they were referred to.
+    pub fn invalid() -> output::Entry {
+        output::Entry {
+            id: gix_hash::Kind::shortest().null(), // NOTE: the actual object hash used in the repo doesn't matter here, this is a sentinel value.
+            kind: Kind::Base(gix_object::Kind::Blob),
+            decompressed_size: 0,
+            compressed_data: vec![],
+        }
+    }
+
+    /// Returns true if this object doesn't really exist but still has to be handled responsibly
+    ///
+    /// Note that this is true for tree entries that are commits/git submodules, or for objects which aren't present in our local clone
+    /// due to shallow clones.
+    pub fn is_invalid(&self) -> bool {
+        self.id.is_null()
+    }
+
+    /// Create an Entry from a previously counted object which is located in a pack. It's `entry` is provided here.
+    /// The `target_version` specifies what kind of target `Entry` version the caller desires. Both supported versions use
+    /// the same entry encoding.
+    ///
+    /// Errors from `pack_offset_to_oid` are propagated rather than triggering recompression as if the base were absent.
+    pub fn from_pack_entry(
+        mut entry: find::Entry,
+        count: &output::Count,
+        potential_bases: &[output::Count],
+        bases_index_offset: usize,
+        pack_offset_to_oid: Option<impl FnMut(u32, u64) -> Result<Option<ObjectId>>>,
+        target_version: data::Version,
+    ) -> Option<Result<Self>> {
+        if entry.version != target_version {
+            return None;
+        }
+
+        let pack_offset_must_be_zero = 0;
+        let pack_entry = match data::Entry::from_bytes(&entry.data, pack_offset_must_be_zero, count.id.kind()) {
+            Ok(e) => e,
+            Err(err) => return Some(Err(err)),
+        };
+
+        use crate::data::entry::Header::*;
+        match pack_entry.header {
+            Commit => Some(output::entry::Kind::Base(gix_object::Kind::Commit)),
+            Tree => Some(output::entry::Kind::Base(gix_object::Kind::Tree)),
+            Blob => Some(output::entry::Kind::Base(gix_object::Kind::Blob)),
+            Tag => Some(output::entry::Kind::Base(gix_object::Kind::Tag)),
+            OfsDelta { base_distance } => {
+                let pack_location = count.entry_pack_location.as_ref().expect("packed");
+                let Some(base_offset) =
+                    crate::data::entry::Header::verified_base_pack_offset(pack_location.pack_offset, base_distance)
+                else {
+                    return Some(Err(
+                        message("an ofs-delta base distance pointing before pack start").corrupted_error()
+                    ));
+                };
+                match potential_bases.binary_search_by(|e| {
+                    e.entry_pack_location
+                        .as_ref()
+                        .expect("packed")
+                        .pack_offset
+                        .cmp(&base_offset)
+                }) {
+                    Ok(idx) => Some(output::entry::Kind::DeltaRef {
+                        object_index: idx + bases_index_offset,
+                    }),
+                    Err(_) => match pack_offset_to_oid {
+                        Some(mut lookup) => match lookup(pack_location.pack_id, base_offset) {
+                            Ok(base_id) => base_id.map(|id| output::entry::Kind::DeltaOid { id }),
+                            Err(err) => return Some(Err(err)),
+                        },
+                        None => None,
+                    },
+                }
+            }
+            RefDelta { base_id: _ } => None, // ref deltas are for thin packs or legacy, repack them as base objects
+        }
+        .map(|kind| {
+            Ok(output::Entry {
+                id: count.id.to_owned(),
+                kind,
+                decompressed_size: pack_entry.decompressed_size as usize,
+                compressed_data: {
+                    entry.data.copy_within(pack_entry.data_offset as usize.., 0);
+                    entry.data.resize(
+                        entry.data.len()
+                            - usize::try_from(pack_entry.data_offset).expect("offset representable as usize"),
+                        0,
+                    );
+                    entry.data
+                },
+            })
+        })
+    }
+
+    /// Create a new instance from the given `oid` and its corresponding git object data `obj`,
+    /// deflating it with `compression`.
+    ///
+    /// Note that `git` compresses pack entries with the level configured with `pack.compression`,
+    /// whose default is [`Compression::DEFAULT`](gix_zlib::Compression::DEFAULT).
+    pub fn from_data(
+        count: &output::Count,
+        obj: &gix_object::Data<'_>,
+        compression: gix_zlib::Compression,
+    ) -> Result<Self> {
+        Ok(output::Entry {
+            id: count.id.to_owned(),
+            kind: Kind::Base(obj.kind),
+            decompressed_size: obj.data.len(),
+            compressed_data: {
+                let mut out = gix_zlib::stream::deflate::Write::new(Vec::new(), compression);
+                if let Err(err) = std::io::copy(&mut &*obj.data, &mut out) {
+                    match err.kind() {
+                        std::io::ErrorKind::Other => {
+                            bail!(err.and_raise(message("Failed to compress pack entry")));
+                        }
+                        err => unreachable!("Should never see other errors than zlib, but got {:?}", err),
+                    }
+                }
+                out.flush()
+                    .or_raise(|| message("Failed to finish compressing pack entry"))?;
+                out.into_inner()
+            },
+        })
+    }
+
+    /// Transform ourselves into a pack entry header which can be written into a pack of `version`.
+    ///
+    /// `index_to_pack(object_index) -> pack_offset` is a function to convert the base object's index into
+    /// the input object array (if each object is numbered) to an offset into the pack.
+    /// This information is known to the one calling the method.
+    pub fn to_entry_header(
+        &self,
+        _version: data::Version,
+        index_to_base_distance: impl FnOnce(usize) -> u64,
+    ) -> data::entry::Header {
+        use Kind::*;
+        match self.kind {
+            Base(kind) => {
+                use gix_object::Kind::*;
+                match kind {
+                    Tree => data::entry::Header::Tree,
+                    Blob => data::entry::Header::Blob,
+                    Commit => data::entry::Header::Commit,
+                    Tag => data::entry::Header::Tag,
+                }
+            }
+            DeltaOid { id } => data::entry::Header::RefDelta { base_id: id.to_owned() },
+            DeltaRef { object_index } => data::entry::Header::OfsDelta {
+                base_distance: index_to_base_distance(object_index),
+            },
+        }
+    }
+}

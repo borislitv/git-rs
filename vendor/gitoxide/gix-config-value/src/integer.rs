@@ -1,0 +1,243 @@
+use gix_error::Result;
+
+use std::{borrow::Cow, fmt::Display, str::FromStr};
+
+use bstr::{BStr, BString, ByteSlice};
+use gix_error::{Message, ResultExt, ensure, validation};
+
+use crate::Integer;
+
+impl Integer {
+    /// Parse `input`, apply its optional suffix multiplier, and convert it to the signed or unsigned integer `T`.
+    ///
+    /// Accepts byte strings, UTF-8 strings, and byte containers through [`gix_utils::AsBStr`].
+    /// The suffixes `k`, `m`, and `g` (case-insensitive) multiply the parsed value by 1024, 1048576,
+    /// and 1073741824 respectively. Both the parsed and multiplied values must fit in `i64`,
+    /// even when `T` is an unsigned or wider integer type.
+    ///
+    /// Malformed input, suffix multiplication overflow, and values outside `T`'s range are
+    /// [validation errors](gix_error::Class::Validation). Errors retain the original `input` bytes as
+    /// [metadata](gix_error::Error::metadata()), and target conversion errors retain `T::Error` as a cause.
+    ///
+    /// ```
+    /// use gix_config_value::Integer;
+    ///
+    /// let unsigned: usize = Integer::from_bytes("10m")?;
+    /// assert_eq!(unsigned, 10 * 1024 * 1024);
+    /// let signed: i64 = Integer::from_bytes(b"-2k")?;
+    /// assert_eq!(signed, -2048);
+    /// # Ok::<(), gix_error::Error>(())
+    /// ```
+    pub fn from_bytes<T>(input: impl gix_utils::AsBStr) -> Result<T>
+    where
+        T: TryFrom<i64>,
+        T::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let input = input.as_bstr();
+        let value = Self::try_from(input)?.to_decimal().ok_or_else(|| {
+            gix_error::message("integer suffix multiplication overflows `i64`")
+                .with_input(input)
+                .validation_error()
+        })?;
+        T::try_from(value).or_raise(|| {
+            validation(format!("integer is out of range for `{}`", std::any::type_name::<T>())).with_input(input)
+        })
+    }
+
+    /// Canonicalize values as simple decimal numbers.
+    /// An optional suffix of k, m, or g (case-insensitive), will cause the
+    /// value to be multiplied by 1024 (k), 1048576 (m), or 1073741824 (g) respectively.
+    ///
+    /// Returns the result if there is no multiplication overflow.
+    /// Prefer [`Self::from_bytes()`] when parsing raw input to obtain classified errors with input metadata.
+    pub fn to_decimal(&self) -> Option<i64> {
+        match self.suffix {
+            None => Some(self.value),
+            Some(suffix) => match suffix {
+                Suffix::Kibi => self.value.checked_mul(1024),
+                Suffix::Mebi => self.value.checked_mul(1024 * 1024),
+                Suffix::Gibi => self.value.checked_mul(1024 * 1024 * 1024),
+            },
+        }
+    }
+}
+
+impl Display for Integer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.value)?;
+        if let Some(suffix) = self.suffix {
+            write!(f, "{suffix}")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Integer {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if let Some(suffix) = self.suffix {
+            serializer.serialize_i64(self.value << suffix.bitwise_offset())
+        } else {
+            serializer.serialize_i64(self.value)
+        }
+    }
+}
+
+fn int_err(input: impl Into<BString>) -> Message {
+    validation("Integers needs to be positive or negative numbers which may have a suffix like 1k, 42, or 50G")
+        .with_input(gix_error::MetadataValue::Bytes(input.into().into()))
+}
+
+/// Parse `input` the way `git_parse_signed()` does, which hands the value to
+/// `strtoimax()` with a base of `0`: an optional sign, then hexadecimal behind a `0x`
+/// prefix, binary behind a `0b` prefix, octal behind a `0` prefix, and decimal otherwise.
+fn parse_like_git(input: &str) -> Option<i64> {
+    let (negative, rest) = match input.as_bytes().first() {
+        Some(b'+') => (false, &input[1..]),
+        Some(b'-') => (true, &input[1..]),
+        _ => (false, input),
+    };
+
+    let Some(prefixed) = rest.strip_prefix('0') else {
+        return input.parse().ok();
+    };
+    let (digits, radix) = if let Some(hexadecimal) = prefixed.strip_prefix(['x', 'X']) {
+        (hexadecimal, 16)
+    } else if let Some(binary) = prefixed.strip_prefix(['b', 'B']) {
+        (binary, 2)
+    } else if !prefixed.is_empty() {
+        (prefixed, 8)
+    } else {
+        return input.parse().ok();
+    };
+
+    if digits.starts_with('+') || digits.starts_with('-') {
+        return None;
+    }
+    let magnitude = i128::from_str_radix(digits, radix).ok()?;
+    i64::try_from(if negative { -magnitude } else { magnitude }).ok()
+}
+
+impl TryFrom<&BStr> for Integer {
+    type Error = gix_error::Error;
+
+    fn try_from(s: &BStr) -> Result<Self> {
+        let s = std::str::from_utf8(s).or_raise(|| int_err(s))?;
+        if let Some(value) = parse_like_git(s) {
+            return Ok(Self { value, suffix: None });
+        }
+
+        ensure!(s.len() > 1, int_err(s));
+
+        let last_idx = s.len() - 1;
+        ensure!(s.is_char_boundary(last_idx), int_err(s));
+
+        let (number, suffix) = s.split_at(s.len() - 1);
+        if let (Some(value), Ok(suffix)) = (parse_like_git(number), suffix.parse()) {
+            Ok(Self {
+                value,
+                suffix: Some(suffix),
+            })
+        } else {
+            Err(int_err(s).validation_error())
+        }
+    }
+}
+
+impl TryFrom<&str> for Integer {
+    type Error = gix_error::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        Self::try_from(BStr::new(value))
+    }
+}
+
+impl TryFrom<Cow<'_, BStr>> for Integer {
+    type Error = gix_error::Error;
+
+    fn try_from(c: Cow<'_, BStr>) -> Result<Self> {
+        Self::try_from(c.as_ref())
+    }
+}
+
+impl TryFrom<BString> for Integer {
+    type Error = gix_error::Error;
+
+    fn try_from(value: BString) -> Result<Self> {
+        Self::try_from(BStr::new(&value))
+    }
+}
+
+/// Integer suffixes that are supported by `git-config`.
+///
+/// These values are base-2 unit of measurements, not the base-10 variants.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub enum Suffix {
+    /// Multiply the value by 2^10.
+    Kibi,
+    /// Multiply the value by 2^20.
+    Mebi,
+    /// Multiply the value by 2^30.
+    Gibi,
+}
+
+impl Suffix {
+    /// Returns the number of bits that the suffix shifts left by.
+    #[must_use]
+    pub const fn bitwise_offset(self) -> usize {
+        match self {
+            Self::Kibi => 10,
+            Self::Mebi => 20,
+            Self::Gibi => 30,
+        }
+    }
+}
+
+impl Display for Suffix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kibi => write!(f, "k"),
+            Self::Mebi => write!(f, "m"),
+            Self::Gibi => write!(f, "g"),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Suffix {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Kibi => "k",
+            Self::Mebi => "m",
+            Self::Gibi => "g",
+        })
+    }
+}
+
+impl FromStr for Suffix {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::try_from(BStr::new(s))
+    }
+}
+
+impl TryFrom<&BStr> for Suffix {
+    type Error = ();
+
+    fn try_from(s: &BStr) -> std::result::Result<Self, Self::Error> {
+        match s.as_bytes() {
+            b"k" | b"K" => Ok(Self::Kibi),
+            b"m" | b"M" => Ok(Self::Mebi),
+            b"g" | b"G" => Ok(Self::Gibi),
+            _ => Err(()),
+        }
+    }
+}

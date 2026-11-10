@@ -1,0 +1,169 @@
+use crate::{Repository, clone::PrepareCheckout};
+
+///
+pub mod main_worktree {
+    use std::sync::atomic::AtomicBool;
+
+    use crate::error::{ResultExt, message};
+
+    use crate::{Error, Progress, Repository, Result, clone::PrepareCheckout};
+
+    /// The progress ids used in [`PrepareCheckout::main_worktree()`].
+    ///
+    /// Use this information to selectively extract the progress of interest in case the parent application has custom visualization.
+    #[derive(Debug, Copy, Clone)]
+    pub enum ProgressId {
+        /// The amount of files checked out thus far.
+        CheckoutFiles,
+        /// The amount of bytes written in total, the aggregate of the size of the content of all files thus far.
+        BytesWritten,
+    }
+
+    impl From<ProgressId> for gix_utils::progress::Id {
+        fn from(v: ProgressId) -> Self {
+            match v {
+                ProgressId::CheckoutFiles => *b"CLCF",
+                ProgressId::BytesWritten => *b"CLCB",
+            }
+        }
+    }
+
+    /// Modification
+    impl PrepareCheckout {
+        /// Checkout the main worktree, determining how many threads to use by looking at `checkout.workers`.
+        /// Automatic threading uses one worker per logical core, capped at four on macOS.
+        ///
+        /// Note that this is a no-op if the remote was empty, leaving this repository empty as well. This can be validated by checking
+        /// if the `head()` of the returned repository is *not* unborn.
+        ///
+        /// # Interruption
+        ///
+        /// Like [`gix_worktree_state::checkout()`], interruption alone does not return an error: this method writes the
+        /// index and returns `Ok((repository, outcome))` even if only part of the worktree was checked out.
+        /// Callers must inspect `should_interrupt` after this method returns to distinguish interruption from completion;
+        /// `Ok` and an outcome without errors do not guarantee a complete checkout.
+        ///
+        /// The returned repository and any partially checked-out files are retained when this preparation is dropped,
+        /// so the fetch does not need to be repeated. Finish checkout with
+        /// `git -C <destination> restore --source=HEAD --staged --worktree :/`, which overwrites tracked files.
+        ///
+        /// # Panics
+        ///
+        /// If called after it returned `Ok`, including after interruption, as the repository has already been passed to the caller.
+        pub fn main_worktree<P>(
+            &mut self,
+            mut progress: P,
+            should_interrupt: &AtomicBool,
+        ) -> Result<(Repository, gix_worktree_state::checkout::Outcome)>
+        where
+            P: gix_utils::progress::NestedProgress,
+            P::SubProgress: gix_utils::progress::NestedProgress + 'static,
+        {
+            self.main_worktree_inner(&mut progress, should_interrupt)
+        }
+
+        fn main_worktree_inner(
+            &mut self,
+            progress: &mut dyn gix_utils::progress::DynNestedProgress,
+            should_interrupt: &AtomicBool,
+        ) -> Result<(Repository, gix_worktree_state::checkout::Outcome)> {
+            let _span = gix_trace::coarse!("gix::clone::PrepareCheckout::main_worktree()");
+            let repo = self
+                .repo
+                .as_ref()
+                .expect("BUG: this method may only be called until it is successful");
+            let workdir = repo.workdir().ok_or_else(|| {
+                Error::from_error(message!(
+                    "Repository at \"{}\" is a bare repository and cannot have a main worktree checkout",
+                    repo.git_dir().display()
+                ))
+            })?;
+
+            let root_tree_id = repo.head()?.try_peel_to_id()?;
+
+            let root_tree = match root_tree_id {
+                Some(id) => {
+                    id.object()
+                        .expect("downloaded from remote")
+                        .peel_to_tree()
+                        .or_raise(|| message("The object pointed to by HEAD is not a treeish"))?
+                        .id
+                }
+                None => {
+                    return Ok((
+                        self.repo.take().expect("still present"),
+                        gix_worktree_state::checkout::Outcome::default(),
+                    ));
+                }
+            };
+
+            let protect_options = repo.config.protect_options()?;
+            let index = gix_index::State::from_tree(&root_tree, &repo.objects, protect_options)
+                .or_raise(|| message!("Could not create index from tree at {root_tree}"))?;
+            let mut index = gix_index::File::from_state(index, repo.index_path());
+
+            let mut opts = repo.checkout_options(gix_worktree::stack::state::attributes::Source::IdMapping)?;
+            opts.destination_is_initially_empty = true;
+
+            let mut files = progress.add_child_with_id("checkout".to_string(), ProgressId::CheckoutFiles.into());
+            let mut bytes = progress.add_child_with_id("writing".to_string(), ProgressId::BytesWritten.into());
+
+            files.init(Some(index.entries().len()), crate::progress::count("files"));
+            bytes.init(None, crate::progress::bytes());
+
+            let start = std::time::Instant::now();
+            let outcome = gix_worktree_state::checkout(
+                &mut index,
+                workdir,
+                repo.objects.clone().into_arc().or_raise(|| {
+                    message("Failed to reopen object database as Arc (only if thread-safety wasn't compiled in)")
+                })?,
+                &files,
+                &bytes,
+                should_interrupt,
+                opts,
+            )?;
+            files.show_throughput(start);
+            bytes.show_throughput(start);
+
+            index.write(Default::default())?;
+            Ok((self.repo.take().expect("still present").clone(), outcome))
+        }
+    }
+}
+
+/// Access
+impl PrepareCheckout {
+    /// Get access to the repository before checkout returns it to the caller.
+    ///
+    /// # Panics
+    ///
+    /// If [`Self::main_worktree()`] returned `Ok`, including after interruption, and passed the [`Repository`] to the caller.
+    pub fn repo(&self) -> &Repository {
+        self.repo
+            .as_ref()
+            .expect("present as checkout operation isn't complete")
+    }
+}
+
+/// Consumption
+impl PrepareCheckout {
+    /// Persist the contained repository as is even if an error may have occurred when checking out the main working tree.
+    pub fn persist(mut self) -> Repository {
+        self.repo.take().expect("present and consumed once")
+    }
+}
+
+impl Drop for PrepareCheckout {
+    fn drop(&mut self) {
+        if let Some(repo) = self.repo.take() {
+            super::cleanup_clone_destination_on_drop(&repo, self.remove_worktree_on_drop);
+        }
+    }
+}
+
+impl From<PrepareCheckout> for Repository {
+    fn from(prep: PrepareCheckout) -> Self {
+        prep.persist()
+    }
+}

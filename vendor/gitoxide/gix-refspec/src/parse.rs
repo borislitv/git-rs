@@ -1,0 +1,160 @@
+/// Define how the parsed refspec should be used.
+#[derive(PartialOrd, Ord, PartialEq, Eq, Copy, Clone, Hash, Debug)]
+pub enum Operation {
+    /// The `src` side is local and the `dst` side is remote.
+    Push,
+    /// The `src` side is remote and the `dst` side is local.
+    Fetch,
+}
+
+pub(crate) mod function {
+    use crate::{RefSpecRef, parse::Operation, types::Mode};
+    use bstr::{BStr, ByteSlice};
+    use gix_error::{Result, ResultExt, bail, message, validation};
+
+    /// Parse `spec` for use in `operation` and return it if it is valid.
+    /// Patterns with more than one `*` include the offending source or destination bytes as `input`
+    /// [metadata](gix_error::Error::metadata()).
+    pub fn parse(mut spec: &BStr, operation: Operation) -> Result<RefSpecRef<'_>> {
+        fn fetch_head_only(mode: Mode) -> RefSpecRef<'static> {
+            RefSpecRef {
+                mode,
+                op: Operation::Fetch,
+                src: Some("HEAD".into()),
+                dst: None,
+            }
+        }
+
+        let mode = match spec.first() {
+            Some(&b'^') => {
+                spec = &spec[1..];
+                Mode::Negative
+            }
+            Some(&b'+') => {
+                spec = &spec[1..];
+                Mode::Force
+            }
+            Some(_) => Mode::Normal,
+            None => {
+                return match operation {
+                    Operation::Push => Err(message("Empty refspecs are invalid").validation_error()),
+                    Operation::Fetch => Ok(fetch_head_only(Mode::Normal)),
+                };
+            }
+        };
+
+        // Split on the last colon like `strrchr()` in Git's `parse_refspec()` does, so that a
+        // push source may itself contain one - `:/message` and `<rev>:<path>` are both valid
+        // revisions. With a single colon this is the same position as the first one.
+        let (mut src, dst) = match spec.rfind_byte(b':') {
+            Some(pos) => {
+                if mode == Mode::Negative {
+                    bail!(validation(
+                        "Negative refspecs cannot have destinations as they exclude sources"
+                    ));
+                }
+
+                let (src, dst) = spec.split_at(pos);
+                let dst = &dst[1..];
+                let src = (!src.is_empty()).then(|| src.as_bstr());
+                let dst = (!dst.is_empty()).then(|| dst.as_bstr());
+                match (src, dst) {
+                    (None, None) => match operation {
+                        Operation::Push => (None, None),
+                        Operation::Fetch => (Some("HEAD".into()), None),
+                    },
+                    (None, Some(dst)) => match operation {
+                        Operation::Push => (None, Some(dst)),
+                        Operation::Fetch => (Some("HEAD".into()), Some(dst)),
+                    },
+                    (Some(src), None) => match operation {
+                        Operation::Push => {
+                            bail!(validation("Cannot push into an empty destination"));
+                        }
+                        Operation::Fetch => (Some(src), None),
+                    },
+                    (Some(src), Some(dst)) => (Some(src), Some(dst)),
+                }
+            }
+            None => {
+                let src = (!spec.is_empty()).then_some(spec);
+                if Operation::Fetch == operation && mode != Mode::Negative && src.is_none() {
+                    return Ok(fetch_head_only(mode));
+                } else {
+                    (src, None)
+                }
+            }
+        };
+
+        if let Some(spec) = src.as_mut()
+            && *spec == "@"
+        {
+            *spec = "HEAD".into();
+        }
+        let (src, src_had_pattern) = validated(src, operation == Operation::Push && dst.is_some())?;
+        let (dst, dst_had_pattern) = validated(dst, false)?;
+        if mode != Mode::Negative
+            && src_had_pattern != dst_had_pattern
+            && !(operation == Operation::Push && dst.is_none())
+        {
+            bail!(validation(
+                "Both sides of a two-sided specification need a pattern, like 'a/*:b/*'"
+            ));
+        }
+
+        if mode == Mode::Negative {
+            match src {
+                Some(spec) => {
+                    if looks_like_object_hash(spec) {
+                        bail!(validation("Negative specs must not be object hashes"));
+                    }
+                }
+                None => bail!(validation("Negative specs must not be empty")),
+            }
+        }
+
+        Ok(RefSpecRef {
+            op: operation,
+            mode,
+            src,
+            dst,
+        })
+    }
+
+    fn looks_like_object_hash(spec: &BStr) -> bool {
+        spec.len() >= gix_hash::Kind::shortest().len_in_hex() && spec.iter().all(u8::is_ascii_hexdigit)
+    }
+
+    fn validate_partial_name_with_single_glob(
+        spec: &BStr,
+    ) -> std::result::Result<(), gix_validate::reference::name::Error> {
+        let mut buf = smallvec::SmallVec::<[u8; 256]>::with_capacity(spec.len());
+        buf.extend_from_slice(spec);
+        let glob_pos = buf.find_byte(b'*').expect("glob present");
+        buf[glob_pos] = b'a';
+        gix_validate::reference::name_partial(buf.as_bstr())?;
+        Ok(())
+    }
+
+    /// Validate `spec`, and return it along with whether it holds a glob.
+    ///
+    /// `any_name` skips the check entirely, for the one side Git leaves unchecked.
+    fn validated(spec: Option<&BStr>, any_name: bool) -> Result<(Option<&BStr>, bool)> {
+        match spec {
+            Some(spec) => {
+                let glob_count = spec.iter().filter(|b| **b == b'*').take(2).count();
+                if glob_count > 1 {
+                    bail!(validation("refspec patterns may only contain a single '*' character").with_input(spec));
+                }
+                let has_globs = glob_count > 0;
+                if has_globs {
+                    validate_partial_name_with_single_glob(spec).or_error()?;
+                } else if !any_name {
+                    gix_validate::reference::name_partial(spec).or_error()?;
+                }
+                Ok((Some(spec), has_globs))
+            }
+            None => Ok((None, false)),
+        }
+    }
+}

@@ -14,3 +14,26 @@
 !tests/support/cache_faults.py
 !tests/fixtures/
 !tests/fixtures/cache-storage-budget.json
+!crates/
+!crates/git-core/
+!crates/git-core/**
+!vendor/
+!vendor/gitoxide/
+!vendor/gitoxide/**
+
+# Exact test-helper scratch roots excluded by tools/check-core-source.py.
+# Original tracked archives and fuzz regression inputs remain in the context.
+vendor/gitoxide/gix-blame/tests/fixtures/generated-do-not-edit
+vendor/gitoxide/gix-blame/tests/fixtures/generated-do-not-edit/**
+vendor/gitoxide/gix-diff/tests/fixtures/generated-do-not-edit
+vendor/gitoxide/gix-diff/tests/fixtures/generated-do-not-edit/**
+vendor/gitoxide/gix-imara-diff/tests/fixtures/generated-do-not-edit
+vendor/gitoxide/gix-imara-diff/tests/fixtures/generated-do-not-edit/**
+vendor/gitoxide/gix-pack/tests/fixtures/generated-do-not-edit
+vendor/gitoxide/gix-pack/tests/fixtures/generated-do-not-edit/**
+vendor/gitoxide/tests/tools/tests/fixtures/generated-do-not-edit
+vendor/gitoxide/tests/tools/tests/fixtures/generated-do-not-edit/**
+
+# Cargo's nested workspace output is never source.
+vendor/gitoxide/target
+vendor/gitoxide/target/**
