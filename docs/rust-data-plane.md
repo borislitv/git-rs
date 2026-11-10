@@ -81,9 +81,13 @@ until the worker has finished cleanup. `CapacityBudget` accounts for live backin
 capacity, including retained results; it is not an RSS or allocator-overhead metric.
 Arbitrary callbacks, panic hooks and destructors still require bounded behavior.
 
-The audited Gitoxide closure lives in `vendor/gitoxide`, with original source,
-patches, licenses and a source manifest. Root path overrides and the locked package
-graph prevent duplicate registry/fork type instances. Controlled pack, zlib, diff,
+Gitoxide is a normal Git dependency pinned to the owned
+[`borislitv/gitoxide` fork](https://github.com/borislitv/gitoxide/pull/1), revision
+`c3282a004f677b4d9b0b6bacb507462edf4b9e0a` (the stable Stage 3/4 source).
+`docs/gitoxide-source.json` records its upstream base, licenses and imara origin;
+original source, notices, tests and changes remain in that repository, not copied
+into this application. The source audit and locked package graph reject mixed
+registry/fork or revision identities. Controlled pack, zlib, diff,
 tokenization and blame entrypoints expose inner-loop cancellation and admission;
 configuration is request-local rather than operational environment mutation.
 The core currently uses an uncached decoder. General blame still needs owner-aware
@@ -91,10 +95,13 @@ scratch reuse, complete native porcelain provenance and application integration
 before replacing its existing serving boundary.
 
 Run `make check` for the source audit, workspace formatting, strict Clippy and
-application/core tests. `make vendor-check` separately runs the five affected
-vendor packages, strict Clippy and explicit doctests. Build output stays outside
-the audited vendor inventory; only the exact generated fixture directories are
-ignored. Root contract tests cover real sealed-RAM links, cross-pack bases,
+application/core tests. `make vendor-check GITOXIDE_DIR=<checkout>` separately
+verifies that checkout's owned origin, exact revision, clean tracked source and
+license notices, then runs the five affected dependency packages, strict Clippy
+and explicit doctests. CI checks out the same pin under ignored `.local/gitoxide`;
+build output remains under the application's target directory. Cargo fetches the
+same immutable source for application and Docker builds. Root contract tests cover
+real sealed-RAM links, cross-pack bases,
 wrong-object rejection, no-growth caller buffers, source lifetimes and cancellation.
 These foundation gates do not establish a Git-free runtime, general native-exact
 blame, hard realtime cancellation or production deployment readiness.

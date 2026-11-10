@@ -3,21 +3,24 @@
 HELM ?= helm
 K3S_CONTAINER ?= git-rs-k3s-test
 VENDOR_TARGET_DIR ?= $(abspath $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)/vendor)
+GITOXIDE_DIR ?= .local/gitoxide
 VENDOR_PACKAGES = -p gix-pack -p gix-zlib -p gix-blame -p gix-diff -p gix-imara-diff
 
 core-source-check:
 	python3 tools/check-core-source.py
+	python3 -B tests/core_source_test.py
 
 check: core-source-check
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --locked --workspace --all-targets
 
-# Keep build output outside the audited vendor source inventory.
+# Test the exact external checkout, never a copied application source subtree.
 vendor-check: core-source-check
-	cargo test --locked --manifest-path vendor/gitoxide/Cargo.toml --target-dir "$(VENDOR_TARGET_DIR)" $(VENDOR_PACKAGES)
-	cargo clippy --locked --manifest-path vendor/gitoxide/Cargo.toml --target-dir "$(VENDOR_TARGET_DIR)" $(VENDOR_PACKAGES) --lib --tests -- -D warnings
-	cargo test --locked --manifest-path vendor/gitoxide/Cargo.toml --target-dir "$(VENDOR_TARGET_DIR)" -p gix-blame -p gix-diff -p gix-imara-diff --doc
+	python3 tools/check-core-source.py --dependency-root "$(GITOXIDE_DIR)"
+	cargo test --locked --manifest-path "$(GITOXIDE_DIR)/Cargo.toml" --target-dir "$(VENDOR_TARGET_DIR)" $(VENDOR_PACKAGES)
+	cargo clippy --locked --manifest-path "$(GITOXIDE_DIR)/Cargo.toml" --target-dir "$(VENDOR_TARGET_DIR)" $(VENDOR_PACKAGES) --lib --tests -- -D warnings
+	cargo test --locked --manifest-path "$(GITOXIDE_DIR)/Cargo.toml" --target-dir "$(VENDOR_TARGET_DIR)" -p gix-blame -p gix-diff -p gix-imara-diff --doc
 
 cache-build:
 	cargo build --locked --bin git-rs --example cache-process

@@ -33,7 +33,7 @@ COPY migrations ./migrations
 COPY benches ./benches
 COPY tests/support/cache_process.rs ./tests/support/cache_process.rs
 COPY crates/git-core ./crates/git-core
-COPY vendor/gitoxide ./vendor/gitoxide
+# Cargo fetch resolves the owned Gitoxide source at the immutable lockfile pin.
 RUN cargo fetch --locked && cargo build --release --offline --locked
 
 FROM toolchain AS git-build

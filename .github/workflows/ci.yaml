@@ -66,11 +66,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Audit pristine core source and license inventory
         run: make core-source-check
+      - name: Check out the pinned owned Gitoxide source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/gitoxide
+          ref: c3282a004f677b4d9b0b6bacb507462edf4b9e0a
+          path: .local/gitoxide
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.99.1
           components: clippy
-      - name: Normal vendor tests, strict Clippy and explicit doctests
+      - name: Pinned dependency tests, strict Clippy and explicit doctests
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config git coreutils

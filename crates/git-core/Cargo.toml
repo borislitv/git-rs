@@ -6,11 +6,11 @@ rust-version = "1.99"
 description = "Bounded cooperative Git computation core"
 
 [dependencies]
-gix-object = { version = "=0.66.1", default-features = false }
-gix-hash = { version = "=0.28.1", default-features = false, features = ["sha1"] }
-gix-pack = { version = "=0.77.0", default-features = false }
-gix-error = "=0.5.2"
-gix-zlib = { version = "=0.4.0", default-features = false }
+gix-object = { git = "https://github.com/borislitv/gitoxide", rev = "c3282a004f677b4d9b0b6bacb507462edf4b9e0a", version = "=0.66.1", default-features = false }
+gix-hash = { git = "https://github.com/borislitv/gitoxide", rev = "c3282a004f677b4d9b0b6bacb507462edf4b9e0a", version = "=0.28.1", default-features = false, features = ["sha1"] }
+gix-pack = { git = "https://github.com/borislitv/gitoxide", rev = "c3282a004f677b4d9b0b6bacb507462edf4b9e0a", version = "=0.77.0", default-features = false }
+gix-error = { git = "https://github.com/borislitv/gitoxide", rev = "c3282a004f677b4d9b0b6bacb507462edf4b9e0a", version = "=0.5.2" }
+gix-zlib = { git = "https://github.com/borislitv/gitoxide", rev = "c3282a004f677b4d9b0b6bacb507462edf4b9e0a", version = "=0.4.0", default-features = false }
 hashbrown = { version = "=0.17.1", default-features = false }
 
 [dev-dependencies]

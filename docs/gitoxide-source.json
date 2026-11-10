@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "imara_origin": {
+    "git": "https://github.com/pascalkuthe/imara-diff",
+    "ledger_in_source": "gix-imara-diff/UPSTREAM-PROVENANCE.tsv",
+    "rev": "32d1e45d3df061e6ccba6db7fdce92db29e345d8"
+  },
+  "licenses": {
+    "default_gitoxide": "MIT OR Apache-2.0",
+    "gix-imara-diff": "Apache-2.0"
+  },
+  "notices_in_source": [
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "gix-imara-diff/LICENSE"
+  ],
+  "pull_request": "https://github.com/borislitv/gitoxide/pull/1",
+  "qualified_snapshot": "Stage 3/4 controlled computation (A)",
+  "source": {
+    "git": "https://github.com/borislitv/gitoxide",
+    "rev": "c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+  },
+  "upstream": {
+    "base": "dd39fb66e3b1551c9fe849043e39b357a9799ca1",
+    "repository": "https://github.com/GitoxideLabs/gitoxide"
+  }
+}
