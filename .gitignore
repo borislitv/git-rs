@@ -4,3 +4,8 @@
 /.env
 *.private.md
 __pycache__/
+/vendor/gitoxide/gix-blame/tests/fixtures/generated-do-not-edit/
+/vendor/gitoxide/gix-diff/tests/fixtures/generated-do-not-edit/
+/vendor/gitoxide/gix-imara-diff/tests/fixtures/generated-do-not-edit/
+/vendor/gitoxide/gix-pack/tests/fixtures/generated-do-not-edit/
+/vendor/gitoxide/tests/tools/tests/fixtures/generated-do-not-edit/

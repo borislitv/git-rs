@@ -63,6 +63,42 @@ Rust-only boundary has been met. Compatibility must be preserved through each
 replacement rather than by disabling strict validation or narrowing accepted
 repository shapes.
 
+## Shared core foundation
+
+`crates/git-core` provides the versioned `git-rs-core` library. Its
+`SnapshotSession`/`SnapshotOdb` accepts an explicitly pinned physical object provider
+and verifies object identity. The root `Scratch::snapshot_odb` adapter preserves
+sealed pack/index mappings and source ownership through full reads, cross-pack
+delta resolution, byte-oriented paths and exhaustive commit ancestry. An absent
+physical empty tree stays absent. `reachable_from_refs` enumerates commits, not the
+complete tree/blob closure needed by a future pack writer or strict receiver.
+
+`CpuExecutor` has a fixed worker count, bounded queue and request-local `Control`.
+Dropping a completion `Ticket` does not cancel independently owned work; explicit
+cancellation and deadline propagation stop cooperative algorithms. A timeout is
+not stop acknowledgment. Captured source owners, buffers and admission survive
+until the worker has finished cleanup. `CapacityBudget` accounts for live backing
+capacity, including retained results; it is not an RSS or allocator-overhead metric.
+Arbitrary callbacks, panic hooks and destructors still require bounded behavior.
+
+The audited Gitoxide closure lives in `vendor/gitoxide`, with original source,
+patches, licenses and a source manifest. Root path overrides and the locked package
+graph prevent duplicate registry/fork type instances. Controlled pack, zlib, diff,
+tokenization and blame entrypoints expose inner-loop cancellation and admission;
+configuration is request-local rather than operational environment mutation.
+The core currently uses an uncached decoder. General blame still needs owner-aware
+scratch reuse, complete native porcelain provenance and application integration
+before replacing its existing serving boundary.
+
+Run `make check` for the source audit, workspace formatting, strict Clippy and
+application/core tests. `make vendor-check` separately runs the five affected
+vendor packages, strict Clippy and explicit doctests. Build output stays outside
+the audited vendor inventory; only the exact generated fixture directories are
+ignored. Root contract tests cover real sealed-RAM links, cross-pack bases,
+wrong-object rejection, no-growth caller buffers, source lifetimes and cancellation.
+These foundation gates do not establish a Git-free runtime, general native-exact
+blame, hard realtime cancellation or production deployment readiness.
+
 ## Generality and scaling
 
 The service is for arbitrary Git repositories: multiple files/directories,

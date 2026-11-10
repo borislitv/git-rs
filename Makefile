@@ -1,12 +1,23 @@
-.PHONY: check cache-build cache-check integration failures chart kubernetes istio image bench
+.PHONY: check core-source-check vendor-check cache-build cache-check integration failures chart kubernetes istio image bench
 
 HELM ?= helm
 K3S_CONTAINER ?= git-rs-k3s-test
+VENDOR_TARGET_DIR ?= $(abspath $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)/vendor)
+VENDOR_PACKAGES = -p gix-pack -p gix-zlib -p gix-blame -p gix-diff -p gix-imara-diff
 
-check:
-	cargo fmt -- --check
-	cargo clippy --all-targets -- -D warnings
-	cargo test --locked --all-targets
+core-source-check:
+	python3 tools/check-core-source.py
+
+check: core-source-check
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo test --locked --workspace --all-targets
+
+# Keep build output outside the audited vendor source inventory.
+vendor-check: core-source-check
+	cargo test --locked --manifest-path vendor/gitoxide/Cargo.toml --target-dir "$(VENDOR_TARGET_DIR)" $(VENDOR_PACKAGES)
+	cargo clippy --locked --manifest-path vendor/gitoxide/Cargo.toml --target-dir "$(VENDOR_TARGET_DIR)" $(VENDOR_PACKAGES) --lib --tests -- -D warnings
+	cargo test --locked --manifest-path vendor/gitoxide/Cargo.toml --target-dir "$(VENDOR_TARGET_DIR)" -p gix-blame -p gix-diff -p gix-imara-diff --doc
 
 cache-build:
 	cargo build --locked --bin git-rs --example cache-process
