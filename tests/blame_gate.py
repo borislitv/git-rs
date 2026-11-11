@@ -6,7 +6,9 @@ bounded systemd unit and a dedicated aggregate slice, including Docker fixtures.
 All application/test executables run in the recorded read-only test image.
 """
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,9 +16,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from types import SimpleNamespace
+
+from cache_gate import FAILURE_EXCERPT_BYTES, failed_child_excerpt
 
 ROOT = Path(__file__).resolve().parents[1]
 LEGACY_REPOSITORY = "https://github.com/borislitv/git-rs"
@@ -33,7 +38,8 @@ EXCLUDE = {"blame_artifacts": {"artifact_process"},
 ROOT_RUNTIME = "runtime_support::owned_source_runtime_fences_ready_cache_http_response_staging_and_publication"
 HARNESS_FILES = ("tests/blame_gate.py", "tests/blame_artifacts.py", "tests/derived_cache.py",
                  "tests/integration.py", "tests/blame_concurrency.py",
-                 "tests/support/cache_faults.py", "tests/support/blame_artifact_faults.py")
+                 "tests/support/cache_faults.py", "tests/support/blame_artifact_faults.py",
+                 "tests/cache_gate.py")
 LABEL = "git-rs.blame-gate="
 PREPARATION_LABEL = "git-rs.blame-preparation="
 SLICE_PATTERN = r"git-rs-blame-[a-zA-Z0-9_-]{8,80}\.slice"
@@ -178,12 +184,33 @@ def checkout_identity(path, expected=None):
 
 def cargo_artifacts(builder, source, target, arguments):
     target.mkdir(mode=0o700)
-    text = preparation_output(["--user", f"{os.getuid()}:{os.getgid()}",
-                   "--env", "HOME=/tmp", "--env", "CARGO_HOME=/target/cargo-home",
-                   "--volume", f"{source}:/source:ro", "--volume", f"{target}:/target",
-                   "--workdir", "/source", "--entrypoint", "cargo", builder,
-                   *arguments, "--locked", "--target-dir", "/target",
-                   "--message-format=json"], timeout=RUNTIME_SECONDS)
+    started = time.monotonic()
+    try:
+        text = preparation_output(["--network", "host", "--user", f"{os.getuid()}:{os.getgid()}",
+                       "--env", "HOME=/tmp", "--env", "CARGO_HOME=/target/cargo-home",
+                       "--volume", f"{source}:/source:ro", "--volume", f"{target}:/target",
+                       "--workdir", "/source", "--entrypoint", "cargo", builder,
+                       *arguments, "--locked", "--target-dir", "/target",
+                       "--message-format=json"], timeout=RUNTIME_SECONDS)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        # Keep Cargo JSON stdout private. Reuse the gate's bounded, escaped,
+        # environment-secret redaction policy; never retain the raw stderr tail.
+        stderr = error.stderr or b""
+        if isinstance(stderr, str):
+            stderr = stderr.encode("utf-8", errors="replace")
+        try:
+            with tempfile.TemporaryDirectory(prefix=".cargo-failure-", dir=target) as directory:
+                log = Path(directory) / "stderr"
+                log.write_bytes(stderr[-FAILURE_EXCERPT_BYTES:])
+                excerpt = io.StringIO()
+                with contextlib.redirect_stdout(excerpt):
+                    failed_child_excerpt(log, os.environ, error, time.monotonic() - started)
+                diagnostic = excerpt.getvalue()
+                (target / "cargo-failure.log").write_text(diagnostic)
+                print(diagnostic, end="", file=sys.stderr, flush=True)
+        except OSError as diagnostic_error:
+            print(f"Cargo stderr unavailable: {type(diagnostic_error).__name__}", file=sys.stderr)
+        raise
     found = {}
     for line in text.splitlines():
         message = json.loads(line)

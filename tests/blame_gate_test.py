@@ -2,10 +2,13 @@
 """Light gate guard/fault tests: no Docker, systemd, Git, Cargo or network."""
 import hashlib
 import copy
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -119,6 +122,83 @@ class GateTests(unittest.TestCase):
         self.assertIn("ROOT_SECRET_ACCESS_KEY=synthetic-secret-key", argv)
         self.assertIn("test-access:synthetic-secret-key", request.call_args.args[0])
         self.assertEqual(request.call_args.args[0][-1], "http://127.0.0.1:9000/source-test")
+
+    def test_cargo_preparation_uses_host_network_but_image_inspection_stays_offline(self):
+        token = "b" * 32
+        env = {"BLAME_GATE_PREP_TOKEN": token,
+               "BLAME_GATE_PREP_SLICE": "git-rs-blame-prep-12345678.slice"}
+        runs = []
+
+        def daemon(argv, **kwargs):
+            if argv[:2] == ["docker", "ps"]:
+                return ""
+            runs.append((argv, kwargs))
+            if "cargo" in argv:
+                return json.dumps({"reason": "compiler-artifact", "target": {"name": "sample"},
+                                   "executable": "/target/debug/sample"})
+            return "inspected"
+
+        with patch.dict(os.environ, env), patch.object(gate, "output", side_effect=daemon), \
+                patch.object(gate.os, "sched_getaffinity", return_value={24, 25}):
+            result = gate.cargo_artifacts("sha256:builder", self.root, self.root / "target", ["build"])
+            self.assertEqual(gate.image_output("sha256:runtime", ["/usr/bin/git", "--version"]),
+                             "inspected")
+        self.assertEqual(result, {"sample": self.root / "target/debug/sample"})
+        self.assertEqual(len(runs), 2)
+        for (argv, options), network in zip(runs, ("host", "none")):
+            self.assertIn("--network", argv)
+            self.assertEqual(argv[argv.index("--network") + 1], network)
+            self.assertEqual(argv.count("--network"), 1)
+            self.assertIn("git-rs.blame-preparation=" + token, argv)
+            self.assertEqual(argv[argv.index("--cgroup-parent") + 1], env["BLAME_GATE_PREP_SLICE"])
+            self.assertEqual(argv[argv.index("--memory") + 1], "4g")
+            self.assertEqual(argv[argv.index("--memory-swap") + 1], "4g")
+            self.assertEqual(argv[argv.index("--pids-limit") + 1], "256")
+            self.assertEqual(argv[argv.index("--cpus") + 1], "2")
+            self.assertEqual(argv[argv.index("--cpuset-cpus") + 1], "24,25")
+            self.assertLessEqual(options["timeout"], 900)
+
+    def test_actual_failed_cargo_child_surfaces_only_bounded_escaped_redacted_stderr(self):
+        secret = "synthetic-cargo-secret-123456"
+        child = ("import sys; sys.stdout.write('UNPUBLISHED_CARGO_JSON'); "
+                 "sys.stderr.write('x' * 20000 + "
+                 + repr("\x1b[31m\n::error:: download_failed_synthetic " + secret) + "); sys.exit(23)")
+
+        def fail(*args, **kwargs):
+            return subprocess.run([sys.executable, "-c", child], check=True,
+                                  capture_output=True, text=True, timeout=5)
+
+        output = io.StringIO()
+        target = self.root / "target"
+        with patch.dict(os.environ, {"GIT_RS_TEST_SECRET": secret}), \
+                patch.object(gate, "preparation_output", side_effect=fail), \
+                contextlib.redirect_stderr(output):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                gate.cargo_artifacts("sha256:builder", self.root, target, ["build"])
+        self.assertEqual(raised.exception.returncode, 23)
+        excerpt = output.getvalue()
+        self.assertIn("download_failed_synthetic", excerpt)
+        self.assertIn("[REDACTED]", excerpt)
+        self.assertIn("\\u001b", excerpt)
+        self.assertNotIn("\x1b", excerpt)
+        self.assertNotIn("\n::error::", excerpt)
+        self.assertNotIn(secret, excerpt)
+        self.assertNotIn("UNPUBLISHED_CARGO_JSON", excerpt)
+        self.assertLessEqual(len(excerpt.encode()), 18 * 1024)
+        self.assertEqual((target / "cargo-failure.log").read_text(), excerpt)
+        self.assertEqual(list(target.iterdir()), [target / "cargo-failure.log"])
+        self.assertIn("tests/cache_gate.py", gate.HARNESS_FILES)
+
+    def test_cargo_timeout_surfaces_partial_stderr_and_preserves_failure(self):
+        error = subprocess.TimeoutExpired("cargo", 900, stderr=b"download timed out\n")
+        target = self.root / "target"
+        with patch.object(gate, "preparation_output", side_effect=error), \
+                contextlib.redirect_stderr(io.StringIO()) as output:
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                gate.cargo_artifacts("sha256:builder", self.root, target, ["build"])
+        self.assertIs(raised.exception, error)
+        self.assertIn("download timed out", output.getvalue())
+        self.assertIn("TimeoutExpired", (target / "cargo-failure.log").read_text())
 
     def test_preparation_timeout_or_partial_create_cleans_only_owned_containers(self):
         token = "b" * 32
