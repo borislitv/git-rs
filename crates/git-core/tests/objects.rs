@@ -200,6 +200,45 @@ fn nested_byte_paths_and_symlinks_are_read_without_filesystem_interpretation() {
 }
 
 #[test]
+fn woof_tree_lookup_uses_the_object_bound_not_the_commit_metadata_bound() {
+    for (extra_bytes, succeeds) in [(0, true), (1, false)] {
+        let mut source = provider();
+        let blob = insert(&mut source, Kind::Blob, b"small\n");
+        let mut bytes = Vec::new();
+        for n in 0..2000 {
+            bytes.extend_from_slice(format!("100644 file{n:04}\0").as_bytes());
+            bytes.extend_from_slice(blob.as_bytes());
+        }
+        assert_eq!(bytes.len(), 72_000);
+        let tree = insert(&mut source, Kind::Tree, &bytes);
+        let commit = insert(&mut source, Kind::Commit, format!("tree {tree}\nauthor A <a@example.invalid> 1 +0000\ncommitter A <a@example.invalid> 1 +0000\n\nSmall\n").as_bytes());
+        let budget = CapacityBudget::new(256 * 1024);
+        let session = open(
+            source,
+            budget.clone(),
+            ReadLimits {
+                max_object_bytes: 72_000 - extra_bytes,
+                max_metadata_bytes: 64 * 1024,
+                ..ReadLimits::default()
+            },
+        );
+        for start in [tree, commit] {
+            let result = session.lookup_blob(&start, b"file1999");
+            if succeeds {
+                let (id, object) = result
+                    .expect("wide tree lookup must not use the commit metadata cap")
+                    .unwrap();
+                assert_eq!(id, blob);
+                assert_eq!(object.data.as_slice(), b"small\n");
+            } else {
+                assert!(result.is_err(), "trees still obey the finite object bound");
+            }
+            assert_eq!(budget.used(), 0);
+        }
+    }
+}
+
+#[test]
 fn cancelled_session_cannot_read_headers_or_bodies() {
     let source = provider();
     let identity = source.identity.clone();

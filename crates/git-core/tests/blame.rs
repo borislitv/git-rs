@@ -61,6 +61,160 @@ fn complete_diamond_and_unrelated_root_dags_match_native_bytes() {
 }
 
 #[test]
+fn woof_cold_blame_after_oversized_terminal_ref_admission_matches_native() {
+    use git_rs_core::{Porcelain, ReadLimits, SnapshotSession, VerifiedObjectProvider};
+    let mut fixture = Fixture::new();
+    let tip = fixture.commit(&[(b"file", b"small\n", "100644")], &[], 1, b"Small\n", None);
+    let terminal = fixture.insert(gix_object::Kind::Blob, &[b'x'; 2048]);
+    fixture.git(
+        &["update-ref", "refs/heads/main", &tip.to_string()],
+        None,
+        b"",
+    );
+    fixture.git(
+        &["update-ref", "refs/tags/bytes", &terminal.to_string()],
+        None,
+        b"",
+    );
+    fixture.git(&["fsck", "--strict"], None, b"");
+    let provider = fixture.provider();
+    let identity = provider.identity().clone();
+    let budget = CapacityBudget::new(8 * 1024 * 1024);
+    let ctl = control();
+    let session = SnapshotSession::open(
+        provider,
+        &identity,
+        ctl.clone(),
+        budget.clone(),
+        ReadLimits {
+            max_object_bytes: 512,
+            ..BlameOptions::default().read_limits()
+        },
+    )
+    .unwrap();
+    assert!(
+        session.object(&terminal).is_err(),
+        "a full read really is over limit"
+    );
+    let visible = session
+        .reachable_from_refs([
+            (b"refs/heads/main".as_slice(), tip),
+            (b"refs/tags/bytes".as_slice(), terminal),
+        ])
+        .expect("an unrelated terminal blob must not prevent cold foreground admission");
+    assert_eq!(visible.iter().collect::<Vec<_>>(), vec![tip]);
+    let complete = session
+        .blame_complete(
+            BlameRequest {
+                commit: &tip,
+                path: b"file",
+            },
+            &BlameOptions::default(),
+        )
+        .unwrap();
+    let output =
+        Porcelain::encode_complete(&complete, &ctl, &budget, git_rs_core::blame::MAX_BODY_BYTES)
+            .unwrap();
+    assert_eq!(
+        output.chunks().flatten().copied().collect::<Vec<_>>(),
+        fixture.native(tip, b"file")
+    );
+    drop(output);
+    drop(complete);
+    drop(visible);
+    drop(session);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn woof_cold_blame_of_wide_trees_matches_native_and_retains_failure_boundaries() {
+    let mut fixture = Fixture::new();
+    let filler = fixture.insert(gix_object::Kind::Blob, b"small\n");
+    let before = fixture.insert(gix_object::Kind::Blob, b"before\nanchor\n");
+    let after = fixture.insert(gix_object::Kind::Blob, b"after\nanchor\n");
+    let names: Vec<_> = (0..2000).map(|n| format!("file{n:04}")).collect();
+    let mut entries: Vec<_> = names
+        .iter()
+        .map(|name| (name.as_bytes(), "100644", filler))
+        .collect();
+    entries[1999].2 = before;
+    let old_tree = fixture.tree(&entries);
+    let root = fixture.commit_tree(old_tree, &[], 1, b"Wide root\n", None);
+    entries[1999].2 = after;
+    let tree = fixture.tree(&entries);
+    assert_eq!(
+        fixture.git(&["cat-file", "-s", &tree.to_string()], None, b""),
+        b"72000\n"
+    );
+    let tip = fixture.commit_tree(tree, &[root], 2, b"Wide edit\n", None);
+    fixture.git(
+        &["update-ref", "refs/heads/main", &tip.to_string()],
+        None,
+        b"",
+    );
+    fixture.git(&["fsck", "--strict"], None, b"");
+    for commit in [root, tip] {
+        let native = fixture.native(commit, b"file1999");
+        for options in [
+            BlameOptions::default(),
+            BlameOptions::native_root(Default::default()),
+        ] {
+            assert_eq!(render(&fixture, commit, b"file1999", &options), native);
+        }
+    }
+    // A valid wide tree must reach admission, not be mislabeled corrupt. Its
+    // actual backing still cannot exceed the shared capacity budget.
+    let budget = CapacityBudget::new(64 * 1024);
+    let session = fixture.session(budget.clone(), control());
+    assert!(matches!(
+        session.blame_complete(
+            BlameRequest {
+                commit: &tip,
+                path: b"file1999"
+            },
+            &BlameOptions::default()
+        ),
+        Err(BlameError::Capacity(_))
+    ));
+    assert_eq!(budget.used(), 0);
+    drop(session);
+    let mut malformed = fixture.provider().objects[&tree].1.clone();
+    malformed.extend_from_slice(b"100644 truncated\0\x01");
+    let broken_tree = fixture.insert(gix_object::Kind::Tree, &malformed);
+    let broken = fixture.commit_tree(broken_tree, &[], 3, b"Malformed tree\n", None);
+    let budget = CapacityBudget::new(8 * 1024 * 1024);
+    let ctl = control();
+    let session = fixture.session(budget.clone(), ctl.clone());
+    assert_eq!(
+        session
+            .blame_complete(
+                BlameRequest {
+                    commit: &broken,
+                    path: b"file1999"
+                },
+                &BlameOptions::default()
+            )
+            .err(),
+        Some(BlameError::Corrupt("physical tree entry"))
+    );
+    assert_eq!(budget.used(), 0);
+    ctl.cancel();
+    assert_eq!(
+        session
+            .blame_complete(
+                BlameRequest {
+                    commit: &tip,
+                    path: b"file1999"
+                },
+                &BlameOptions::default()
+            )
+            .err(),
+        Some(BlameError::Stopped(StopReason::Cancelled))
+    );
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn octopus_and_crisscross_dags_match_complete_native_output() {
     let mut fixture = Fixture::new();
     let root = fixture.commit(

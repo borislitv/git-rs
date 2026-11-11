@@ -25,6 +25,8 @@ pub const MAX_BLOB_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_COMMITS: usize = 1_000_000;
 pub(crate) const MAX_COMMIT_BYTES: usize = 64 * 1024;
+// Match the pinned vendor's total-object bound, not its per-name metadata bound.
+const MAX_TREE_BYTES: usize = 128 * 1024 * 1024;
 // Fixed attribute/filter-selection metadata constructed by the pinned Platform
 // constructor, never populated from repository configuration in the raw path.
 // This conservative bootstrap charge is separate from dependency-owned data leases;
@@ -398,8 +400,15 @@ impl<P: VerifiedObjectProvider> FindHeader for FindBridge<'_, P> {
                 if header.kind == Kind::Blob && header.size > MAX_BLOB_BYTES as u64 {
                     return Err(BlameError::BlobTooLarge);
                 }
-                if header.kind != Kind::Blob && header.size > MAX_COMMIT_BYTES as u64 {
+                if matches!(header.kind, Kind::Commit | Kind::Tag)
+                    && header.size > MAX_COMMIT_BYTES as u64
+                {
                     return Err(BlameError::Corrupt("metadata byte limit exceeded"));
+                }
+                if header.kind == Kind::Tree
+                    && header.size > self.session.limits.max_object_bytes.min(MAX_TREE_BYTES) as u64
+                {
+                    return Err(BlameError::Corrupt("tree object byte limit exceeded"));
                 }
             }
             Ok(header)
@@ -780,8 +789,10 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 .header(&tree_id)
                 .map_err(|e| source_error(e.as_ref()))?
                 .ok_or(BlameError::Corrupt("missing physical tree"))?;
-            if header.kind != Kind::Tree || header.size > MAX_COMMIT_BYTES as u64 {
-                return Err(BlameError::Corrupt("physical tree metadata limit or type"));
+            if header.kind != Kind::Tree
+                || header.size > self.limits.max_object_bytes.min(MAX_TREE_BYTES) as u64
+            {
+                return Err(BlameError::Corrupt("physical tree object limit or type"));
             }
             let tree = self
                 .required(&tree_id, Kind::Tree)

@@ -52,6 +52,11 @@ worker cannot publish a partial successful annotation. A single query may annota
 allocation capacity, source mappings, caches and snapshot metadata need additional
 memory and scratch allowances.
 
+Each physical tree participating in blame may contain up to 128 MiB of tree
+records, subject to a smaller session object bound and shared capacity admission.
+The 64 KiB commit/tag metadata ceiling is not a total-directory-size limit.
+Existing tree-entry framing and per-name validation remain enforced.
+
 Commit-kind and uncompressed blob-size checks use physical Rust library headers,
 without inflating complete object bodies or spawning `cat-file`. This includes
 delta-compressed objects in verified, source-pinned packs acquired on demand.

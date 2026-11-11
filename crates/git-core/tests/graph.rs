@@ -246,3 +246,84 @@ fn reachability_result_keeps_its_backing_capacity_admitted() {
     drop(reachable);
     assert_eq!(budget.used(), 0);
 }
+
+#[test]
+fn woof_terminal_refs_above_the_object_read_limit_do_not_hide_reachable_commits() {
+    let mut source = source();
+    let root = commit(&mut source, &[], 1, "root");
+    let bytes = vec![b'x'; 1024];
+    let blob = gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Blob, &bytes).unwrap();
+    source.objects.insert(blob, (Kind::Blob, bytes));
+    let mut bytes = Vec::new();
+    for n in 0..40 {
+        bytes.extend_from_slice(format!("100644 file{n:04}\0").as_bytes());
+        bytes.extend_from_slice(blob.as_bytes());
+    }
+    let tree = gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Tree, &bytes).unwrap();
+    source.objects.insert(tree, (Kind::Tree, bytes));
+    let mut refs = vec![(b"refs/heads/main".as_slice(), root)];
+    for (kind, terminal) in [(Kind::Blob, blob), (Kind::Tree, tree)] {
+        let bytes = format!("object {terminal}\ntype {kind}\ntag terminal\n\nTerminal\n");
+        let tag =
+            gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Tag, bytes.as_bytes()).unwrap();
+        source.objects.insert(tag, (Kind::Tag, bytes.into_bytes()));
+        refs.push((b"refs/tags/direct", terminal));
+        refs.push((b"refs/tags/annotated", tag));
+    }
+    let wrong_tag = format!("object {blob}\ntype commit\ntag wrong\n\nWrong kind\n");
+    let wrong_tag_id =
+        gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Tag, wrong_tag.as_bytes()).unwrap();
+    source
+        .objects
+        .insert(wrong_tag_id, (Kind::Tag, wrong_tag.into_bytes()));
+    let identity = source.identity.clone();
+    let budget = CapacityBudget::new(64 * 1024);
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let session = SnapshotSession::open(
+        source,
+        &identity,
+        control.clone(),
+        budget.clone(),
+        ReadLimits {
+            max_object_bytes: 512,
+            ..ReadLimits::default()
+        },
+    )
+    .unwrap();
+    // Actual bytes and matching physical headers, with the same object-size
+    // denial as the production reader, scaled down instead of allocating 129 MiB.
+    for terminal in [blob, tree] {
+        assert!(session.header(&terminal).unwrap().unwrap().size > 512);
+        assert!(session.object(&terminal).is_err());
+    }
+    let reachable = session
+        .reachable_from_refs(refs)
+        .expect("terminal bodies must not gate commit reachability");
+    assert_eq!(reachable.iter().collect::<Vec<_>>(), vec![root]);
+    drop(reachable);
+    assert_eq!(budget.used(), 0);
+    let missing = ObjectId::null(gix_hash::Kind::Sha1);
+    assert!(
+        session
+            .reachable_from_refs([(b"refs/tags/missing".as_slice(), missing)])
+            .is_err()
+    );
+    let error = session
+        .reachable_from_refs([
+            (b"refs/heads/main".as_slice(), root),
+            (b"refs/tags/wrong".as_slice(), wrong_tag_id),
+        ])
+        .err()
+        .expect("a valid commit ref must not hide a tag target kind mismatch");
+    assert!(error.to_string().contains("tag target type mismatch"));
+    control.cancel();
+    let error = session
+        .reachable_from_refs([(b"refs/tags/bytes".as_slice(), blob)])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.downcast_ref::<git_rs_core::StopReason>(),
+        Some(&git_rs_core::StopReason::Cancelled)
+    );
+    assert_eq!(budget.used(), 0);
+}

@@ -212,23 +212,24 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             let mut tags = Seen::new(self)?;
             loop {
                 self.control.check()?;
-                let object = self
-                    .object(&id)?
+                let header = self
+                    .header(&id)?
                     .ok_or_else(|| invalid("missing ref target"))?;
-                if object.kind == Kind::Commit {
+                if header.kind == Kind::Commit {
                     tips.push(&id, self)?;
                     break;
                 }
-                if object.kind != Kind::Tag {
+                // Terminal trees/blobs add no commits. Their physical header
+                // establishes existence/kind without applying a body-read limit
+                // intended for objects that actually participate in this walk.
+                if header.kind != Kind::Tag {
                     break;
                 }
                 if tags.contains(&id) {
                     return Err(invalid("tag cycle"));
                 }
                 tags.insert(id, self)?;
-                if object.data.as_slice().len() > self.limits.max_metadata_bytes {
-                    return Err(invalid("metadata byte limit exceeded"));
-                }
+                let object = self.required(&id, Kind::Tag)?;
                 let tag = gix_object::TagRef::from_bytes(object.data.as_slice(), id.kind())?;
                 let target = tag.target();
                 let header = self

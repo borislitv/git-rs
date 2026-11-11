@@ -77,6 +77,8 @@ pub struct SnapshotIdentity {
 #[derive(Clone, Copy, Debug)]
 pub struct ReadLimits {
     pub max_object_bytes: usize,
+    /// Whole commit/tag bound. Trees use max_object_bytes and the same shared
+    /// capacity budget as other physical object bodies, not this metadata cap.
     pub max_metadata_bytes: usize,
     pub max_graph_objects: usize,
     pub max_graph_edges: usize,
@@ -459,7 +461,9 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         if object.kind != kind {
             return Err(invalid("unexpected object type"));
         }
-        if kind != Kind::Blob && object.data.as_slice().len() > self.limits.max_metadata_bytes {
+        if matches!(kind, Kind::Commit | Kind::Tag)
+            && object.data.as_slice().len() > self.limits.max_metadata_bytes
+        {
             return Err(invalid("metadata byte limit exceeded"));
         }
         Ok(object)
@@ -486,7 +490,9 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         let initial = self
             .object(start)?
             .ok_or_else(|| invalid("missing lookup root"))?;
-        if initial.data.as_slice().len() > self.limits.max_metadata_bytes {
+        if initial.kind == Kind::Commit
+            && initial.data.as_slice().len() > self.limits.max_metadata_bytes
+        {
             return Err(invalid("metadata byte limit exceeded"));
         }
         let mut tree_id = match initial.kind {
