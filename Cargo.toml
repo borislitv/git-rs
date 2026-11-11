@@ -7,7 +7,8 @@ description = "Experimental stateless Git backend with PostgreSQL and immutable 
 
 [workspace]
 resolver = "2"
-members = [".", "crates/git-core"]
+members = ["crates/git-core"]
+exclude = [".local/iconv-native"]
 
 [dependencies]
 aws-credential-types = "1.3.1"
