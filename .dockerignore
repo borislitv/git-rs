@@ -1,6 +1,7 @@
 *
 !Cargo.toml
 !Cargo.lock
+!Dockerfile
 !src/
 !src/**
 !migrations/
@@ -11,9 +12,16 @@
 !tests/*.py
 !tests/support/
 !tests/support/cache_process.rs
+!tests/support/blame_http.rs
+!tests/support/blame_prepared.rs
+!tests/support/blame_work_observer.rs
 !tests/support/cache_faults.py
+!tests/support/blame_artifact_faults.py
 !tests/fixtures/
 !tests/fixtures/cache-storage-budget.json
 !crates/
 !crates/git-core/
 !crates/git-core/**
+!docs/
+!docs/gitoxide-source.json
+!docs/codec-source.json

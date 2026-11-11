@@ -27,23 +27,36 @@ Git treats the path literally, including characters that otherwise have pathspec
 
 ## Output and limits
 
-The default implementation executes native Git with `blame --root --line-porcelain
---no-textconv --no-progress`. HTTP 200 contains the complete output as
+The serving implementation uses the pinned Rust core over a verified physical
+snapshot, with native-root, whole-file Myers semantics. Native Git is a test
+oracle, not a serving subprocess or fallback. HTTP 200 contains complete output as
 `application/octet-stream`, with an exact `Content-Length` and `Cache-Control: no-store`.
 Content lines can contain non-UTF-8 bytes. The application does not check out trees, run
-text conversion or load client hooks. It does not retain annotation results between requests.
+text conversion or load client hooks. An independently configured derived cache
+may retain complete bodies and authenticated completed-work checkpoints.
+
+The default NativeRootV1 profile explicitly enables the five qualified request-local
+tuning switches: line-token reuse, retained current-input tokens, unchanged-run reuse,
+bounded resource reuse and change indexing. Its immutable canonical tuning byte is 31.
+This does not enable persisted mapping/body reuse or add a production tuning override.
+The vendor tuning default and explicit conservative core profile remain all-off.
+The synthetic 2000-commit/20000-line C7 profile passed the prepared 5 s and hosted
+8 s median gates under a 20 s deadline, 1 GiB job budget and 256 MiB prepared/32 MiB
+hosted decoder budgets (aggregate ceiling 4 GiB/2 CPUs/256 tasks). This is not a
+general latency guarantee; full joined authentication/runtime and real-image CI
+qualification remain pending. See [qualification scope](rust-data-plane.md).
 
 The complete body is buffered before success headers are sent. A failed, cancelled or oversized
 worker cannot publish a partial successful annotation. A single query may annotate a blob up to
 128 MiB and produce up to 256 MiB of output. These are payload limits, not total-RSS bounds:
-allocation capacity, native processes, materialization and snapshot metadata need additional
+allocation capacity, source mappings, caches and snapshot metadata need additional
 memory and scratch allowances.
 
 Commit-kind and uncompressed blob-size checks use physical Rust library headers,
 without inflating complete object bodies or spawning `cat-file`. This includes
-loose objects and delta-compressed objects in verified, request-pinned RAM packs.
+delta-compressed objects in verified, source-pinned packs acquired on demand.
 These checks do not grant reachability or authorization: the leased published
-snapshot, native reachability and literal path checks still precede annotation.
+snapshot, Rust reachability and literal path checks still precede annotation.
 
 By default only one blame computation executes per serving process and another returns 503.
 Operators may set `GIT_RS_BLAME_CONCURRENCY` (1..=4, default 1) and
@@ -54,15 +67,18 @@ an ordinary request admission but acquires no scratch, cache pins, reader lease 
 it honors cancellation and the original absolute deadline, without a fresh execution budget.
 There is no FIFO guarantee. All queries still share the four ordinary request admissions;
 health has independent admission. The absolute `GIT_RS_OPERATION_SECONDS` deadline covers the request,
-materialization, computation and response writes. Client disconnection cancels the owned native
-process group. Successful and failed requests release their read hold and private scratch;
+source acquisition, computation and response writes. A queued job abandoned by its
+last waiter is cancelled; its actual admission remains held through capture
+destruction. An already-running job has an independent finite lifetime: one
+departed waiter cannot cancel another waiter or release the job's source early.
+Successful and failed jobs release their read hold and private scratch;
 a crashed server's committed hold instead remains until its bounded expiry.
 
 Increasing concurrency does not increase the process-private RAM cache budget, SQL pool,
 Tokio threads or per-worker thread settings. It is not a memory/CPU isolation mechanism.
 Choose it against the pod's aggregate CPU/memory/scratch limits and the selected worker's
 own bounded CPU/memory settings, not the host core count. Each executing query can still
-materialize a snapshot up to the existing 12 GiB scratch admission limit and buffer up to
+select up to the existing 12 GiB source-pack admission limit and buffer up to
 256 MiB of output, in addition to worker memory. Completed response buffers can coexist
 until their ordinary request admissions finish. Defaults deliberately preserve the old
 resource envelope; do not multiply large-worker budgets without aggregate headroom.
@@ -80,56 +96,155 @@ resource envelope; do not multiply large-worker budgets without aggregate headro
 A deadline or broken connection may close the transport without an HTTP error body. Clients
 must require a complete 200 response, not interpret a truncated body as an annotation.
 
-## Optional operator-owned worker
+## Authenticated completed-work reuse
 
-`GIT_RS_BLAME_WORKER` selects an existing absolute executable file at server startup.
-Unset means native Git. The executable and its dependencies must be supplied by the operator's
-runtime image; the application chart and standard image do not install a separate worker.
-Relative, missing, directory and non-executable targets are rejected before serving state is
-created. This setting is server configuration, never a command selected by a client.
+`GIT_RS_BLAME_WORKER` is obsolete and rejected at startup. Production exposes no
+HTTP tuning, producer override or native-worker selection.
 
-The executable receives three separate OS arguments:
+The ordinary optional cache configuration can retain complete bodies. Typed
+object/mapping checkpoints additionally require the explicit
+`GIT_RS_BLAME_CHECKPOINT_KEY_FILE` setting, alongside the existing cache namespace,
+owner and PostgreSQL/S3 configuration. The file must be an absolute path to
+exactly 32 random bytes, owned by root or the service UID, with no group/other
+permissions. All ancestors must be real protected directories owned by root or
+the service UID, with no group/other write permission. A private subdirectory
+under world-writable `/tmp` is deliberately insufficient. Provision the key with
+the operator's secret-management mechanism; do not log it or pass it in URLs.
 
-```text
-WORKER PRIVATE_BARE_REPOSITORY FULL_COMMIT_OID REPOSITORY_RELATIVE_PATH
-```
+This is a trusted-producer MAC contract. Authorized producers sharing checkpoints
+must share the namespace, authorized cache owner UUID and key. They must run the
+bound producer/options implementation. A checksum, matching producer label or
+structurally valid byte partition alone does not prove canonical Myers tie choice.
+HMAC authenticates the complete frame and its repository/principal/generation/
+storage-epoch/query/producer/options scope. Physical objects additionally verify
+their kind, size and Git OID. Mapping units contain both complete byte-line
+partitions; no vendor interner state or suspended DAG frontier is persisted.
 
-The application has already authorized and leased the snapshot, checked commit reachability,
-resolved the literal blob path and enforced the uncompressed size limit. The worker must emit
-a complete line-porcelain annotation to stdout and exit zero. Different valid grouping of
-adjacent records is permitted; each line's commit, original position, metadata and content must
-remain correct. Nonzero exit or oversized output fails the entire response; there is no automatic
-retry or fallback after a worker error.
+Rotate the key by provisioning a new protected file and restarting/reloading all
+producer instances. New signers reject old checkpoints as optional misses. An
+already-running instance retains its old key until replacement; editing the file
+does not revoke the key already held in memory.
 
-The child environment contains a fixed `PATH`, `HOME`, `LC_ALL` and
-`GIT_RS_BLAME_REMAINING_MILLIS`, the remaining absolute budget at launch. Service SQL/S3
-credentials and arbitrary parent environment variables are not inherited. Standard input is
-closed and diagnostic stderr is suppressed. Worker descendants must stay in the inherited
-process group so request cancellation can terminate them. The operator owns executable
-deployment integrity, worker correctness and its CPU/memory limits; executable selection alone
-does not establish annotation equivalence or a performance improvement.
+One derivation imports at most one checkpoint into a temporary owned batch. It
+becomes visible only after the outer cache consumption fence and a fresh source
+fence succeed. Memory callbacks perform no SQL/network I/O. Complete-edge
+boundaries publish only after 256 successful mapping insertions or five seconds,
+plus a final complete batch. Metadata streaming cannot evict imported mappings
+before their first use. Storage failure skips optional writes; real source,
+cancellation and codec-runtime errors remain operation errors.
+
+Bounds are 16 MiB framed record storage plus 3072-record metadata, 2048 retained
+mappings, 4 MiB per mapping and 1 MiB per physical object. Actual backing capacity
+and temporary copies share the original 1 GiB job capacity budget; these are not
+whole-process RSS limits. Source catalogs additionally cap 4096 refs, 1 MiB of
+ref names and 4096 indexes; metadata streaming has its existing <=128 MiB bound.
+Selected indexes cap at 128 MiB. Graph and original deadline limits remain active.
+
+## Optional post-confirmation warming
+
+Set `GIT_RS_BLAME_WARM_PATH` to one literal percent-encoded repository-relative
+path to opt in. It is disabled by default and requires authenticated checkpoint
+configuration. It inspects at most 128 changed commands / 64 KiB of names and
+selects one changed branch tip; it does not scan trees or discover paths.
+
+Only confirmed `metadata::publish` results can schedule a hint. Warm jobs use the
+same CPU pool and actual work admission as queries, plus a single warm admission.
+They have no waiter, acquire a fresh authorized source only after dequeue, and
+have an independent 30-second deadline assigned before submission. Queue time
+consumes that deadline. Generation, storage epoch and branch tip are checked again
+after acquisition. Source/output cleanup precedes admission refund.
+
+Warming does not add CPU capacity or alter the default 1/0 rejection policy. It
+can occupy that capacity when enabled. Busy scheduling, stale hints, cache/network
+outage, warm cancellation and observation failures cannot reject or roll back a
+confirmed push. A departed query socket has no ownership of a warm job.
+
+## Actual-work observation
+
+`CompleteResponse::work_statistics()` is optional: a final-body hit or disabled
+memo path does not claim avoided diff work. `Observer::work_completed` has a
+default no-op implementation and reports completed core traversal/mapping counts
+and measured attribution/checkpoint wall time, excluding porcelain encoding.
+Imported physical-object copies and imported mapping loads are distinguished from
+job-local copies. Core `hits` and `computations`, not load counts, establish actual
+mapping reuse. `completed` counts delivered complete units, not persisted rows.
+
+The test-only HTTP fixture supports immutable tuning/reuse selection and actual
+work metrics. Performance options force a ready-body miss. These switches and
+synthetic signing-key fixtures are not production HTTP/configuration surfaces.
 
 ## Verification
 
 Synthetic native integration covers reader credentials, rename history, non-UTF-8 paths and
 content, rejection of a valid unreachable commit in a stored pack, the uncompressed-blob bound
-and unchanged publication state. Separate worker cases check native output equivalence,
-credential isolation, failed/oversized output, occupied admission, client disconnect, deadline,
-closed-output cancellation, descendant reaping, read-hold/scratch release and admission reuse.
-An intermediate migration contract permits at most three native Git commands for
-a valid annotation and two for an oversized blob; header type/size probes do not
-consume a native subprocess. Library tests compare physical headers with native
-Git and read 128 MiB loose/ref-delta blobs under a 96 MiB address-space limit.
-These contracts do not establish a full-repository performance score or production HA behavior.
+and unchanged publication state. Root/core cases cover native output equivalence,
+runtime rejection, admission, queued disconnect/expiry, held-response source fences
+and resource cleanup. Separate-process checkpoint gates compare actual mapping
+hits/computations and native output across a 2001-commit / 2000-edge history.
+Authenticated frame, key-file, controlled-clock cadence and capacity-pressure
+tests cover the new boundary. Real HTTP-push cases exercise warming and independent
+cache-network outage. These do not establish a full-repository performance score
+or production HA behavior.
 
 The existing `make integration` and native integration CI job run the concurrency contract
-using their already-provisioned disposable SQL/S3 fixtures. For a focused run without the
-large integration fixture, use `python3 tests/integration.py --provision --binary
-target/debug/git-rs --blame-concurrency-only`. Omit `--provision` to use disposable endpoints
-configured as for the integration harness (`PGPORT` and `GIT_RS_S3_ENDPOINT`, with the
-synthetic bucket already created). The contract creates its own tiny synthetic repository.
-A socket-controlled worker proves two distinct HTTP queries overlap, a third waits without
-materialization, overflow returns 503, and success, worker failure, execution disconnect,
-queued disconnect and queued absolute expiry return capacity. Native Git independently
-supplies the expected complete annotations. The synchronization socket is test-only;
-the serving executable boundary and environment remain unchanged.
+using their already-provisioned disposable SQL/S3 fixtures. CI also explicitly compiles
+the Rust HTTP fixture with `make blame-core-build`; this does not execute ignored
+PostgreSQL/checkpoint contracts or the artifact/legacy-migration harness.
+
+For the focused core/shared-cache/output/concurrency run, use the public Make targets
+below. Prebuild outside measurement, then run `blame-core-check` in a separate bounded
+systemd unit. Do not invoke focused provisioning directly or fabricate INVOCATION_ID:
+systemd supplies it to both the runner and independent `ExecStopPost` cleanup.
+
+Run from the checkout, with Docker access and the fixture images pinned by
+`tests/integration.py` already available locally (focused provisioning uses
+`--pull=never`). Set the shell inputs `cpu_quota`, `memory_max` and `tasks_max` to
+explicit finite cgroup limits selected for the test host. They are inputs to this
+operator wrapper, not git-rs configuration settings or qualified performance budgets.
+The wrapper preserves the existing 900-second runtime bound and 40-second stop bound:
+
+```sh
+(
+  set -eu
+  : "${cpu_quota:?select a finite systemd CPUQuota}"
+  : "${memory_max:?select a finite systemd MemoryMax}"
+  : "${tasks_max:?select a finite systemd TasksMax}"
+  checkout="$(pwd -P)"
+  target_dir="$(python3 -c 'import os; from pathlib import Path; print(Path(os.environ.get("CARGO_TARGET_DIR", "target")).resolve())')"
+  CARGO_TARGET_DIR="$target_dir" make blame-core-build
+  cpus="$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')"
+  unit="git-rs-blame-core-$(date +%s)-$$"
+  cleanup() {
+    if [ "$(systemctl show "$unit.service" --property=LoadState --value)" != not-found ]; then
+      sudo systemctl stop "$unit.service"
+    fi
+  }
+  trap cleanup EXIT
+  sudo systemd-run --wait --pipe --unit="$unit" \
+    --working-directory="$checkout" \
+    --property="User=$(id -un)" --property="Group=$(id -gn)" \
+    --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+    --property=KillMode=control-group --property=MemorySwapMax=0 \
+    --property="CPUQuota=$cpu_quota" --property="MemoryMax=$memory_max" \
+    --property="TasksMax=$tasks_max" --property="AllowedCPUs=$cpus" \
+    --property="ExecStopPost=/usr/bin/make blame-core-cleanup" \
+    --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+    --setenv="CARGO_TARGET_DIR=$target_dir" \
+    /usr/bin/make blame-core-check
+)
+```
+
+The Make runner uses prebuilt binaries and retains invocation-specific synthetic
+reports/logs. Cleanup removes only containers carrying that invocation's ownership
+label. Docker fixtures have their own harness resource caps; the systemd cgroup
+does not contain Docker-daemon-owned containers. The wrapper requires measured
+runtime, failure/timeout cleanup and resource qualification before becoming a CI gate.
+The new ignored-contract and legacy-migration gates are not enabled in current CI;
+do not infer coverage from this compile step or claim a measured 900-second fit.
+
+A socket-controlled test observer checks real query overlap/queuing, overflow and
+cleanup without replacing attribution. Native Git independently supplies expected
+annotations. Synchronization sockets and tuning selectors are test-only. The full
+functional/authentication harness must be rerun after a root integration;
+pre-join results are not evidence for the joined source. The Stage 5/8 production
+performance result remains unqualified.

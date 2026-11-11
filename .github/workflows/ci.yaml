@@ -59,6 +59,133 @@ jobs:
             .local/derived-cache-*/report.json
             .local/derived-cache-*/*.log
             .local/derived-cache-*/*.stderr
+  # Preparation only: enable after parent qualification proves the complete gate
+  # fits 900s, aggregate limits and failure/timeout cleanup. No fixed test count.
+  blame:
+    if: ${{ false }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the immutable v1 migration source separately
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/git-rs
+          ref: 43d79301993c88cdde044c5dead260a4b0424079
+          path: .local/cache-v1
+          persist-credentials: false
+      - name: Light controller guards and fault tests
+        run: python3 -B tests/blame_gate_test.py
+      - name: Build shared-OS compiler and immutable native test images
+        run: |
+          docker build --target test-fixture-build -t git-rs:blame-build .
+          docker build --target test -t git-rs:blame-test .
+          python3 -B tests/blame_gate.py images > "$RUNNER_TEMP/blame-images"
+          while IFS= read -r image; do docker pull "$image"; done < "$RUNNER_TEMP/blame-images"
+      - name: Prebuild current contracts and exact legacy binaries; seal provenance
+        run: |
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          unit="git-rs-blame-prep-$tag.service"
+          slice="git-rs-blame-prep-$tag.slice"
+          token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          # Record ownership before the first daemon-side container creation.
+          printf 'BLAME_GATE_PREP_UNIT=%s\nBLAME_GATE_PREP_SLICE=%s\nBLAME_GATE_PREP_TOKEN=%s\n' "$unit" "$slice" "$token" >> "$GITHUB_ENV"
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
+          [Unit]
+          Description=Owned blame input preparation aggregate
+          [Slice]
+          CPUQuota=200%
+          AllowedCPUs=$cpus
+          MemoryMax=4G
+          MemorySwapMax=0
+          TasksMax=256
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --property="User=$(id -un)" --property="Group=$(id -gn)" \
+            --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+            --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
+            --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_gate.py cleanup --prep-token $token" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="BLAME_GATE_PREP_UNIT=$unit" --setenv="BLAME_GATE_PREP_SLICE=$slice" \
+            --setenv="BLAME_GATE_PREP_TOKEN=$token" \
+            /usr/bin/make blame-gate-prepare
+          manifest="$GITHUB_WORKSPACE/.local/blame-prebuilt/manifest.json"
+          hash=$(sha256sum "$manifest")
+          printf 'BLAME_GATE_MANIFEST_SHA256=%s\n' "${hash%% *}" >> "$GITHUB_ENV"
+      - name: Owned aggregate-slice blame, artifact and migration qualification
+        run: |
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          unit="git-rs-blame-$tag.service"
+          slice="git-rs-blame-$tag.slice"
+          printf 'BLAME_GATE_UNIT=%s\nBLAME_GATE_SLICE=%s\n' "$unit" "$slice" >> "$GITHUB_ENV"
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
+          [Unit]
+          Description=Owned synthetic blame qualification aggregate
+          [Slice]
+          CPUQuota=200%
+          AllowedCPUs=$cpus
+          MemoryMax=4G
+          MemorySwapMax=0
+          TasksMax=256
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --property="User=$(id -un)" --property="Group=$(id -gn)" \
+            --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+            --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
+            --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_gate.py cleanup" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="BLAME_GATE_UNIT=$unit" --setenv="BLAME_GATE_SLICE=$slice" \
+            --setenv="BLAME_GATE_MANIFEST_SHA256=$BLAME_GATE_MANIFEST_SHA256" \
+            /usr/bin/make blame-gate-check
+      - name: Stop only the owned blame unit and aggregate slice
+        if: always()
+        run: |
+          failed=0
+          if [ -n "${BLAME_GATE_PREP_UNIT:-}" ]; then
+            if [ "$(systemctl show "$BLAME_GATE_PREP_UNIT" --property=LoadState --value)" != not-found ]; then
+              sudo systemctl stop "$BLAME_GATE_PREP_UNIT" || failed=1
+            fi
+            python3 -B tests/blame_gate.py cleanup --prep-token "$BLAME_GATE_PREP_TOKEN" || failed=1
+            sudo systemctl stop "$BLAME_GATE_PREP_SLICE" || failed=1
+            sudo rm -f -- "/run/systemd/system/$BLAME_GATE_PREP_SLICE" || failed=1
+            sudo systemctl daemon-reload || failed=1
+          fi
+          if [ -n "${BLAME_GATE_UNIT:-}" ]; then
+            if [ "$(systemctl show "$BLAME_GATE_UNIT" --property=LoadState --value)" != not-found ]; then
+              sudo systemctl stop "$BLAME_GATE_UNIT" || failed=1
+            fi
+            sudo systemctl stop "$BLAME_GATE_SLICE" || failed=1
+            sudo rm -f -- "/run/systemd/system/$BLAME_GATE_SLICE" || failed=1
+            sudo systemctl daemon-reload || failed=1
+          fi
+          exit "$failed"
+      - name: Preserve synthetic inventories, provenance and bounded-gate logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blame-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            .local/blame-prebuilt/manifest.json
+            .local/blame-gate-*/report.json
+            .local/blame-gate-*/controller.log
+            .local/blame-gate-*/artifacts.json
+            .local/blame-gate-*/artifacts.stderr
+            .local/blame-gate-*/inventory.json
+            .local/blame-gate-*/blame_*.log
+            .local/blame-gate-*/derived-cache-*/*.log
+            .local/blame-gate-*/derived-cache-*/*.stderr
+            .local/blame-gate-*/focused/report.json
+            .local/blame-gate-*/focused/*.log
   vendor:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -70,8 +197,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: borislitv/gitoxide
-          ref: c3282a004f677b4d9b0b6bacb507462edf4b9e0a
+          ref: 7ce87f63e03ef116cb2d3df097cd688e6d19c35b
           path: .local/gitoxide
+          persist-credentials: false
+      - name: Check out the pinned owned codec source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/iconv-native-rs
+          ref: f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f
+          path: .local/iconv-native
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
@@ -102,6 +236,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config gnu-coreutils
           make check
           make bench
+      - name: Compile the Rust blame HTTP fixture (no ignored-contract execution)
+        run: make blame-core-build
       - name: Chart and pinned operator-schema contracts
         run: |
           python3 -m venv "$RUNNER_TEMP/python"

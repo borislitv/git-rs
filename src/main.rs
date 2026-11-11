@@ -168,16 +168,35 @@ enum HttpIdentity {
 }
 
 fn serve(args: &[String]) -> Result<()> {
+    // Rust retains the initial GNU C/ASCII thread locale. Blame::new verifies
+    // that producer-bound codeset before workers/listeners; never setlocale or
+    // uselocale while serving. Native subprocesses likewise use LC_ALL=C.
     let pack_threads = pack_threads()?;
-    let blame = std::env::var_os("GIT_RS_BLAME_WORKER")
-        .map_or_else(
-            || Ok(git_rs::blame::Blame::default()),
-            |path| git_rs::blame::Blame::with_worker(PathBuf::from(path)),
-        )?
-        .with_capacity(
-            blame_capacity("GIT_RS_BLAME_CONCURRENCY", 1)?,
-            blame_capacity("GIT_RS_BLAME_WAITERS", 0)?,
-        )?;
+    if std::env::var_os("GIT_RS_BLAME_WORKER").is_some() {
+        return Err(invalid(
+            "GIT_RS_BLAME_WORKER is obsolete; remove it: blame now runs directly in the bounded Rust core executor",
+        ));
+    }
+    let mut blame = git_rs::blame::Blame::new(
+        blame_capacity("GIT_RS_BLAME_CONCURRENCY", 1)?,
+        blame_capacity("GIT_RS_BLAME_WAITERS", 0)?,
+    )?;
+    if let Some(key_file) = std::env::var_os("GIT_RS_BLAME_CHECKPOINT_KEY_FILE") {
+        let config = git_rs::derived_cache::CacheConfig::from_env()?;
+        blame = blame.with_authenticated_cache(config, Path::new(&key_file))?;
+    } else if std::env::var_os("GIT_RS_CACHE_NAMESPACE").is_some() {
+        // The cache is optional. Invalid/unavailable cache configuration must not
+        // remove the independently bounded local derivation path.
+        if let Ok(cache) = git_rs::derived_cache::DerivedCache::from_env() {
+            blame = blame.with_cache(cache);
+        }
+    }
+    if let Some(path) = std::env::var_os("GIT_RS_BLAME_WARM_PATH") {
+        let path = path
+            .to_str()
+            .ok_or_else(|| invalid("warm path must be percent-encoded UTF-8"))?;
+        blame = blame.with_warming(git_rs::blame::WarmPolicy::one_path(path)?)?;
+    }
     metrics::global();
     let _diagnostics = metrics::init_service_logs()?;
     // Validate credentials before opening any serving listener. Production and
@@ -234,7 +253,7 @@ fn serve(args: &[String]) -> Result<()> {
     let engine = Arc::new(Engine {
         blame,
         store: Store::from_env()?,
-        cache: Cache::new(cache_bytes, 8 * 1024 * 1024),
+        cache: Arc::new(Cache::new(cache_bytes, 8 * 1024 * 1024)),
         scratch_root: own_root,
         operation_seconds: operation_seconds()?,
         pack_threads,
@@ -423,9 +442,9 @@ fn run() -> Result<()> {
         Some(action @ ("backup" | "truncate" | "cleanup")) if args.len() >= 4 => {
             let root = PathBuf::from(option(&args, "--scratch")?);
             let engine = Engine {
-                blame: git_rs::blame::Blame::default(),
+                blame: git_rs::blame::Blame::new(1, 0)?,
                 store: Store::from_env()?,
-                cache: Cache::new(0, 0),
+                cache: Arc::new(Cache::new(0, 0)),
                 scratch_root: root,
                 operation_seconds: operation_seconds()?,
                 pack_threads: pack_threads()?,
@@ -455,6 +474,10 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // The default hook may block indefinitely on stderr before an executor can
+    // catch a panic. Do not format untrusted payloads or perform I/O here. The
+    // executor turns unwinding into a bounded failed-job acknowledgment.
+    std::panic::set_hook(Box::new(|_| {}));
     let timings = metrics::init_timing_logs();
     let result = run();
     drop(timings);

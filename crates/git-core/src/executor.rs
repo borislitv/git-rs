@@ -88,9 +88,10 @@ impl std::fmt::Display for WaitError {
 }
 impl std::error::Error for WaitError {}
 
-type Work = Box<dyn FnOnce() + Send + 'static>;
+type Work = Box<dyn FnOnce(&Shared) + Send + 'static>;
 struct Job {
     id: u64,
+    control: Control,
     work: Work,
 }
 struct State {
@@ -98,6 +99,9 @@ struct State {
     controls: Vec<(u64, Control)>,
     next_id: u64,
     stopped: bool,
+    // The watcher owns at most one removed queued closure until actual cleanup.
+    // Its slot is not reusable while a captured destructor is still running.
+    discarding: Option<u64>,
 }
 struct Shared {
     state: Mutex<State>,
@@ -106,6 +110,8 @@ struct Shared {
 }
 
 /// Fixed CPU workers plus one non-CPU deadline watcher, with fail-fast admission.
+/// The watcher discards stopped queued captures without waiting for a free CPU
+/// worker. Its queue slot and completion remain owned until cleanup finishes.
 ///
 /// Cancellation is cooperative: arbitrary callbacks/destructors can block forever.
 /// Drop cancels and joins, rather than pretending an abort is a stop acknowledgment.
@@ -135,6 +141,7 @@ impl CpuExecutor {
                 controls: Vec::new(),
                 next_id: 0,
                 stopped: false,
+                discarding: None,
             }),
             wake: Condvar::new(),
             queue_capacity: config.queue_capacity,
@@ -186,7 +193,8 @@ impl CpuExecutor {
         if state.stopped {
             return Err(SubmitError::Stopped);
         }
-        if state.queue.len() >= self.shared.queue_capacity {
+        if state.queue.len() + usize::from(state.discarding.is_some()) >= self.shared.queue_capacity
+        {
             return Err(SubmitError::Full);
         }
         let id = state.next_id;
@@ -195,7 +203,8 @@ impl CpuExecutor {
         let job_control = control.clone();
         state.queue.push_back(Job {
             id,
-            work: Box::new(move || {
+            control: control.clone(),
+            work: Box::new(move |shared| {
                 // The callable is consumed/dropped inside the unwind boundary even
                 // when cancelled before starting; completion is sent only afterwards.
                 let result = catch_unwind(AssertUnwindSafe(move || {
@@ -205,6 +214,9 @@ impl CpuExecutor {
                     result
                 }))
                 .unwrap_or(Err(JobError::Panicked));
+                // Release the queue slot only after captures were destroyed, but
+                // before publishing Ticket completion/capacity reuse to callers.
+                acknowledge(shared, id);
                 // A dropped waiter cannot keep a worker blocked on output.
                 let _ = send.send(result);
             }),
@@ -249,26 +261,60 @@ fn worker(shared: Arc<Shared>) {
         };
         // Also isolate result destruction if the receiver disappeared. A user
         // output's Drop can panic after the inner computation unwind boundary.
-        let _ = catch_unwind(AssertUnwindSafe(job.work));
-        let mut state = shared.state.lock().unwrap();
-        state.controls.retain(|(id, _)| *id != job.id);
+        let _ = catch_unwind(AssertUnwindSafe(|| (job.work)(&shared)));
+        // Also covers panic while destroying a panic payload or rejected output.
+        acknowledge(&shared, job.id);
     }
 }
 
+fn acknowledge(shared: &Shared, id: u64) {
+    let mut state = shared.state.lock().unwrap();
+    state.controls.retain(|(registered, _)| *registered != id);
+    if state.discarding == Some(id) {
+        state.discarding = None;
+    }
+    shared.wake.notify_all();
+}
+
 fn watch_deadlines(shared: Arc<Shared>) {
+    // This thread never executes a live callback. Mark cleanup as executor-owned
+    // too: captured destructors must not recursively submit into the same pool.
+    IN_WORKER.set(true);
     let mut state = shared.state.lock().unwrap();
     loop {
-        if state.stopped {
-            return;
-        }
         let now = Instant::now();
-        let mut delay = Duration::from_secs(60);
+        // Control::cancel is also public and cannot notify this Condvar. Poll
+        // only while queued work exists, using the same finite watcher thread.
+        let mut delay = if state.queue.is_empty() {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_millis(10)
+        };
         for (_, control) in &state.controls {
             if control.deadline() <= now {
                 control.cancel();
             } else {
                 delay = delay.min(control.deadline() - now);
             }
+        }
+        if let Some(index) = state
+            .queue
+            .iter()
+            .position(|job| job.control.check().is_err())
+        {
+            let job = state.queue.remove(index).expect("queued index exists");
+            state.discarding = Some(job.id);
+            drop(state);
+            // Cancellation/deadline is monotonic: the wrapper drops the captured
+            // callback without invoking it, and sends Stopped only AFTER cleanup.
+            // Never run captures/destructors with queue or root flight locks held.
+            let _ = catch_unwind(AssertUnwindSafe(|| (job.work)(&shared)));
+            acknowledge(&shared, job.id);
+            state = shared.state.lock().unwrap();
+            continue;
+        }
+        if state.stopped {
+            return;
         }
         state = shared.wake.wait_timeout(state, delay).unwrap().0;
     }
@@ -338,6 +384,12 @@ struct CapacityState {
 }
 
 impl CapacityBudget {
+    /// Whether both handles admit storage against the same live budget state.
+    /// Equal limits or usage do not imply shared ownership.
+    pub fn shares_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn new(limit: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(CapacityState { limit, used: 0 })),
@@ -424,6 +476,10 @@ pub struct CapacityBuffer {
 }
 
 impl CapacityBuffer {
+    pub(crate) fn shares_budget(&self, budget: &CapacityBudget) -> bool {
+        self.reservation.budget.shares_with(budget)
+    }
+
     pub fn capacity(&self) -> usize {
         self.data.capacity()
     }

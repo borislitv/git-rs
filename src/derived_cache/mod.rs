@@ -1,5 +1,7 @@
 //! Optional, independently migrated derived artifacts. Source authorization and
 //! reader ownership remain with the caller; cache leases never grant source access.
+mod artifacts;
+mod build;
 mod config;
 mod coordinator;
 mod key;
@@ -7,6 +9,11 @@ mod maintenance;
 mod payload;
 mod postgres;
 
+pub use artifacts::{
+    ArtifactKind, BlameArtifacts, CheckpointVersion, CompleteArtifact, CompleteCheckpoint,
+    MAX_BODY_BYTES, MAX_CHUNK_BYTES, StagedChunk,
+};
+pub use build::{BlameBuilds, BuildLease, BuildLimits, BuildLookup};
 pub use config::CacheConfig;
 pub use coordinator::{Coordinator, Derivation};
 pub use key::{ArtifactKey, KeyParts};
@@ -108,6 +115,18 @@ impl DerivedCache {
         let rows = self.inner.pg.query(
             "SELECT * FROM git_rs_cache.acquire_read($1::text::uuid,$2::text::uuid,$3,$4,$5::text::uuid,$6,$7)",
             &[&c.namespace, &c.owner, &&key.hash[..], &key.canonical, &reader, &c.read_seconds, &(c.max_payload_bytes as i64)], 1, 1024)?;
+        self.load_read(key, access, reader, started, rows)
+    }
+
+    fn load_read(
+        &self,
+        key: &ArtifactKey,
+        access: Arc<dyn Access>,
+        reader: String,
+        started: Instant,
+        rows: Vec<tokio_postgres::Row>,
+    ) -> Result<Option<Payload>> {
+        let c = &self.inner.config;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
@@ -218,6 +237,16 @@ impl DerivedCache {
     }
 
     pub fn publish(&self, claim: &Claim, access: &dyn Access, bytes: &[u8]) -> Result<bool> {
+        self.publish_inner(claim, access, bytes, None)
+    }
+
+    fn publish_inner(
+        &self,
+        claim: &Claim,
+        access: &dyn Access,
+        bytes: &[u8],
+        manifest: Option<&artifacts::ManifestCommit<'_>>,
+    ) -> Result<bool> {
         self.check_claim(claim)?;
         access.check(&claim.key)?;
         let c = &self.inner.config;
@@ -232,7 +261,10 @@ impl DerivedCache {
         }
         let _working = self.inner.budget.reserve(bytes.len() * 4 + 65536)?;
         let digest = hash(bytes)?;
-        let id = config::identifier()?;
+        let id = match manifest.and_then(|manifest| manifest.checkpoint_payload) {
+            Some(id) => id.to_owned(),
+            None => config::identifier()?,
+        };
         let prepare = || {
             self.inner.pg.query(
             "SELECT git_rs_cache.prepare_payload($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9)",
@@ -264,9 +296,13 @@ impl DerivedCache {
         process::check_operation()?;
         access.check(&claim.key)?;
         let inline = (!external).then_some(bytes);
-        let published = self.inner.pg.query(
+        let published = if let Some(manifest) = manifest {
+            manifest.commit(self, claim, &id, inline)
+        } else {
+            self.inner.pg.query(
             "SELECT git_rs_cache.publish($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8)",
-            &[&c.namespace, &c.owner, &&claim.key.hash[..], &claim.token, &claim.generation, &id, &inline, &c.ttl_seconds], 1, 64);
+            &[&c.namespace, &c.owner, &&claim.key.hash[..], &claim.token, &claim.generation, &id, &inline, &c.ttl_seconds], 1, 64)
+        };
         match published {
             Ok(rows) => Ok(rows[0].try_get(0)?),
             Err(error) => {

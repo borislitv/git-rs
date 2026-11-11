@@ -1,8 +1,16 @@
-FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS toolchain
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS codec-base
+# One OS package transaction supplies both compilation and serving. Never copy
+# libc/gconv files piecemeal between independently upgraded distribution stages.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       build-essential ca-certificates curl xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+       build-essential ca-certificates curl xz-utils libssl-dev pkg-config \
+       libcurl4-openssl-dev libexpat1-dev zlib1g-dev gettext \
+       coreutils gnu-coreutils openssh-server tini libcurl4t64 libexpat1 libssl3t64 zlib1g perl \
+       python3 python3-venv postgresql-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/ssh/ssh_host_*
+
+FROM codec-base AS toolchain
 WORKDIR /tmp/rust
 # Official component archives avoid installing rustup or unused LLVM tools.
 RUN set -eu; \
@@ -22,24 +30,24 @@ RUN set -eu; \
     done; rustc --version; cargo --version
 
 FROM toolchain AS rust-toolchain
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    libssl-dev pkg-config && rm -rf /var/lib/apt/lists/*
 
 FROM rust-toolchain AS build
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock Dockerfile ./
 COPY src ./src
 COPY migrations ./migrations
 COPY benches ./benches
 COPY tests/support/cache_process.rs ./tests/support/cache_process.rs
+COPY tests/support/blame_http.rs ./tests/support/blame_http.rs
 COPY crates/git-core ./crates/git-core
-# Cargo fetch resolves the owned Gitoxide source at the immutable lockfile pin.
+COPY docs/gitoxide-source.json docs/codec-source.json ./docs/
 RUN cargo fetch --locked && cargo build --release --offline --locked
 
+FROM build AS test-fixture-build
+COPY tests/support/blame_prepared.rs tests/support/blame_work_observer.rs ./tests/support/
+RUN cargo build --release --offline --locked --example blame-http-fixture
+
 FROM toolchain AS git-build
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    libssl-dev libcurl4-openssl-dev libexpat1-dev zlib1g-dev gettext \
-    && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp/git
 RUN curl --fail --show-error --location --max-time 180 --retry 3 \
       https://www.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz -o git.tar.xz \
@@ -49,12 +57,8 @@ RUN curl --fail --show-error --location --max-time 180 --retry 3 \
     && make prefix=/usr gitexecdir=/usr/lib/git-core NO_TCLTK=YesPlease DESTDIR=/opt/git install \
     && /opt/git/usr/bin/git --version
 
-FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS runtime
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    curl ca-certificates coreutils gnu-coreutils openssh-server tini libcurl4t64 libexpat1 libssl3t64 zlib1g perl \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -f /etc/ssh/ssh_host_* \
+FROM codec-base AS runtime
+RUN rm -f /etc/ssh/ssh_host_* \
     && mkdir -p /run/sshd /var/empty/git-rs \
     && groupadd -g 10001 git-rs && useradd -u 10001 -g 10001 -M -d /var/empty/git-rs -s /bin/sh -p '*' git-rs
 COPY --from=git-build /opt/git/usr/ /usr/
@@ -73,14 +77,12 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/git-rs"]
 
 FROM runtime AS test
 USER 0:0
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3 python3-venv postgresql-client \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/test-python \
+COPY --from=test-fixture-build /build/target/release/examples/blame-http-fixture /usr/local/bin/examples/blame-http-fixture
+RUN python3 -m venv /opt/test-python \
     && /opt/test-python/bin/pip install --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0 \
     && mkdir -p /opt/git-rs/.local && chown 10001:10001 /opt/git-rs/.local && chmod 0700 /opt/git-rs/.local
 COPY tests /opt/git-rs/tests
-ENV PATH="/opt/test-python/bin:${PATH}"
+ENV PATH="/opt/test-python/bin:${PATH}" LANG=C LC_ALL=C
 WORKDIR /opt/git-rs
 USER 10001:10001
 

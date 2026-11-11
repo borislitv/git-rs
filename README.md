@@ -5,8 +5,9 @@ Experimental stateless Git backend in safe Rust, backed by PostgreSQL and S3-com
 Ordinary Git clients connect through OpenSSH or authenticated Smart HTTP behind a TLS gateway.
 Application replicas have no persistent repository
 volume: PostgreSQL stores authoritative refs/permissions and S3 stores immutable native Git
-pack/idx objects. Each request uses a private temporary bare repository; the only reusable
-application cache is bounded process memory.
+pack/idx objects. Requests use private scratch and bounded process memory. Optional
+independently configured PostgreSQL/S3 derived artifacts can share complete blame
+bodies and authenticated completed work; they never replace source authorization.
 
 **Status: experimental prerelease, not a production HA certification.** Read
 [operations, recovery and limits](OPERATIONS.md) before storing important data.
@@ -28,8 +29,9 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
 - Safe Rust with Tokio, tokio-postgres and a bounded SQL pool; `unsafe_code` is forbidden.
   SQL runs in-process, with verified TLS and no SQL subprocess. Request initialization,
   ref restoration and ref-name validation use isolated `gix` library operations.
-  Snapshot and blame object kind/size checks use physical library headers
-  without inflating full blobs or spawning Git.
+  Blame path resolution, metadata, ancestry, attribution and complete porcelain run
+  in the pinned Rust core over demand-acquired verified objects. Header probes do
+  not inflate full blobs or spawn Git.
   Wire protocols, pack/delta normalization and graph validation still use upstream Git.
   The required [Rust server data plane](docs/rust-data-plane.md) records replacement gates;
   native Git remains the compatibility client and test oracle in the target design.
@@ -109,11 +111,18 @@ git clone https://git.example.invalid/team/project.git
 
 The gateway terminates HTTPS, preserves `Authorization`, and connects over a trusted/encrypted
 path to the backend. The application HTTP listener is plaintext; HTTPRoute alone supplies neither
-authentication nor transport encryption. See [credential setup](OPERATIONS.md#authenticated-http).
+authentication nor transport encryption. See [credential setup](OPERATIONS.md#authenticated-http-listener).
 
 The same authenticated listener provides [complete immutable blame](docs/blame.md) for a
-published commit and literal file path. Native Git is the default worker; the response is
-complete line-porcelain output with bounded admission, payload size and operation lifetime.
+published commit and literal file path. The Rust core produces complete line-porcelain
+output with bounded admission, payload size and operation lifetime. External worker
+selection is obsolete and rejected. The default NativeRootV1 profile enables its five
+performance-qualified request-local tuning switches; this is not a Stage 5 release
+or completion of the pending joined authentication/runtime and real-image CI gates.
+See [profile and qualification scope](docs/rust-data-plane.md).
+Optional authenticated checkpoints and post-confirmation
+one-path warming are described in [operations](OPERATIONS.md#authenticated-checkpoints-and-warming);
+persisted reuse remains independently configured, not enabled by the tuning profile.
 
 Prometheus request, phase, detailed stage, dependency, subprocess and cache metrics are available
 at `/metrics` on the internal health listener. Opt-in correlated timing records use a bounded,
@@ -144,8 +153,9 @@ independent fixture administration, and the runtime programs above:
 
 ```sh
 make integration           # 64 MiB synthetic data, native Git/SSH and cold restart
-python3 tests/integration.py --provision --large-mib 64 --debug-timings
-python3 tests/integration.py --provision --binary target/release/git-rs --long-operations
+LANG=C LC_ALL=C python3 tests/integration.py --provision --large-mib 64 --debug-timings
+cargo build --release --locked --bin git-rs --example blame-http-fixture
+LANG=C LC_ALL=C python3 tests/integration.py --provision --binary target/release/git-rs --long-operations
 make failures              # real S3/PostgreSQL transport and maintenance faults
 make bench                 # release-mode RAM-cache microbenchmark
 python3 -m pip install PyYAML==6.0.3 jsonschema==4.26.0
@@ -165,10 +175,18 @@ SSH and authenticated HTTP, rejects unknown identities and checks cold restart. 
 to verify their failover behavior. CI also runs native tests inside the Docker `test` target so
 they use the same pinned Git version as the runtime.
 
+Current CI is not complete coverage of the new blame/cache work: it runs the old
+bounded cache gate and ordinary workspace tests, but not the new ignored contracts
+or artifact/legacy-migration harness as a dedicated gate. See the
+[coverage inventory and publication gaps](docs/rust-data-plane.md#current-ci-coverage-and-publication-gaps).
+Functional root/memo proofs do not establish Stage 5/8 production performance;
+no such result or production HA qualification is available yet.
+
 ## Current limits
 
-- Each request materializes the complete live pack catalog; this is a prototype, not a lazy
-  object filesystem or a substitute for repository sharding.
+- Native transport/maintenance materializes the complete live pack catalog. Blame
+  demand-acquires verified indexes/packs within explicit source bounds; neither is
+  a substitute for repository sharding or full deployment qualification.
 - Git SHA-1 repositories only; four admitted requests per serving process; operation deadline
   defaults to 120 seconds and is configurable from 1 to 3600 seconds; snapshot admission up to
   12 GiB; incoming pack/body up to 4 GiB. Durable holds cover the remaining operation plus a
@@ -176,9 +194,10 @@ they use the same pinned Git version as the runtime.
 - `GIT_RS_PACK_THREADS` sets native Git's per-request `pack.threads` to `1..4`, default 1.
   Choose it within the backend CPU/memory budget; four admitted requests can each use that many
   workers, and Git's per-thread delta-base cache and object buffers need separate allowances.
-- Blame executes one query per process, with a 128 MiB uncompressed-blob limit and a 256 MiB
-  complete-output limit. Annotation results are not cached; computation uses the same absolute
-  operation budget and private snapshot materialization as other reads.
+- Blame defaults to one executing job and no queue, with a 128 MiB uncompressed-blob
+  limit and a 256 MiB complete-output limit. Optional complete-body/checkpoint reuse
+  still requires source holds and fresh fences. Jobs have finite independent lifetimes;
+  waiters retain their individual deadlines. Warming is disabled by default.
 - Default cache 64 MiB, maximum cacheable entry 8 MiB, 4 KiB accounting increments and at most
   256 live cache files, including fills and evicted reader pins. Linux `/proc/<pid>/fd` must be
   accessible to same-UID native Git children. Memfd is not a no-swap or total-RSS guarantee;

@@ -116,15 +116,348 @@ fn bounded_queue_cancels_without_executing_queued_work() {
         Err(SubmitError::Full)
     ));
     queued.cancel();
-    assert!(matches!(
-        dropped_rx.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    release.send(()).unwrap();
-    assert_eq!(first.wait(), Ok(()));
-    assert_eq!(queued.wait(), Err(JobError::Stopped(StopReason::Cancelled)));
+    assert_eq!(
+        queued.wait_timeout(WAIT),
+        Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+    );
     dropped_rx.recv_timeout(WAIT).unwrap();
     assert!(!ran.load(Ordering::Acquire));
+    assert_eq!(first.wait_timeout(Duration::ZERO), Err(WaitError::Timeout));
+    release.send(()).unwrap();
+    assert_eq!(first.wait(), Ok(()));
+}
+
+#[test]
+fn queued_discard_acknowledges_actual_cleanup_and_reuses_capacity_with_worker_busy() {
+    for expired in [false, true] {
+        let executor = pool(1, 1);
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let active = executor
+            .submit(control(), JobOptions::default(), move |_, _| {
+                started.send(()).unwrap();
+                release_rx.recv_timeout(WAIT * 3).unwrap();
+                Ok(1)
+            })
+            .unwrap();
+        started_rx.recv_timeout(WAIT).unwrap();
+        struct Cleanup {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            _charge: CapacityReservation,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.recv_timeout(WAIT).unwrap();
+            }
+        }
+        let budget = CapacityBudget::new(128);
+        let (cleanup_started, cleanup_rx) = mpsc::channel();
+        let (cleanup_release, cleanup_release_rx) = mpsc::channel();
+        let cleanup = Cleanup {
+            started: cleanup_started,
+            release: cleanup_release_rx,
+            _charge: budget.reservation(128).unwrap(),
+        };
+        let queued_control = if expired {
+            Control::new(Instant::now() + Duration::from_millis(200))
+        } else {
+            control()
+        };
+        let queued = executor
+            .submit::<(), _>(queued_control, JobOptions::default(), move |_, _| {
+                let _cleanup = cleanup;
+                panic!("discarded queued callback executed")
+            })
+            .unwrap();
+        if !expired {
+            queued.cancel();
+        }
+        cleanup_rx
+            .recv_timeout(WAIT)
+            .expect("queued capture must be discarded while CPU worker remains gated");
+        assert_eq!(budget.used(), 128);
+        assert_eq!(queued.wait_timeout(Duration::ZERO), Err(WaitError::Timeout));
+        // The destructor is outside the queue lock, but still owns its queue slot.
+        assert!(matches!(
+            executor.submit(control(), JobOptions::default(), |_, _| Ok(())),
+            Err(SubmitError::Full)
+        ));
+        cleanup_release.send(()).unwrap();
+        let reason = if expired {
+            StopReason::Deadline
+        } else {
+            StopReason::Cancelled
+        };
+        assert_eq!(
+            queued.wait_timeout(WAIT),
+            Ok(Err(JobError::Stopped(reason)))
+        );
+        assert_eq!(
+            budget.used(),
+            0,
+            "completion preceded actual capture cleanup"
+        );
+        let replacement = executor
+            .submit(control(), JobOptions::default(), |_, _| Ok(2))
+            .unwrap();
+        assert_eq!(active.wait_timeout(Duration::ZERO), Err(WaitError::Timeout));
+        assert_eq!(
+            replacement.wait_timeout(Duration::ZERO),
+            Err(WaitError::Timeout)
+        );
+        release.send(()).unwrap();
+        assert_eq!(active.wait(), Ok(1));
+        assert_eq!(replacement.wait(), Ok(2));
+    }
+}
+
+#[test]
+fn cancelled_middle_entry_is_discarded_without_reordering_survivors() {
+    let executor = pool(1, 3);
+    let (started, started_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let active = executor
+        .submit(control(), JobOptions::default(), move |_, _| {
+            started.send(()).unwrap();
+            release_rx.recv_timeout(WAIT).unwrap();
+            Ok(())
+        })
+        .unwrap();
+    started_rx.recv_timeout(WAIT).unwrap();
+    let (order, observed) = mpsc::channel();
+    let mut tickets = Vec::new();
+    for index in 0..3 {
+        let order = order.clone();
+        tickets.push(
+            executor
+                .submit(control(), JobOptions::default(), move |_, _| {
+                    order.send(index).unwrap();
+                    Ok(index)
+                })
+                .unwrap(),
+        );
+    }
+    tickets[1].cancel();
+    assert_eq!(
+        tickets[1].wait_timeout(WAIT),
+        Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+    );
+    let last = executor
+        .submit(control(), JobOptions::default(), move |_, _| {
+            order.send(3).unwrap();
+            Ok(3)
+        })
+        .unwrap();
+    assert_eq!(active.wait_timeout(Duration::ZERO), Err(WaitError::Timeout));
+    release.send(()).unwrap();
+    assert_eq!(active.wait(), Ok(()));
+    assert_eq!(tickets.remove(0).wait(), Ok(0));
+    drop(tickets.remove(0)); // consumed cancelled ticket
+    assert_eq!(tickets.remove(0).wait(), Ok(2));
+    assert_eq!(last.wait(), Ok(3));
+    assert_eq!(
+        (0..3)
+            .map(|_| observed.recv_timeout(WAIT).unwrap())
+            .collect::<Vec<_>>(),
+        [0, 2, 3]
+    );
+}
+
+#[test]
+fn cancel_racing_worker_dequeue_keeps_capture_until_actual_stop() {
+    for _ in 0..24 {
+        let executor = pool(1, 1);
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let active = executor
+            .submit(control(), JobOptions::default(), move |_, _| {
+                started.send(()).unwrap();
+                release_rx.recv_timeout(WAIT).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        started_rx.recv_timeout(WAIT).unwrap();
+        let (dropped, dropped_rx) = mpsc::channel();
+        let hold = Hold(dropped);
+        let (finish, finish_rx) = mpsc::channel();
+        let queued_control = control();
+        let racing = queued_control.clone();
+        let queued = executor
+            .submit(queued_control, JobOptions::default(), move |control, _| {
+                let _hold = hold;
+                finish_rx.recv_timeout(WAIT).unwrap();
+                control.check()?;
+                Ok(())
+            })
+            .unwrap();
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                racing.cancel();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                release.send(()).unwrap();
+            });
+            barrier.wait();
+        });
+        let _ = finish.send(()); // receiver may already have been discarded
+        assert_eq!(
+            queued.wait_timeout(WAIT),
+            Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+        );
+        dropped_rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(active.wait(), Ok(()));
+    }
+}
+
+#[test]
+fn queued_destructor_nested_submit_and_panic_do_not_disable_discard() {
+    let executor = Arc::new(pool(1, 1));
+    let (started, started_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let active = executor
+        .submit(control(), JobOptions::default(), move |_, _| {
+            started.send(()).unwrap();
+            release_rx.recv_timeout(WAIT).unwrap();
+            Ok(())
+        })
+        .unwrap();
+    started_rx.recv_timeout(WAIT).unwrap();
+    struct Cleanup {
+        executor: std::sync::Weak<CpuExecutor>,
+        nested: Arc<AtomicBool>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let executor = self.executor.upgrade().unwrap();
+            self.nested.store(
+                matches!(
+                    executor.submit(control(), JobOptions::default(), |_, _| Ok(())),
+                    Err(SubmitError::Nested)
+                ),
+                Ordering::Release,
+            );
+            panic!("synthetic queued destructor panic");
+        }
+    }
+    let nested = Arc::new(AtomicBool::new(false));
+    let cleanup = Cleanup {
+        executor: Arc::downgrade(&executor),
+        nested: nested.clone(),
+    };
+    let queued = executor
+        .submit(control(), JobOptions::default(), move |_, _| {
+            let _cleanup = cleanup;
+            Ok(())
+        })
+        .unwrap();
+    queued.cancel();
+    assert_eq!(queued.wait_timeout(WAIT), Ok(Err(JobError::Panicked)));
+    assert!(nested.load(Ordering::Acquire));
+    let next = executor
+        .submit(control(), JobOptions::default(), |_, _| Ok(4))
+        .unwrap();
+    next.cancel();
+    assert_eq!(
+        next.wait_timeout(WAIT),
+        Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+    );
+    release.send(()).unwrap();
+    assert_eq!(active.wait(), Ok(()));
+}
+
+#[test]
+fn queued_capture_can_drop_last_executor_owner_without_self_join() {
+    let executor = Arc::new(pool(1, 1));
+    let (started, started_rx) = mpsc::channel();
+    let active = executor
+        .submit::<(), _>(control(), JobOptions::default(), move |control, _| {
+            started.send(()).unwrap();
+            loop {
+                control.check()?;
+                std::thread::yield_now();
+            }
+        })
+        .unwrap();
+    started_rx.recv_timeout(WAIT).unwrap();
+    struct Owner {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        _executor: Arc<CpuExecutor>,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(WAIT).unwrap();
+        }
+    }
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let owner = Owner {
+        entered,
+        release: release_rx,
+        _executor: executor.clone(),
+    };
+    let queued = executor
+        .submit(control(), JobOptions::default(), move |_, _| {
+            let _owner = owner;
+            Ok(())
+        })
+        .unwrap();
+    queued.cancel();
+    entered_rx.recv_timeout(WAIT).unwrap();
+    drop(executor); // the watcher will destroy the sole remaining owner
+    release.send(()).unwrap();
+    assert_eq!(
+        queued.wait_timeout(WAIT),
+        Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+    );
+    assert_eq!(
+        active.wait_timeout(WAIT),
+        Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+    );
+}
+
+#[test]
+fn shutdown_discards_queued_captures_before_running_stop_acknowledgment() {
+    let executor = pool(1, 1);
+    let (started, started_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let active = executor
+        .submit(control(), JobOptions::default(), move |_, _| {
+            started.send(()).unwrap();
+            release_rx.recv_timeout(WAIT).unwrap();
+            Ok(())
+        })
+        .unwrap();
+    started_rx.recv_timeout(WAIT).unwrap();
+    let (dropped, dropped_rx) = mpsc::channel();
+    let hold = Hold(dropped);
+    let queued = executor
+        .submit(control(), JobOptions::default(), move |_, _| {
+            let _hold = hold;
+            panic!("shutdown callback ran");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .unwrap();
+    let shutdown = std::thread::spawn(move || drop(executor));
+    assert_eq!(
+        queued.wait_timeout(WAIT),
+        Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+    );
+    dropped_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(active.wait_timeout(Duration::ZERO), Err(WaitError::Timeout));
+    release.send(()).unwrap();
+    assert_eq!(
+        active.wait_timeout(WAIT),
+        Ok(Err(JobError::Stopped(StopReason::Cancelled)))
+    );
+    shutdown.join().unwrap();
 }
 
 #[test]

@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Light gate guard/fault tests: no Docker, systemd, Git, Cargo or network."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import blame_gate as gate
+
+
+class GateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def seal_manifest(self, bundle, manifest):
+        manifest.pop("namespace_sha256", None)
+        manifest["namespace_sha256"] = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        path = bundle / "manifest.json"
+        if path.exists():
+            path.chmod(0o600)
+        path.write_text(json.dumps(manifest))
+        path.chmod(0o444)
+
+    def bundle(self):
+        bundle = self.root / "bundle"
+        bundle.mkdir()
+        (bundle / "bin").mkdir()
+        binaries = {}
+        for name in ("current", "fixture", "cache_process", "legacy", "legacy_process", *gate.SUITES):
+            data = ("synthetic executable " + name).encode()
+            path = bundle / "bin" / name
+            path.write_bytes(data)
+            path.chmod(0o555)
+            binaries[name] = {"path": "bin/" + name, "sha256": hashlib.sha256(data).hexdigest()}
+        manifest = {"format": 1, "current_commit": "e" * 40,
+                    "legacy": {"repository": gate.LEGACY_REPOSITORY,
+                               "commit": gate.LEGACY_COMMIT,
+                               "cargo_manifest_sha256": "e" * 64,
+                               "cargo_lock_sha256": "f" * 64},
+                    "git_source": gate.GIT_SOURCE, "builder_packages": "same OS",
+                    "runtime_packages": "same OS", "runtime_image": "sha256:" + "a" * 64,
+                    "builder_image": "sha256:" + "b" * 64, "binaries": binaries,
+                    "harness_sources": {name: "c" * 64 for name in gate.HARNESS_FILES},
+                    "inventory": {suite: [gate.ROOT_RUNTIME] if suite == "blame_core"
+                                  else ["actual_fixture_case"] for suite in gate.SUITES}}
+        self.seal_manifest(bundle, manifest)
+        (bundle / "bin").chmod(0o555)
+        bundle.chmod(0o555)
+        return bundle, manifest
+
+    def cgroup(self, **changes):
+        directory = self.root / "cgroup"
+        directory.mkdir(exist_ok=True)
+        values = {"memory.max": str(4 * 1024**3), "pids.max": "256",
+                  "cpu.max": "200000 100000", "memory.swap.max": "0",
+                  "cpuset.cpus.effective": "24-25"}
+        values.update(changes)
+        for name, value in values.items():
+            (directory / name).write_text(value)
+        return directory
+
+    def test_missing_invocation_refuses_cleanup_before_any_external_call(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(gate, "output") as run:
+            with self.assertRaisesRegex(ValueError, "INVOCATION_ID"):
+                gate.cleanup()
+            run.assert_not_called()
+
+    def test_focused_pass_executes_shipped_release_paths(self):
+        with patch.object(gate, "command") as run:
+            gate.focused_gate()
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--binary") + 1], "/usr/local/bin/git-rs")
+        self.assertEqual(argv[argv.index("--blame-fixture-binary") + 1],
+                         "/usr/local/bin/examples/blame-http-fixture")
+
+    def test_preparation_timeout_or_partial_create_cleans_only_owned_containers(self):
+        token = "b" * 32
+        label = "git-rs.blame-preparation=" + token
+        env = {"BLAME_GATE_PREP_TOKEN": token,
+               "BLAME_GATE_PREP_SLICE": "git-rs-blame-prep-12345678.slice"}
+        for failure in (subprocess.TimeoutExpired("docker", 60),
+                        subprocess.CalledProcessError(125, "docker"), KeyboardInterrupt()):
+            containers = {"abcdef123456": "unrelated"}
+
+            def daemon(argv, **kwargs):
+                if argv[:2] == ["docker", "run"]:
+                    # The daemon has created a container, but the client never gets its ID.
+                    containers["123456abcdef"] = label
+                    self.assertIn(label, argv)
+                    self.assertEqual(argv[argv.index("--cgroup-parent") + 1], env["BLAME_GATE_PREP_SLICE"])
+                    self.assertEqual(argv[argv.index("--memory-swap") + 1], "4g")
+                    self.assertEqual(argv[argv.index("--cpuset-cpus") + 1], "24,25")
+                    self.assertLessEqual(kwargs["timeout"], 900)
+                    raise failure
+                if argv[:2] == ["docker", "ps"]:
+                    selected = argv[-1].removeprefix("label=")
+                    return "\n".join(key for key, owner in containers.items() if owner == selected)
+                raise AssertionError(argv)
+
+            def remove(argv, **kwargs):
+                self.assertEqual(argv[:3], ["docker", "rm", "-f"])
+                for key in argv[3:]:
+                    del containers[key]
+
+            with self.subTest(failure=type(failure).__name__), patch.dict(os.environ, env), \
+                    patch.object(gate, "output", side_effect=daemon), \
+                    patch.object(gate, "command", side_effect=remove), \
+                    patch.object(gate.os, "sched_getaffinity", return_value={24, 25}):
+                with self.assertRaises(type(failure)):
+                    gate.image_output("sha256:image", ["/bin/true"])
+                self.assertEqual(containers, {"abcdef123456": "unrelated"})
+                gate.cleanup_preparation(token)
+                gate.cleanup_preparation(token)
+                self.assertEqual(containers, {"abcdef123456": "unrelated"})
+
+    def test_preparation_ownership_refuses_invalid_nonce_before_daemon_calls(self):
+        for token in ("", "a" * 31, "A" * 32, "--all"):
+            with self.subTest(token=token), patch.object(gate, "output") as query, \
+                    patch.object(gate, "command") as remove:
+                with self.assertRaisesRegex(ValueError, "nonce"):
+                    gate.cleanup_preparation(token)
+                query.assert_not_called()
+                remove.assert_not_called()
+
+    def test_preparation_requires_attested_parent_before_building(self):
+        env = {"BLAME_GATE_PREP_TOKEN": "b" * 32, "INVOCATION_ID": "a" * 32}
+        with patch.dict(os.environ, env, clear=True), patch.object(gate, "output") as external, \
+                patch.object(gate, "prepare_bundle") as build:
+            with self.assertRaisesRegex(ValueError, "slice"):
+                gate.prepare(SimpleNamespace())
+            external.assert_not_called()
+            build.assert_not_called()
+
+    def test_preparation_cargo_and_inspection_share_owned_runner(self):
+        env = {"BLAME_GATE_PREP_TOKEN": "b" * 32,
+               "BLAME_GATE_PREP_SLICE": "git-rs-blame-prep-12345678.slice"}
+        launches = []
+
+        def daemon(argv, **kwargs):
+            if argv[:2] == ["docker", "ps"]:
+                return ""
+            launches.append(argv)
+            return ""
+
+        with patch.dict(os.environ, env), patch.object(gate, "output", side_effect=daemon), \
+                patch.object(gate.os, "sched_getaffinity", return_value={24, 25}):
+            gate.image_output("sha256:image", ["/bin/true"])
+            gate.cargo_artifacts("sha256:builder", self.root, self.root / "target", ["build"])
+        self.assertEqual(len(launches), 2)
+        for argv in launches:
+            self.assertIn("git-rs.blame-preparation=" + env["BLAME_GATE_PREP_TOKEN"], argv)
+            self.assertEqual(argv[argv.index("--cgroup-parent") + 1], env["BLAME_GATE_PREP_SLICE"])
+
+    def test_preparation_build_failure_still_reaps_daemon_owned_container(self):
+        token = "b" * 32
+        containers = {"abcdef123456": "unrelated", "123456abcdef": token}
+
+        def query(argv, **kwargs):
+            self.assertEqual(argv[-1], "label=git-rs.blame-preparation=" + token)
+            return "\n".join(key for key, owner in containers.items() if owner == token)
+
+        def remove(argv, **kwargs):
+            for key in argv[3:]:
+                del containers[key]
+
+        with patch.dict(os.environ, {"BLAME_GATE_PREP_TOKEN": token}), \
+                patch.object(gate, "verify_unit"), \
+                patch.object(gate, "prepare_bundle", side_effect=RuntimeError("build failed")), \
+                patch.object(gate, "output", side_effect=query), \
+                patch.object(gate, "command", side_effect=remove):
+            with self.assertRaisesRegex(RuntimeError, "build failed"):
+                gate.prepare(SimpleNamespace())
+        self.assertEqual(containers, {"abcdef123456": "unrelated"})
+
+    def test_cleanup_removes_only_invocation_labeled_ids_and_rechecks(self):
+        token = "a" * 32
+        with patch.dict(os.environ, {"INVOCATION_ID": token}), \
+                patch.object(gate, "output", side_effect=["123456abcdef", ""]) as query, \
+                patch.object(gate, "command") as remove:
+            gate.cleanup()
+        expected = ["docker", "ps", "-aq", "--filter", "label=git-rs.blame-gate=" + token]
+        self.assertEqual(query.call_count, 2)
+        self.assertEqual(query.call_args_list[0].args[0], expected)
+        self.assertEqual(query.call_args_list[1].args[0], expected)
+        remove.assert_called_once_with(["docker", "rm", "-f", "123456abcdef"], timeout=20)
+
+    def test_failed_or_invalid_query_never_falls_through_to_removal(self):
+        for result in (subprocess.TimeoutExpired("docker", 5), "--all"):
+            with self.subTest(result=type(result).__name__), \
+                    patch.dict(os.environ, {"INVOCATION_ID": "a" * 32}), \
+                    patch.object(gate, "output", side_effect=result if isinstance(result, Exception)
+                                 else [result]), patch.object(gate, "command") as remove:
+                with self.assertRaises((ValueError, subprocess.TimeoutExpired)):
+                    gate.cleanup()
+                remove.assert_not_called()
+
+    def test_cleanup_failure_is_not_success(self):
+        with patch.dict(os.environ, {"INVOCATION_ID": "a" * 32}), \
+                patch.object(gate, "output", side_effect=["123456abcdef", "123456abcdef"]), \
+                patch.object(gate, "command"):
+            with self.assertRaisesRegex(ValueError, "remain"):
+                gate.cleanup()
+
+    def test_sealed_complete_bundle_is_accepted_without_running_binaries(self):
+        bundle, expected = self.bundle()
+        self.assertEqual(gate.load_manifest(bundle)["binaries"], expected["binaries"])
+
+    def test_modified_binary_is_rejected_even_when_manifest_is_unchanged(self):
+        bundle, _ = self.bundle()
+        binary = bundle / "bin/legacy"
+        binary.chmod(0o755)
+        binary.write_bytes(b"substituted old executable")
+        binary.chmod(0o555)
+        with self.assertRaisesRegex(ValueError, "digest"):
+            gate.load_manifest(bundle)
+
+    def test_coherent_wrong_legacy_commit_is_rejected(self):
+        bundle, manifest = self.bundle()
+        manifest["legacy"]["commit"] = "d" * 40
+        self.seal_manifest(bundle, manifest)
+        with self.assertRaisesRegex(ValueError, "legacy provenance"):
+            gate.load_manifest(bundle)
+
+    def test_missing_test_binary_and_mutable_manifest_are_rejected(self):
+        bundle, manifest = self.bundle()
+        manifest["binaries"].pop("blame_checkpoints")
+        self.seal_manifest(bundle, manifest)
+        with self.assertRaisesRegex(ValueError, "binary set"):
+            gate.load_manifest(bundle)
+        (bundle / "manifest.json").chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            gate.load_manifest(bundle)
+
+    def test_path_escape_and_namespace_corruption_are_rejected(self):
+        bundle, manifest = self.bundle()
+        manifest["binaries"]["legacy"]["path"] = "../outside"
+        self.seal_manifest(bundle, manifest)
+        with self.assertRaisesRegex(ValueError, "unsafe bundle path"):
+            gate.load_manifest(bundle)
+        manifest["namespace_sha256"] = "0" * 64
+        path = bundle / "manifest.json"
+        path.chmod(0o600)
+        path.write_text(json.dumps(manifest))
+        path.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "namespace binding"):
+            gate.load_manifest(bundle)
+
+    def test_mismatched_build_runtime_os_is_rejected(self):
+        bundle, manifest = self.bundle()
+        manifest["runtime_packages"] = "different OS"
+        self.seal_manifest(bundle, manifest)
+        with self.assertRaisesRegex(ValueError, "OS package closure"):
+            gate.load_manifest(bundle)
+
+    def test_inventory_excludes_only_named_subprocess_helpers_and_has_no_fixed_count(self):
+        self.assertEqual(gate.inventory("z_case: test\nartifact_process: test\na_case: test\n",
+                                        "blame_artifacts"), ["a_case", "z_case"])
+        self.assertEqual(gate.inventory("checkpoint_reuse_child: test\nreal_case: test\n",
+                                         "blame_reuse"), ["real_case"])
+        self.assertEqual(gate.inventory("runtime_support::runtime_child: test\n"
+                                        "runtime_support::new_nested_contract: test\n", "blame_core"),
+                         ["runtime_support::new_nested_contract"])
+        with self.assertRaisesRegex(ValueError, "no ignored"):
+            gate.inventory("artifact_process: test\n", "blame_artifacts")
+
+    def test_cargo_recipe_uses_machine_reported_executables_and_separate_target(self):
+        target = self.root / "old-target"
+        message = json.dumps({"reason": "compiler-artifact", "target": {"name": "cache-process"},
+                              "executable": "/target/debug/examples/cache-process"})
+        with patch.object(gate, "preparation_output", return_value=message) as build:
+            paths = gate.cargo_artifacts("sha256:builder", self.root, target,
+                                         ["build", "--example", "cache-process"])
+        self.assertEqual(paths, {"cache-process": target / "debug/examples/cache-process"})
+        argv = build.call_args.args[0]
+        self.assertIn("--locked", argv)
+        self.assertIn("--message-format=json", argv)
+        self.assertIn(str(target) + ":/target", argv)
+        self.assertIn(str(self.root) + ":/source:ro", argv)
+
+    def test_cargo_report_cannot_escape_or_ambiguously_replace_executables(self):
+        for index, executable in enumerate(("/outside/bin", "/target/debug/git-rs")):
+            message = json.dumps({"reason": "compiler-artifact", "target": {"name": "git-rs"},
+                                  "executable": executable})
+            report = message if index == 0 else message + "\n" + message
+            with self.subTest(executable=executable), patch.object(gate, "preparation_output", return_value=report):
+                with self.assertRaises(ValueError):
+                    gate.cargo_artifacts("builder", self.root, self.root / str(index), ["build"])
+
+    def test_exact_aggregate_caps_are_accepted(self):
+        gate.verify_limits(self.cgroup())
+
+    def test_overbudget_or_unbounded_aggregate_limits_are_rejected(self):
+        faults = [{"memory.max": "max"}, {"memory.max": str(4 * 1024**3 + 1)},
+                  {"pids.max": "257"}, {"pids.max": "max"}, {"cpu.max": "300000 100000"},
+                  {"cpu.max": "max 100000"}, {"memory.swap.max": "1"},
+                  {"cpuset.cpus.effective": "24-26"}]
+        for fault in faults:
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                gate.verify_limits(self.cgroup(**fault))
+
+    def test_systemd_duration_parser_rejects_infinity_and_preserves_900_bound(self):
+        self.assertEqual(gate.seconds("15min"), 900)
+        self.assertEqual(gate.seconds("40s"), 40)
+        for value in ("infinity", "900", "garbage15min"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                gate.seconds(value)
+
+    def test_unit_ownership_shutdown_and_timeout_guards(self):
+        token = "a" * 32
+        slice_name = "git-rs-blame-12345678.slice"
+        unit = "git-rs-blame-12345678.service"
+        parent = "/owned.slice"
+        base = {"InvocationID": token, "ControlGroup": parent + "/" + unit,
+                "Slice": slice_name, "RuntimeMaxUSec": "15min", "TimeoutStopUSec": "40s",
+                "KillMode": "control-group", "ExecStopPost": "/usr/bin/python3 -B tests/blame_gate.py cleanup"}
+        directory = self.cgroup()
+        read = Path.read_text
+
+        def read_host(path, *args, **kwargs):
+            if str(path) == "/proc/self/cgroup":
+                return "0::" + base["ControlGroup"] + "\n"
+            if str(path).startswith("/sys/fs/cgroup/owned.slice/"):
+                return read(directory / path.name, *args, **kwargs)
+            return read(path, *args, **kwargs)
+
+        for fault in ({}, {"InvocationID": "b" * 32}, {"RuntimeMaxUSec": "16min"},
+                      {"TimeoutStopUSec": "41s"}, {"ExecStopPost": ""}, {"KillMode": "process"},
+                      {"Slice": "unrelated.slice"}):
+            props = dict(base, **fault)
+
+            def external(argv, **_):
+                if argv[0] == "docker":
+                    return "systemd 2"
+                if "--property=ControlGroup" in argv and "--value" in argv:
+                    return parent
+                return "\n".join(k + "=" + v for k, v in props.items())
+
+            with self.subTest(fault=fault), patch.dict(os.environ, {"INVOCATION_ID": token}), \
+                    patch.object(gate, "output", side_effect=external), patch.object(Path, "read_text", read_host):
+                if fault:
+                    with self.assertRaises(ValueError):
+                        gate.verify_unit(unit, slice_name)
+                else:
+                    self.assertEqual(gate.verify_unit(unit, slice_name), token)
+
+    def test_proxy_injects_parent_and_owner_without_touching_harness_arguments(self):
+        env = {"INVOCATION_ID": "a" * 32, "GIT_RS_GATE_SLICE": "git-rs-blame-12345678.slice"}
+        with patch.dict(os.environ, env), patch.object(gate.os, "execv") as execute:
+            gate.docker_proxy(["run", "-d", "--memory", "256m", "pinned-fixture"])
+        argv = execute.call_args.args[1]
+        self.assertEqual(argv[:5], ["/usr/bin/docker", "run", "--cgroup-parent",
+                                   env["GIT_RS_GATE_SLICE"], "--pull=never"])
+        self.assertIn("git-rs.blame-gate=" + env["INVOCATION_ID"], argv)
+        self.assertEqual(argv[-4:], ["-d", "--memory", "256m", "pinned-fixture"])
+
+    def test_proxy_rejects_cgroup_escape_before_exec(self):
+        env = {"INVOCATION_ID": "a" * 32, "GIT_RS_GATE_SLICE": "git-rs-blame-12345678.slice"}
+        for flag in ("--privileged", "--cgroup-parent=other.slice", "--pid=host"):
+            with self.subTest(flag=flag), patch.dict(os.environ, env), \
+                    patch.object(gate.os, "execv") as execute:
+                with self.assertRaisesRegex(ValueError, "escape"):
+                    gate.docker_proxy(["run", flag, "fixture"])
+                execute.assert_not_called()
+
+    def test_docker_transport_is_pinned_to_the_attested_local_daemon(self):
+        environment = {"DOCKER_HOST": "tcp://unrelated.invalid:2375", "DOCKER_CONTEXT": "remote"}
+        with patch.dict(os.environ, environment), patch.object(gate.subprocess, "run") as run:
+            gate.command(["docker", "info"])
+        actual = run.call_args.kwargs["env"]
+        self.assertEqual(actual["DOCKER_HOST"], "unix:///var/run/docker.sock")
+        self.assertNotIn("DOCKER_CONTEXT", actual)
+
+    def test_failed_cleanup_cannot_publish_completed_report(self):
+        bundle, _ = self.bundle()
+        (self.root / ".local").mkdir()
+        args = SimpleNamespace(bundle=bundle, unit="owned.service", slice="owned.slice",
+                               manifest_sha256=hashlib.sha256((bundle / "manifest.json").read_bytes()).hexdigest())
+        token = "a" * 32
+        real_stat = Path.stat
+
+        def stat(path, *a, **kw):
+            if str(path) == "/var/run/docker.sock":
+                return SimpleNamespace(st_gid=123)
+            return real_stat(path, *a, **kw)
+
+        with patch.object(gate, "ROOT", self.root), patch.object(gate, "verify_unit", return_value=token), \
+                patch.object(gate.os, "sched_getaffinity", return_value={24, 25}), \
+                patch.object(gate, "command"), patch.object(gate, "cleanup", side_effect=ValueError("cleanup failed")), \
+                patch.object(Path, "stat", stat):
+            with self.assertRaisesRegex(ValueError, "cleanup failed"):
+                gate.run_gate(args)
+        report = json.loads((self.root / (".local/blame-gate-" + token) / "report.json").read_text())
+        self.assertFalse(report["completed"])
+        self.assertTrue(report["work_completed"])
+
+
+if __name__ == "__main__":
+    unittest.main()

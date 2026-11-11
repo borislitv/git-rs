@@ -63,4 +63,15 @@ impl ArtifactKey {
     pub fn digest(&self) -> &[u8; 32] {
         &self.hash
     }
+
+    /// Internal complete-body chunks bind the entire root scope and content.
+    pub(crate) fn body_chunk(&self, digest: &[u8; 32]) -> Self {
+        let mut canonical = b"git-rs-body-chunk\0\x01".to_vec();
+        canonical.extend_from_slice(&self.hash);
+        canonical.extend_from_slice(digest);
+        Self {
+            hash: openssl::sha::sha256(&canonical),
+            canonical,
+        }
+    }
 }

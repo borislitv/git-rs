@@ -3,6 +3,7 @@
 import argparse
 import base64
 import concurrent.futures
+from contextlib import nullcontext
 import hashlib
 import http.client
 import json
@@ -12,6 +13,7 @@ import pwd
 import random
 import re
 import select
+import shutil
 import signal
 import socket
 import socketserver
@@ -21,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from urllib.parse import quote_from_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,8 +103,12 @@ class Fixture:
         self.containers, self.processes, self.logs = [], [], []
         self.daemons, self.health_ports = {}, {}
         self.results = {}
+        self.blame_fixture_binary = None
+        self.blame_core_resources = False
+        self.identity = uuid.uuid4().hex
+        self.containers_started = False
         self.env = {k: v for k, v in os.environ.items() if k in ["PATH", "LANG", "TERM"]}
-        self.env.update(HOME=str(base), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
+        self.env.update(HOME=str(base), LC_ALL="C", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
                         GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Test Author",
                         GIT_AUTHOR_EMAIL="author@example.invalid", GIT_COMMITTER_NAME="Test Author",
                         GIT_COMMITTER_EMAIL="author@example.invalid", GIT_RS_CACHE_BYTES="1048576",
@@ -113,6 +120,7 @@ class Fixture:
         (base / "scratch").mkdir(mode=0o700)
 
     def setup(self, provision):
+        self.check_native_git()
         if provision:
             pg = self.container(["-e", "POSTGRES_PASSWORD=development-only", "-e", "POSTGRES_DB=git_rs",
                                  "-p", "127.0.0.1::5432", PG_IMAGE])
@@ -135,8 +143,38 @@ class Fixture:
             for key in ["PGPORT", "GIT_RS_S3_ENDPOINT"]:
                 self.env[key] = os.environ[key]
 
+    def check_native_git(self):
+        """Fail before provisioning if PATH/native helpers are not the pinned oracle."""
+        found = shutil.which("git", path=self.env["PATH"])
+        assert found and Path(found).resolve() == Path("/usr/bin/git").resolve(), (
+            "native Git oracle must resolve to the genuine pinned /usr/bin/git", found)
+        binary = Path(found).read_bytes()
+        assert binary.startswith(b"\x7fELF"), "native Git oracle must be ELF, never a version wrapper"
+        for executable in ("git", "/usr/bin/git"):
+            version = command([executable, "--version"], env=self.env).stdout.strip()
+            assert version == b"git version 2.56.0", ("pinned Git 2.56.0 oracle required", executable, version)
+        helper_path = command(["/usr/bin/git", "--exec-path"], env=self.env).stdout.strip()
+        assert helper_path == b"/usr/lib/git-core", ("pinned complete Git helper install required", helper_path)
+        for helper in ("git-http-backend", "git-remote-http"):
+            path = Path("/usr/lib/git-core") / helper
+            assert path.is_file() and os.access(path, os.X_OK), ("missing native Git helper", path)
+        self.results["native_git_oracle"] = {"version": "2.56.0", "executable": str(Path(found).resolve()),
+            "sha256": hashlib.sha256(binary).hexdigest(), "exec_path": helper_path.decode()}
+
     def container(self, args):
-        identifier = command(["docker", "run", "-d", *args]).stdout.decode().strip()
+        self.containers_started = True
+        owned = ["--label", "git-rs.integration-fixture=" + self.identity]
+        if os.environ.get("GIT_RS_TEST_OWNER_LABEL"):
+            owned += ["--label", os.environ["GIT_RS_TEST_OWNER_LABEL"]]
+        if self.blame_core_resources:
+            pg = PG_IMAGE in args
+            memory = "1024m" if pg else "512m"
+            owned += ["--pull=never", "--cpuset-cpus", os.environ.get("GIT_RS_TEST_SERVICE_CPUS", ",".join(map(str, sorted(os.sched_getaffinity(0))[:2]))),
+                      "--cpus", ".5" if pg else ".25", "--memory", memory,
+                       "--memory-swap", memory, "--pids-limit", "64" if pg else "48"]
+            if pg:
+                owned += ["--tmpfs", "/var/lib/postgresql:rw,size=512m"]
+        identifier = command(["docker", "run", "-d", *owned, *args]).stdout.decode().strip()
         self.containers.append(identifier)
         return identifier
 
@@ -185,6 +223,30 @@ class Fixture:
         self.health_ports[name] = int(re.search(r"health 127.0.0.1:(\d+)", log_path.read_text()).group(1))
         return process, int(ready().group(1))
 
+    def start_blame(self, name, *, control=None, phase="source", seconds=30,
+                    concurrency=2, waiters=1, cache=False, principal="alice"):
+        assert self.blame_fixture_binary, "--blame-fixture-binary prebuilt test example is required"
+        path = self.base / f"{name}.log"
+        log = path.open("xb")
+        self.logs.append(log)
+        args = [str(self.blame_fixture_binary), "--scratch", str(self.base / "scratch"),
+                "--socket", str(self.base / f"{name}.sock"), "--seconds", str(seconds),
+                "--concurrency", str(concurrency), "--waiters", str(waiters), "--principal", principal]
+        if control is not None:
+            args += ["--control", str(control), "--phase", phase]
+        if cache:
+            args.append("--cache")
+        child = subprocess.Popen(args, env=self.env, stdout=log, stderr=log)
+        self.processes.append(child)
+        def ready():
+            if child.poll() is not None:
+                raise AssertionError(path.read_text())
+            return re.search(r"development HTTP 127.0.0.1:(\d+)", path.read_text())
+        wait_for(ready, "test-only real-core HTTP listener")
+        self.daemons[name] = child
+        self.health_ports[name] = int(re.search(r"health 127.0.0.1:(\d+)", path.read_text()).group(1))
+        return child, int(ready().group(1))
+
     def health(self, name, path):
         connection = http.client.HTTPConnection("127.0.0.1", self.health_ports[name], timeout=3)
         connection.request("GET", path)
@@ -192,6 +254,19 @@ class Fixture:
         status, body = response.status, response.read()
         connection.close()
         return status, body
+
+    def stop(self, name):
+        child = self.daemons.pop(name)
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
+
+    def stop_daemons(self):
+        for name in list(self.daemons):
+            self.stop(name)
 
     def record_memory(self):
         peaks = []
@@ -215,8 +290,25 @@ class Fixture:
                 process.wait()
         for log in self.logs:
             log.close()
-        for identifier in self.containers:
+        identifiers = set(self.containers)
+        if self.containers_started:
+            recovered = command(["docker", "ps", "-aq", "--filter",
+                                 "label=git-rs.integration-fixture=" + self.identity], ok=False)
+            identifiers.update(recovered.stdout.decode().split())
+        if self.blame_core_resources:
+            for identifier in identifiers:
+                resources = command(["docker", "inspect", identifier], ok=False)
+                (self.base / (identifier[:12] + ".resources.json")).write_bytes(resources.stdout)
+                diagnostic = command(["docker", "logs", "--tail", "100", identifier], ok=False)
+                (self.base / (identifier[:12] + ".log")).write_bytes(
+                    diagnostic.stdout[-16384:] + diagnostic.stderr[-16384:])
+        for identifier in identifiers:
             command(["docker", "rm", "-f", identifier], ok=False)
+        if self.containers_started:
+            left = command(["docker", "ps", "-aq", "--filter",
+                            "label=git-rs.integration-fixture=" + self.identity]).stdout.strip()
+            assert not left, "owned integration containers remain after cleanup"
+            self.results["owned_containers_removed"] = True
 
 
 def pkt(payload):
@@ -631,9 +723,17 @@ def authenticated_http_test(f):
     f.cli("grant", "team/http-auth", "alice", "bob", "reader", "refs/")
     f.cli("create", "team/http-private", "carol")
     url = f"http://alice@127.0.0.1:{port}/team/http-auth.git"
+    def native_calls():
+        status, body = f.health("authenticated-http", "/metrics")
+        assert status == 200
+        return metric_value(body, 'git_rs_subprocess_duration_seconds_count{program="git"}')
+    before_push = native_calls()
     f.git(source, "-c", helpers["alice"], "push", url, "HEAD:refs/heads/main")
+    assert native_calls() > before_push, "receive-pack must retain its native server boundary"
     clone = f.base / "authenticated-http-clone"
+    before_clone = native_calls()
     f.git(source, "-c", helpers["bob"], "clone", url.replace("alice@", "bob@"), clone)
+    assert native_calls() > before_clone, "upload-pack must retain its native server boundary"
     assert f.git(clone, "rev-parse", "HEAD").stdout.strip() == oid
     assert (clone / "synthetic.txt").read_text() == "authenticated HTTP fixture\n"
     before = f.git(source, "-c", helpers["alice"], "ls-remote", url).stdout
@@ -699,12 +799,18 @@ def complete_blame_test(f, source, port, actors):
 
     def request(commit, filename, actor="bob", slug="team/http-auth"):
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-        connection.request("GET", f"/{slug}.git/blame/{commit.decode()}?path={quote_from_bytes(filename, safe='')}",
-                           headers=authorization(actor) if actor else {})
-        response = connection.getresponse()
-        result = response.status, response.read(), response.getheader("Cache-Control")
-        connection.close()
-        return result
+        try:
+            connection.request("GET", f"/{slug}.git/blame/{commit.decode()}?path={quote_from_bytes(filename, safe='')}",
+                               headers=authorization(actor) if actor else {})
+            response = connection.getresponse()
+            return response.status, response.read(), response.getheader("Cache-Control")
+        finally:
+            connection.close()
+            # These are serial ACL/oracle checks, not a default 1/0 overload test.
+            # Receiving the last byte precedes post-flush fencing and owner drop.
+            wait_for(lambda: metric_value(f.health("authenticated-http", "/metrics")[1],
+                                          "git_rs_active_requests") == 0,
+                     "prior authenticated HTTP handler returned before the next serial query")
 
     def native_calls():
         status, body = f.health("authenticated-http", "/metrics")
@@ -720,9 +826,7 @@ def complete_blame_test(f, source, port, actors):
         assert status == 200 and payload == expected, (status, payload, expected)
         assert cache_control == "no-store"
         calls = native_calls() - before_calls
-        assert calls <= 3, (
-            "blame type/size preflight must use library headers; at most reachability, literal path and annotation remain native",
-            calls)
+        assert calls == 0, ("real blame must not execute native Git", calls)
         annotation_calls.append(calls)
     blob = f.git(source, "rev-parse", "HEAD:" + os.fsdecode(path)).stdout.strip()
     for commit, filename in [(unreachable, path), (blob, path), (b"f" * 40, path),
@@ -733,7 +837,7 @@ def complete_blame_test(f, source, port, actors):
     before_calls = native_calls()
     assert request(oid, b"oversized.bin")[0:2] == (413, b""), "oversized blobs must be rejected before annotation"
     oversized_calls = native_calls() - before_calls
-    assert oversized_calls <= 2, ("oversized blob header checks must not invoke cat-file or an annotation worker", oversized_calls)
+    assert oversized_calls == 0, ("oversized blob checks must not invoke native Git", oversized_calls)
     assert request(oid, path, actor=None)[0:2] == (401, b"")
     assert request(oid, path, actor="carol")[0:2] == (500, b"")
     after = f.sql(f"SELECT generation,(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}),"
@@ -753,170 +857,65 @@ def complete_blame_test(f, source, port, actors):
 
 
 def blame_worker_test(f, source, oid, path):
-    """Exercise executable selection, buffered failure, busy admission and group cleanup."""
-    print("complete-blame worker admission, disconnect and absolute cancellation", flush=True)
-    state_file = f.base / "blame-worker-state.json"
-    worker_source = f'''#!{sys.executable}
-import json,os,signal,subprocess,sys
-from pathlib import Path
-assert not any(key.startswith(("PG", "AWS", "GIT_RS_S3")) for key in os.environ)
-assert 0 < int(os.environ["GIT_RS_BLAME_REMAINING_MILLIS"]) <= 30000
-mode = MODE
-if mode == "native":
-    os.execv("/usr/bin/git", ["git", "--literal-pathspecs", "-C", sys.argv[1], "blame", "--root", "--line-porcelain", "--no-textconv", "--no-progress", sys.argv[2], "--", sys.argv[3]])
-if mode == "failure":
-    sys.stdout.buffer.write(b"incomplete annotation must never escape\\n")
-    sys.stdout.buffer.flush()
-    sys.exit(7)
-if mode == "oversized-output":
-    block = b"x" * (1024 * 1024)
-    for _ in range(256):
-        sys.stdout.buffer.write(block)
-    sys.stdout.buffer.write(b"x")
-    sys.stdout.buffer.flush()
-    sys.exit(0)
-child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                         stdout=subprocess.DEVNULL if mode == "closed-output" else None)
-def identity(pid):
-    fields=Path("/proc/"+str(pid)+"/stat").read_text().rsplit(")",1)[1].split()
-    return {{"pid":pid,"startTicks":int(fields[19])}}
-sys.stdout.buffer.write(b"not a completed annotation\\n")
-sys.stdout.buffer.flush()
-if mode == "closed-output":
-    os.close(sys.stdout.fileno())
-ready=Path({str(state_file)!r})
-pending=ready.with_suffix(".pending")
-pending.write_text(json.dumps({{"leader":identity(os.getpgrp()),"parent":identity(os.getpid()),"child":identity(child.pid)}}))
-pending.replace(ready)
-signal.pause()
-'''
-
-    def start(name, mode, seconds):
-        worker = f.base / ("selected-" + name)
-        worker.write_text(worker_source.replace("mode = MODE", "mode = " + repr(mode)))
-        worker.chmod(0o700)
-        previous = dict(f.env)
-        f.env.update(GIT_RS_BLAME_WORKER=str(worker), GIT_RS_OPERATION_SECONDS=str(seconds))
-        try:
-            return f.start(name)
-        finally:
-            f.env.clear()
-            f.env.update(previous)
-
-    target = f"/team/http-auth.git/blame/{oid.decode()}?path={quote_from_bytes(path, safe='')}"
-    _, native_port = start("selected-blame-native", "native", 30)
-    connection = http.client.HTTPConnection("127.0.0.1", native_port, timeout=5)
-    connection.request("GET", target)
-    response = connection.getresponse()
-    body = response.read()
-    connection.close()
-    expected = f.git(source, "--literal-pathspecs", "blame", "--root", "--line-porcelain",
-                     "--no-textconv", "--no-progress", oid.decode(), "--", os.fsdecode(path)).stdout
-    assert response.status == 200 and body == expected, "selected workers must return the complete native annotation"
-    _, failed_port = start("selected-blame-failure", "failure", 30)
-    connection = http.client.HTTPConnection("127.0.0.1", failed_port, timeout=5)
-    connection.request("GET", target)
-    response = connection.getresponse()
-    assert response.status == 500 and response.read() == b"", "failed workers must not return partial annotations"
-    connection.close()
-    oversized_daemon, oversized_port = start("selected-blame-oversized-output", "oversized-output", 30)
-    connection = http.client.HTTPConnection("127.0.0.1", oversized_port, timeout=15)
-    try:
-        connection.request("GET", target)
-        response = connection.getresponse()
-        assert response.status == 500 and response.read() == b"", "oversized output must not become a partial success"
-    finally:
-        connection.close()
-    status = Path(f"/proc/{oversized_daemon.pid}/status").read_text()
-    oversized_hwm = int(re.search(r"VmHWM:\s+(\d+)", status).group(1)) * 1024
-    assert oversized_hwm < 512 * 1024 * 1024, "bounded annotation output must fit its separate daemon memory allowance"
-    f.results["oversized_blame_output"] = {
-        "rejected_payload_bytes": 256 * 1024 * 1024 + 1,
-        "observed_daemon_hwm_bytes": oversized_hwm,
-        "test_daemon_memory_allowance_bytes": 512 * 1024 * 1024,
-    }
-    # This case deliberately fills a large annotation buffer. Qualify its HWM
-    # separately, then release it before the ordinary streaming Git memory tests.
-    oversized_daemon.terminate()
-    oversized_daemon.wait(timeout=5)
-
-    def require_reaped(records):
-        deadline = time.monotonic() + 5
-        while any(process_owned(record) for record in records.values()):
-            assert time.monotonic() < deadline, "blame cancellation must reap the complete owned group promptly"
-            threading.Event().wait(0.02)
-
-    for label, seconds, disconnect, mode in [
-        ("disconnect", 30, True, "slow"),
-        ("deadline", 2, False, "slow"),
-        ("closed-output-disconnect", 30, True, "closed-output"),
-    ]:
-        if state_file.exists():
-            state_file.unlink()
-        _, port = start("blame-" + label, mode, seconds)
-        peer = socket.create_connection(("127.0.0.1", port), timeout=5)
-        records = None
-        try:
-            peer.sendall(f"GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
-            wait_for(state_file.exists, "owned blocking blame worker and descendant")
-            records = json.loads(state_file.read_text())
-            assert not select.select([peer], [], [], 0)[0], "annotations must be complete before success headers or body"
-            assert f.health("blame-" + label, "/livez") == (200, b"live\n")
-            if disconnect:
-                busy = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                busy.request("GET", target)
-                response = busy.getresponse()
-                assert response.status == 503 and response.read() == b"", "only one blame worker may execute per daemon"
-                busy.close()
-                peer.close()
-            else:
-                peer.settimeout(5)
-                try:
-                    payload = peer.recv(4096)
-                except ConnectionResetError:
-                    payload = b""
-                assert not payload.startswith(b"HTTP/1.1 200"), "expired queries cannot return successful annotations"
-            require_reaped(records)
-            repo = "(SELECT id FROM git_rs.repositories WHERE slug='team/http-auth')"
-            wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
-                     "cancelled blame hold release")
-            instance = f.base / "scratch"
-            assert not list(instance.glob("instance-*/request-*")), "cancelled request scratch must be removed"
-            followup = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-            followup.request("GET", target.split("?", 1)[0] + "?path=definitely-missing.txt")
-            response = followup.getresponse()
-            assert response.status == 404 and response.read() == b"", "cancellation must return blame admission"
-            followup.close()
-        finally:
-            peer.close()
-            if records and process_owned(records["leader"]):
-                os.killpg(records["leader"]["pid"], signal.SIGKILL)
-    f.results["complete_blame_worker_lifecycle"] = {
-        "server_owned_executable": "passed", "credentials_not_inherited": True,
-        "failed_output_not_returned": True, "one_executing_query": True,
-        "disconnect_and_deadline_reap_descendants": True, "read_holds_and_scratch_released": True,
-        "closed_output_wait_is_cancellable": True, "cancelled_capacity_reusable": True,
-        "oversized_output_not_returned": True,
-    }
+    """The obsolete worker setting must reject startup and never execute a file."""
+    marker = f.base / "obsolete-worker-ran"
+    worker = f.base / "obsolete-worker"
+    worker.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    worker.chmod(0o700)
+    rejected = command([f.binary, "serve", "--scratch", str(f.base / "scratch"),
+                        "--socket", str(f.base / "obsolete.sock")],
+                       env=dict(f.env, GIT_RS_BLAME_WORKER=str(worker)), ok=False)
+    assert rejected.returncode and b"GIT_RS_BLAME_WORKER" in rejected.stderr, rejected.stderr
+    assert not marker.exists(), "production must never activate an external blame worker"
+    f.results["obsolete_blame_worker_rejected"] = True
 
 
-def blame_blocked_output_test(f, oid):
+def blame_lease_state(f, repo):
+    """One SQL snapshot: response EOF is not acknowledgement of reader cleanup."""
+    return json.loads(f.sql(
+        f"SELECT json_build_object('db_now',clock_timestamp(),"
+        f"'count',(SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}),"
+        f"'leases',(SELECT coalesce(json_agg(row_to_json(l)),'[]') "
+        f"FROM git_rs.repository_leases l WHERE repo_id={repo}),"
+        f"'operations',(SELECT coalesce(json_agg(json_build_object('id',id,'principal',principal,"
+        f"'generation',generation,'committed_at',committed_at,'confirmations',confirmations)),'[]') "
+        f"FROM git_rs.operations WHERE repo_id={repo}))"))
+
+
+def blame_blocked_output_test(f, oid, *, slug="team/http-auth"):
     """A backpressured complete response must expire and count as an error."""
-    previous = f.env.get("GIT_RS_OPERATION_SECONDS")
-    f.env["GIT_RS_OPERATION_SECONDS"] = "2"
+    repo = f"(SELECT id FROM git_rs.repositories WHERE slug='{slug}')"
+    observations = []
+    f.results["blocked_blame_output_observations"] = observations
+    def prior_readers_drained():
+        state = blame_lease_state(f, repo)
+        observation = {"phase": "prior-cleanup", "monotonic": time.monotonic(), **state}
+        # Keep the first and latest states without unbounded polling history.
+        observations[1:] = [observation] if observations else []
+        if not observations:
+            observations.append(observation)
+        return state["count"] == 0
+    # A prior response can be fully received while its post-flush check / lease
+    # DELETE still runs in another daemon. Exclude those owners BEFORE starting
+    # this test's two-second request; never kill them or discount their leases.
+    try:
+        wait_for(prior_readers_drained, "prior source owners drained before blocked writer")
+    except AssertionError as error:
+        raise AssertionError(f"{error}: {observations}") from error
+    previous = dict(f.env)
+    f.env.update(GIT_RS_OPERATION_SECONDS="2", GIT_RS_BLAME_CONCURRENCY="2", GIT_RS_BLAME_WAITERS="0")
     try:
         daemon, port = f.start("blame-blocked-output")
     finally:
-        if previous is None:
-            del f.env["GIT_RS_OPERATION_SECONDS"]
-        else:
-            f.env["GIT_RS_OPERATION_SECONDS"] = previous
+        f.env.clear()
+        f.env.update(previous)
     peer = socket.socket()
     peer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
     peer.settimeout(5)
     try:
         peer.connect(("127.0.0.1", port))
-        target = f"/team/http-auth.git/blame/{oid.decode()}?path=blocked-output.txt"
+        target = f"/{slug}.git/blame/{oid.decode()}?path=blocked-output.txt"
+        request_started = time.monotonic()
         peer.sendall(f"GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
         headers = bytearray()
         while not headers.endswith(b"\r\n\r\n"):
@@ -925,14 +924,34 @@ def blame_blocked_output_test(f, oid):
             headers.extend(byte)
         assert headers.startswith(b"HTTP/1.1 200 OK\r\n"), headers
         assert int(re.search(rb"Content-Length: (\d+)", headers).group(1)) > 32 * 1024 * 1024
+        headers_received = time.monotonic()
+        state = blame_lease_state(f, repo)
+        observation = {"phase": "blocked-writer", "request_started": request_started,
+                       "headers_received": headers_received, "observed": time.monotonic(),
+                       "absolute_deadline_seconds": 2, **state}
+        observations.append(observation)
+        if state["count"] != 1:
+            observation["metrics"] = f.health("blame-blocked-output", "/metrics")[1].decode()
+        assert state["count"] == 1, ("blocked response must own exactly one source lease", observation)
+        healthy = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            healthy.request("GET", target.split("?", 1)[0] + "?path=missing-parallel.txt")
+            reply = healthy.getresponse()
+            assert (reply.status, reply.read()) == (404, b""), "blocked output must not prevent healthy parallel work"
+        finally:
+            healthy.close()
         # Stop reading only after response writes are observable. The small receive
         # window then applies real TCP backpressure until the absolute deadline.
         wait_for(lambda: metric_value(f.health("blame-blocked-output", "/metrics")[1],
                                       "git_rs_active_requests") == 0, "blocked blame deadline")
         metrics = f.health("blame-blocked-output", "/metrics")[1]
-        assert metric_value(metrics, 'git_rs_requests_total{transport="http",outcome="error"}') == 1, (
-            "blocked blame writes must be counted as errors")
+        assert metric_value(metrics, 'git_rs_requests_total{transport="http",outcome="error"}') == 2, (
+            "blocked write and healthy parallel 404 must both be counted as errors")
         assert metric_value(metrics, 'git_rs_requests_total{transport="http",outcome="success"}') == 0
+        wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
+                 "blocked writer source ownership released only after write stop")
+        observations.append({"phase": "stopped-cleanup", "monotonic": time.monotonic(),
+                             **blame_lease_state(f, repo)})
         status = Path(f"/proc/{daemon.pid}/status").read_text()
         peak = int(re.search(r"VmHWM:\s+(\d+)", status).group(1)) * 1024
         assert peak < 128 * 1024 * 1024, "complete-response buffering must fit its separate test allowance"
@@ -944,6 +963,342 @@ def blame_blocked_output_test(f, oid):
         peer.close()
         daemon.terminate()
         daemon.wait(timeout=5)
+
+
+def blame_core_test(f):
+    """Independent native byte oracle over synthetic raw objects and general DAGs."""
+    slug = "team/core-oracles"
+    f.cli("create", slug, "alice")
+    source = f.base / "core-oracles"
+    f.git(f.base, "init", "--initial-branch=main", source)
+    def object_id(kind, body):
+        return command(["git", "-C", source, "hash-object", "-w", "-t", kind, "--stdin"],
+                       env=f.env, data=body).stdout.strip()
+    def tree(files):
+        groups, entries = {}, []
+        for path, data in files.items():
+            head, separator, tail = path.partition(b"/")
+            if separator:
+                groups.setdefault(head, {})[tail] = data
+            else:
+                mode, kind, body = data if isinstance(data, tuple) else (b"100644", b"blob", data)
+                oid = body if kind == b"commit" else object_id("blob", body)
+                entries.append(mode + b" " + kind + b" " + oid + b"\t" + head + b"\0")
+        entries += [b"040000 tree " + tree(children) + b"\t" + name + b"\0"
+                    for name, children in groups.items()]
+        return command(["git", "-C", source, "mktree", "-z"], env=f.env,
+                       data=b"".join(entries)).stdout.strip()
+    def commit(files, parents=(), *, encoding=False, timestamp=1577836800):
+        identity = (b"Auteur \xe9 <author@example.invalid> " if encoding else
+                    b"Author <author@example.invalid> ") + str(timestamp).encode() + b" -0000\n"
+        body = b"tree " + tree(files) + b"\n" + b"".join(b"parent " + p + b"\n" for p in parents)
+        body += b"author " + identity + b"committer Committer <committer@example.invalid> 1577836800 +0230\n"
+        body += (b"encoding ISO-8859-1\n" if encoding else b"")
+        body += b"\nSynthetic " + (b"r\xe9sum\xe9" if encoding else b"summary") + b"\ncontinued paragraph\n\nbody\n"
+        return object_id("commit", body)
+    raw = b'folder/quote"\\\t\xff.txt'
+    files = {b"story.txt": b"one\ntwo\nthree\n", b"nested/root.txt": b"root\n",
+             b"empty": b"", b"binary": b"zero\0\xff\r\nlast\r\n", b"no-lf": b"unterminated",
+             raw: b"raw\xff\0\r\nno-final-LF", b"candidate-a": b"tie\n", b"candidate-b": b"tie\n"}
+    root = commit(files)
+    a_files, b_files = dict(files), dict(files)
+    a_files[b"story.txt"], b_files[b"story.txt"] = b"ONE\ntwo\nthree\n", b"one\ntwo\nTHREE\n"
+    a, b = commit(a_files, [root], timestamp=1577836790), commit(b_files, [root])
+    merged = dict(files)
+    merged[b"story.txt"] = b"ONE\ntwo\nTHREE\n"
+    diamond = commit(merged, [a, b], timestamp=1577836780)
+    reverse = commit(merged, [b, a])
+    crisscross = commit(merged, [diamond, reverse])
+    third_files = dict(files)
+    third_files[b"story.txt"] += b"four\n"
+    third = commit(third_files, [root])
+    octopus_files = dict(merged)
+    octopus_files[b"story.txt"] += b"four\n"
+    octopus = commit(octopus_files, [a, b, third])
+    renamed = dict(files)
+    renamed[b"moved/story.txt"] = renamed.pop(b"story.txt") + b"edit\n"
+    rename = commit(renamed, [root])
+    left_files, right_files = dict(a_files), dict(b_files)
+    left_files[b"left.txt"] = left_files.pop(b"story.txt")
+    right_files[b"right.txt"] = right_files.pop(b"story.txt")
+    left, right = commit(left_files, [a]), commit(right_files, [b])
+    both_names = dict(left_files)
+    both_names[b"right.txt"] = right_files[b"right.txt"]
+    merged_names = commit(both_names, [left, right])
+    left_final, right_final = dict(left_files), dict(right_files)
+    left_final[b"merged.txt"] = left_final.pop(b"left.txt")
+    right_final[b"merged.txt"] = right_final.pop(b"right.txt")
+    converging_files = dict(left_final)
+    converging_files[b"merged.txt"] = merged[b"story.txt"]
+    converging = commit(converging_files, [commit(left_final, [left]), commit(right_final, [right])])
+    ties = dict(files)
+    ties.pop(b"candidate-a")
+    ties[b"tie-target"] = ties.pop(b"candidate-b")
+    ties[b"copied"] = ties[b"story.txt"]
+    tie = commit(ties, [root])
+    unrelated_files = dict(files)
+    unrelated_files[b"story.txt"] = b"unrelated\n"
+    unrelated = commit(unrelated_files)
+    roots = commit(unrelated_files, [root, unrelated])
+    codec = commit(files, encoding=True)
+    modes = dict(files)
+    modes[b"executable"] = (b"100755", b"blob", b"executable\n")
+    modes[b"symlink"] = (b"120000", b"blob", b"nested/root.txt")
+    modes[b"gitlink"] = (b"160000", b"commit", root)
+    modes.pop(b"story.txt")
+    modes[b"story.txt/changed-type"] = b"directory replaces old blob\n"
+    type_changes = commit(modes, [root])
+    tagged = commit(dict(files), [root], timestamp=1577836750)
+    tag = object_id("tag", b"object " + tagged + b"\ntype commit\ntag synthetic\n"
+                    b"tagger Tagger <tagger@example.invalid> 1577836800 +0000\n\nSynthetic tag\n")
+    cases = [("root", root, list(files)), ("diamond", diamond, [b"story.txt"]),
+             ("crisscross", crisscross, [b"story.txt"]), ("octopus", octopus, [b"story.txt"]),
+             ("rename-edit", rename, [b"moved/story.txt"]), ("copy-ties", tie, [b"tie-target", b"copied"]),
+             ("merged-names", merged_names, [b"left.txt", b"right.txt"]),
+             ("converging-renames", converging, [b"merged.txt"]),
+             ("type-changes", type_changes, [b"executable", b"symlink", b"story.txt/changed-type"]),
+             ("multiple-roots", roots, [b"story.txt"]), ("metadata-codec", codec, [raw])]
+    for label, oid, _ in cases:
+        f.git(source, "update-ref", "refs/heads/" + label, oid.decode())
+    f.git(source, "update-ref", "refs/heads/main", octopus.decode())
+    f.git(source, "update-ref", "refs/tags/synthetic", tag.decode())
+    _, port = f.start("core-oracles")
+    def native_calls():
+        status, body = f.health("core-oracles", "/metrics")
+        assert status == 200
+        return metric_value(body, 'git_rs_subprocess_duration_seconds_count{program="git"}')
+    url = f"http://127.0.0.1:{port}/{slug}.git"
+    before_push = native_calls()
+    f.git(source, "push", "--mirror", url)
+    assert native_calls() > before_push, "receive-pack must retain its native server boundary"
+    clone = f.base / "core-native-boundary-clone.git"
+    before_clone = native_calls()
+    f.git(f.base, "clone", "--bare", url, clone)
+    assert f.git(clone, "rev-parse", "refs/heads/main").stdout.strip() == octopus
+    assert native_calls() > before_clone, "upload-pack must retain its native server boundary"
+    dangling = commit(files, [octopus], timestamp=1577836700)
+    pack = command(["git", "-C", source, "pack-objects", "--stdout"], env=f.env,
+                   data=dangling + b"\n").stdout
+    assert b"ok refs/heads/dangling-carrier" in raw_push(port, octopus, [b"refs/heads/dangling-carrier"],
+                                                       pack=pack, slug=slug)
+    def request(oid, path, service_port=port):
+        peer = http.client.HTTPConnection("127.0.0.1", service_port, timeout=30)
+        try:
+            peer.request("GET", f"/{slug}.git/blame/{oid.decode()}?path={quote_from_bytes(path, safe='')}")
+            reply = peer.getresponse()
+            return reply.status, reply.read()
+        finally:
+            peer.close()
+            # A zero-byte response can be consumed before the serving thread
+            # drops its completed-response admission. These are serial oracle
+            # cases, not an intentional default-capacity overload/retry test.
+            service = "core-oracles" if service_port == port else "core-oracles-reader"
+            wait_for(lambda: metric_value(f.health(service, "/metrics")[1], "git_rs_active_requests") == 0,
+                     "prior oracle HTTP handler returned before the next serial query")
+    repo = f"(SELECT id FROM git_rs.repositories WHERE slug='{slug}')"
+    def publication():
+        return f.sql(f"SELECT generation,storage_epoch,(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}),"
+                     f"(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
+    before = publication()
+    before_blame = native_calls()
+    count = 0
+    for label, oid, paths in [*cases, ("tag-only-reachable", tagged, [b"story.txt"])]:
+        for path in paths:
+            oracle = f.git(source, "--literal-pathspecs", "blame", "--root", "--line-porcelain",
+                           "--no-textconv", "--no-progress", oid.decode(), "--", os.fsdecode(path)).stdout
+            actual = request(oid, path)
+            assert actual == (200, oracle), (label, path, actual, oracle)
+            count += 1
+    rejected_targets = [(dangling, b"story.txt"), (tag, b"story.txt"), (root, b"folder"), (root, b"absent"),
+                        (type_changes, b"gitlink"), (type_changes, b"story.txt")]
+    for oid, path in rejected_targets:
+        assert request(oid, path) == (404, b""), (oid, path)
+    assert native_calls() == before_blame, "Rust blame must not cross the native Git server boundary"
+    f.cli("grant", slug, "alice", "bob", "reader", "refs/")
+    _, reader_port = f.start("core-oracles-reader", "bob")
+    assert request(root, raw, reader_port)[0] == 200
+    f.cli("grant", slug, "alice", "bob", "none", "refs/")
+    assert request(root, raw, reader_port) == (500, b""), "revoked source access must not reuse a response"
+    # Grant mutations intentionally fence generation; blame itself never publishes.
+    assert before.split("|")[1:] == publication().split("|")[1:]
+    wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0", "oracle source cleanup")
+    f.results["real_core_byte_oracles"] = {"byte_exact_cases": count, "tags_and_dangling": True,
+        "metadata_codec_and_raw_paths": True, "general_DAG": True, "revocation": True,
+        "invalid_target_cases": len(rejected_targets), "reader_acl_checks": 2,
+        "functional_target_checks": count + len(rejected_targets) + 2,
+        "native_receive_upload_boundaries_preserved": True, "blame_native_subprocesses": 0}
+    return source, root, raw, slug
+
+
+def blame_shared_cache_test(f, source, oid, path, slug):
+    """Two actual HTTP processes/restart read verified cached artifacts, not an opaque fake."""
+    from blame_concurrency import Gates
+    previous = dict(f.env)
+    suffix = uuid.uuid4().hex[:12]
+    database, role = "blame_cache_" + suffix, "blame_cache_" + suffix
+    f.sql(f"CREATE ROLE {role} LOGIN PASSWORD 'synthetic-cache-only'; CREATE DATABASE {database}; "
+          f"GRANT CREATE ON DATABASE {database} TO {role};")
+    f.env.update(GIT_RS_CACHE_DSN=f"host=127.0.0.1 port={f.env['PGPORT']} dbname={database} user={role} password=synthetic-cache-only sslmode=disable",
+                 GIT_RS_CACHE_NAMESPACE=str(uuid.uuid4()), GIT_RS_CACHE_OWNER=str(uuid.uuid4()),
+                 GIT_RS_CACHE_S3_ENDPOINT=f.env["GIT_RS_S3_ENDPOINT"], GIT_RS_CACHE_S3_BUCKET="blame-derived",
+                 GIT_RS_CACHE_S3_ACCESS_KEY="test-access", GIT_RS_CACHE_S3_SECRET_KEY="synthetic-secret-key")
+    config = (f'url = "{f.env["GIT_RS_S3_ENDPOINT"]}/blame-derived"\naws-sigv4 = "aws:amz:us-east-1:s3"\n'
+              'user = "test-access:synthetic-secret-key"\n')
+    command(["curl", "--disable", "--silent", "--fail", "--max-time", "5", "--config", "-", "--request", "PUT"], data=config.encode())
+    f.cli("cache-migrate")
+    admin = dict(f.env, PGDATABASE=database)
+    def cache_sql(sql):
+        return command(["psql", "-XqAt", "-v", "ON_ERROR_STOP=1"], env=admin, data=sql.encode()).stdout.decode().strip()
+    target = f"/{slug}.git/blame/{oid.decode()}?path={quote_from_bytes(path, safe='')}"
+    repo = f"(SELECT id FROM git_rs.repositories WHERE slug='{slug}')"
+    source_before = f.sql(f"SELECT generation,storage_epoch,(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}),"
+                          f"(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
+    expected = f.git(source, "--literal-pathspecs", "blame", "--root", "--line-porcelain",
+                     "--no-textconv", "--no-progress", oid.decode(), "--", os.fsdecode(path)).stdout
+    gates = Gates(f.base / "cache-blame.sock")
+    def fetch(port):
+        peer = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        peer.request("GET", target)
+        return peer
+    def finish(peer):
+        reply = peer.getresponse()
+        try:
+            assert (reply.status, reply.read()) == (200, expected)
+        finally:
+            peer.close()
+    def source_drained():
+        wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
+                 "real blame source ownership drained before stopping service")
+    try:
+        _, producer = f.start_blame("blame-cache-producer", control=gates.path, phase="complete", cache=True)
+        peer = fetch(producer)
+        gate, _ = gates.entered()
+        assert int(cache_sql("SELECT count(*) FROM git_rs_cache.manifest_roots")) > 0
+        wait_for(lambda: cache_sql("SELECT count(*) FROM git_rs_cache.read_holds") == "0",
+                 "producer transient staging holds drained")
+        descriptor = cache_sql("SELECT payload FROM git_rs_cache.manifest_roots ORDER BY payload")
+        gate.sendall(b"G")
+        finish(peer)
+        consumer_process, consumer = f.start_blame("blame-cache-consumer", control=gates.path, phase="complete", cache=True)
+        for port in [consumer]:
+            peer = fetch(port)
+            gate, _ = gates.entered()
+            assert int(cache_sql("SELECT count(*) FROM git_rs_cache.read_holds WHERE payload IN "
+                                 "(SELECT payload FROM git_rs_cache.manifest_roots)")) > 0, "a verified root manifest hit must own read admission"
+            assert cache_sql("SELECT payload FROM git_rs_cache.manifest_roots ORDER BY payload") == descriptor
+            gate.sendall(b"G")
+            finish(peer)
+        # Reading Content-Length bytes does not acknowledge the server's final
+        # fences/hold release. Do not SIGTERM the first consumer mid-cleanup.
+        wait_for(lambda: metric_value(f.health("blame-cache-consumer", "/metrics")[1], "git_rs_active_requests") == 0,
+                 "independent cache consumer HTTP handler completed")
+        wait_for(lambda: cache_sql("SELECT count(*) FROM git_rs_cache.read_holds") == "0",
+                 "independent cache consumer released read holds before restart")
+        source_drained()
+        consumer_process.terminate()
+        consumer_process.wait(timeout=5)
+        _, restarted = f.start_blame("blame-cache-restarted", control=gates.path, phase="complete", cache=True)
+        peer = fetch(restarted)
+        gate, _ = gates.entered()
+        assert int(cache_sql("SELECT count(*) FROM git_rs_cache.read_holds WHERE payload IN "
+                             "(SELECT payload FROM git_rs_cache.manifest_roots)")) > 0
+        gate.sendall(b"G")
+        finish(peer)
+        wait_for(lambda: cache_sql("SELECT count(*) FROM git_rs_cache.read_holds") == "0", "cache response holds released")
+        source_drained()
+        f.stop("blame-cache-producer")
+        f.stop("blame-cache-restarted")
+        _, joined_port = f.start_blame("blame-cache-joined", control=gates.path, phase="source", cache=True)
+        creator = fetch(joined_port)
+        gate, _ = gates.entered()
+        joined = fetch(joined_port)
+        wait_for(lambda: metric_value(f.health("blame-cache-joined", "/metrics")[1], "git_rs_fixture_blame_waiters") == 2,
+                 "cached same-key waiter attached")
+        assert f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "1"
+        assert not gates.pending(), "same-key waiter must not start a second derivation"
+        creator.close()
+        wait_for(lambda: metric_value(f.health("blame-cache-joined", "/metrics")[1], "git_rs_fixture_blame_waiters") == 1,
+                 "cached creator cancellation detached")
+        assert f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "1"
+        gate.sendall(b"G")
+        finish(joined)
+        source_drained()
+        f.stop("blame-cache-joined")
+        # Fence an already verified cached body before HTTP success, not merely
+        # an unauthorized cold lookup. ACL changes are intentional generation writes.
+        f.cli("grant", slug, "alice", "bob", "reader", "refs/")
+        _, bob_port = f.start_blame("blame-cache-revocation", control=gates.path,
+                                   phase="complete", cache=True, principal="bob")
+        peer = fetch(bob_port)
+        gate, _ = gates.entered()
+        gate.sendall(b"G")
+        finish(peer)
+        wait_for(lambda: cache_sql("SELECT count(*) FROM git_rs_cache.read_holds") == "0", "Bob initial cache holds drained")
+        peer = fetch(bob_port)
+        gate, _ = gates.entered()
+        assert int(cache_sql("SELECT count(*) FROM git_rs_cache.read_holds WHERE payload IN "
+                             "(SELECT payload FROM git_rs_cache.manifest_roots)")) > 0
+        assert not select.select([peer.sock], [], [], 0)[0], "no HTTP success before final source fencing"
+        f.cli("grant", slug, "alice", "bob", "none", "refs/")
+        gate.sendall(b"G")
+        try:
+            reply = peer.getresponse()
+            assert (reply.status, reply.read()) == (500, b""), "revoked cached response must not escape"
+        finally:
+            peer.close()
+        source_drained()
+        f.stop("blame-cache-revocation")
+        # Outage only this fixture-owned cache DB, never the source DB/cluster.
+        f.sql(f"REVOKE CONNECT ON DATABASE {database} FROM PUBLIC,{role}; "
+              f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{database}';")
+        _, dead_cache = f.start_blame("blame-cache-dead", cache=True)
+        finish(fetch(dead_cache))
+        source_after = f.sql(f"SELECT generation,storage_epoch,(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}),"
+                             f"(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
+        old, new = source_before.split("|"), source_after.split("|")
+        assert int(new[0]) == int(old[0]) + 2 and new[1:] == old[1:], (
+            "only the two explicit ACL grants may change source state", old, new)
+        f.results["real_blame_shared_cache"] = {"independent_process_hit_with_read_holds": True,
+            "cache_scope": "complete-result cache only; this fixture does not exercise checkpoint mapping reuse or warming",
+            "restart_verified_hit": True, "cache_outage_bounded_recomputation": True,
+            "cancelled_creator_keeps_shared_cached_job_owned": True,
+            "cached_response_revocation_before200": True, "only_explicit_ACL_changes_publish": True,
+            "fixture_credential_model": "single synthetic S3 account, separate bucket and namespace"}
+    finally:
+        gates.close()
+        f.env.clear()
+        f.env.update(previous)
+
+
+def blame_core_output_test(f, source, slug):
+    """Real serialized output limits and real blocked writes, not fabricated stdout."""
+    f.git(source, "checkout", "-f", "main")
+    with (source / "blocked-output.txt").open("wb") as output:
+        for _ in range(32):
+            output.write(b"x" * (1024 * 1024))
+    (source / "output-limit.txt").write_bytes(b"x\n" * (512 * 1024))
+    f.git(source, "add", "blocked-output.txt", "output-limit.txt")
+    identities = dict(f.env, GIT_AUTHOR_NAME="Synthetic" * 32, GIT_COMMITTER_NAME="Synthetic" * 32)
+    f.git(source, "commit", "-qm", "Synthetic bounded serialization " + "s" * 300, env=identities)
+    oid = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    daemon, publish = f.start("core-output-publisher")
+    f.git(source, "push", f"http://127.0.0.1:{publish}/{slug}.git", "main")
+    # The known metadata alone exceeds 256 MiB for 524288 lines. The source
+    # blob is only 1 MiB; this specifically exercises the complete-output cap.
+    assert (2 * len(identities["GIT_AUTHOR_NAME"]) + 300) * 512 * 1024 > 256 * 1024 * 1024
+    peer = http.client.HTTPConnection("127.0.0.1", publish, timeout=120)
+    try:
+        peer.request("GET", f"/{slug}.git/blame/{oid.decode()}?path=output-limit.txt")
+        reply = peer.getresponse()
+        assert (reply.status, reply.read()) == (413, b""), "oversized real serialization must never emit partial 200"
+    finally:
+        peer.close()
+    peak = int(re.search(r"VmHWM:\s+(\d+)", Path(f"/proc/{daemon.pid}/status").read_text()).group(1)) * 1024
+    assert peak < 512 * 1024 * 1024, "preserve the separate oversized-output memory gate"
+    f.results["oversized_blame_output"] = {"real_serializer_limit_bytes": 256 * 1024 * 1024,
+                                           "observed_daemon_hwm_bytes": peak}
+    f.stop("core-output-publisher")
+    blame_blocked_output_test(f, oid, slug=slug)
 
 
 def long_operation_test(f, seconds=180):
@@ -1042,22 +1397,58 @@ def main():
     parser.add_argument("--long-operations", action="store_true",
                         help="also run the 125-second native publication deadline regression")
     parser.add_argument("--blame-concurrency-only", action="store_true",
-                        help="run only the tiny synthetic blame concurrency contract")
+                         help="run only the tiny synthetic blame concurrency contract")
+    parser.add_argument("--blame-core-only", action="store_true",
+                        help="real PG/S3 Rust blame byte oracles, shared reuse, output and concurrency gates")
+    parser.add_argument("--blame-fixture-binary", type=Path,
+                        help="prebuilt test-only blame-http-fixture example (never a production worker)")
+    parser.add_argument("--fixture-dir", type=Path,
+                        help="fresh private directory to retain fixture logs/results after cleanup")
     args = parser.parse_args()
+    if args.blame_core_only:
+        assert args.provision, "--blame-core-only requires fresh owned --provision fixtures"
     # OpenSSH StrictModes checks all parents of authorized_keys. A system /tmp
     # parent is world-writable, so keep this private fixture under the checkout.
     # The focused HTTP-only contract can use /tmp to keep Unix socket paths short.
-    local = None if args.blame_concurrency_only else ROOT / ".local"
+    local = None if (args.blame_concurrency_only or args.blame_core_only) else ROOT / ".local"
     if local is not None:
         local.mkdir(mode=0o700, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="grs-", dir=local) as directory:
+    if args.fixture_dir:
+        assert args.fixture_dir.parent.is_dir(), "fixture directory parent must already exist"
+        args.fixture_dir.mkdir(mode=0o700)
+        context = nullcontext(str(args.fixture_dir))
+    else:
+        context = tempfile.TemporaryDirectory(prefix="grs-", dir=local)
+    if args.blame_core_only or args.blame_concurrency_only:
+        def interrupted(signum, _):
+            raise InterruptedError(f"owned blame integration interrupted by {signum}")
+        signal.signal(signal.SIGTERM, interrupted)
+        signal.signal(signal.SIGINT, interrupted)
+    with context as directory:
         fixture = None
         try:
             fixture = Fixture(Path(directory), args.binary.resolve())
+            fixture.blame_fixture_binary = (args.blame_fixture_binary or
+                args.binary.resolve().parent / "examples/blame-http-fixture").resolve()
+            assert fixture.blame_fixture_binary.is_file(), "build the blame-http-fixture test example first"
+            fixture.blame_core_resources = args.blame_core_only or args.blame_concurrency_only
+            if fixture.blame_core_resources and args.provision:
+                invocation = os.environ.get("INVOCATION_ID")
+                assert invocation and os.environ.get("GIT_RS_TEST_OWNER_LABEL", "").endswith("=" + invocation), (
+                    "focused provision requires independently bounded systemd ownership/cleanup")
             if args.debug_timings:
                 fixture.env["GIT_RS_DEBUG_TIMINGS"] = "1"
             fixture.setup(args.provision)
-            if args.blame_concurrency_only:
+            if args.blame_core_only:
+                fixture.cli("migrate")
+                source, oid, path, slug = blame_core_test(fixture)
+                fixture.stop_daemons()
+                blame_shared_cache_test(fixture, source, oid, path, slug)
+                fixture.stop_daemons()
+                blame_core_output_test(fixture, source, slug)
+                fixture.stop_daemons()
+                blame_worker_test(fixture, source, oid, path)
+            elif args.blame_concurrency_only:
                 fixture.cli("migrate")
             else:
                 exercise(fixture, args.large_mib, args.skip_ssh)
@@ -1066,14 +1457,18 @@ def main():
                     long_operation_test(fixture)
             blame_concurrency_test(fixture)
             print(json.dumps({"status": "passed", **fixture.results}, indent=2))
-        except Exception:
+        except Exception as error:
             if fixture:
+                fixture.results["error"] = repr(error)
                 for path in Path(directory).glob("*.log"):
                     print(path.name, path.read_text()[-8000:])
             raise
         finally:
             if fixture:
-                fixture.close()
+                try:
+                    fixture.close()
+                finally:
+                    (Path(directory) / "report.json").write_text(json.dumps(fixture.results, indent=2) + "\n")
 
 
 if __name__ == "__main__":

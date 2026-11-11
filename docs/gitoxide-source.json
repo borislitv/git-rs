@@ -14,11 +14,11 @@
     "LICENSE-APACHE",
     "gix-imara-diff/LICENSE"
   ],
-  "pull_request": "https://github.com/borislitv/gitoxide/pull/1",
-  "qualified_snapshot": "Stage 3/4 controlled computation (A)",
+  "pull_request": "https://github.com/borislitv/gitoxide/pull/2",
+  "qualified_snapshot": "Stage 5 completed MappingMemo, bounded fixed-work polling, linear immutable trace roots, exclusive prepared-token leases, bounded single-origin hunk reuse, request-local raw input pair preservation, lazy controlled indentation preparation and real hook-free raw mapping work accounting (C7)",
   "source": {
     "git": "https://github.com/borislitv/gitoxide",
-    "rev": "c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+    "rev": "7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
   },
   "upstream": {
     "base": "dd39fb66e3b1551c9fe849043e39b357a9799ca1",

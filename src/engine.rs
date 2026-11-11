@@ -21,7 +21,7 @@ use std::sync::{Condvar, Mutex};
 pub struct Engine {
     pub blame: crate::blame::Blame,
     pub store: Store,
-    pub cache: Cache,
+    pub cache: std::sync::Arc<Cache>,
     pub scratch_root: PathBuf,
     pub operation_seconds: u64,
     pub pack_threads: u8,
@@ -70,6 +70,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn validate(
         &self,
+        slug: &str,
         path: &Path,
         snapshot: &Snapshot,
         lease: &metadata::Barrier,
@@ -208,7 +209,7 @@ impl Engine {
                     .upload(&snapshot.id, operation, &directory, &hash)
             })?);
         }
-        metrics::measure(Metric::Phase(Phase::Publish), || {
+        let generation = metrics::measure(Metric::Phase(Phase::Publish), || {
             metadata::publish(
                 snapshot,
                 lease,
@@ -219,6 +220,10 @@ impl Engine {
                 &packs,
             )
         })?;
+        // Publication is confirmed; optional hint/submission cannot reject it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.warm_after_confirmed(slug, principal, snapshot, generation, operation, commands)
+        }));
         Ok(())
     }
 
@@ -322,6 +327,7 @@ impl Engine {
         setup.finish(true);
         metrics::measure(Metric::Phase(Phase::Git), || {
             self.execute(
+                slug,
                 &scratch.path,
                 &snapshot,
                 &barrier,
@@ -342,6 +348,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
+        slug: &str,
         path: &Path,
         snapshot: &Snapshot,
         lease: &metadata::Barrier,
@@ -400,7 +407,8 @@ impl Engine {
                             }),
                             || {
                                 self.validate(
-                                    path, snapshot, lease, principal, operation, commands, publish,
+                                    slug, path, snapshot, lease, principal, operation, commands,
+                                    publish,
                                 )
                             },
                         )

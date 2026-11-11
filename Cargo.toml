@@ -15,7 +15,7 @@ aws-sigv4 = { version = "1.6.4", default-features = false, features = ["sign-htt
 deadpool-postgres = "0.14.2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 git-rs-core = { version = "0.1.0", path = "crates/git-core" }
-gix = { git = "https://github.com/borislitv/gitoxide", rev = "c3282a004f677b4d9b0b6bacb507462edf4b9e0a", version = "0.90.0", default-features = false, features = ["sha1"] }
+gix = { git = "https://github.com/borislitv/gitoxide", rev = "7ce87f63e03ef116cb2d3df097cd688e6d19c35b", version = "0.90.0", default-features = false, features = ["sha1"] }
 memfd = "0.6.6"
 native-tls = "0.2"
 openssl = "0.10"
@@ -41,3 +41,7 @@ harness = false
 [[example]]
 name = "cache-process"
 path = "tests/support/cache_process.rs"
+
+[[example]]
+name = "blame-http-fixture"
+path = "tests/support/blame_http.rs"

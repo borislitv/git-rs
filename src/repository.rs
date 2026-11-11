@@ -1,6 +1,7 @@
 //! Library-only operations on an application-owned request repository.
 
 use crate::{Result, invalid, process, protocol::MAX_REF, scratch::Scratch};
+use git_rs_core::objects::VerifiedObject;
 use git_rs_core::pack::{PackLocation, PackSet};
 use git_rs_core::{
     CapacityBudget, Control, Object, ReadLimits, SnapshotIdentity, SnapshotOdb,
@@ -12,6 +13,9 @@ use std::fs;
 use std::io::Read;
 
 const MAX_BASE_RECURSION: usize = 32;
+
+#[path = "blame_source.rs"]
+pub(crate) mod blame_source;
 
 pub(crate) fn ref_name(name: &[u8]) -> Result<gix::refs::FullName> {
     if name.len() > MAX_REF || !name.starts_with(b"refs/") {
@@ -289,13 +293,8 @@ impl<G> VerifiedObjectProvider for PhysicalSnapshot<'_, G> {
         &self.identity
     }
     fn header(&self, id: &gix::hash::oid, control: &Control) -> Result<Option<gix::objs::Header>> {
-        self.object(id, control, &self.capacity, self.limits)
-            .map(|object| {
-                object.map(|object| gix::objs::Header {
-                    kind: object.kind,
-                    size: object.data.as_slice().len() as u64,
-                })
-            })
+        self.verified_object(id, control, &self.capacity, self.limits)
+            .map(|object| object.map(|object| object.header()))
     }
     fn object(
         &self,
@@ -304,10 +303,23 @@ impl<G> VerifiedObjectProvider for PhysicalSnapshot<'_, G> {
         capacity: &CapacityBudget,
         limits: ReadLimits,
     ) -> Result<Option<Object>> {
-        if let Some(object) = self.packs.decode(id, control, capacity, limits)? {
+        self.verified_object(id, control, capacity, limits)?
+            .map(|object| object.into_object(control, capacity))
+            .transpose()
+    }
+    fn verified_object(
+        &self,
+        id: &gix::hash::oid,
+        control: &Control,
+        capacity: &CapacityBudget,
+        limits: ReadLimits,
+    ) -> Result<Option<VerifiedObject>> {
+        if let Some(object) = self.packs.decode_verified(id, control, capacity, limits)? {
             return Ok(Some(object));
         }
-        self.loose(id, control, capacity, limits)
+        self.loose(id, control, capacity, limits)?
+            .map(|object| VerifiedObject::verify(id, object, control, capacity, limits))
+            .transpose()
     }
     fn pack_location(
         &self,

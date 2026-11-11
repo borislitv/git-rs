@@ -10,9 +10,9 @@ still requires Git until every remaining boundary below is replaced and qualifie
 
 Safe Rust, byte-oriented Git names, request cancellation and bounded resources
 remain requirements. The target is one shared Rust core with cooperative checks
-inside long-running algorithms. The existing external blame executable is migration
-debt, not a permanent second backend. Moving work into the serving process does not
-by itself give it a hard cancellation boundary.
+inside long-running algorithms. Complete blame now runs directly in that core;
+external blame-worker selection is obsolete and rejected at serving startup.
+Cooperative in-process cancellation is not a hard realtime cancellation boundary.
 
 ## Current replacement map
 
@@ -22,10 +22,10 @@ by itself give it a hard cancellation boundary.
 | Snapshot refs and HEAD | `gix-ref` transactions and validated byte-exact HEAD; PostgreSQL remains authoritative | Exact byte-oriented refs, arbitrary default branch, empty/unborn repository, no reflogs |
 | Ref-name validation | `gix` reference validation at command parsing and validation | Native-compatible valid and invalid names, including non-UTF-8 names |
 | Snapshot/blame object kind and size | `gix-pack`/`gix-odb` physical header-only reads | Native-exact loose/ref-delta headers, sealed RAM links, missing-object and cancellation checks, bounded-memory regression |
-| Path, metadata and ancestry reads | Native Git commands | Library reads with exact object identity, literal paths and complete graph semantics |
+| Blame path, metadata and ancestry reads | Rust `SnapshotSession` over verified physical objects | Byte-oriented literal paths, exact object identity and exhaustive ancestry; native maintenance paths remain separate debt |
 | Push ingestion and validation | Native receive-pack/index-pack/fsck | Streaming Rust ingestion; strict validation of every incoming object; authenticated existing bases; complete graph closure |
 | Fetch and negotiation | Native upload-pack/http-backend | Ordinary clients over HTTP/SSH; protocol versions, tags, notes and shallow behavior qualified explicitly |
-| Complete blame | Native default or an operator-selected worker | General graph/path behavior, exact owners/positions/metadata/content, bounded complete response and cancellation |
+| Complete blame | Pinned Rust core, NativeRootV1 whole-file Myers and complete porcelain | Native oracle equivalence, general graph/rename behavior, bounded complete response, source fencing and cooperative cancellation |
 | Backup and history maintenance | Native Git commands plus database fencing | Verified compatible backup/restore, ownership, fencing and durable retirement |
 
 `gix` 0.90.0 supplies useful object, pack, ref, traversal and blame components.
@@ -54,8 +54,9 @@ reads loose and sealed-RAM ref-delta blobs around the 128 MiB payload limit in a
 child with a 96 MiB address-space limit, so replacing a header probe with full
 body inflation fails. This test limit is not a serving-process RSS or hard
 cancellation guarantee. Published reachability, literal path resolution and the
-default annotation computation still use their explicit native boundaries.
-Push tip checks remain part of the native ingestion/validation boundary.
+annotation computation now use the Rust core as well. Push tip checks remain part
+of the native ingestion/validation boundary. Receive-pack, upload-pack/http-backend,
+backup and history maintenance still require the native runtime.
 
 Newly migrated paths must not invoke Git as a hidden fallback. Existing native
 paths remain explicit migration debt; they are not evidence that the final
@@ -82,29 +83,69 @@ capacity, including retained results; it is not an RSS or allocator-overhead met
 Arbitrary callbacks, panic hooks and destructors still require bounded behavior.
 
 Gitoxide is a normal Git dependency pinned to the owned
-[`borislitv/gitoxide` fork](https://github.com/borislitv/gitoxide/pull/1), revision
-`c3282a004f677b4d9b0b6bacb507462edf4b9e0a` (the stable Stage 3/4 source).
+[`borislitv/gitoxide` fork](https://github.com/borislitv/gitoxide/pull/2), revision
+`7ce87f63e03ef116cb2d3df097cd688e6d19c35b` (C7 completed MappingMemo,
+bounded fixed-work polling, linear immutable trace-root maintenance and exclusive
+prepared-token leases, bounded single-origin hunk reuse and request-local raw
+input pair preservation and lazy controlled indentation preparation). The original
+complete admitted indentation dictionary is built only on the first maintained
+heuristic request and reused across both passes; no request does no dictionary
+work. Scoring, tie preference, polling and public heuristic signatures are unchanged.
+Raw mapping edges and fresh diff computations are counted independently of optional
+memo hooks. Hook-free accounting creates no producer identity, wire slot or cache;
+unchanged and empty fast paths do not manufacture mapping work from commit counts.
+Successful no-rewrite traversal, including consumer
+Break, can retain the existing two-resource raw pair within the request. Entry
+provenance reset and rewrite/error/stop/panic cleanup preserve source isolation;
+this does not add a cache or extend the platform's request lifetime.
 `docs/gitoxide-source.json` records its upstream base, licenses and imara origin;
 original source, notices, tests and changes remain in that repository, not copied
 into this application. The source audit and locked package graph reject mixed
 registry/fork or revision identities. Controlled pack, zlib, diff,
 tokenization and blame entrypoints expose inner-loop cancellation and admission;
 configuration is request-local rather than operational environment mutation.
-The core currently uses an uncached decoder. General blame still needs owner-aware
-scratch reuse, complete native porcelain provenance and application integration
-before replacing its existing serving boundary.
+The physical provider discovers indexes and acquires selected packs on demand for
+blame, preserving source holds and verified RAM pins. Owner-aware decoder buffers,
+completed mapping hooks and byte-exact complete porcelain are integrated with the
+root serving path. This does not replace native receive/upload or backup handling.
+
+Production constructs `BlameOptions::default()`: all five qualified `BlameTuning` switches
+(`reuse_line_tokens`, `retain_current_input_tokens`, `reuse_unchanged_runs`,
+`bounded_resource_cache`, `index_changes`) are explicitly on in NativeRootV1.
+The canonical profile remains versioned and immutable, with tuning byte 31;
+the vendor tuning default remains all-off. The explicit conservative core profile
+is `BlameOptions::native_root(BlameTuning::default())`; fixture `--tuning off`
+also remains available. There is no production HTTP/CLI tuning or producer override.
+Authenticated completed-work reuse is a separate optional integration, not an
+implicit enablement of these tuning switches. The codec is also a pinned owned
+Git dependency; its source identity is recorded in `docs/codec-source.json`.
+Runtime verification binds the GNU libc iconv profile and actual GNU C/ASCII
+thread codeset before serving/cache use. Native compatibility oracles use LC_ALL=C.
+
+The C7 all-on profile passed the synthetic 2000-commit/20000-line performance
+qualification: three prepared runs had a 4.443925 s median against the 5 s gate,
+and three fresh hosted runs had a 4.391570 s median against the 8 s gate. Each
+successful output matched all 6346057 native porcelain bytes; hosted runs observed
+1999 actual mapping edges/computations and zero hits. All three full tokens-off
+negative runs reached the unchanged 20 s deadline. Limits were a shared 1 GiB job,
+256 MiB prepared/32 MiB hosted decoder budgets, and an aggregate ceiling of
+4 GiB, 2 CPUs and 256 tasks. These are synthetic qualification results, not general
+latency guarantees or a Stage 5 release. Full joined functional/authentication,
+destructive-runtime and real-image CI qualification remain pending.
 
 Run `make check` for the source audit, workspace formatting, strict Clippy and
-application/core tests. `make vendor-check GITOXIDE_DIR=<checkout>` separately
-verifies that checkout's owned origin, exact revision, clean tracked source and
-license notices, then runs the five affected dependency packages, strict Clippy
-and explicit doctests. CI checks out the same pin under ignored `.local/gitoxide`;
-build output remains under the application's target directory. Cargo fetches the
+application/core tests that are not ignored. `make vendor-check` separately
+verifies owned origin, exact revision, clean tracked source and license notices
+for both checkouts (`GITOXIDE_DIR` and `CODEC_DIR`, defaulting to `.local/gitoxide`
+and `.local/iconv-native`). It runs five Gitoxide packages, strict Clippy and
+explicit Gitoxide doctests, plus codec library/tests and strict Clippy. CI checks
+out those immutable pins; build output remains under the application's target
+directory. Cargo fetches the
 same immutable source for application and Docker builds. Root contract tests cover
 real sealed-RAM links, cross-pack bases,
 wrong-object rejection, no-growth caller buffers, source lifetimes and cancellation.
-These foundation gates do not establish a Git-free runtime, general native-exact
-blame, hard realtime cancellation or production deployment readiness.
+These gates do not establish a Git-free runtime, hard realtime cancellation,
+full-repository performance or production deployment readiness.
 
 ## Generality and scaling
 
@@ -113,18 +154,22 @@ branches, merges, renames, tags and nonmonotonic commit timestamps. Single-path 
 linear-history optimizations need complete semantic alternatives. Test varied
 history shapes and unrelated-path changes as well as large-file stress cases.
 
-The current complete-pack-catalog materialization is a scaling limitation. A
-library object-store adapter should access verified immutable objects without
-fetching every live pack for a small read, while maintaining snapshot leases,
-catalog digests, object closure and memory limits. Repository-level graph/index
-work should not be rebuilt independently for each queried file.
+Native transport/maintenance still materializes the complete live pack catalog.
+Blame instead uses demand-driven verified index/pack acquisition, with bounds of
+4096 refs, 1 MiB of ref names, 4096 indexes, 128 MiB selected index bytes and
+12 GiB selected pack/index bytes. Metadata retains its separate <=128 MiB bound.
+This is bounded source access, not a claim that every repository fits one job or
+that graph/index work is shared across all queries.
 
 ## Storage and failure semantics
 
-`derived_cache` provides independently migrated opaque artifacts before the Git
-engine refactor. It is not yet connected to serving/blame. `cache-migrate` initializes
-logged `git_rs_cache` tables through an independent, bounded PostgreSQL pool. The
-metadata text-row limit remains 8,192 bytes; artifacts use parameterized binary
+`derived_cache` is connected to complete blame bodies and, with an explicit signing
+key, authenticated completed-work checkpoints. `cache-migrate` initializes/upgrades
+logged `git_rs_cache` tables to version 2 through an independent, bounded pool;
+source `migrate` is separate. The upgrade from cache v1 is transactional and
+forward-only. Old migrators reject v2; rollback and namespace ownership policy are
+documented in [operations](../OPERATIONS.md#cache-schema-upgrade-and-rollback).
+The metadata text-row limit remains 8,192 bytes; artifacts use parameterized binary
 transport. Keys include repository, security scope, object format, ordered inputs,
 options, representation and producer version. Only raw payload encoding is currently
 supported, so there is no implicit decompression or unbounded expansion.
@@ -146,7 +191,30 @@ The opaque-artifact `Coordinator` coalesces local requests, owns actual-work per
 and source holds after waiter cancellation, and uses a finite independent operation
 budget. Its trusted computation callback must poll `Derivation::check()` inside
 bounded loops. This is not a general hard-stop guarantee for arbitrary callbacks;
-the later Git-core executor must qualify every inner algorithm separately.
+the Git-core executor must qualify every inner algorithm separately.
+
+The root blame scheduler gives actual work a finite independent lifetime and owns
+its source hold, scratch and admission through cleanup and complete response
+consumption. Each waiter retains its own cancellation/deadline. The last queued
+waiter's departure cancels queued work; a departed running waiter cannot cancel
+other waiters or release the job's source early. Source authorization, generation
+and storage epoch fences remain required on cached as well as computed results.
+
+An authenticated `WorkSet` contains completed physical objects and mappings with
+both complete byte-line partitions. It persists neither a suspended traversal
+frontier nor vendor interner IDs. HMAC-SHA256 binds the entire frame to the exact
+producer/options, repository/principal, generation/epoch, namespace and authorized
+owner. Objects also verify kind/size/OID. Imports are temporary until outer cache
+and fresh source fences succeed. Memory callbacks perform no SQL/network I/O.
+Checkpoint cadence is 256 successful mapping insertions or five seconds at a
+complete-edge boundary, plus the final complete batch. Storage failure skips
+optional writes; source, cancellation and codec-runtime errors remain errors.
+
+Opt-in one-path warming runs only after confirmed publication, on the same CPU
+pool and actual-work admission, with one additional warm admission and a 30-second
+deadline including queue time. It acquires fresh source authority after dequeue;
+stale hints, capacity and optional-cache failures cannot roll back a confirmed push.
+See [blame](blame.md) and the key/rotation policy in [operations](../OPERATIONS.md).
 
 Build first with `make cache-build` (or set `CARGO_TARGET_DIR` to a fresh build
 directory). The cache qualification target is `make cache-check`, using those
@@ -167,6 +235,30 @@ owned streaming standby and concurrent authoritative metadata reads. Its budget
 file is `tests/fixtures/cache-storage-budget.json`; startup-independent reuse,
 wire accounting and copy-coverage limitations are recorded in each report.
 These checks do not qualify general Git derivation, serving integration or HA.
+
+### Current CI coverage and publication gaps
+
+The active cache CI job invokes only the older `cache_gate.py` controller.
+`make check` does not execute ignored contracts. The disabled blame gate discovers
+the exact ignored-test inventory from each compiled suite's `--ignored --list`,
+including nested runtime modules, and records the selected names in its sealed
+manifest. It excludes only the named subprocess helpers `artifact_process`,
+`checkpoint_reuse_child`, `warm_cache_outage_child` and
+`runtime_support::runtime_child`; helpers execute through their parent contracts.
+There is no fixed contract-count acceptance threshold. These contracts require
+explicit owned fixtures. The disabled job wires `tests/blame_artifacts.py` for
+contracts/faults/migration; its legacy phase requires real old binaries and their
+verified hashes. A green ordinary workspace test is not migration evidence, and
+disabled wiring is not executed CI coverage.
+
+Native integration CI invokes the full integration harness and its concurrency
+path; it does not invoke the focused `--blame-core-only` mode. The Make focused
+entrypoints are wiring, not a qualified CI gate. Root/checkpoint functional and
+actual-work reuse proofs do not establish a Stage 5/8 production performance result.
+There is no such performance result yet. Re-run joined-source functional,
+authentication, migration and isolated runtime-codec gates before publication;
+qualify performance and deployment/HA independently. Do not present existing CI
+as coverage of every new contract.
 
 PostgreSQL remains authoritative for refs, authorization, catalog and fencing;
 immutable S3 objects hold pack/index bytes. Computation changing from Git CLI to

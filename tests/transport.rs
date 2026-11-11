@@ -179,7 +179,7 @@ fn blame_capacity_rejects_invalid_settings_before_serving() {
 }
 
 #[test]
-fn blame_worker_configuration_rejects_invalid_executables_before_serving() {
+fn obsolete_blame_worker_configuration_is_rejected_before_serving() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = std::env::temp_dir().join(format!(
@@ -195,6 +195,8 @@ fn blame_worker_configuration_rejects_invalid_executables_before_serving() {
         root.join("missing"),
         root.clone(),
         not_executable,
+        PathBuf::from("/usr/bin/git"),
+        PathBuf::from(""),
     ] {
         let scratch = root.join("must-not-be-created");
         let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
@@ -208,9 +210,8 @@ fn blame_worker_configuration_rejects_invalid_executables_before_serving() {
             .unwrap();
         assert!(!output.status.success());
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("GIT_RS_BLAME_WORKER must name an absolute executable file"),
-            "invalid executable must fail before serving state is created: {:?}",
+            String::from_utf8_lossy(&output.stderr).contains("GIT_RS_BLAME_WORKER is obsolete"),
+            "obsolete worker configuration must fail before serving state is created: {:?}",
             output.stderr
         );
         assert!(!scratch.exists());

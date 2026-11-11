@@ -355,6 +355,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "deadpool"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -523,10 +537,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
@@ -659,19 +689,27 @@ dependencies = [
 name = "git-rs-core"
 version = "0.1.0"
 dependencies = [
+ "gix-actor",
+ "gix-blame",
+ "gix-diff",
  "gix-error",
+ "gix-filter",
+ "gix-glob",
  "gix-hash",
  "gix-object",
  "gix-pack",
+ "gix-worktree",
  "gix-zlib",
  "hashbrown 0.17.1",
+ "iconv-native",
  "memfd",
+ "sha2",
 ]
 
 [[package]]
 name = "gix"
 version = "0.90.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-actor",
  "gix-commitgraph",
@@ -714,7 +752,7 @@ dependencies = [
 [[package]]
 name = "gix-actor"
 version = "0.44.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-date",
@@ -724,7 +762,7 @@ dependencies = [
 [[package]]
 name = "gix-attributes"
 version = "0.37.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -738,9 +776,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-bitmap"
+version = "0.6.1"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+dependencies = [
+ "gix-error",
+]
+
+[[package]]
+name = "gix-blame"
+version = "0.20.0"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+dependencies = [
+ "gix-commitgraph",
+ "gix-date",
+ "gix-diff",
+ "gix-error",
+ "gix-hash",
+ "gix-object",
+ "gix-revwalk",
+ "gix-trace",
+ "gix-traverse",
+ "gix-worktree",
+ "smallvec",
+]
+
+[[package]]
 name = "gix-chunk"
 version = "0.10.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-error",
 ]
@@ -748,7 +812,7 @@ dependencies = [
 [[package]]
 name = "gix-command"
 version = "0.12.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -760,7 +824,7 @@ dependencies = [
 [[package]]
 name = "gix-commitgraph"
 version = "0.42.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-chunk",
@@ -773,7 +837,7 @@ dependencies = [
 [[package]]
 name = "gix-config"
 version = "0.62.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-config-value",
@@ -792,7 +856,7 @@ dependencies = [
 [[package]]
 name = "gix-config-value"
 version = "0.21.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bitflags 2.13.2",
  "bstr",
@@ -805,7 +869,7 @@ dependencies = [
 [[package]]
 name = "gix-date"
 version = "0.18.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -816,18 +880,27 @@ dependencies = [
 [[package]]
 name = "gix-diff"
 version = "0.70.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
+ "gix-command",
  "gix-error",
+ "gix-filter",
+ "gix-fs",
  "gix-hash",
+ "gix-imara-diff",
  "gix-object",
+ "gix-path",
+ "gix-tempfile",
+ "gix-trace",
+ "gix-traverse",
+ "gix-worktree",
 ]
 
 [[package]]
 name = "gix-discover"
 version = "0.57.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "dunce",
@@ -841,7 +914,7 @@ dependencies = [
 [[package]]
 name = "gix-error"
 version = "0.5.2"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
 ]
@@ -849,7 +922,7 @@ dependencies = [
 [[package]]
 name = "gix-filter"
 version = "0.36.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "encoding_rs",
@@ -869,7 +942,7 @@ dependencies = [
 [[package]]
 name = "gix-fs"
 version = "0.24.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -883,7 +956,7 @@ dependencies = [
 [[package]]
 name = "gix-glob"
 version = "0.29.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bitflags 2.13.2",
  "bstr",
@@ -896,7 +969,7 @@ dependencies = [
 [[package]]
 name = "gix-hash"
 version = "0.28.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "faster-hex",
  "gix-error",
@@ -907,7 +980,7 @@ dependencies = [
 [[package]]
 name = "gix-hashtable"
 version = "0.18.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-hash",
  "hashbrown 0.17.1",
@@ -915,9 +988,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-ignore"
+version = "0.24.0"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+dependencies = [
+ "bstr",
+ "gix-glob",
+ "gix-path",
+ "gix-trace",
+ "unicode-bom",
+]
+
+[[package]]
+name = "gix-imara-diff"
+version = "0.3.2"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+dependencies = [
+ "bstr",
+ "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "gix-index"
+version = "0.58.0"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+dependencies = [
+ "bitflags 2.13.2",
+ "bstr",
+ "filetime",
+ "fnv",
+ "gix-bitmap",
+ "gix-error",
+ "gix-fs",
+ "gix-hash",
+ "gix-lock",
+ "gix-object",
+ "gix-parallel",
+ "gix-trace",
+ "gix-traverse",
+ "gix-utils",
+ "gix-validate",
+ "hashbrown 0.17.1",
+ "itoa",
+ "libc",
+ "memmap2",
+ "rustix",
+ "smallvec",
+]
+
+[[package]]
 name = "gix-lock"
 version = "26.0.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-error",
  "gix-fs",
@@ -928,7 +1050,7 @@ dependencies = [
 [[package]]
 name = "gix-macros"
 version = "0.2.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -938,7 +1060,7 @@ dependencies = [
 [[package]]
 name = "gix-note"
 version = "0.3.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-error",
  "gix-hash",
@@ -948,7 +1070,7 @@ dependencies = [
 [[package]]
 name = "gix-object"
 version = "0.66.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-actor",
@@ -965,7 +1087,7 @@ dependencies = [
 [[package]]
 name = "gix-odb"
 version = "0.87.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "arc-swap",
  "crc32fast",
@@ -989,7 +1111,7 @@ dependencies = [
 [[package]]
 name = "gix-pack"
 version = "0.77.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "clru",
  "crc32fast",
@@ -1010,7 +1132,7 @@ dependencies = [
 [[package]]
 name = "gix-packetline"
 version = "0.24.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "faster-hex",
@@ -1021,7 +1143,7 @@ dependencies = [
 [[package]]
 name = "gix-parallel"
 version = "0.50.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "crossbeam-channel",
  "gix-trace",
@@ -1032,7 +1154,7 @@ dependencies = [
 [[package]]
 name = "gix-path"
 version = "0.14.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -1043,7 +1165,7 @@ dependencies = [
 [[package]]
 name = "gix-protocol"
 version = "0.68.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-date",
@@ -1060,7 +1182,7 @@ dependencies = [
 [[package]]
 name = "gix-quote"
 version = "0.10.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -1070,7 +1192,7 @@ dependencies = [
 [[package]]
 name = "gix-ref"
 version = "0.69.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-actor",
  "gix-error",
@@ -1089,7 +1211,7 @@ dependencies = [
 [[package]]
 name = "gix-refspec"
 version = "0.47.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -1101,7 +1223,7 @@ dependencies = [
 [[package]]
 name = "gix-revision"
 version = "0.52.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-commitgraph",
@@ -1116,7 +1238,7 @@ dependencies = [
 [[package]]
 name = "gix-revwalk"
 version = "0.38.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-commitgraph",
  "gix-date",
@@ -1130,7 +1252,7 @@ dependencies = [
 [[package]]
 name = "gix-sec"
 version = "0.16.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bitflags 2.13.2",
  "gix-path",
@@ -1141,7 +1263,7 @@ dependencies = [
 [[package]]
 name = "gix-shallow"
 version = "0.15.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -1153,8 +1275,9 @@ dependencies = [
 [[package]]
 name = "gix-tempfile"
 version = "26.0.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
+ "dashmap",
  "gix-fs",
  "libc",
  "parking_lot",
@@ -1165,12 +1288,12 @@ dependencies = [
 [[package]]
 name = "gix-trace"
 version = "0.3.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 
 [[package]]
 name = "gix-transport"
 version = "0.62.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-command",
@@ -1187,7 +1310,7 @@ dependencies = [
 [[package]]
 name = "gix-traverse"
 version = "0.64.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bitflags 2.13.2",
  "gix-commitgraph",
@@ -1203,7 +1326,7 @@ dependencies = [
 [[package]]
 name = "gix-url"
 version = "0.40.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
@@ -1215,7 +1338,7 @@ dependencies = [
 [[package]]
 name = "gix-utils"
 version = "0.5.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "bytes",
@@ -1229,16 +1352,34 @@ dependencies = [
 [[package]]
 name = "gix-validate"
 version = "0.13.1"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "bstr",
  "gix-error",
 ]
 
 [[package]]
+name = "gix-worktree"
+version = "0.59.0"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+dependencies = [
+ "bstr",
+ "gix-attributes",
+ "gix-error",
+ "gix-fs",
+ "gix-glob",
+ "gix-hash",
+ "gix-ignore",
+ "gix-index",
+ "gix-object",
+ "gix-path",
+ "gix-validate",
+]
+
+[[package]]
 name = "gix-worktree-stream"
 version = "0.39.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-attributes",
  "gix-error",
@@ -1257,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "gix-zlib"
 version = "0.4.0"
-source = "git+https://github.com/borislitv/gitoxide?rev=c3282a004f677b4d9b0b6bacb507462edf4b9e0a#c3282a004f677b4d9b0b6bacb507462edf4b9e0a"
+source = "git+https://github.com/borislitv/gitoxide?rev=7ce87f63e03ef116cb2d3df097cd688e6d19c35b#7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 dependencies = [
  "gix-error",
  "zlib-rs",
@@ -1271,6 +1412,12 @@ checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
 dependencies = [
  "byteorder",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
@@ -1288,6 +1435,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
+]
 
 [[package]]
 name = "heapless"
@@ -1419,6 +1571,16 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "iconv-native"
+version = "0.1.0"
+source = "git+https://github.com/borislitv/iconv-native-rs?rev=f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f#f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"
+dependencies = [
+ "cfg-if",
+ "sha2",
+ "vcpkg",
 ]
 
 [[package]]

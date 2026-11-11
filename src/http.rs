@@ -373,30 +373,47 @@ fn handle_blame(
         let _finish = Finish(&finished);
         engine.blame(slug, principal, query)
     });
-    let (status, body) = match response {
+    let status = match response {
         Ok(crate::blame::Response::Complete(body)) => {
+            crate::process::check_operation()?;
+            // Keep sealed output, source/cache holds, physical pins and actual
+            // work admission alive until write/flush acknowledges consumption.
+            let deadline = operation.deadline().min(body.deadline());
+            let writing = crate::process::Operation::until(deadline);
+            let interrupt = stream.try_clone()?;
+            writing.with_interrupt(
+                || {
+                    let _ = interrupt.shutdown(std::net::Shutdown::Both);
+                },
+                || {
+                    body.check()?;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )?;
+                    body.write_to(stream)
+                },
+            )?;
             timer.outcome(Outcome::Success);
-            ("200 OK", body)
+            return Ok(());
         }
-        Ok(crate::blame::Response::Busy) => ("503 Service Unavailable", Vec::new()),
-        Ok(crate::blame::Response::NotFound) => ("404 Not Found", Vec::new()),
-        Ok(crate::blame::Response::TooLarge) => ("413 Content Too Large", Vec::new()),
+        Ok(crate::blame::Response::Busy) => "503 Service Unavailable",
+        Ok(crate::blame::Response::NotFound) => "404 Not Found",
+        Ok(crate::blame::Response::TooLarge) => "413 Content Too Large",
         Err(error) => {
             timer.outcome(Outcome::Error);
             stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n")?;
             return Err(error);
         }
     };
-    if status != "200 OK" {
-        timer.outcome(Outcome::Error);
-    }
+    timer.outcome(Outcome::Error);
     crate::process::check_operation()?;
     write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
+        0
     )?;
-    stream.write_all(&body)?;
     stream.flush()?;
     Ok(())
 }

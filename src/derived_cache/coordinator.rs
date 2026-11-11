@@ -229,12 +229,13 @@ impl Coordinator {
         }
     }
 
-    fn with_renewal<T: Send>(
+    pub(crate) fn with_renewal<T: Send>(
         cache: &DerivedCache,
         claim: &Claim,
         compute: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let operation = Operation::current().expect("independent cache job operation");
+        let operation = Operation::current()
+            .ok_or_else(|| invalid("cache renewal requires a bounded operation"))?;
         std::thread::scope(|scope| {
             let (done, finished) = mpsc::channel();
             scope.spawn(move || {

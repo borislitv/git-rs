@@ -22,5 +22,25 @@
 - Serving never deletes objects. Explicit owner-only history truncation requires a verified
   native bundle backup, reader/writer fencing and durable retirement before object cleanup.
 - Test native Git behavior, concurrent publications, dependency failures and cold restarts.
+- Blame path/ancestry/metadata, attribution and complete porcelain use the pinned Rust core;
+  never reintroduce a native blame fallback. GIT_RS_BLAME_WORKER is obsolete and rejected.
+  Native receive/upload and backup/history-maintenance boundaries remain explicit migration debt.
+- BlameOptions::default selects the performance-qualified NativeRootV1 profile with all five
+  BlameTuning switches on. Keep the vendor tuning default all-off and the explicit conservative
+  core profile available. Production exposes no tuning/producer override; test-fixture selectors
+  are not a serving API. Profile changes require fresh native, resource and performance qualification.
+- Shared blame bodies and authenticated WorkSet objects/mappings are optional derivations.
+  Preserve source authority, generation/epoch fences, complete line partitions and producer/key
+  scope. Persist completed units only, never vendor interner IDs or a suspended traversal frontier.
+  Keep SQL/network I/O out of memory callbacks. Do not weaken protected signing-file checks.
+- Actual jobs retain finite lifetime, source holds and admission through cleanup; each waiter
+  owns its cancellation/deadline. Post-confirmed opt-in warming uses the same CPU pool and work
+  admission, fresh authorized source and its own finite deadline; it cannot fail a confirmed push.
+- Cache v1-to-v2 migration is independent and forward-only. Old migrators reject v2; rollback
+  requires caching disabled or a separate compatible cache schema/database and fresh owned prefix.
+  Never infer old-writer quiescence from schema rejection or reuse retired payload identities.
+- Ordinary CI skips ignored contracts and currently wires only the older cache controller, not
+  the new artifact/migration harness. Track explicit joined-source functional/authentication and
+  isolated codec-runtime gates. Root/memo proofs are not Stage 5/8 production performance results.
 - Public artifacts use synthetic data, reserved example domains and public sources only.
 - Keep unverified operational claims explicit. A local development test is not an HA proof.

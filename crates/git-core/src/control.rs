@@ -9,6 +9,44 @@ pub struct Control {
     deadline: Instant,
 }
 
+/// Opt-in clock amortization for an invocation's **bounded CPU work only**.
+///
+/// Every checkpoint observes explicit cancellation. The first checkpoint reads
+/// the absolute deadline, then at most 32 further checkpoints may elapse before
+/// the next deadline read, even without an executor/deadline watcher. This is a
+/// work-point bound, not a wall-clock/scheduler/opaque-call latency guarantee.
+///
+/// The caller must establish a finite maximum work quantum between checkpoints
+/// and call `boundary()` before/after I/O, allocations, external callbacks, phase
+/// transitions and completion/publication. Never replace those strict checks or
+/// `Control::check()` with a sampled checkpoint. Do not reuse across invocations.
+/// Borrowing and the lack of Clone keep the counter local; no timer/TLS is used.
+pub struct CpuPoller<'a> {
+    control: &'a Control,
+    remaining: u8,
+}
+
+impl CpuPoller<'_> {
+    /// Observe cancellation now; sample time initially and every <=32 points.
+    #[inline]
+    pub fn checkpoint(&mut self) -> Result<(), StopReason> {
+        if self.control.flag.load(Ordering::Acquire) || self.remaining == 0 {
+            self.boundary()
+        } else {
+            self.remaining -= 1;
+            Ok(())
+        }
+    }
+
+    /// Strict absolute check, including on a partially consumed CPU quantum.
+    #[inline]
+    pub fn boundary(&mut self) -> Result<(), StopReason> {
+        self.control.check()?;
+        self.remaining = 31;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     Cancelled,
@@ -48,6 +86,15 @@ impl Control {
 
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Release);
+    }
+
+    /// Start a non-cloneable, borrowed bounded-CPU invocation. This does not
+    /// change the strict semantics of `check()` or rely on a watcher thread.
+    pub fn cpu_poller(&self) -> CpuPoller<'_> {
+        CpuPoller {
+            control: self,
+            remaining: 0,
+        }
     }
 
     pub fn check(&self) -> Result<(), StopReason> {

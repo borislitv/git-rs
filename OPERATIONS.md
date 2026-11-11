@@ -22,18 +22,21 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `PGSSLCERT`, `PGSSLKEY` | optional client certificate and unencrypted PKCS#8 key, configured together |
 | `GIT_RS_S3_ENDPOINT`, `GIT_RS_S3_BUCKET`, `GIT_RS_S3_REGION` | HTTPS path-style S3 endpoint/bucket; default region `us-east-1` |
 | `GIT_RS_S3_ACCESS_KEY`, `GIT_RS_S3_SECRET_KEY` | service S3 credentials |
-| `SSL_CERT_FILE`, `SSL_CERT_DIR` | custom S3 TLS trust roots passed to curl |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | custom S3 TLS trust roots for the in-process transport |
 | `GIT_RS_CACHE_BYTES` | reusable RAM cache capacity, default 67108864 bytes; `0` disables |
 | `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..3600`, default 120 |
 | `GIT_RS_PACK_THREADS` | native Git `pack.threads` per request, integer `1..4`, default 1 |
-| `GIT_RS_BLAME_WORKER` | optional absolute operator-owned executable; unset uses native Git |
+| `GIT_RS_BLAME_CONCURRENCY`, `GIT_RS_BLAME_WAITERS` | 1 / 0; concurrency 1–4, waiters 0–3, total at most 4 |
+| `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` | optional protected absolute 32-byte signing-key file; requires explicit cache configuration |
+| `GIT_RS_BLAME_WARM_PATH` | optional single literal percent-encoded path; requires authenticated checkpoint cache; disabled by default |
 | `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |
 
 The Helm chart obtains credentials from existing Secrets or bucket-claim outputs. Do not put
 credentials, private keys or real identity maps in values files, command-line flags or source
-control. S3 credentials are passed to curl over stdin; child environments do not inherit arbitrary
-Git configuration or proxies. Subprocess errors intentionally suppress raw external diagnostics.
+control. S3 requests use the in-process signed HTTP transport; child environments
+do not inherit arbitrary Git configuration or proxies. Subprocess errors
+intentionally suppress raw external diagnostics.
 
 SQL uses an eight-connection process-local deadpool-postgres pool and a two-worker Tokio runtime.
 Pool waits, connection establishment, query streaming and session reset share the operation's
@@ -61,15 +64,38 @@ plaintext PostgreSQL/S3 fixtures. It is not a production authentication scheme.
 
 Complete immutable blame uses the authenticated HTTP identity and a leased, published read
 snapshot. It admits one computation per process, accepts at most 256 MiB of complete output, rejects
-blobs over 128 MiB and shares the operation deadline. An optional worker inherits no SQL/S3
-credentials and must keep descendants in its owned process group. See the
-[endpoint, output and worker contract](docs/blame.md).
+blobs over 128 MiB and shares the operation deadline. Path resolution, ancestry,
+attribution and complete porcelain use the pinned Rust core, without a native
+blame subprocess or fallback. Native receive/upload and backup/maintenance remain
+migration debt. See the [endpoint and completed-work contract](docs/blame.md).
+
+Remove `GIT_RS_BLAME_WORKER` from inherited environments before starting this
+binary: even an empty setting is obsolete and causes serving startup to fail.
+Old worker executable/CLI instructions and chart environment overrides are not
+supported migration paths. Check rendered manifests and remove legacy settings;
+chart cleanup belongs to the separate Stage 11 work, not a promise that an older
+published chart configures the new cache/key/warming features.
+
+Production uses the default core options with all five performance tuning
+switches off until qualification. There is no production tuning/producer override.
+The default is one executing job and no queue. Waiters have individual deadlines;
+actual jobs have a finite independent lifetime and retain source holds, scratch,
+buffers and admission through cleanup. Disconnecting a running waiter cannot
+release another waiter's source. Abandoned queued work is cancelled cooperatively.
+Increasing admission does not increase CPU, RAM, SQL or container allowances.
 
 ## Independently configured derived artifacts
 
-The `derived_cache` library is currently an opaque-artifact foundation; serving and
-blame do not yet consume it. Run `git-rs cache-migrate` independently of source
-`migrate`. Both namespaces use logged tables; no transaction spans their databases.
+Complete blame may reuse shared complete bodies through `derived_cache`. With
+explicit authenticated configuration it can also reuse completed objects and
+mapping checkpoints. It always requires a fresh authorized source and fences;
+cache data is never source authority. Run `git-rs cache-migrate` independently of
+source `migrate`. Both schemas use logged tables; no transaction spans their databases.
+
+Bodies use bounded chunk/manifest storage: they may remain entirely in PostgreSQL
+when each payload fits the configured inline bound, or use separately configured
+cache S3. This is optional reuse, not a claim that the maximum body fits default
+cache quotas or that shared-database performance has been qualified.
 
 Supply `GIT_RS_CACHE_NAMESPACE` and `GIT_RS_CACHE_OWNER` as stable, canonical
 lowercase UUIDs. They bind an explicitly owned namespace and its immutable
@@ -118,6 +144,91 @@ responses destroy their sessions. Successful sessions are fully consumed/reset.
 RAM accounting excludes allocator/runtime/TLS overhead; provision additional
 headroom. Payload callbacks must buffer complete success and validate source/read
 authority before returning it, rather than stream a result before the final check.
+
+### Authenticated checkpoints and warming
+
+Without a checkpoint key, optional cache configuration can retain complete bodies;
+invalid/unavailable ordinary cache setup leaves the local derivation path available.
+Setting `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` instead makes startup validate the cache
+configuration and signing file explicitly; invalid signing configuration fails
+startup rather than silently selecting an unauthenticated checkpoint writer.
+
+The signing file must be a regular non-symlink file at an absolute path, exactly
+32 random bytes, owned by root or the service UID and with no group/other access.
+Every ancestor must be a real directory owned by root or the service UID, without
+group/other write permission. A private child directory under world-writable
+`/tmp` does not meet this policy. Provision through secret management; never log
+the bytes, embed them in values, or put them in command arguments. Symlink-based
+Secret projections must be adapted to a protected real-file layout before use.
+
+Authorized producers sharing checkpoints must share the namespace, immutable
+cache owner UUID and key, and run the bound producer/options implementation.
+HMAC-SHA256 authenticates completed objects/mappings and both complete byte-line
+partitions, scoped to repository, principal, generation, storage epoch, query and
+producer/options. Objects additionally verify kind, size and OID. Checksums or
+well-formed mappings alone do not prove canonical Myers tie selection. No suspended
+traversal frontier or vendor interner state is a reusable checkpoint.
+
+Rotate by provisioning a new protected key file and restarting all producers.
+There is no key-file hot reload; existing processes retain the old key in memory.
+New instances treat old-key checkpoints as optional misses, not authorization.
+Changing the key does not rotate cache ownership or authorize purging old data.
+For namespace rotation, use a fresh canonical UUID/prefix, declare its owner and
+quotas explicitly, and quiesce old writers/readers before separately fenced cleanup.
+
+The bounded WorkSet stores at most 16 MiB of framed records plus 3072-record
+metadata, 2048 mappings, 4 MiB per mapping and 1 MiB per object. Capacity and
+temporary copies share the 1 GiB job budget, not a process RSS guarantee. Imports
+become visible only after cache-consumption and fresh source fences. Callbacks do
+no SQL/network I/O. Complete-edge checkpoints occur after 256 successful mapping
+insertions or five seconds, plus a final complete batch. Optional storage writes
+may be skipped; source/codec errors and cancellation cannot become cache success.
+
+`GIT_RS_BLAME_WARM_PATH` opts into one literal percent-encoded path, without tree
+discovery. Only confirmed publication can schedule a changed branch tip. Warming
+uses the same CPU pool and actual-work admission, one warm slot, and an independent
+30-second deadline assigned before submission. Fresh authorization/generation/
+epoch/tip checks happen after dequeue. It may consume query capacity; busy/stale/
+failed warming cannot reject or roll back a confirmed push. Keep it disabled until
+its resource impact is qualified for the deployment.
+
+### Cache schema upgrade and rollback
+
+The cache schema is now version 2; the authoritative source schema remains separate.
+Use this forward-only procedure with the dedicated cache role and explicit
+namespace/owner configuration:
+
+1. Inventory all cache producers, readers and maintenance owners. Preserve the
+   old cache database/object-prefix ownership records and plan rollback isolation.
+2. Run `git-rs cache-migrate` using the new binary against the intended cache
+   database. It serializes migration, creates v1 if absent, then transactionally
+   applies v1-to-v2. A failed upgrade transaction leaves an existing v1 unchanged.
+3. Verify version 2 and run the owned migration/functional acceptance harness before
+   exposing new cache-backed features. Do not infer this from source `migrate` or
+   ordinary non-ignored tests. The new migration harness is not yet in public CI.
+4. For rollback, do not downgrade tables or reset version numbers. An old
+   `cache-migrate` binary rejects v2. Existing old opaque-cache runtimes may still
+   have valid holds; rejection by their migrator is not proof that they stopped.
+5. Run the old application with caching disabled, or provision a separate
+   old-version-compatible cache database/schema with a fresh namespace UUID/object
+   prefix and explicit ownership. A fresh UUID in the upgraded v2 database alone
+   does not make its schema v1-compatible. Never reuse old payload identities.
+6. Retire old namespaces only after explicit writer/reader quiescence and the
+   normal fenced read-hold/grace/deletion procedure. An empty replacement database
+   cannot authorize deletion in the old object prefix.
+
+### Verification and publication limits
+
+Current CI runs the older bounded `tests/cache_gate.py` qualification, ordinary
+workspace checks, and full native integration. It does not yet wire the new
+`tests/blame_artifacts.py` contracts/faults/legacy-migration harness or focused
+`--blame-core-only` gate. New ignored blame contracts need explicit owned fixtures;
+see the [current coverage inventory](docs/rust-data-plane.md#current-ci-coverage-and-publication-gaps).
+Legacy migration evidence requires actual old binaries with verified hashes.
+Runtime codec rejection probes that modify runtime files require disposable
+isolated containers, never the runner host. Root/memo evidence is functional and
+actual-work reuse evidence only: no Stage 5/8 production performance result or
+deployment HA qualification is available. Keep tuning switches off.
 
 ## Authenticated HTTP listener
 

@@ -110,7 +110,7 @@ class Fixture:
         self.containers, self.processes = [], []
         self.results = {"completed": False, "fixture": self.identity, "cases": {}}
         self.cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))[:2]))
-        self.env = {key: value for key, value in os.environ.items() if key in ("PATH", "LANG", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_NET_OFFLINE")}
+        self.env = {key: value for key, value in os.environ.items() if key in ("PATH", "LANG", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_NET_OFFLINE", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR")}
         self.env.update(PGHOST="127.0.0.1", PGUSER="postgres", PGDATABASE="git_rs",
                         PGPASSWORD="development-only", PGSSLMODE="disable", PGCONNECT_TIMEOUT="2",
                         GIT_RS_DEV_HTTP="1", GIT_RS_CACHE_PGUSER="git_rs_cache",

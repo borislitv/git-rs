@@ -131,14 +131,58 @@ impl Postgres {
     pub fn migrate(&self) -> Result<()> {
         self.run(async {
             let connection = self.acquire().await?;
+            // Session ownership spans the independently transactional migration
+            // files. An error/interruption destroys Checkout and releases this
+            // lock; never recycle a session retaining migration authority.
             connection
                 .client()
-                .batch_execute(include_str!("../../migrations/cache/001.sql"))
+                .batch_execute("SELECT pg_advisory_lock(91079170002)")
                 .await
                 .map_err(sql_error)?;
+            let exists: bool = connection
+                .client()
+                .query_one(
+                    "SELECT to_regclass('git_rs_cache.schema_version') IS NOT NULL",
+                    &[],
+                )
+                .await
+                .map_err(sql_error)?
+                .try_get(0)?;
+            let mut version: i32 = if exists {
+                connection
+                    .client()
+                    .query_one(
+                        "SELECT version FROM git_rs_cache.schema_version WHERE singleton",
+                        &[],
+                    )
+                    .await
+                    .map_err(sql_error)?
+                    .try_get(0)?
+            } else {
+                0
+            };
+            if version == 0 {
+                connection
+                    .client()
+                    .batch_execute(include_str!("../../migrations/cache/001.sql"))
+                    .await
+                    .map_err(sql_error)?;
+                version = 1;
+            }
+            if version == 1 {
+                connection
+                    .client()
+                    .batch_execute(include_str!("../../migrations/cache/002.sql"))
+                    .await
+                    .map_err(sql_error)?;
+                version = 2;
+            }
+            if version != 2 {
+                return Err(invalid("unsupported cache schema version"));
+            }
             connection
                 .client()
-                .batch_execute("ROLLBACK; RESET ALL;")
+                .batch_execute("SELECT pg_advisory_unlock(91079170002); ROLLBACK; RESET ALL;")
                 .await
                 .map_err(sql_error)?;
             connection.recycle();

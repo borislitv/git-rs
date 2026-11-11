@@ -59,20 +59,38 @@ pub struct Operation {
 thread_local! { static OPERATION: RefCell<Option<Arc<Operation>>> = const { RefCell::new(None) }; }
 
 impl Operation {
-    pub fn new(seconds: u64) -> Arc<Self> {
+    /// Preserve an existing absolute deadline when bridging independently owned
+    /// CPU work and source I/O. This never resets a queue or response budget.
+    pub fn until(deadline: Instant) -> Arc<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let now = Instant::now();
-        // Independent cleanup budgets retain their parent's diagnostic context,
-        // without inheriting its deadline or cancellation state.
         let timing = Self::current().map_or_else(
             || (NEXT_ID.fetch_add(1, Ordering::Relaxed), now),
             |parent| parent.timing,
         );
         Arc::new(Self {
-            deadline: now + Duration::from_secs(seconds),
+            deadline,
             cancelled: AtomicBool::new(false),
             timing,
         })
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            Err(invalid("operation cancelled or deadline exceeded"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn new(seconds: u64) -> Arc<Self> {
+        // Independent cleanup budgets retain their parent's diagnostic context,
+        // without inheriting its deadline or cancellation state.
+        Self::until(Instant::now() + Duration::from_secs(seconds))
     }
     pub(crate) fn timing(&self) -> (u64, Instant) {
         self.timing

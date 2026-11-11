@@ -128,6 +128,175 @@ pub struct Object {
     pub data: CapacityBuffer,
 }
 
+/// A hash-verified immutable value, not evidence of source membership or authority.
+/// Private backing and header/identity fields keep the proof bound to these exact
+/// bytes. Converting to the mutable Object API consumes this witness.
+pub struct VerifiedObject {
+    id: gix_hash::ObjectId,
+    kind: Kind,
+    backing: VerifiedBacking,
+    // Pack witnesses preserve the complete chain's checked resource summary,
+    // so handing an existing immutable owner to a tighter session cannot hide
+    // intermediate sizes/depth. A generic mutable result has no pack attestation.
+    pack_plan: Option<crate::pack::DecodePlan>,
+}
+
+enum VerifiedBacking {
+    Owned(CapacityBuffer),
+    Cached(crate::pack::CachedObject),
+}
+
+impl std::fmt::Debug for VerifiedObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedObject")
+            .field("id", &self.id)
+            .field("header", &self.header())
+            .field("capacity", &self.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedObject {
+    /// Verify one mutable provider result before sealing its ownership. This is
+    /// the only public constructor; no caller-provided attestation is accepted.
+    pub fn verify(
+        id: &oid,
+        object: Object,
+        control: &Control,
+        budget: &CapacityBudget,
+        limits: ReadLimits,
+    ) -> Result<Self> {
+        let value = Self {
+            id: id.to_owned(),
+            kind: object.kind,
+            backing: VerifiedBacking::Owned(object.data),
+            pack_plan: None,
+        };
+        value.validate(id, control, budget, limits)?;
+        let mut hash = gix_hash::hasher(id.kind());
+        hash.update(&gix_object::encode::loose_header(
+            value.kind,
+            value.as_slice().len() as u64,
+        ));
+        for chunk in value.as_slice().chunks(32 * 1024) {
+            control.check()?;
+            hash.update(chunk);
+        }
+        if hash.try_finalize()?.as_ref() != id {
+            return Err(invalid("physical object hash mismatch"));
+        }
+        control.check()?;
+        Ok(value)
+    }
+
+    // Trusted pack implementation only: decode_at has checked the complete
+    // physical hash, and the caller copies those exact bytes under control.
+    pub(crate) fn from_pack_verified(
+        id: &oid,
+        kind: Kind,
+        data: CapacityBuffer,
+        plan: crate::pack::DecodePlan,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            kind,
+            backing: VerifiedBacking::Owned(data),
+            pack_plan: Some(plan),
+        }
+    }
+
+    pub(crate) fn from_cached(value: crate::pack::CachedObject) -> Self {
+        let plan = value.plan();
+        Self {
+            id: value.id(),
+            kind: value.header().kind,
+            backing: VerifiedBacking::Cached(value),
+            pack_plan: Some(plan),
+        }
+    }
+
+    pub fn id(&self) -> &oid {
+        self.id.as_ref()
+    }
+    pub fn header(&self) -> Header {
+        Header {
+            kind: self.kind,
+            size: self.as_slice().len() as u64,
+        }
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.backing {
+            VerifiedBacking::Owned(data) => data.as_slice(),
+            VerifiedBacking::Cached(data) => data.as_slice(),
+        }
+    }
+    pub fn capacity(&self) -> usize {
+        match &self.backing {
+            VerifiedBacking::Owned(data) => data.capacity(),
+            VerifiedBacking::Cached(data) => data.capacity(),
+        }
+    }
+
+    fn validate(
+        &self,
+        requested: &oid,
+        control: &Control,
+        budget: &CapacityBudget,
+        limits: ReadLimits,
+    ) -> Result<()> {
+        control.check()?;
+        limits.validate()?;
+        if self.id() != requested {
+            return Err(invalid("verified object identity mismatch"));
+        }
+        if self.as_slice().len() > limits.max_object_bytes {
+            return Err(invalid("object byte limit exceeded"));
+        }
+        if let Some(plan) = self.pack_plan {
+            plan.validate(limits)?;
+        }
+        let shared = match &self.backing {
+            VerifiedBacking::Owned(data) => data.shares_budget(budget),
+            VerifiedBacking::Cached(data) => data.shares_budget(budget),
+        };
+        if !shared {
+            return Err(invalid("verified object budget identity mismatch"));
+        }
+        control.check()?;
+        Ok(())
+    }
+
+    /// Consume/discard the witness. Mutable returned bytes carry no reusable
+    /// attestation; converting an immutable cache pin necessarily copies it.
+    pub fn into_object(self, control: &Control, budget: &CapacityBudget) -> Result<Object> {
+        control.check()?;
+        let kind = self.kind;
+        let data = match self.backing {
+            VerifiedBacking::Owned(data) => {
+                if !data.shares_budget(budget) {
+                    return Err(invalid("verified object budget identity mismatch"));
+                }
+                data
+            }
+            VerifiedBacking::Cached(pin) => {
+                if !pin.shares_budget(budget) {
+                    return Err(invalid("verified object budget identity mismatch"));
+                }
+                let mut data = budget.buffer(pin.as_slice().len())?;
+                for chunk in pin.as_slice().chunks(32 * 1024) {
+                    control.check()?;
+                    let start = data.as_slice().len();
+                    data.resize(start + chunk.len(), 0)?;
+                    data.as_mut_slice()[start..].copy_from_slice(chunk);
+                }
+                data
+            }
+        };
+        control.check()?;
+        Ok(Object { kind, data })
+    }
+}
+
 /// Trust boundary for a previously verified catalog and pinned immutable bytes.
 ///
 /// Implementors must retain their source lease/pins for their entire lifetime,
@@ -135,7 +304,9 @@ pub struct Object {
 /// notably, the known empty-tree ID is not evidence that a tree exists. Reads
 /// must allocate through `budget`, enforce `limits`, and poll `control` inside
 /// expensive work. Never consult config, alternates, hooks or a working tree.
-/// The session additionally verifies the hash of every returned full object.
+/// Mutable results are verified on every read by the default verified_object
+/// seam. Overrides may return an opaque immutable witness, never a public proof
+/// bit attached to mutable Object bytes. Neither form authorizes source access.
 pub trait VerifiedObjectProvider {
     fn identity(&self) -> &SnapshotIdentity;
     fn header(&self, id: &oid, control: &Control) -> Result<Option<Header>>;
@@ -146,6 +317,23 @@ pub trait VerifiedObjectProvider {
         budget: &CapacityBudget,
         limits: ReadLimits,
     ) -> Result<Option<Object>>;
+
+    /// Resolve physical membership/source authority on every call, independently
+    /// of any byte-integrity witness. The default reads once and verifies that
+    /// mutable result, including after prior successful reads. Missing is final,
+    /// not a request to try a second provider read or manufacture a virtual object.
+    fn verified_object(
+        &self,
+        id: &oid,
+        control: &Control,
+        budget: &CapacityBudget,
+        limits: ReadLimits,
+    ) -> Result<Option<VerifiedObject>> {
+        control.check()?;
+        self.object(id, control, budget, limits)?
+            .map(|object| VerifiedObject::verify(id, object, control, budget, limits))
+            .transpose()
+    }
 
     fn pack_location(
         &self,
@@ -244,31 +432,22 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
     }
 
     pub fn object(&self, id: &oid) -> Result<Option<Object>> {
+        self.verified_object(id)?
+            .map(|object| object.into_object(&self.control, &self.capacity))
+            .transpose()
+    }
+
+    pub fn verified_object(&self, id: &oid) -> Result<Option<VerifiedObject>> {
         self.control.check()?;
         self.check_hash_kind(id)?;
-        let object = self
-            .provider
-            .object(id, &self.control, &self.capacity, self.limits)?;
+        let object =
+            self.provider
+                .verified_object(id, &self.control, &self.capacity, self.limits)?;
         self.control.check()?;
         let Some(object) = object else {
             return Ok(None);
         };
-        let bytes = object.data.as_slice();
-        if bytes.len() > self.limits.max_object_bytes {
-            return Err(invalid("object byte limit exceeded"));
-        }
-        let mut hash = gix_hash::hasher(id.kind());
-        hash.update(&gix_object::encode::loose_header(
-            object.kind,
-            bytes.len() as u64,
-        ));
-        for chunk in bytes.chunks(64 * 1024) {
-            self.control.check()?;
-            hash.update(chunk);
-        }
-        if hash.try_finalize()?.as_ref() != id {
-            return Err(invalid("physical object hash mismatch"));
-        }
+        object.validate(id, &self.control, &self.capacity, self.limits)?;
         self.control.check()?;
         Ok(Some(object))
     }
@@ -369,20 +548,20 @@ impl<P: VerifiedObjectProvider> gix_object::Find for SnapshotSession<P> {
     ) -> gix_error::Result<Option<gix_object::Data<'a>>> {
         buffer.clear();
         let result = (|| -> Result<Option<gix_object::Kind>> {
-            let Some(object) = self.object(id)? else {
+            let Some(object) = self.verified_object(id)? else {
                 return Ok(None);
             };
-            if buffer.capacity() < object.data.as_slice().len() {
+            if buffer.capacity() < object.as_slice().len() {
                 return Err(invalid(
                     "Find requires an admitted buffer with sufficient capacity",
                 ));
             }
-            for chunk in object.data.as_slice().chunks(32 * 1024) {
+            for chunk in object.as_slice().chunks(32 * 1024) {
                 self.control.check()?;
                 buffer.extend_from_slice(chunk);
             }
             self.control.check()?;
-            Ok(Some(object.kind))
+            Ok(Some(object.header().kind))
         })();
         match result {
             Ok(Some(kind)) => Ok(Some(gix_object::Data::new(buffer, kind, id.kind()))),
