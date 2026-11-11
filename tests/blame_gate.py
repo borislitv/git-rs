@@ -332,7 +332,7 @@ def cleanup_label(label):
     ids = output(query, timeout=5).split()
     require(all(re.fullmatch(r"[0-9a-f]{12,64}", x) for x in ids), "invalid Docker container ID")
     if ids:
-        command(["docker", "rm", "-f", *ids], timeout=20)
+        command(["docker", "rm", "-f", "-v", *ids], timeout=20)
     require(not output(query, timeout=5), "owned blame gate containers remain")
 
 

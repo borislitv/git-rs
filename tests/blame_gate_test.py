@@ -145,8 +145,8 @@ class GateTests(unittest.TestCase):
                 raise AssertionError(argv)
 
             def remove(argv, **kwargs):
-                self.assertEqual(argv[:3], ["docker", "rm", "-f"])
-                for key in argv[3:]:
+                self.assertEqual(argv[:4], ["docker", "rm", "-f", "-v"])
+                for key in argv[4:]:
                     del containers[key]
 
             with self.subTest(failure=type(failure).__name__), patch.dict(os.environ, env), \
@@ -207,7 +207,7 @@ class GateTests(unittest.TestCase):
             return "\n".join(key for key, owner in containers.items() if owner == token)
 
         def remove(argv, **kwargs):
-            for key in argv[3:]:
+            for key in argv[4:]:
                 del containers[key]
 
         with patch.dict(os.environ, {"BLAME_GATE_PREP_TOKEN": token}), \
@@ -229,10 +229,49 @@ class GateTests(unittest.TestCase):
         self.assertEqual(query.call_count, 2)
         self.assertEqual(query.call_args_list[0].args[0], expected)
         self.assertEqual(query.call_args_list[1].args[0], expected)
-        remove.assert_called_once_with(["docker", "rm", "-f", "123456abcdef"], timeout=20)
+        remove.assert_called_once_with(["docker", "rm", "-f", "-v", "123456abcdef"], timeout=20)
+
+    def test_independent_cleanup_reaps_anonymous_volumes_but_preserves_named_shared_and_foreign_state(self):
+        token = "a" * 32
+        owned, foreign = "1" * 64, "2" * 64
+        for label, cleanup in ((gate.LABEL + token, gate.cleanup),
+                               (gate.PREPARATION_LABEL + token, lambda: gate.cleanup_preparation(token))):
+            with self.subTest(label=label):
+                containers = {owned: {"label": label, "volumes": {"anonymous", "named", "shared"}},
+                              foreign: {"label": "foreign", "volumes": {"named", "shared", "foreign"}}}
+                sentinel = copy.deepcopy(containers[foreign])
+                volumes = {"anonymous", "named", "shared", "foreign"}
+                removed = []
+
+                def query(argv, **kwargs):
+                    self.assertEqual(argv, ["docker", "ps", "-aq", "--filter", "label=" + label])
+                    return "\n".join(key for key, value in containers.items() if value["label"] == label)
+
+                def remove(argv, **kwargs):
+                    self.assertEqual(kwargs["timeout"], 20)
+                    self.assertEqual(argv[:3], ["docker", "rm", "-f"])
+                    ids = [item for item in argv[3:] if item != "-v"]
+                    self.assertEqual(ids, [owned])
+                    for identity in ids:
+                        mounts = containers.pop(identity)["volumes"]
+                        removed.append(identity)
+                        if "-v" in argv:
+                            # Docker removes only anonymous volumes with no remaining users.
+                            for volume in mounts - {"named"}:
+                                if not any(volume in value["volumes"] for value in containers.values()):
+                                    volumes.remove(volume)
+
+                with patch.dict(os.environ, {"INVOCATION_ID": token}), \
+                        patch.object(gate, "output", side_effect=query), \
+                        patch.object(gate, "command", side_effect=remove):
+                    cleanup()
+                    cleanup()
+                self.assertEqual(removed, [owned])
+                self.assertEqual(containers, {foreign: sentinel})
+                self.assertEqual(volumes, {"named", "shared", "foreign"})
 
     def test_failed_or_invalid_query_never_falls_through_to_removal(self):
-        for result in (subprocess.TimeoutExpired("docker", 5), "--all"):
+        for result in (subprocess.TimeoutExpired("docker", 5), "--all", "123456abcdef --all"):
             with self.subTest(result=type(result).__name__), \
                     patch.dict(os.environ, {"INVOCATION_ID": "a" * 32}), \
                     patch.object(gate, "output", side_effect=result if isinstance(result, Exception)
