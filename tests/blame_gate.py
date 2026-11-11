@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -417,6 +418,130 @@ def root_environment(fixture):
     return env
 
 
+def runtime_container(reference):
+    records = json.loads(output(["docker", "inspect", reference], timeout=5))
+    require(len(records) == 1, "runtime container identity is ambiguous")
+    return records[0]
+
+
+def runtime_outer(token, slice_name, expected_id=None, cpus=(1000000000,)):
+    name = "git-rs-blame-" + token
+    value = runtime_container(expected_id or name)
+    identity = value["Id"]
+    require(re.fullmatch(r"[0-9a-f]{64}", identity), "invalid runtime outer ID")
+    require(expected_id is None or identity == expected_id, "runtime outer ID changed")
+    environment = dict(item.split("=", 1) for item in value["Config"]["Env"] if "=" in item)
+    require(value["Name"] == "/" + name and value["State"]["Running"]
+            and value["Config"]["Labels"].get(LABEL[:-1]) == token
+            and environment.get("INVOCATION_ID") == token
+            and environment.get("GIT_RS_GATE_SLICE") == slice_name
+            and value["HostConfig"]["CgroupParent"] == slice_name,
+            "runtime outer ownership/invocation mismatch")
+    require(value["HostConfig"]["NanoCpus"] in cpus, "unexpected runtime outer CPU allocation")
+    # Host networking can inherit a non-ID hostname. Bind the dispatcher to the
+    # actual isolated PID namespace instead of trusting that hostname convention.
+    require(value["HostConfig"].get("PidMode", "") == "", "runtime outer shares a PID namespace")
+    require(output(["docker", "exec", identity, "/usr/bin/readlink", "/proc/self/ns/pid"], timeout=5)
+            == os.readlink("/proc/self/ns/pid"), "runtime dispatcher is not this outer container")
+    return value
+
+
+def runtime_children(name, identity=None):
+    found = output(["docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + name + "$"], timeout=5).split()
+    if identity:
+        found += output(["docker", "ps", "-aq", "--no-trunc", "--filter", "id=" + identity], timeout=5).split()
+    require(all(re.fullmatch(r"[0-9a-f]{64}", item) for item in found), "invalid runtime child discovery")
+    return set(found)
+
+
+def runtime_child(child_id, name, token, outer_id, slice_name):
+    child = runtime_container(child_id)
+    labels = child["Config"]["Labels"]
+    environment = dict(item.split("=", 1) for item in child["Config"]["Env"] if "=" in item)
+    require(child["Id"] == child_id and child["Name"] == "/" + name
+            and labels.get(LABEL[:-1]) == token
+            and labels.get("git-rs.blame-runtime-outer") == outer_id
+            and environment.get("INVOCATION_ID") == token
+            and environment.get("GIT_RS_GATE_SLICE") == slice_name
+            and child["HostConfig"]["CgroupParent"] == slice_name
+            and child["HostConfig"]["NanoCpus"] == 1000000000
+            and child["HostConfig"]["Memory"] == 256 * 1024**2
+            and child["HostConfig"]["MemorySwap"] == 256 * 1024**2
+            and child["HostConfig"]["PidsLimit"] == 32,
+            "refusing unowned or changed runtime child")
+    return child
+
+
+def remove_runtime_child(name, identity, token, outer_id, slice_name):
+    found = runtime_children(name, identity)
+    for child_id in found:
+        require(identity is None or child_id == identity, "runtime child ID changed")
+        runtime_child(child_id, name, token, outer_id, slice_name)
+    for child_id in found:
+        command(["docker", "rm", "-f", "-v", child_id], timeout=20)
+    require(not runtime_children(name, identity), "runtime child removal was not acknowledged")
+
+
+def run_root_runtime(manifest, executable, env, stream):
+    """Transfer an idle dispatcher's CPU, retaining its 1.25 combined allowance.
+
+    Never restore the donor until exact owned child removal is acknowledged,
+    including an ambiguous create/start/update failure. Global cleanup remains
+    independently responsible for interruption of the dispatcher itself.
+    """
+    token = invocation()
+    slice_name = os.environ.get("GIT_RS_GATE_SLICE", "")
+    require(re.fullmatch(SLICE_PATTERN, slice_name), "invalid runtime aggregate slice")
+    require(re.fullmatch(r"sha256:[0-9a-f]{64}", manifest["runtime_image"]), "mutable runtime image")
+    require(Path(executable) == Path("/gate/bin/blame_core"), "unexpected isolated runtime executable")
+    outer_id = runtime_outer(token, slice_name)["Id"]
+    name = "git-rs-blame-runtime-" + token + "-" + uuid.uuid4().hex
+    require(not runtime_children(name), "runtime child name already exists")
+    for key, value in (("INVOCATION_ID", token), ("GIT_RS_GATE_SLICE", slice_name)):
+        require(key not in env or env[key] == value, "conflicting runtime invocation environment")
+    child_id, donated, failure, completed = None, False, None, None
+    try:
+        command(["docker", "update", "--cpus", ".25", outer_id], timeout=10)
+        runtime_outer(token, slice_name, outer_id, (250000000,))
+        donated = True
+        arguments = ["docker", "create", "--pull=never", "--init", "--read-only", "--network", "host", "--user", "0:0",
+                     "--name", name, "--label", LABEL + token,
+                     "--label", "git-rs.blame-runtime-outer=" + outer_id,
+                     "--cgroup-parent", slice_name, "--cpus", "1", "--memory", "256m",
+                     "--memory-swap", "256m", "--pids-limit", "32",
+                     "--volumes-from", outer_id + ":ro",
+                     "--mount", "type=volume,destination=/usr/lib/x86_64-linux-gnu/gconv",
+                     "--tmpfs", "/tmp:rw,nosuid,size=128m,mode=1777",
+                     "--env", "GIT_RS_OWNED_CODEC_CONTAINER=1",
+                     "--env", "INVOCATION_ID=" + token, "--env", "GIT_RS_GATE_SLICE=" + slice_name,
+                     *[x for key in sorted(env) for x in ("--env", key + "=" + env[key])],
+                     "--entrypoint", str(executable), manifest["runtime_image"],
+                     "--ignored", "--exact", ROOT_RUNTIME, "--test-threads=1", "--nocapture"]
+        created = output(arguments, timeout=30)
+        require(re.fullmatch(r"[0-9a-f]{64}", created), "invalid created runtime child ID")
+        child_id = created
+        runtime_child(child_id, name, token, outer_id, slice_name)
+        runtime_outer(token, slice_name, outer_id, (250000000,))
+        completed = command(["docker", "start", "--attach", child_id], env=dict(os.environ, **env),
+                            timeout=300, stdout=stream, stderr=subprocess.STDOUT)
+    except BaseException as error:
+        failure = error
+    try:
+        remove_runtime_child(name, child_id, token, outer_id, slice_name)
+        current = runtime_outer(token, slice_name, outer_id,
+                                (250000000,) if donated else (250000000, 1000000000))
+        if current["HostConfig"]["NanoCpus"] == 250000000:
+            command(["docker", "update", "--cpus", "1", outer_id], timeout=10)
+            runtime_outer(token, slice_name, outer_id)
+    except BaseException as cleanup_error:
+        if failure is not None:
+            raise BaseExceptionGroup("runtime work and cleanup/restore failed", [failure, cleanup_error])
+        raise
+    if failure is not None:
+        raise failure
+    return completed
+
+
 def inside():
     token = invocation()
     require(Path("/.dockerenv").is_file(), "gate helpers run only inside the prepared test image")
@@ -480,20 +605,10 @@ def inside():
                                  "--test-threads=1", "--nocapture"]
                     environment = env
                     if suite == "blame_core" and case == ROOT_RUNTIME:
-                        # Only this disposable overlay may mutate/restore TSCII.
-                        # It uses the SAME immutable runtime image and RO binaries.
-                        arguments = ["docker", "run", "--rm", "--init", "--network", "host",
-                                     "--user", "0:0", "--cpus", ".25", "--memory", "256m",
-                                     "--memory-swap", "256m", "--pids-limit", "32",
-                                     "--volumes-from", "git-rs-blame-" + token + ":ro",
-                                     "--tmpfs", "/tmp:rw,nosuid,size=128m,mode=1777",
-                                     "--env", "GIT_RS_OWNED_CODEC_CONTAINER=1",
-                                     *[x for key in sorted(env) for x in ("--env", key)],
-                                     "--entrypoint", str(paths[suite]),
-                                     manifest["runtime_image"], *arguments[1:]]
-                        environment = dict(os.environ, **env)
-                    completed = command(arguments, env=environment,
-                                        timeout=300, stdout=stream, stderr=subprocess.STDOUT)
+                        completed = run_root_runtime(manifest, paths[suite], env, stream)
+                    else:
+                        completed = command(arguments, env=environment,
+                                            timeout=300, stdout=stream, stderr=subprocess.STDOUT)
                 require(completed.returncode == 0, "root contract failed")
                 require("1 passed; 0 failed; 0 ignored" in
                         (ROOT / f".local/{suite}-{index}.log").read_text(),

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Light gate guard/fault tests: no Docker, systemd, Git, Cargo or network."""
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -438,6 +439,187 @@ class GateTests(unittest.TestCase):
         report = json.loads((self.root / (".local/blame-gate-" + token) / "report.json").read_text())
         self.assertFalse(report["completed"])
         self.assertTrue(report["work_completed"])
+
+
+class RuntimeDaemon:
+    """Stateful Docker boundary: running allocations and removal acknowledgements."""
+    token = "a" * 32
+    outer = "1" * 64
+    sentinel = "2" * 64
+    child = "3" * 64
+    slice = "git-rs-blame-runtime12345678.slice"
+
+    def __init__(self, fault=None):
+        self.fault = fault
+        self.namespace = os.readlink("/proc/self/ns/pid")
+        self.containers = {
+            self.outer: {"Id": self.outer, "Name": "/git-rs-blame-" + self.token,
+                         "State": {"Running": True},
+                         "Config": {"Hostname": self.outer[:12], "Labels": {gate.LABEL[:-1]: self.token},
+                                    "Env": ["INVOCATION_ID=" + self.token, "GIT_RS_GATE_SLICE=" + self.slice]},
+                         "HostConfig": {"NanoCpus": 1000000000, "CgroupParent": self.slice}},
+            self.sentinel: {"Id": self.sentinel, "Name": "/unowned-sentinel",
+                            "State": {"Running": True}, "Config": {"Labels": {}},
+                            "HostConfig": {"NanoCpus": 50000000}},
+        }
+        self.preserved = copy.deepcopy(self.containers[self.sentinel])
+        self.observations = []
+        self.start_observation = None
+
+    def fail(self, point):
+        if self.fault == point or isinstance(self.fault, tuple) and point in self.fault:
+            raise subprocess.TimeoutExpired("docker " + point, 5)
+
+    def command(self, argv, **kwargs):
+        assert 0 < kwargs["timeout"] <= 300
+        result = ""
+        operation = argv[1]
+        if operation == "inspect":
+            matches = [value for key, value in self.containers.items()
+                       if key == argv[-1] or value["Name"] == "/" + argv[-1]]
+            if not matches:
+                raise subprocess.CalledProcessError(1, argv)
+            result = json.dumps(matches)
+        elif operation == "ps":
+            selector = argv[-1]
+            if selector.startswith("name=^/"):
+                name = selector.removeprefix("name=^").removesuffix("$")
+                result = "\n".join(key for key, value in self.containers.items() if value["Name"] == name)
+            else:
+                assert selector.startswith("id=")
+                result = "\n".join(key for key in self.containers if key == selector[3:])
+        elif operation == "exec":
+            assert argv == ["docker", "exec", self.outer, "/usr/bin/readlink", "/proc/self/ns/pid"]
+            result = self.namespace
+        elif operation == "update":
+            assert argv[-1] == self.outer, "never update a discovered/unowned container"
+            restoring = argv[-2] == "1"
+            self.fail("restore-before" if restoring else "donate-before")
+            if restoring:
+                assert self.child not in self.containers, "CPU restored before actual removal acknowledgement"
+            self.containers[self.outer]["HostConfig"]["NanoCpus"] = 1000000000 if restoring else 250000000
+            self.fail("restore-after" if restoring else "donate-after")
+        elif operation == "create":
+            self.fail("create-before")
+            labels = dict(argv[index + 1].split("=", 1) for index, item in enumerate(argv) if item == "--label")
+            environment = [argv[index + 1] for index, item in enumerate(argv) if item == "--env"]
+            assert argv[argv.index("--cpus") + 1] == "1"
+            assert argv[argv.index("--memory") + 1] == "256m"
+            assert argv[argv.index("--memory-swap") + 1] == "256m"
+            assert argv[argv.index("--pids-limit") + 1] == "32"
+            assert argv[argv.index("--volumes-from") + 1] == self.outer + ":ro"
+            self.containers[self.child] = {
+                "Id": self.child, "Name": "/" + argv[argv.index("--name") + 1], "State": {"Running": False},
+                "Config": {"Labels": labels, "Env": environment},
+                "HostConfig": {"NanoCpus": 1000000000, "Memory": 256 * 1024**2,
+                               "MemorySwap": 256 * 1024**2, "PidsLimit": 32, "CgroupParent": self.slice}}
+            self.fail("create-after")  # Daemon committed, client never received ID.
+            result = "malformed ID" if self.fault == "create-bad-id" else self.child
+        elif operation == "start":
+            assert argv[-1] == self.child
+            self.containers[self.child]["State"]["Running"] = True
+            self.start_observation = copy.deepcopy(self.containers)
+            self.check_allowance()
+            if self.fault == "unowned-child":
+                self.containers[self.child]["Config"]["Labels"] = {}
+            if self.fault == "outer-replaced":
+                self.containers[self.outer]["Name"] = "/changed-owner"
+            self.fail("start-timeout")  # Child is still alive, not just an exception.
+            if self.fault == "interrupted":
+                raise KeyboardInterrupt()
+            if self.fault == "start-exit":
+                self.containers[self.child]["State"]["Running"] = False
+                raise subprocess.CalledProcessError(101, argv)
+            self.containers[self.child]["State"]["Running"] = False
+        elif operation == "rm":
+            assert argv[2:4] == ["-f", "-v"] and argv[-1] == self.child
+            self.fail("remove-timeout")
+            if self.fault != "false-removal-ack":
+                del self.containers[self.child]
+        else:
+            raise AssertionError(argv)
+        self.check_allowance()
+        self.observations.append(copy.deepcopy(self.containers))
+        return SimpleNamespace(stdout=result, returncode=0)
+
+    def check_allowance(self):
+        pair = [value for key, value in self.containers.items() if key != self.sentinel]
+        assert sum(value["HostConfig"]["NanoCpus"] for value in pair if value["State"]["Running"]) <= 1250000000
+        assert self.containers[self.sentinel] == self.preserved
+
+
+class RuntimeHandoffTests(unittest.TestCase):
+    def run_case(self, daemon):
+        with patch.dict(os.environ, {"INVOCATION_ID": daemon.token, "GIT_RS_GATE_SLICE": daemon.slice,
+                                     "HOSTNAME": daemon.outer[:12]}), patch.object(gate, "command", side_effect=daemon.command):
+            return gate.run_root_runtime({"runtime_image": "sha256:" + "f" * 64},
+                                         Path("/gate/bin/blame_core"), {}, None)
+
+    def test_runtime_handoff_preserves_budget_and_nonowned_state_through_acknowledged_removal(self):
+        daemon = RuntimeDaemon()
+        self.assertEqual(self.run_case(daemon).returncode, 0)
+        during = daemon.start_observation
+        self.assertEqual(during[daemon.outer]["HostConfig"]["NanoCpus"], 250000000)
+        self.assertEqual(during[daemon.child]["HostConfig"]["NanoCpus"], 1000000000)
+        self.assertEqual(set(daemon.containers), {daemon.outer, daemon.sentinel})
+        self.assertEqual(daemon.containers[daemon.outer]["HostConfig"]["NanoCpus"], 1000000000)
+        self.assertEqual(daemon.containers[daemon.sentinel], daemon.preserved)
+
+    def test_create_update_and_running_failures_reap_actual_child_before_restoring(self):
+        for fault in ("donate-before", "donate-after", "create-before", "create-after", "create-bad-id",
+                      "start-timeout", "start-exit", "interrupted"):
+            with self.subTest(fault=fault):
+                daemon = RuntimeDaemon(fault)
+                with self.assertRaises((subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, KeyboardInterrupt)):
+                    self.run_case(daemon)
+                self.assertEqual(set(daemon.containers), {daemon.outer, daemon.sentinel})
+                self.assertEqual(daemon.containers[daemon.outer]["HostConfig"]["NanoCpus"], 1000000000)
+
+    def test_unacknowledged_or_unowned_child_refuses_restoration_and_keeps_failure_visible(self):
+        for fault in ("remove-timeout", "false-removal-ack", "unowned-child"):
+            with self.subTest(fault=fault):
+                daemon = RuntimeDaemon(fault)
+                with self.assertRaises((subprocess.TimeoutExpired, ValueError)):
+                    self.run_case(daemon)
+                self.assertIn(daemon.child, daemon.containers)
+                self.assertEqual(daemon.containers[daemon.outer]["HostConfig"]["NanoCpus"], 250000000)
+                self.assertEqual(daemon.containers[daemon.sentinel], daemon.preserved)
+
+    def test_restore_failure_is_reported_after_child_absence_and_never_changes_wrong_outer(self):
+        for fault, expected in (("restore-before", 250000000), ("restore-after", 1000000000),
+                                ("outer-replaced", 250000000)):
+            with self.subTest(fault=fault):
+                daemon = RuntimeDaemon(fault)
+                with self.assertRaises((subprocess.TimeoutExpired, ValueError)):
+                    self.run_case(daemon)
+                self.assertNotIn(daemon.child, daemon.containers)
+                self.assertEqual(daemon.containers[daemon.outer]["HostConfig"]["NanoCpus"], expected)
+
+    def test_work_failure_and_failed_removal_both_survive_without_unsafe_restoration(self):
+        daemon = RuntimeDaemon(("start-timeout", "remove-timeout"))
+        with self.assertRaises(BaseExceptionGroup) as raised:
+            self.run_case(daemon)
+        self.assertEqual(len(raised.exception.exceptions), 2)
+        self.assertTrue(all(isinstance(error, subprocess.TimeoutExpired) for error in raised.exception.exceptions))
+        self.assertTrue(daemon.containers[daemon.child]["State"]["Running"])
+        self.assertEqual(daemon.containers[daemon.outer]["HostConfig"]["NanoCpus"], 250000000)
+
+    def test_real_invocation_owner_namespace_and_original_cpu_are_required_before_any_update(self):
+        for field in ("label", "invocation", "namespace", "shared-pids", "cpu", "slice", "name"):
+            with self.subTest(field=field):
+                daemon = RuntimeDaemon()
+                outer = daemon.containers[daemon.outer]
+                if field == "label": outer["Config"]["Labels"] = {}
+                if field == "invocation": outer["Config"]["Env"] = []
+                if field == "namespace": daemon.namespace = "pid:[foreign]"
+                if field == "shared-pids": outer["HostConfig"]["PidMode"] = "host"
+                if field == "cpu": outer["HostConfig"]["NanoCpus"] = 500000000
+                if field == "slice": outer["HostConfig"]["CgroupParent"] = "foreign.slice"
+                if field == "name": outer["Name"] = "/foreign"
+                expected = copy.deepcopy(daemon.containers)
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    self.run_case(daemon)
+                self.assertEqual(daemon.containers, expected)
 
 
 if __name__ == "__main__":
