@@ -76,8 +76,9 @@ supported migration paths. Check rendered manifests and remove legacy settings;
 chart cleanup belongs to the separate Stage 11 work, not a promise that an older
 published chart configures the new cache/key/warming features.
 
-Production uses the default core options with all five performance tuning
-switches off until qualification. There is no production tuning/producer override.
+Production uses the qualified NativeRootV1 core profile with all five performance
+tuning switches on. The vendor default and explicit conservative core profile
+remain all-off. There is no production tuning/producer override.
 The default is one executing job and no queue. Waiters have individual deadlines;
 actual jobs have a finite independent lifetime and retain source holds, scratch,
 buffers and admission through cleanup. Disconnecting a running waiter cannot
@@ -205,7 +206,8 @@ namespace/owner configuration:
    applies v1-to-v2. A failed upgrade transaction leaves an existing v1 unchanged.
 3. Verify version 2 and run the owned migration/functional acceptance harness before
    exposing new cache-backed features. Do not infer this from source `migrate` or
-   ordinary non-ignored tests. The new migration harness is not yet in public CI.
+   ordinary non-ignored tests. The split public blame CI explicitly runs the
+   migration harness; inspect its actual completed inventory and results.
 4. For rollback, do not downgrade tables or reset version numbers. An old
    `cache-migrate` binary rejects v2. Existing old opaque-cache runtimes may still
    have valid holds; rejection by their migrator is not proof that they stopped.
@@ -219,16 +221,21 @@ namespace/owner configuration:
 
 ### Verification and publication limits
 
-Current CI runs the older bounded `tests/cache_gate.py` qualification, ordinary
-workspace checks, and full native integration. It does not yet wire the new
-`tests/blame_artifacts.py` contracts/faults/legacy-migration harness or focused
-`--blame-core-only` gate. New ignored blame contracts need explicit owned fixtures;
-see the [current coverage inventory](docs/rust-data-plane.md#current-ci-coverage-and-publication-gaps).
+Current CI includes bounded `tests/cache_gate.py` qualification, ordinary workspace
+checks and full native integration. Separate `blame-images` and dependent `blame`
+jobs build and transfer exact image identities, then explicitly run the ignored
+blame contracts, `tests/blame_artifacts.py` contracts/faults/legacy-migration harness
+and focused `--blame-core-only` integration. Each job retains its 20-minute bound;
+preparation and execution each retain 900-second bounds. Wiring does not establish
+successful execution: inspect the exact revision, selected inventory, results and
+cleanup artifacts. See the [current coverage inventory](docs/rust-data-plane.md#current-ci-coverage-and-publication-gaps).
 Legacy migration evidence requires actual old binaries with verified hashes.
 Runtime codec rejection probes that modify runtime files require disposable
 isolated containers, never the runner host. Root/memo evidence is functional and
-actual-work reuse evidence only: no Stage 5/8 production performance result or
-deployment HA qualification is available. Keep tuning switches off.
+actual-work reuse evidence only. Qualified synthetic native-parity/performance
+measurements do not establish a general production latency, throughput, RSS or
+deployment HA guarantee. Preserve the qualified default profile; changing it
+requires fresh native, resource and performance qualification.
 
 ## Authenticated HTTP listener
 
