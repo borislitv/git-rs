@@ -39,8 +39,9 @@
 - Cache v1-to-v2 migration is independent and forward-only. Old migrators reject v2; rollback
   requires caching disabled or a separate compatible cache schema/database and fresh owned prefix.
   Never infer old-writer quiescence from schema rejection or reuse retired payload identities.
-- Ordinary CI skips ignored contracts and currently wires only the older cache controller, not
-  the new artifact/migration harness. Track explicit joined-source functional/authentication and
-  isolated codec-runtime gates. Root/memo proofs are not Stage 5/8 production performance results.
+- Ordinary workspace tests skip ignored contracts. Split blame CI wires the explicit compiled
+  contracts, artifact/migration harness and focused serving/runtime gates; its same-workflow
+  hosted execution is pending. Preserve locally qualified coverage and finite budgets.
+  Root/memo proofs are not Stage 5/8 production performance results.
 - Public artifacts use synthetic data, reserved example domains and public sources only.
 - Keep unverified operational claims explicit. A local development test is not an HA proof.

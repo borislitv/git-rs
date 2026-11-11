@@ -239,8 +239,14 @@ reports/logs. Cleanup removes only containers carrying that invocation's ownersh
 label. Docker fixtures have their own harness resource caps; the systemd cgroup
 does not contain Docker-daemon-owned containers. The wrapper requires measured
 runtime, failure/timeout cleanup and resource qualification before becoming a CI gate.
-The new ignored-contract and legacy-migration gates are not enabled in current CI;
-do not infer coverage from this compile step or claim a measured 900-second fit.
+The full public gate has local qualification: 58 selected contracts, 11 migration/
+artifact groups, four isolated runtime scenarios and 31 focused serving checks.
+The split `blame-images` / `blame` workflow keeps both jobs at 20 minutes and
+preparation/measurement units at 900 seconds. Image transfer verifies one
+uncompressed archive's checksum, both immutable IDs and the current commit before
+preparation; no registry credentials or Docker user configuration are exported.
+The first exact-HEAD hosted split execution and cold image-job fit remain pending.
+Do not infer those results from this standalone compile step or raise its budgets.
 
 A socket-controlled test observer checks real query overlap/queuing, overflow and
 cleanup without replacing attribution. Native Git independently supplies expected

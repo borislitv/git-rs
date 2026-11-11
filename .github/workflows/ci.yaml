@@ -59,10 +59,72 @@ jobs:
             .local/derived-cache-*/report.json
             .local/derived-cache-*/*.log
             .local/derived-cache-*/*.stderr
-  # Preparation only: enable after parent qualification proves the complete gate
-  # fits 900s, aggregate limits and failure/timeout cleanup. No fixed test count.
+  # Images have their own 20-minute job; preparation and measurement keep their
+  # independent 900-second bounds. Cold hosted-image timing remains observable.
+  blame-images:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check bounded image handoff and ownership guards
+        run: python3 -B tests/blame_images_test.py
+      - name: Build both exact shared-base Dockerfile targets with bounded workers
+        run: |
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          slice="git-rs-blame-images-$tag.slice"
+          printf 'BLAME_IMAGE_SLICE=%s\n' "$slice" >> "$GITHUB_ENV"
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
+          [Unit]
+          Description=Owned legacy image build workers
+          [Slice]
+          CPUQuota=200%
+          AllowedCPUs=$cpus
+          MemoryMax=4G
+          MemorySwapMax=0
+          TasksMax=256
+          EOF
+          sudo systemctl daemon-reload
+          for target in test-fixture-build test; do
+            unit="git-rs-blame-images-$target-$tag.service"
+            printf 'BLAME_IMAGE_UNIT=%s\n' "$unit" >> "$GITHUB_ENV"
+            sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
+              --working-directory="$GITHUB_WORKSPACE" \
+              --property="User=$(id -un)" --property="Group=$(id -gn)" \
+              --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+              --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
+              --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_images.py cleanup --slice $slice" \
+              /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/blame_images.py" build \
+                --target "$target" --tag "git-rs:blame-$target" --unit "$unit" --slice "$slice" \
+                --directory "$GITHUB_WORKSPACE/.local/blame-images"
+          done
+      - name: Export both immutable images once with commit and archive identity
+        run: python3 -B tests/blame_images.py export --directory .local/blame-images --commit "$GITHUB_SHA"
+      - name: Stop only owned legacy image workers
+        if: always()
+        run: |
+          if [ -n "${BLAME_IMAGE_SLICE:-}" ]; then
+            if [ -n "${BLAME_IMAGE_UNIT:-}" ] && [ "$(systemctl show "$BLAME_IMAGE_UNIT" --property=LoadState --value)" != not-found ]; then
+              sudo systemctl stop "$BLAME_IMAGE_UNIT" || [ "$(systemctl show "$BLAME_IMAGE_UNIT" --property=LoadState --value)" = not-found ]
+            fi
+            python3 -B tests/blame_images.py cleanup --slice "$BLAME_IMAGE_SLICE"
+            sudo systemctl stop "$BLAME_IMAGE_SLICE"
+            sudo rm -f -- "/run/systemd/system/$BLAME_IMAGE_SLICE"
+            sudo systemctl daemon-reload
+          fi
+      - name: Upload this run and attempt's exact image archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blame-images-${{ github.run_id }}-${{ github.run_attempt }}
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            .local/blame-images/images.tar
+            .local/blame-images/manifest.json
   blame:
-    if: ${{ false }}
+    needs: blame-images
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -76,10 +138,14 @@ jobs:
           persist-credentials: false
       - name: Light controller guards and fault tests
         run: python3 -B tests/blame_gate_test.py
-      - name: Build shared-OS compiler and immutable native test images
+      - name: Download only this run and attempt's image handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: blame-images-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/blame-images
+      - name: Verify and load both images before preparation
         run: |
-          docker build --target test-fixture-build -t git-rs:blame-build .
-          docker build --target test -t git-rs:blame-test .
+          python3 -B tests/blame_images.py load --directory .local/blame-images --commit "$GITHUB_SHA" --env-file "$GITHUB_ENV"
           python3 -B tests/blame_gate.py images > "$RUNNER_TEMP/blame-images"
           while IFS= read -r image; do docker pull "$image"; done < "$RUNNER_TEMP/blame-images"
       - name: Prebuild current contracts and exact legacy binaries; seal provenance
@@ -111,6 +177,8 @@ jobs:
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
             --setenv="BLAME_GATE_PREP_UNIT=$unit" --setenv="BLAME_GATE_PREP_SLICE=$slice" \
             --setenv="BLAME_GATE_PREP_TOKEN=$token" \
+            --setenv="BLAME_GATE_BUILDER_IMAGE=$BLAME_GATE_BUILDER_IMAGE" \
+            --setenv="BLAME_GATE_IMAGE=$BLAME_GATE_IMAGE" \
             /usr/bin/make blame-gate-prepare
           manifest="$GITHUB_WORKSPACE/.local/blame-prebuilt/manifest.json"
           hash=$(sha256sum "$manifest")

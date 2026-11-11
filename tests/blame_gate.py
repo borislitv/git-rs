@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare immutable inputs and supervise the NOT-YET-QUALIFIED blame gate.
+"""Prepare immutable inputs and supervise the locally qualified public blame gate.
 
 Preparation builds outside measurement. Execution requires an independently
 bounded systemd unit and a dedicated aggregate slice, including Docker fixtures.

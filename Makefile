@@ -18,6 +18,7 @@ core-source-check:
 check: core-source-check
 	python3 -B tests/integration_process_test.py
 	python3 -B tests/blame_gate_test.py
+	python3 -B tests/blame_images_test.py
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --locked --workspace --all-targets
@@ -43,7 +44,7 @@ cache-check:
 blame-gate-prepare:
 	python3 -B tests/blame_gate.py prepare --bundle "$(BLAME_GATE_BUNDLE)" --builder-image "$(BLAME_GATE_BUILDER_IMAGE)" --image "$(BLAME_GATE_IMAGE)"
 
-# The disabled CI job supplies a bounded unit, aggregate slice and prepared manifest hash.
+# Split CI supplies verified images, bounded units/slices and a sealed manifest hash.
 blame-gate-check:
 	python3 -B tests/blame_gate.py run --bundle "$(BLAME_GATE_BUNDLE)" --unit "$$BLAME_GATE_UNIT" --slice "$$BLAME_GATE_SLICE" --manifest-sha256 "$$BLAME_GATE_MANIFEST_SHA256"
 

@@ -238,22 +238,36 @@ These checks do not qualify general Git derivation, serving integration or HA.
 
 ### Current CI coverage and publication gaps
 
-The active cache CI job invokes only the older `cache_gate.py` controller.
-`make check` does not execute ignored contracts. The disabled blame gate discovers
+The cache CI job invokes the older `cache_gate.py` controller.
+`make check` does not execute ignored contracts. The separate blame gate discovers
 the exact ignored-test inventory from each compiled suite's `--ignored --list`,
 including nested runtime modules, and records the selected names in its sealed
 manifest. It excludes only the named subprocess helpers `artifact_process`,
 `checkpoint_reuse_child`, `warm_cache_outage_child` and
 `runtime_support::runtime_child`; helpers execute through their parent contracts.
 There is no fixed contract-count acceptance threshold. These contracts require
-explicit owned fixtures. The disabled job wires `tests/blame_artifacts.py` for
+explicit owned fixtures. The split job wires `tests/blame_artifacts.py` for
 contracts/faults/migration; its legacy phase requires real old binaries and their
-verified hashes. A green ordinary workspace test is not migration evidence, and
-disabled wiring is not executed CI coverage.
+verified hashes. The complete actual public gate locally passed 58 selected
+contracts, 11 artifact/migration groups, four runtime scenarios plus their parent,
+and 31 focused serving checks. Cached-image build through completed measurement
+took 954.561 seconds, including orchestration, under the 20-minute budget.
+A green ordinary workspace test is not migration evidence.
+
+CI now separates `blame-images` from `blame`: each job retains a 20-minute ceiling.
+The former uses bounded legacy Docker workers for both exact shared-base targets,
+then saves both immutable IDs into one uncompressed layer-deduplicated archive.
+The same workflow/run/attempt artifact contains its SHA256 and current commit;
+the latter job verifies archive descriptor/config image IDs and checkout before
+loading, then retains separate 900-second preparation and measurement units.
+Image-build/Cargo downloads and existing runtime fixtures use host networking; image
+inspection remains offline. Cold image builds, artifact upload/download and the
+first exact-HEAD hosted split run remain pending, not inferred from cached local
+qualification. No deadline/resource limit is raised to accommodate those costs.
 
 Native integration CI invokes the full integration harness and its concurrency
-path; it does not invoke the focused `--blame-core-only` mode. The Make focused
-entrypoints are wiring, not a qualified CI gate. Root/checkpoint functional and
+path; the split blame job additionally invokes focused `--blame-core-only` mode
+using the shipped release executable. Root/checkpoint functional and
 actual-work reuse proofs do not establish a Stage 5/8 production performance result.
 There is no such performance result yet. Re-run joined-source functional,
 authentication, migration and isolated runtime-codec gates before publication;
