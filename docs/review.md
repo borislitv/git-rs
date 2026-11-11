@@ -76,6 +76,18 @@ suites passed with 64 MiB synthetic data, signature verification by the real S3 
 SSH/authenticated HTTP, cold reconstruction and unknown PUT/COMMIT behavior. These are
 correctness observations, not comparative GitLab timings or a new HA qualification.
 
+The connection-reuse regression uses a trusted loopback TLS server that completes
+one handshake and serves all three policy requests on that connection. It leaves
+additional handshakes pending: the pinned HTTP/1 pool returns drained connections
+through a separately scheduled idle task, and may otherwise establish a new
+connection before that task runs. Body EOF is not a pool-return acknowledgement.
+The fixture therefore tests reuse of the shared client without assuming an
+immediate idle transition; a fresh client per request still fails. The previous
+plaintext fixture serviced only one socket at a time, treating its five-second
+read timeout as EOF before accepting a second socket. It could consequently
+serve three successful requests on two connections despite complete body draining.
+No serving transport, pool limits, deadlines or retry policy changed for this fix.
+
 The final optimized binary repeated the 64 MiB integration and fault suites with
 timing diagnostics disabled. The exact test image also passed the real Helm/k3s
 smoke with two replicas, verified TLS PostgreSQL/S3, SSH and authenticated HTTP,

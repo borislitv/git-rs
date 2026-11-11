@@ -164,13 +164,78 @@ impl Drop for Directory {
 
 #[test]
 fn consecutive_s3_requests_reuse_a_connection() {
-    let policy = b"<VersioningConfiguration/>";
-    let server = Server::new((0..3).map(|_| Reply::Complete(policy.to_vec())).collect());
-    let store = server.store();
-    for _ in 0..3 {
-        store.require_unversioned().unwrap();
-    }
-    let peers = server.finish();
+    let (identity, certificate) = tls_identity();
+    let directory = Directory::new();
+    let ca = directory.0.join("ca.pem");
+    fs::write(&ca, certificate).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (socket, peer) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
+        let mut stream = BufReader::new(acceptor.accept(socket).unwrap());
+        let mut peers = Vec::new();
+        // Keep the listener alive, but complete only one TLS handshake. A
+        // speculative second connection cannot beat the original connection's
+        // asynchronous return to the HTTP pool. A per-call Client cannot reuse
+        // that pool and fails within the bounded request budget instead.
+        for _ in 0..3 {
+            let mut header = String::new();
+            assert!(stream.read_line(&mut header).unwrap() > 0);
+            assert!(header.starts_with("GET /test-bucket?versioning "));
+            let mut headers = 0;
+            loop {
+                header.clear();
+                assert!(stream.read_line(&mut header).unwrap() > 0);
+                if header == "\r\n" {
+                    break;
+                }
+                headers += 1;
+                assert!(headers <= 100);
+            }
+            peers.push(peer);
+            stream
+                .get_mut()
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\n<VersioningConfiguration/>",
+                )
+                .unwrap();
+        }
+        drop(listener);
+        peers
+    });
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "blob::tests::isolated_tls_client"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/nonexistent")
+        .env(
+            "GIT_RS_S3_ENDPOINT",
+            format!("https://localhost:{}", address.port()),
+        )
+        .env("GIT_RS_S3_BUCKET", "test-bucket")
+        .env("GIT_RS_S3_ACCESS_KEY", "synthetic-access")
+        .env("GIT_RS_S3_SECRET_KEY", "synthetic-secret")
+        .env("GIT_RS_TEST_TLS_SUCCESS", "1")
+        .env("GIT_RS_TEST_TLS_REQUESTS", "3")
+        .env("SSL_CERT_FILE", ca)
+        .output()
+        .unwrap();
+    // Also release accept if initialization failed before connecting.
+    let _ = TcpStream::connect(address);
+    let peers = server.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(peers.len(), 3);
     assert_eq!(
         peers.into_iter().collect::<BTreeSet<_>>().len(),
@@ -244,16 +309,19 @@ fn bucket_policy_response_cannot_grow_past_its_budget() {
 #[ignore = "entry point for the isolated TLS fixture"]
 fn isolated_tls_client() {
     let expected = std::env::var("GIT_RS_TEST_TLS_SUCCESS").unwrap() == "1";
-    let result = process::Operation::new(2).enter(|| Store::from_env()?.require_unversioned());
-    assert_eq!(
-        result.is_ok(),
-        expected,
-        "unexpected TLS verification outcome"
-    );
+    let requests = std::env::var("GIT_RS_TEST_TLS_REQUESTS")
+        .map_or(1, |value| value.parse::<usize>().unwrap());
+    for _ in 0..requests {
+        let result = process::Operation::new(2).enter(|| Store::from_env()?.require_unversioned());
+        assert_eq!(
+            result.is_ok(),
+            expected,
+            "unexpected TLS verification outcome: {result:?}"
+        );
+    }
 }
 
-#[test]
-fn tls_requires_a_trusted_certificate_and_matching_hostname() {
+fn tls_identity() -> (native_tls::Identity, Vec<u8>) {
     use openssl::{
         asn1::Asn1Time,
         hash::MessageDigest,
@@ -310,6 +378,12 @@ fn tls_requires_a_trusted_certificate_and_matching_hostname() {
     let identity =
         native_tls::Identity::from_pkcs8(&certificate, &key.private_key_to_pem_pkcs8().unwrap())
             .unwrap();
+    (identity, certificate)
+}
+
+#[test]
+fn tls_requires_a_trusted_certificate_and_matching_hostname() {
+    let (identity, certificate) = tls_identity();
     let directory = Directory::new();
     let ca = directory.0.join("ca.pem");
     fs::write(&ca, &certificate).unwrap();
