@@ -396,6 +396,27 @@ def docker_proxy(arguments):
     os.execv("/usr/bin/docker", ["/usr/bin/docker", *arguments])
 
 
+def root_environment(fixture):
+    from derived_cache import run, wait_until
+    from integration import S3_IMAGE
+
+    env = fixture.test_environment()
+    # Source corruption PUTs use the established source-fixture signing key.
+    # Keep that authority separate from the cache-only S3 root and credentials.
+    source = fixture.container("256m", .25, 32, ["--tmpfs", "/data:rw,size=128m",
+        "-p", "127.0.0.1::7070", "-e", "ROOT_ACCESS_KEY_ID=test-access",
+        "-e", "ROOT_SECRET_ACCESS_KEY=synthetic-secret-key",
+        S3_IMAGE, "--quiet", "posix", "/data"])
+    endpoint = "http://127.0.0.1:" + fixture.port(source, "7070/tcp")
+    request = ["curl", "--disable", "--silent", "--show-error", "--fail", "--max-time", "5",
+               "--aws-sigv4", "aws:amz:us-east-1:s3", "--user", "test-access:synthetic-secret-key",
+               "--request", "PUT", endpoint + "/source-test"]
+    wait_until(lambda: run(request, ok=False).returncode == 0, "root source S3 bucket")
+    env.update(GIT_RS_S3_ENDPOINT=endpoint, GIT_RS_S3_BUCKET="source-test",
+               GIT_RS_S3_ACCESS_KEY="test-access", GIT_RS_S3_SECRET_KEY="synthetic-secret-key")
+    return env
+
+
 def inside():
     token = invocation()
     require(Path("/.dockerenv").is_file(), "gate helpers run only inside the prepared test image")
@@ -450,10 +471,8 @@ def inside():
     fixture = Fixture(settings)
     try:
         fixture.setup()
-        env = fixture.test_environment()
-        env.update(GIT_RS_S3_ENDPOINT=fixture.endpoint, GIT_RS_S3_BUCKET="source-test",
-                   GIT_RS_S3_ACCESS_KEY="test-cache-access", GIT_RS_S3_SECRET_KEY="synthetic-cache-secret",
-                   GIT_RS_BLAME_HTTP_FIXTURE=str(paths["fixture"]))
+        env = root_environment(fixture)
+        env["GIT_RS_BLAME_HTTP_FIXTURE"] = str(paths["fixture"])
         for suite in ("blame_reuse", "blame_core"):
             for index, case in enumerate(manifest["inventory"][suite]):
                 with (ROOT / f".local/{suite}-{index}.log").open("x") as stream:

@@ -81,6 +81,44 @@ class GateTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--blame-fixture-binary") + 1],
                          "/usr/local/bin/examples/blame-http-fixture")
 
+    def test_root_source_corruption_credentials_match_source_s3_not_cache(self):
+        class Fixture:
+            endpoint = "http://127.0.0.1:8000"
+
+            def __init__(self):
+                self.owned = []
+
+            def test_environment(self):
+                return {"GIT_RS_CACHE_S3_ENDPOINT": self.endpoint,
+                        "GIT_RS_CACHE_S3_ACCESS_KEY": "test-cache-access",
+                        "GIT_RS_CACHE_S3_SECRET_KEY": "synthetic-cache-secret"}
+
+            def container(self, memory, cpu, pids, arguments):
+                self.owned.append((memory, cpu, pids, arguments))
+                return "source-container"
+
+            def port(self, container, port):
+                self_case.assertEqual((container, port), ("source-container", "7070/tcp"))
+                return "9000"
+
+        self_case = self
+        fixture = Fixture()
+        with patch("derived_cache.run", return_value=SimpleNamespace(returncode=0)) as request:
+            env = gate.root_environment(fixture)
+        self.assertEqual(env["GIT_RS_S3_ENDPOINT"], "http://127.0.0.1:9000")
+        self.assertEqual(env["GIT_RS_S3_ACCESS_KEY"], "test-access")
+        self.assertEqual(env["GIT_RS_S3_SECRET_KEY"], "synthetic-secret-key")
+        self.assertEqual(env["GIT_RS_CACHE_S3_ENDPOINT"], fixture.endpoint)
+        self.assertEqual(env["GIT_RS_CACHE_S3_ACCESS_KEY"], "test-cache-access")
+        self.assertEqual(env["GIT_RS_CACHE_S3_SECRET_KEY"], "synthetic-cache-secret")
+        self.assertEqual(len(fixture.owned), 1)
+        memory, cpu, pids, argv = fixture.owned[0]
+        self.assertEqual((memory, cpu, pids), ("256m", .25, 32))
+        self.assertIn("ROOT_ACCESS_KEY_ID=test-access", argv)
+        self.assertIn("ROOT_SECRET_ACCESS_KEY=synthetic-secret-key", argv)
+        self.assertIn("test-access:synthetic-secret-key", request.call_args.args[0])
+        self.assertEqual(request.call_args.args[0][-1], "http://127.0.0.1:9000/source-test")
+
     def test_preparation_timeout_or_partial_create_cleans_only_owned_containers(self):
         token = "b" * 32
         label = "git-rs.blame-preparation=" + token
