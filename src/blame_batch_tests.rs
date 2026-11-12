@@ -36,6 +36,142 @@ fn hello() -> UnitKey {
 }
 
 #[test]
+fn complete_body_authentication_binds_full_key_writer_and_rotated_secret() {
+    let control = control();
+    let owner = scope(&[7; 32], b"alice");
+    // An independently framed one-chunk descriptor, not a cache-derived tag.
+    let mut manifest = b"git-rs-complete-artifact\0\x01\x01\0\0\0\x01\0\0\0\x06".to_vec();
+    manifest.extend_from_slice(&openssl::sha::sha256(b"hello\n"));
+    let tag = owner
+        .writer
+        .body_tag(&owner.key, &manifest, &control)
+        .unwrap();
+    owner
+        .writer
+        .verify_body(&owner.key, &manifest, &tag, &control)
+        .unwrap();
+    assert!(
+        scope(&[8; 32], b"alice")
+            .writer
+            .verify_body(&owner.key, &manifest, &tag, &control)
+            .is_err()
+    );
+    // Change each canonical field independently, including producer/options,
+    // source generation/epoch and exact kind/representation. Payload is identical.
+    for field in 0..11 {
+        let inputs: [&[u8]; 4] = [
+            if field == 7 {
+                b"generation-2"
+            } else {
+                b"generation-1"
+            },
+            if field == 8 { b"epoch-2" } else { b"epoch-1" },
+            if field == 9 {
+                b"other-commit"
+            } else {
+                b"commit"
+            },
+            if field == 10 { b"other-path" } else { b"path" },
+        ];
+        let key = ArtifactKey::new(KeyParts {
+            repository: if field == 0 {
+                b"other-repository"
+            } else {
+                b"repository"
+            },
+            security: if field == 1 { b"bob" } else { b"alice" },
+            object_format: if field == 2 { "sha256" } else { "sha1" },
+            kind: if field == 3 {
+                "complete-blame"
+            } else {
+                "complete-blame-workset"
+            },
+            representation: if field == 4 {
+                "other-format"
+            } else {
+                "authenticated-complete-units-v1"
+            },
+            producer: if field == 5 {
+                "other-producer"
+            } else {
+                "fixture-producer"
+            },
+            options: if field == 6 {
+                b"other-options"
+            } else {
+                b"native"
+            },
+            inputs: &inputs,
+        })
+        .unwrap();
+        assert!(
+            owner
+                .writer
+                .verify_body(&key, &manifest, &tag, &control)
+                .is_err(),
+            "foreign full-key field {field}"
+        );
+    }
+    for config in [
+        CacheConfig::new(
+            "33333333-3333-3333-3333-333333333333".into(),
+            "22222222-2222-2222-2222-222222222222".into(),
+        ),
+        CacheConfig::new(
+            "11111111-1111-1111-1111-111111111111".into(),
+            "33333333-3333-3333-3333-333333333333".into(),
+        ),
+    ] {
+        let foreign = WriterProof::from_key(&config, &[7; 32]).unwrap();
+        assert!(
+            foreign
+                .verify_body(&owner.key, &manifest, &tag, &control)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn complete_body_authentication_rejects_repaired_digest_length_kind_and_format() {
+    let owner = scope(&[7; 32], b"alice");
+    let control = control();
+    let mut manifest = b"git-rs-complete-artifact\0\x01\x01\0\0\0\x01\0\0\0\x06".to_vec();
+    manifest.extend_from_slice(&openssl::sha::sha256(b"hello\n"));
+    let tag = owner
+        .writer
+        .body_tag(&owner.key, &manifest, &control)
+        .unwrap();
+    for offset in [0, 25, 26, 30, 34] {
+        let mut changed = manifest.clone();
+        changed[offset] ^= 1;
+        assert!(
+            owner
+                .writer
+                .verify_body(&owner.key, &changed, &tag, &control)
+                .is_err(),
+            "changed descriptor byte {offset}"
+        );
+    }
+    let mut repaired = manifest.clone();
+    let start = repaired.len() - 32;
+    repaired[start..].copy_from_slice(&openssl::sha::sha256(b"jello\n"));
+    assert!(
+        owner
+            .writer
+            .verify_body(&owner.key, &repaired, &tag, &control)
+            .is_err()
+    );
+    let mut corrupt_tag = tag;
+    corrupt_tag[31] ^= 1;
+    assert!(
+        owner
+            .writer
+            .verify_body(&owner.key, &manifest, &corrupt_tag, &control)
+            .is_err()
+    );
+}
+
+#[test]
 fn authenticated_round_trip_accepts_empty_and_split_chunks_and_releases_all_backing() {
     let budget = CapacityBudget::new(8 * 1024 * 1024);
     let control = control();

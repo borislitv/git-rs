@@ -123,6 +123,52 @@ impl WriterProof {
         key.fill(0); // best effort only; not a claim of allocator/native zeroization
         proof
     }
+    /// Authenticate a complete-body descriptor constructed from locally derived
+    /// porcelain, never cache-supplied bytes. The descriptor binds kind, ordered
+    /// chunk lengths/digests and format; the canonical key also binds source,
+    /// security scope, generation/epoch, producer and native options.
+    pub(super) fn body_tag(
+        &self,
+        key: &ArtifactKey,
+        manifest: &[u8],
+        control: &Control,
+    ) -> Result<[u8; 32]> {
+        control.check()?;
+        let mut signer = Signer::new(MessageDigest::sha256(), &self.key)?;
+        signer.update(b"git-rs/authorized-complete-body/v1\0")?;
+        for field in [
+            self.namespace.as_slice(),
+            self.writer.as_slice(),
+            &key.canonical,
+            manifest,
+        ] {
+            signer.update(&(field.len() as u64).to_be_bytes())?;
+            for part in field.chunks(32 * 1024) {
+                control.check()?;
+                signer.update(part)?;
+            }
+        }
+        let mut tag = [0; 32];
+        if signer.sign(&mut tag)? != tag.len() {
+            return Err(invalid("invalid complete-body authentication tag size"));
+        }
+        control.check()?;
+        Ok(tag)
+    }
+    pub(super) fn verify_body(
+        &self,
+        key: &ArtifactKey,
+        manifest: &[u8],
+        tag: &[u8; 32],
+        control: &Control,
+    ) -> Result<()> {
+        let expected = self.body_tag(key, manifest, control)?;
+        if !openssl::memcmp::eq(&expected, tag) {
+            return Err(invalid("unauthorized complete body or repaired cache data"));
+        }
+        control.check()?;
+        Ok(())
+    }
     fn tag(&self, chunks: &[&[u8]], length: usize, control: &Control) -> Result<[u8; 32]> {
         let mut signer = Signer::new(MessageDigest::sha256(), &self.key)?;
         signer.update(b"git-rs/authorized-completed-work/v1\0")?;

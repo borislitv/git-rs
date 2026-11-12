@@ -159,6 +159,8 @@ impl Blame {
             body_lookup: self.body_lookup,
         })
     }
+    /// Without an independent signing key, complete bodies retain the explicit
+    /// trusted-cache-writer contract; content digests are not authenticity proofs.
     pub fn with_cache(mut self, cache: DerivedCache) -> Self {
         self.cache = Some(cache);
         self.writer = None; // never carry a signing namespace across cache changes
@@ -166,7 +168,9 @@ impl Blame {
         self
     }
     /// Configuration and signer are constructed together: callers cannot pair a
-    /// proof for namespace A with a cache opened for namespace B.
+    /// proof for namespace A with a cache opened for namespace B. Signing mode
+    /// authenticates BOTH complete bodies and reusable checkpoints; unsigned or
+    /// incompatible bodies become misses, never a trusted-writer fallback.
     pub fn with_authenticated_cache(
         mut self,
         config: CacheConfig,
@@ -440,6 +444,7 @@ fn publish_body(
     cache: &DerivedCache,
     build: &crate::derived_cache::BuildLease,
     body: &CompletePorcelain,
+    writer: Option<&batch::WriterProof>,
     control: &Control,
     budget: &CapacityBudget,
     observer: &Option<Arc<dyn Observer>>,
@@ -475,6 +480,12 @@ fn publish_body(
     }
     observe(observer, Phase::Publishing, control)?;
     ProducerVersion::verified()?;
-    let _ = artifacts.publish(build, ArtifactKind::CompleteBody, &chunks)?;
+    if let Some(writer) = writer {
+        let _ = artifacts.publish_body_authenticated(build, &chunks, |key, manifest| {
+            writer.body_tag(key, manifest, control)
+        })?;
+    } else {
+        let _ = artifacts.publish(build, ArtifactKind::CompleteBody, &chunks)?;
+    }
     Ok(())
 }

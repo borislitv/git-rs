@@ -133,11 +133,14 @@ pub(super) fn derive(
     });
     if let Some(cache) = env.derived.as_ref().filter(|_| env.body_lookup)
         && let Some(Some(body)) = optional_cache(control, || {
-            BlameArtifacts::new(cache).get_verified(
-                &body_key,
-                ArtifactKind::CompleteBody,
-                body_access.clone(),
-            )
+            let artifacts = BlameArtifacts::new(cache);
+            if let Some(writer) = &env.writer {
+                artifacts.get_body_authenticated(&body_key, body_access.clone(), |manifest, tag| {
+                    writer.verify_body(&body_key, manifest, tag, control)
+                })
+            } else {
+                artifacts.get_verified(&body_key, ArtifactKind::CompleteBody, body_access.clone())
+            }
         })?
     {
         observe(&env.observer, Phase::CacheHit, control)?;
@@ -150,7 +153,7 @@ pub(super) fn derive(
         }));
     }
     let mut checkpoints = if let (Some(cache), Some(writer), Some(work)) =
-        (&env.derived, env.writer, work.as_ref())
+        (&env.derived, env.writer.as_ref(), work.as_ref())
     {
         let key = super::memo::checkpoint_key(&source, &principal, &query, &options, &profile)?;
         let access: Arc<dyn Access> = Arc::new(SourceAccess {
@@ -159,7 +162,7 @@ pub(super) fn derive(
         });
         Some(Checkpoints::open(
             cache.clone(),
-            writer,
+            writer.clone(),
             key,
             &profile,
             source.clone(),
@@ -319,7 +322,15 @@ pub(super) fn derive(
     ) = (&env.derived, &body_build, &outcome)
     {
         let _ = optional_cache(control, || {
-            publish_body(cache, build, body, control, budget, &env.observer)
+            publish_body(
+                cache,
+                build,
+                body,
+                env.writer.as_ref(),
+                control,
+                budget,
+                &env.observer,
+            )
         })?;
     }
     control.check()?;

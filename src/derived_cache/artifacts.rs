@@ -10,6 +10,10 @@ pub const MAX_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHUNKS: usize = 64;
 const HEADER: &[u8] = b"git-rs-complete-artifact\0\x01";
+const BODY_AUTH: &[u8] = b"git-rs-body-auth\0\x01";
+
+type BodyVerifier<'a> = &'a dyn Fn(&[u8], &[u8; 32]) -> Result<()>;
+type BodySigner<'a> = &'a mut dyn FnMut(&ArtifactKey, &[u8]) -> Result<[u8; 32]>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactKind {
@@ -217,10 +221,37 @@ impl BlameArtifacts {
         kind: ArtifactKind,
         chunks: &[StagedChunk],
     ) -> Result<bool> {
+        self.publish_complete(build, kind, chunks, None)
+    }
+
+    /// Root-only signing boundary: sign a descriptor made from the caller's
+    /// locally derived complete chunks. No cache-loaded descriptor is re-signed.
+    /// The signer must bind the complete ArtifactKey and independent writer key.
+    pub(crate) fn publish_body_authenticated(
+        &self,
+        build: &BuildLease,
+        chunks: &[StagedChunk],
+        mut sign: impl FnMut(&ArtifactKey, &[u8]) -> Result<[u8; 32]>,
+    ) -> Result<bool> {
+        self.publish_complete(build, ArtifactKind::CompleteBody, chunks, Some(&mut sign))
+    }
+
+    fn publish_complete(
+        &self,
+        build: &BuildLease,
+        kind: ArtifactKind,
+        chunks: &[StagedChunk],
+        sign: Option<BodySigner<'_>>,
+    ) -> Result<bool> {
         process::remaining()?;
         build.check_cache(&self.cache)?;
         build.check_authority()?;
-        let bytes = encode(build, kind, chunks)?;
+        let mut bytes = encode(build, kind, chunks)?;
+        if let Some(sign) = sign {
+            let tag = sign(&build.key, &bytes)?;
+            bytes.extend_from_slice(BODY_AUTH);
+            bytes.extend_from_slice(&tag);
+        }
         let Some(claim) = build.claim_payload(&self.cache, &build.key)? else {
             return Ok(false);
         };
@@ -336,6 +367,28 @@ impl BlameArtifacts {
         kind: ArtifactKind,
         access: Arc<dyn Access>,
     ) -> Result<Option<CompleteArtifact>> {
+        self.get_complete(key, kind, access, None)
+    }
+
+    /// An authenticated reader never falls back to accepting an unsigned body.
+    /// Verification finishes inside root read/source fences, before any child
+    /// bytes or a ready-body owner can escape. Failure is an exact-root miss.
+    pub(crate) fn get_body_authenticated(
+        &self,
+        key: &ArtifactKey,
+        access: Arc<dyn Access>,
+        verify: impl Fn(&[u8], &[u8; 32]) -> Result<()>,
+    ) -> Result<Option<CompleteArtifact>> {
+        self.get_complete(key, ArtifactKind::CompleteBody, access, Some(&verify))
+    }
+
+    fn get_complete(
+        &self,
+        key: &ArtifactKey,
+        kind: ArtifactKind,
+        access: Arc<dyn Access>,
+        verify: Option<BodyVerifier<'_>>,
+    ) -> Result<Option<CompleteArtifact>> {
         let Some(root) = self.cache.get_verified(key, access.clone())? else {
             return Ok(None);
         };
@@ -349,7 +402,16 @@ impl BlameArtifacts {
             return Ok(None);
         }
         let load = || -> Result<CompleteArtifact> {
-            let specs = root.with_bytes(|bytes| decode(bytes, kind))?;
+            let specs = root.with_bytes(|bytes| {
+                let (manifest, tag) = manifest_bytes(bytes, kind)?;
+                if let Some(verify) = verify {
+                    verify(
+                        manifest,
+                        tag.ok_or_else(|| invalid("unsigned complete body"))?,
+                    )?;
+                }
+                decode(manifest, kind)
+            })?;
             let mut chunks = Vec::with_capacity(specs.len());
             let mut total = 0;
             let root_hold = root
@@ -449,7 +511,7 @@ fn encode(build: &BuildLease, kind: ArtifactKind, chunks: &[StagedChunk]) -> Res
     Ok(bytes)
 }
 
-fn decode(bytes: &[u8], kind: ArtifactKind) -> Result<Vec<(usize, [u8; 32])>> {
+fn manifest_bytes(bytes: &[u8], kind: ArtifactKind) -> Result<(&[u8], Option<&[u8; 32]>)> {
     let header = HEADER.len() + 5;
     if bytes.len() < header
         || !bytes.starts_with(HEADER)
@@ -458,9 +520,29 @@ fn decode(bytes: &[u8], kind: ArtifactKind) -> Result<Vec<(usize, [u8; 32])>> {
         return Err(invalid("unsupported complete-artifact manifest"));
     }
     let count = u32::from_be_bytes(bytes[HEADER.len() + 1..header].try_into()?) as usize;
-    if count > MAX_CHUNKS || bytes.len() != header + count * 36 {
+    if count > MAX_CHUNKS {
         return Err(invalid("invalid complete-artifact manifest length"));
     }
+    let length = header + count * 36;
+    if bytes.len() == length {
+        return Ok((bytes, None));
+    }
+    if kind == ArtifactKind::CompleteBody
+        && bytes.len() == length + BODY_AUTH.len() + 32
+        && &bytes[length..length + BODY_AUTH.len()] == BODY_AUTH
+    {
+        return Ok((
+            &bytes[..length],
+            Some(bytes[length + BODY_AUTH.len()..].try_into()?),
+        ));
+    }
+    Err(invalid("invalid complete-artifact authentication envelope"))
+}
+
+fn decode(bytes: &[u8], kind: ArtifactKind) -> Result<Vec<(usize, [u8; 32])>> {
+    let (bytes, _) = manifest_bytes(bytes, kind)?;
+    let header = HEADER.len() + 5;
+    let count = u32::from_be_bytes(bytes[HEADER.len() + 1..header].try_into()?) as usize;
     let mut specs = Vec::with_capacity(count);
     let mut total = 0usize;
     // The exact manifest length above already excludes a trailing partial entry.

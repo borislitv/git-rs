@@ -27,6 +27,9 @@ mod source_support;
 #[path = "support/blame_runtime_support.rs"]
 mod runtime_support;
 
+#[path = "support/blame_body_auth_support.rs"]
+mod body_auth_support;
+
 fn until(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while !condition() {
