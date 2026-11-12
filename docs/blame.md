@@ -54,8 +54,11 @@ memory and scratch allowances.
 
 Each physical tree participating in blame may contain up to 128 MiB of tree
 records, subject to a smaller session object bound and shared capacity admission.
-The 64 KiB commit/tag metadata ceiling is not a total-directory-size limit.
-Existing tree-entry framing and per-name validation remain enforced.
+Commit and tag objects have a separate 128 MiB total-payload bound, including the
+message. Their physical header section is limited to 64 KiB, including continuation
+lines and the blank-line separator; a large message does not consume that header
+allowance. Tighter session limits still apply. Existing tree-entry framing and
+per-name validation remain enforced.
 
 Commit-kind and uncompressed blob-size checks use physical Rust library headers,
 without inflating complete object bodies or spawning `cat-file`. This includes
@@ -106,8 +109,11 @@ must require a complete 200 response, not interpret a truncated body as an annot
 `GIT_RS_BLAME_WORKER` is obsolete and rejected at startup. Production exposes no
 HTTP tuning, producer override or native-worker selection.
 
-The ordinary optional cache configuration can retain complete bodies. Typed
-object/mapping checkpoints additionally require the explicit
+The ordinary optional cache configuration can retain complete bodies: these are
+the complete line-porcelain responses, not individual Git blobs. Without an
+independent signing key, their semantics trust the cache database writer; a writer
+able to replace bytes and matching checksums can change the response. Typed
+object/mapping checkpoints and authenticated complete bodies require the explicit
 `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` setting, alongside the existing cache namespace,
 owner and PostgreSQL/S3 configuration. The file must be an absolute path to
 exactly 32 random bytes, owned by root or the service UID, with no group/other
@@ -116,7 +122,7 @@ the service UID, with no group/other write permission. A private subdirectory
 under world-writable `/tmp` is deliberately insufficient. Provision the key with
 the operator's secret-management mechanism; do not log it or pass it in URLs.
 
-This is a trusted-producer MAC contract. Authorized producers sharing checkpoints
+This is a trusted-producer MAC contract. Authorized producers sharing artifacts
 must share the namespace, authorized cache owner UUID and key. They must run the
 bound producer/options implementation. A checksum, matching producer label or
 structurally valid byte partition alone does not prove canonical Myers tie choice.
@@ -125,8 +131,20 @@ storage-epoch/query/producer/options scope. Physical objects additionally verify
 their kind, size and Git OID. Mapping units contain both complete byte-line
 partitions; no vendor interner state or suspended DAG frontier is persisted.
 
+In signing mode, complete bodies use a separate HMAC domain over the full expected
+artifact key and a versioned descriptor containing ordered chunk lengths and
+digests. Namespace/writer, repository/principal/generation/storage epoch,
+target/path, producer and options are bound before a body can be accepted as a hit.
+Only newly derived local porcelain is signed; cache-loaded data is never re-signed.
+The raw response bytes are unchanged. An altered, unsigned, incompatible,
+foreign-scope or wrong-key body becomes a cache miss and is recomputed from the
+authorized source. Signing mode never falls back to unsigned acceptance. This
+protects against a cache writer without the signing key, not a compromised producer
+or signing-key holder. Source authorization and final response fences remain required.
+
 Rotate the key by provisioning a new protected file and restarting/reloading all
-producer instances. New signers reject old checkpoints as optional misses. An
+producer instances. New signers reject old checkpoints and complete bodies as
+optional misses. An
 already-running instance retains its old key until replacement; editing the file
 does not revoke the key already held in memory.
 

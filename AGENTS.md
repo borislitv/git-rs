@@ -33,6 +33,12 @@
   Preserve source authority, generation/epoch fences, complete line partitions and producer/key
   scope. Persist completed units only, never vendor interner IDs or a suspended traversal frontier.
   Keep SQL/network I/O out of memory callbacks. Do not weaken protected signing-file checks.
+- Signing mode must authenticate complete bodies as well as checkpoints. Bind the full expected
+  artifact scope and ordered chunk descriptor; repaired ordinary digests cannot authorize a body.
+  Never sign cache-loaded results or fall back to unsigned bodies when a signing key is configured.
+- Commit/tag headers are bounded at 64 KiB, including continuation lines and separator; their
+  complete physical payloads, including messages, are separately bounded at 128 MiB. Preserve
+  tighter session limits, shared capacity admission and controlled parsing/encoding.
 - Actual jobs retain finite lifetime, source holds and admission through cleanup; each waiter
   owns its cancellation/deadline. Post-confirmed opt-in warming uses the same CPU pool and work
   admission, fresh authorized source and its own finite deadline; it cannot fail a confirmed push.

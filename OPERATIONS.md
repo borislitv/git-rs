@@ -154,6 +154,15 @@ Setting `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` instead makes startup validate the ca
 configuration and signing file explicitly; invalid signing configuration fails
 startup rather than silently selecting an unauthenticated checkpoint writer.
 
+The same key authenticates complete response bodies in a separate HMAC domain.
+A complete body is the cached line-porcelain response, including authorship and
+commit metadata. Its signed descriptor binds the expected source/security scope,
+producer/options and ordered chunk lengths/digests. A cache database writer
+without the key cannot replace that response by repairing ordinary checksums.
+Unsigned, altered, incompatible, foreign-scope or wrong-key bodies are cache
+misses and trigger authorized recomputation. Signing mode has no unsigned fallback;
+without signing, the cache writer remains trusted for complete-body semantics.
+
 The signing file must be a regular non-symlink file at an absolute path, exactly
 32 random bytes, owned by root or the service UID and with no group/other access.
 Every ancestor must be a real directory owned by root or the service UID, without
@@ -172,7 +181,8 @@ traversal frontier or vendor interner state is a reusable checkpoint.
 
 Rotate by provisioning a new protected key file and restarting all producers.
 There is no key-file hot reload; existing processes retain the old key in memory.
-New instances treat old-key checkpoints as optional misses, not authorization.
+New instances treat old-key checkpoints and complete bodies as optional misses,
+not authorization.
 Changing the key does not rotate cache ownership or authorize purging old data.
 For namespace rotation, use a fresh canonical UUID/prefix, declare its owner and
 quotas explicitly, and quiesce old writers/readers before separately fenced cleanup.
