@@ -240,6 +240,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "375989decec1a0fa424442bed520fa12ede43a48475ce8c7417d2c69b32b5f6b"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -683,6 +685,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-util",
  "tracing-appender",
+ "zstd",
 ]
 
 [[package]]
@@ -1751,6 +1754,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
  "jiff-tzdb",
+]
+
+[[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom",
+ "libc",
 ]
 
 [[package]]
@@ -3054,3 +3067,28 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "git+https://github.com/borislitv/zstd-rs?rev=66f4b27ef27742d3df45826bc85c4ed423483cf0#66f4b27ef27742d3df45826bc85c4ed423483cf0"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.2.0"
+source = "git+https://github.com/borislitv/zstd-rs?rev=66f4b27ef27742d3df45826bc85c4ed423483cf0#66f4b27ef27742d3df45826bc85c4ed423483cf0"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "git+https://github.com/borislitv/zstd-rs?rev=66f4b27ef27742d3df45826bc85c4ed423483cf0#66f4b27ef27742d3df45826bc85c4ed423483cf0"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

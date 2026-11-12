@@ -275,6 +275,14 @@ jobs:
           ref: f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f
           path: .local/iconv-native
           persist-credentials: false
+      - name: Check out the pinned owned zstd source and native gitlink
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/zstd-rs
+          ref: 66f4b27ef27742d3df45826bc85c4ed423483cf0
+          path: .local/zstd-rs
+          submodules: recursive
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.99.1
@@ -284,6 +292,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config git coreutils
           make vendor-check
+      - name: Verify zstd sources, unified features and minimal safe streaming API
+        run: |
+          test "${ZSTD_SYS_USE_PKG_CONFIG+x}" != x
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/zstd-app-metadata.json"
+          python3 -B tools/check-core-source.py --zstd-root .local/zstd-rs --cargo-metadata "$RUNNER_TEMP/zstd-app-metadata.json"
+          cargo test --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --test streaming_admission -- --test-threads=1
+          cargo test --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --doc
+          cargo clippy --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --all-targets -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo doc --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --no-deps
   verify:
     runs-on: ubuntu-26.04
     timeout-minutes: 35

@@ -93,10 +93,20 @@ mapping checkpoints. It always requires a fresh authorized source and fences;
 cache data is never source authority. Run `git-rs cache-migrate` independently of
 source `migrate`. Both schemas use logged tables; no transaction spans their databases.
 
-Bodies use bounded chunk/manifest storage: they may remain entirely in PostgreSQL
-when each payload fits the configured inline bound, or use separately configured
+Bodies use bounded chunk/manifest storage. Payloads of at least 4 KiB are considered
+for single-threaded zstd level 3 with a 1 MiB window. Compression is retained only
+when it saves at least 128 bytes and 1/16 of the logical length; otherwise storage
+remains raw. The stored size selects inline PostgreSQL versus separately configured
 cache S3. This is optional reuse, not a claim that the maximum body fits default
 cache quotas or that shared-database performance has been qualified.
+
+Both stored and decoded payload sizes remain independently limited to 8 MiB.
+Logical size/digest, artifact keys, signatures and namespace byte charges do not
+change with encoding. Compressed frames require the declared size, checksum, no
+dictionary, one standard frame and no trailing bytes. Decoding uses bounded chunks,
+checks cancellation and admits native workspace and output before allocation.
+PostgreSQL decoding consumes the borrowed stored Row bytes directly; S3 still owns
+its bounded downloaded buffer. These are not end-to-end zero-copy or total-RSS claims.
 
 Supply `GIT_RS_CACHE_NAMESPACE` and `GIT_RS_CACHE_OWNER` as stable, canonical
 lowercase UUIDs. They bind an explicitly owned namespace and its immutable
@@ -115,8 +125,8 @@ The owner UUID is an identity, not an authentication credential.
 | `GIT_RS_CACHE_PGPASSWORD` | Dedicated cache password; source password is not inherited |
 | `GIT_RS_CACHE_PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGTARGETSESSIONATTRS` (all with prefix) | Inherit source TLS policy when omitted; verified hostname/chain required outside loopback development |
 | `GIT_RS_CACHE_CONNECTIONS` | 4; range 1–8, independent of source pool |
-| `GIT_RS_CACHE_INLINE_BYTES` | 262144, provisional; raise up to maximum payload for bounded all-PG comparison |
-| `GIT_RS_CACHE_MAX_PAYLOAD_BYTES` | 8388608, hard maximum 8 MiB |
+| `GIT_RS_CACHE_INLINE_BYTES` | 262144 stored bytes; raise up to maximum payload for bounded all-PG comparison |
+| `GIT_RS_CACHE_MAX_PAYLOAD_BYTES` | 8388608; logical and stored payloads are each bounded by this limit, hard maximum 8 MiB |
 | `GIT_RS_CACHE_MEMORY_BYTES` | 67108864; includes payload capacity and conservative transient reservations, not total process RSS |
 | `GIT_RS_CACHE_NAMESPACE_BYTES`, `GIT_RS_CACHE_NAMESPACE_ROWS` | 1073741824 / 10000 artifact rows; fail closed on quota exhaustion; one fixed maintenance-authority row is reserved separately |
 | `GIT_RS_CACHE_TTL_SECONDS` | 3600; range 1–86400 |
@@ -205,7 +215,7 @@ its resource impact is qualified for the deployment.
 
 ### Cache schema upgrade and rollback
 
-The cache schema is now version 3; the authoritative source schema remains separate.
+The cache schema is now version 4; the authoritative source schema remains separate.
 Use this forward-only procedure with the dedicated cache role and explicit
 namespace/owner configuration:
 
@@ -213,18 +223,18 @@ namespace/owner configuration:
    old cache database/object-prefix ownership records and plan rollback isolation.
 2. Run `git-rs cache-migrate` using the new binary against the intended cache
    database. It serializes migration, creates v1 if absent, then transactionally
-   applies v1-to-v2 and v2-to-v3 in order. Each failed upgrade transaction preserves
+   applies v1-to-v2, v2-to-v3 and v3-to-v4 in order. Each failed upgrade transaction preserves
    its preceding version; a retry resumes from that committed version.
-3. Verify version 3 and run the owned migration/functional acceptance harness before
+3. Verify version 4 and run the owned migration/functional acceptance harness before
    exposing new cache-backed features. Do not infer this from source `migrate` or
    ordinary non-ignored tests. The split public blame CI explicitly runs the
    migration harness; inspect its actual completed inventory and results.
 4. For rollback, do not downgrade tables or reset version numbers. An old
-   v1/v2 `cache-migrate` binary rejects v3. Existing old opaque-cache runtimes may still
+   v1/v2/v3 `cache-migrate` binary rejects v4. Existing old opaque-cache runtimes may still
    have valid holds; rejection by their migrator is not proof that they stopped.
 5. Run the old application with caching disabled, or provision a separate
    old-version-compatible cache database/schema with a fresh namespace UUID/object
-   prefix and explicit ownership. A fresh UUID in the upgraded v3 database alone
+   prefix and explicit ownership. A fresh UUID in the upgraded v4 database alone
    does not make it compatible with an old migrator. Never reuse old payload identities.
 6. Retire old namespaces only after explicit writer/reader quiescence and the
    normal fenced read-hold/grace/deletion procedure. An empty replacement database
@@ -240,6 +250,15 @@ claim, live-reader/build-pin and irreversible-retirement checks remain required.
 Protected retirement still examines namespace candidates; a 64-row result limit
 does not mean only 64 candidates are examined. Tombstone accounting and namespace
 rotation requirements remain unchanged.
+
+Version 4 adds explicit raw/zstd storage metadata and versioned read/publication
+functions. New readers retain legacy raw compatibility. Old raw readers skip
+compressed rows before acquiring a hold; this prevents interpreting a frame as
+application data, but does not promise mixed-version cache availability. Existing
+raw holds and safely fenced maintenance remain valid. Do not remove encoding
+metadata or rewrite immutable payload identities to make a downgrade appear safe.
+Migration cancellation uses bounded cleanup; an ambiguous committed outcome still
+requires rereading the schema version and retrying the idempotent upgrade path.
 
 ### Verification and publication limits
 

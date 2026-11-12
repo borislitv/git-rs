@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[path = "support/blame_cache_support.rs"]
+mod pg_support;
+
 use git_rs::{
     Result,
     derived_cache::{
@@ -409,6 +412,170 @@ fn corrupt_inline_payload_is_a_miss_and_replacement_is_verified() {
                 Ok(())
             })
             .unwrap();
+    });
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+#[ignore = "requires owned PostgreSQL and cache S3"]
+fn physical_encoding_preserves_logical_bytes_quotas_and_default_inline_placement() {
+    // SHA-256 counter blocks provide deterministic incompressible binary data;
+    // expectations do not depend on the production encoder/decoder.
+    let noise: Vec<u8> = (0u32..16384)
+        .flat_map(|counter| openssl::sha::sha256(&counter.to_be_bytes()))
+        .collect();
+    let cases = [
+        ("empty", Vec::new(), "raw-v1"),
+        ("binary", vec![0, 255, 0, 17], "raw-v1"),
+        (
+            "standard-magic-is-raw",
+            b"\x28\xb5\x2f\xfdnot a frame".to_vec(),
+            "raw-v1",
+        ),
+        (
+            "skippable-magic-is-raw",
+            b"\x50\x2a\x4d\x18literal bytes".to_vec(),
+            "raw-v1",
+        ),
+        ("incompressible", noise, "raw-v1"),
+        ("beneficial", vec![73; 512 * 1024], "zstd-v1"),
+    ];
+    for external in [false, true] {
+        for (name, bytes, encoding) in &cases {
+            Operation::new(30).enter(|| {
+                let mut c = CacheConfig::new(id(), id());
+                assert_eq!(c.inline_bytes, 256 * 1024);
+                if external { c.inline_bytes = 0; }
+                let first = cache(&c);
+                let second = cache(&c);
+                let authority = access();
+                let key = key(name);
+                let owner = claim(&first, &key, authority.clone());
+                assert!(first.publish(&owner, authority.as_ref(), bytes).unwrap());
+                let admin = pg_support::Admin::new();
+                let ns = &c.namespace;
+                let external = (external || *name == "incompressible") && !bytes.is_empty();
+                assert_eq!(admin.scalar(&format!("SELECT (encoding='{encoding}' AND size={} AND digest=decode('{}','hex') AND coalesce(stored_size,size)<=size AND coalesce(stored_digest,digest)=CASE WHEN body IS NULL THEN coalesce(stored_digest,digest) ELSE sha256(body) END AND (object_key IS NOT NULL)={external})::text FROM git_rs_cache.payloads WHERE namespace='{ns}'", bytes.len(), hex(&openssl::sha::sha256(bytes)))), "true", "physical/logical metadata for {name}, external={external}");
+                if *encoding == "zstd-v1" {
+                    assert_eq!(admin.scalar(&format!("SELECT (stored_size<size AND stored_digest IS NOT NULL)::text FROM git_rs_cache.payloads WHERE namespace='{ns}'")), "true");
+                }
+                assert_eq!(admin.scalar(&format!("SELECT used_bytes::text FROM git_rs_cache.namespaces WHERE id='{ns}'")), bytes.len().to_string(), "quota remains logical despite compression");
+                let payload = second.get_verified(&key, authority).unwrap().unwrap();
+                assert_eq!(payload.len(), bytes.len());
+                payload.with_bytes(|actual| { assert_eq!(actual, bytes); Ok(()) }).unwrap();
+                assert!(second.allocated() >= bytes.len());
+                drop(payload);
+                assert_eq!(second.allocated(), 0, "last decoded owner releases capacity");
+            });
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires owned PostgreSQL and cache S3"]
+fn compressed_public_load_rejects_storage_logical_and_frame_corruption_without_holds() {
+    for (fault, external) in [
+        ("stored-hash", false),
+        ("logical-hash", false),
+        ("logical-length", false),
+        ("truncated", false),
+        ("concatenated", false),
+        ("trailing", false),
+        ("stored-length", true),
+        ("stored-hash", true),
+        ("logical-hash", true),
+        ("logical-length", true),
+    ] {
+        Operation::new(30).enter(|| {
+            let mut c = CacheConfig::new(id(), id());
+            if external { c.inline_bytes = 0; }
+            let cache = cache(&c);
+            let key = key(fault);
+            let authority = access();
+            let owner = claim(&cache, &key, authority.clone());
+            assert!(cache.publish(&owner, authority.as_ref(), &vec![91; 65536]).unwrap());
+            let admin = pg_support::Admin::new();
+            let ns = &c.namespace;
+            assert_eq!(admin.scalar(&format!("SELECT encoding FROM git_rs_cache.payloads WHERE namespace='{ns}'")), "zstd-v1", "must exercise the public decoder, not raw fallback");
+            if fault == "stored-hash" {
+                admin.sql(&format!("DO $$ BEGIN UPDATE git_rs_cache.payloads SET encoding='unknown-v99' WHERE namespace='{ns}'; RAISE EXCEPTION 'unknown encoding unexpectedly passed its schema boundary'; EXCEPTION WHEN check_violation THEN NULL; END $$"));
+            }
+            // The last three repair all physical metadata: rejection must come
+            // from strict decode, not an ordinary storage checksum mismatch.
+            let mutation = match fault {
+                "stored-length" => "stored_size=stored_size+1",
+                "stored-hash" => "stored_digest=decode(repeat('00',32),'hex')",
+                "logical-hash" => "digest=decode(repeat('00',32),'hex')",
+                "logical-length" => "size=size+1",
+                "truncated" => "body=substring(body FOR octet_length(body)-1),stored_size=octet_length(body)-1,stored_digest=sha256(substring(body FOR octet_length(body)-1))",
+                "concatenated" => "body=body||body,stored_size=octet_length(body)*2,stored_digest=sha256(body||body)",
+                "trailing" => "body=body||decode('00','hex'),stored_size=octet_length(body)+1,stored_digest=sha256(body||decode('00','hex'))",
+                _ => unreachable!(),
+            };
+            admin.sql(&format!("UPDATE git_rs_cache.payloads SET {mutation} WHERE namespace='{ns}'"));
+            assert!(cache.get_verified(&key, authority.clone()).unwrap().is_none(), "{fault} must not expose partial decoded data");
+            assert_eq!(cache.allocated(), 0, "{fault} leaked decode capacity");
+            assert_eq!(admin.scalar(&format!("SELECT count(*)::text FROM git_rs_cache.read_holds WHERE namespace='{ns}'")), "0", "{fault} leaked a read hold");
+            let replacement = claim(&cache, &key, authority.clone());
+            assert!(cache.publish(&replacement, authority.as_ref(), b"replacement").unwrap());
+            cache.get_verified(&key, authority).unwrap().unwrap().with_bytes(|bytes| { assert_eq!(bytes, b"replacement"); Ok(()) }).unwrap();
+        });
+    }
+}
+
+#[test]
+#[ignore = "requires an owned PostgreSQL cache fixture"]
+fn old_raw_read_api_misses_compressed_rows_before_inserting_a_hold() {
+    Operation::new(30).enter(|| {
+        let c = CacheConfig::new(id(), id());
+        let cache = cache(&c);
+        let key = key("old-read-compressed");
+        let authority = access();
+        let claim = claim(&cache, &key, authority.clone());
+        assert!(cache.publish(&claim, authority.as_ref(), &vec![27; 65536]).unwrap());
+        let admin = pg_support::Admin::new();
+        let ns = &c.namespace;
+        admin.sql("SET ROLE git_rs_cache; SET search_path=git_rs_cache,pg_catalog");
+        assert_eq!(admin.scalar(&format!("SELECT encoding FROM git_rs_cache.payloads WHERE namespace='{ns}'")), "zstd-v1");
+        for _ in 0..3 {
+            assert_eq!(admin.scalar(&format!("SELECT count(*)::text FROM git_rs_cache.jobs j CROSS JOIN LATERAL git_rs_cache.acquire_read(j.namespace,'{}',j.key_hash,j.canonical,'{}',30,8388608) r WHERE j.namespace='{ns}'", c.owner, id())), "0");
+        }
+        assert_eq!(admin.scalar(&format!("SELECT count(*)::text FROM git_rs_cache.read_holds WHERE namespace='{ns}'")), "0", "old v1/v2/v3 API must filter BEFORE hold insertion");
+        let operation = Operation::new(15);
+        let decoded = operation.enter(|| cache.get_verified(&key, authority.clone())).unwrap().unwrap();
+        assert!(cache.allocated() >= 65536);
+        operation.cancel();
+        assert!(operation.enter(|| decoded.with_bytes(|_| -> Result<()> { panic!("cancelled decoded owner must not invoke a consumer") })).is_err());
+        drop(decoded);
+        assert_eq!(cache.allocated(), 0, "cancellation releases actual decoded ownership");
+        assert_eq!(admin.scalar(&format!("SELECT count(*)::text FROM git_rs_cache.read_holds WHERE namespace='{ns}'")), "0");
+        cache.get_verified(&key, authority).unwrap().unwrap().with_bytes(|bytes| { assert_eq!(bytes, vec![27; 65536]); Ok(()) }).unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires an owned PostgreSQL cache fixture"]
+fn compressed_maximum_logical_payload_is_bounded_independently_of_physical_size() {
+    Operation::new(30).enter(|| {
+        let c = CacheConfig::new(id(), id());
+        let cache = cache(&c);
+        let authority = access();
+        let maximum = key("maximum-logical");
+        let owner = claim(&cache, &maximum, authority.clone());
+        let bytes = vec![39; 8 * 1024 * 1024];
+        assert!(cache.publish(&owner, authority.as_ref(), &bytes).unwrap());
+        let admin = pg_support::Admin::new();
+        assert_eq!(admin.scalar(&format!("SELECT (encoding='zstd-v1' AND size=8388608 AND stored_size<262144 AND object_key IS NULL)::text FROM git_rs_cache.payloads WHERE namespace='{}'", c.namespace)), "true");
+        cache.get_verified(&maximum, authority.clone()).unwrap().unwrap().with_bytes(|actual| { assert_eq!(actual, bytes); Ok(()) }).unwrap();
+        let next = key("over-maximum-logical");
+        let owner = claim(&cache, &next, authority.clone());
+        assert!(cache.publish(&owner, authority.as_ref(), &vec![39; 8 * 1024 * 1024 + 1]).is_err(), "compression savings must not bypass the logical 8 MiB admission cap");
+        assert!(cache.get_verified(&next, authority).unwrap().is_none());
+        assert_eq!(admin.scalar(&format!("SELECT used_bytes::text FROM git_rs_cache.namespaces WHERE id='{}'", c.namespace)), "8388608");
+        assert_eq!(cache.allocated(), 0);
     });
 }
 

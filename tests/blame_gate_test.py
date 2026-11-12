@@ -4,6 +4,7 @@ import hashlib
 import copy
 import contextlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 import blame_gate as gate
-from blame_artifacts import V2_MIGRATION_CONTRACT, record_contracts
+from blame_artifacts import V2_MIGRATION_CONTRACT, V3_MIGRATION_CONTRACT, record_contracts
 
 
 class ArtifactInventoryTests(unittest.TestCase):
@@ -52,6 +53,22 @@ class ArtifactInventoryTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     record_contracts(results, "blame_build", {V2_MIGRATION_CONTRACT}, result)
                 self.assertNotIn("contract_inventory", results)
+
+    def test_v3_dedicated_contract_requires_its_own_successful_execution(self):
+        general = {"ordinary_contract"}
+        phases = [general, {V2_MIGRATION_CONTRACT}, {V3_MIGRATION_CONTRACT}]
+        expected = sorted(set().union(*phases))
+        for order in itertools.permutations(phases):
+            with self.subTest(order=order):
+                results = {}
+                for index, names in enumerate(order):
+                    record_contracts(results, "blame_build", names, self.outcome())
+                    if index < 2:
+                        self.assertNotEqual(results["contract_inventory"]["blame_build"], expected)
+                self.assertEqual(results["contract_inventory"]["blame_build"], expected)
+        self.assertNotIn(V3_MIGRATION_CONTRACT, gate.EXCLUDE.get("blame_build", set()))
+        self.assertIn(V3_MIGRATION_CONTRACT, gate.inventory(
+            V3_MIGRATION_CONTRACT + ": test\n", "blame_build"))
 
 
 class GateTests(unittest.TestCase):

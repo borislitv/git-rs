@@ -3,12 +3,52 @@
 mod support;
 use git_rs::{
     derived_cache::{
-        BlameBuilds, BuildLease, BuildLimits, BuildLookup, CacheConfig, DerivedCache, Lookup,
+        ArtifactKey, BlameBuilds, BuildLease, BuildLimits, BuildLookup, CacheConfig, DerivedCache,
+        KeyParts, Lookup,
     },
     process::Operation,
 };
 use std::{sync::mpsc, time::Duration};
 use support::*;
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// Frozen raw SQL APIs, not the new runtime's v4 lookup/prepare on a v1/v2/v3 DB.
+fn seed_frozen_raw(admin: &Admin, config: &CacheConfig, name: &[u8], bytes: &[u8]) -> ArtifactKey {
+    let key = key(name);
+    let mut canonical = b"git-rs-artifact-key\0\x01".to_vec();
+    for field in [
+        b"synthetic/blame-cache".as_slice(),
+        b"fixture-readers-v1",
+        b"opaque",
+        b"complete-body",
+        b"complete-v1",
+        b"fixture-v1",
+        b"native-root-v1",
+    ] {
+        canonical.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        canonical.extend_from_slice(field);
+    }
+    canonical.extend_from_slice(&1u32.to_be_bytes());
+    canonical.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    canonical.extend_from_slice(name);
+    assert_eq!(
+        &openssl::sha::sha256(&canonical),
+        key.digest(),
+        "sealed key wire fixture"
+    );
+    let (ns, owner, token, payload) = (&config.namespace, &config.owner, id(), id());
+    let hash = format!("decode('{}','hex')", hex(key.digest()));
+    let digest = format!("decode('{}','hex')", hex(&openssl::sha::sha256(bytes)));
+    admin.sql("SET ROLE git_rs_cache; SET search_path=git_rs_cache,pg_catalog");
+    assert_eq!(admin.scalar(&format!("SELECT owned::text FROM git_rs_cache.claim('{ns}','{owner}',{hash},decode('{}','hex'),'{token}',60,120)", hex(&canonical))), "true");
+    assert_eq!(admin.scalar(&format!("SELECT git_rs_cache.prepare_payload('{ns}','{owner}',{hash},'{token}',1,'{payload}',{digest},{},false)::text", bytes.len())), "true");
+    assert_eq!(admin.scalar(&format!("SELECT git_rs_cache.publish('{ns}','{owner}',{hash},'{token}',1,'{payload}',decode('{}','hex'),3600)::text", hex(bytes))), "true");
+    admin.sql("RESET ROLE; RESET search_path");
+    key
+}
 
 fn claim(
     builds: &BlameBuilds,
@@ -146,16 +186,32 @@ fn migration_preserves_existing_opaque_bytes_and_is_idempotent() {
         if let Ok(expected) = std::env::var("GIT_RS_TEST_CACHE_SCHEMA_EXPECTED") { assert_eq!(before,expected); }
         println!("cache schema before upgrade: {before}");
         let config = CacheConfig::new(id(),id());
-        admin.sql(&format!("SET ROLE git_rs_cache; SELECT git_rs_cache.register_namespace('{}','{}',{},{}); RESET ROLE;",config.namespace,config.owner,config.namespace_rows,config.namespace_bytes));
+        admin.sql(&format!("SET ROLE git_rs_cache; SET search_path=git_rs_cache,pg_catalog; SELECT git_rs_cache.register_namespace('{}','{}',{},{}); RESET ROLE;",config.namespace,config.owner,config.namespace_rows,config.namespace_bytes));
+        let key = seed_frozen_raw(&admin, &config, b"v1-opaque", b"opaque bytes before upgrade");
+        let magic = seed_frozen_raw(&admin, &config, b"raw-zstd-magic", b"\x28\xb5\x2f\xfdlegacy literal, not compressed");
         let cache = DerivedCache::open(config).unwrap();
-        let key = key(b"v1-opaque");
-        let claim = match cache.get_or_claim(&key,authority()).unwrap() { Lookup::Claimed(claim)=>claim,_=>panic!("fresh fixture artifact") };
-        assert!(cache.publish(&claim,authority().as_ref(),b"opaque bytes before upgrade").unwrap());
         cache.migrate().unwrap();
         cache.migrate().unwrap();
-        assert_eq!(admin.scalar("SELECT version::text FROM git_rs_cache.schema_version WHERE singleton"),"3");
+        assert_eq!(admin.scalar("SELECT version::text FROM git_rs_cache.schema_version WHERE singleton"),"4");
         assert_eq!(admin.scalar("SELECT (i.indisvalid AND i.indisready AND pg_get_indexdef(i.indexrelid) LIKE '%(namespace, staged_payload)%' AND pg_get_expr(i.indpred,i.indrelid) = '((state = ''computing''::text) AND (staged_payload IS NOT NULL))')::text FROM pg_index i WHERE i.indexrelid='git_rs_cache.jobs_staged_payload'::regclass"),"true");
         cache.get_verified(&key,authority()).unwrap().unwrap().with_bytes(|bytes| {assert_eq!(bytes,b"opaque bytes before upgrade");Ok(())}).unwrap();
+        cache.get_verified(&magic,authority()).unwrap().unwrap().with_bytes(|bytes| {assert_eq!(bytes,b"\x28\xb5\x2f\xfdlegacy literal, not compressed");Ok(())}).unwrap();
+        if std::env::var("GIT_RS_TEST_LEGACY_COMPRESSED_PROBE").as_deref() == Ok("1") {
+            // Same documented process-fixture key as the pinned old runtime.
+            // Python then asks that real old runtime for this newly encoded row.
+            let legacy = DerivedCache::from_env().unwrap();
+            let probe = ArtifactKey::new(KeyParts {
+                repository: b"synthetic/process", security: b"fixture-readers-v1",
+                object_format: "opaque", kind: "fixture", inputs: &[b"new-compressed"],
+                options: b"", representation: "raw-v1", producer: "fixture-v1",
+            }).unwrap();
+            let owner = match legacy.get_or_claim(&probe, authority()).unwrap() {
+                Lookup::Claimed(owner) => owner,
+                _ => panic!("fresh legacy compatibility probe"),
+            };
+            assert!(legacy.publish(&owner, authority().as_ref(), &vec![173; 65536]).unwrap());
+            legacy.get_verified(&probe, authority()).unwrap().unwrap().with_bytes(|bytes| { assert_eq!(bytes, vec![173; 65536]); Ok(()) }).unwrap();
+        }
         claim_build_after_upgrade(&cache);
     });
 }
@@ -182,20 +238,9 @@ fn v2_index_migration_cancellation_and_failure_preserve_retryable_state() {
     );
     println!("installed embedded frozen cache migrations: 001 -> 002");
     let config = CacheConfig::new(id(), id());
-    admin.sql(&format!("SET ROLE git_rs_cache; SELECT git_rs_cache.register_namespace('{}','{}',{},{}); RESET ROLE;", config.namespace, config.owner, config.namespace_rows, config.namespace_bytes));
+    admin.sql(&format!("SET ROLE git_rs_cache; SET search_path=git_rs_cache,pg_catalog; SELECT git_rs_cache.register_namespace('{}','{}',{},{}); RESET ROLE;", config.namespace, config.owner, config.namespace_rows, config.namespace_bytes));
     let cache = DerivedCache::open(config.clone()).unwrap();
-    let key = key(b"v2-before-upgrade");
-    let claim = Operation::new(15).enter(|| match cache.get_or_claim(&key, authority()).unwrap() {
-        Lookup::Claimed(claim) => claim,
-        _ => panic!("fresh artifact"),
-    });
-    Operation::new(15).enter(|| {
-        assert!(
-            cache
-                .publish(&claim, authority().as_ref(), b"preserved v2 bytes")
-                .unwrap()
-        )
-    });
+    let key = seed_frozen_raw(&admin, &config, b"v2-before-upgrade", b"preserved v2 bytes");
     let locker = Admin::new();
     locker.sql("BEGIN; LOCK TABLE git_rs_cache.jobs IN ROW EXCLUSIVE MODE");
     let operation = Operation::new(15);
@@ -231,7 +276,7 @@ fn v2_index_migration_cancellation_and_failure_preserve_retryable_state() {
     });
     assert_eq!(
         admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
-        "3"
+        "4"
     );
     // Source authority and the pre-upgrade cache namespace are unchanged.
     let cache = DerivedCache::open(config).unwrap();
@@ -252,6 +297,83 @@ fn claim_build_after_upgrade(cache: &DerivedCache) {
     let builds = BlameBuilds::new(cache);
     let lease = claim(&builds, &key(b"post-upgrade-build"), BuildLimits::default());
     lease.check_authority().unwrap();
+}
+
+#[test]
+#[ignore = "requires a dedicated fresh v3 PostgreSQL cache fixture"]
+fn v3_encoding_migration_cancel_ddl_failure_and_concurrent_retry_preserve_raw_bytes() {
+    let admin = Admin::new();
+    assert_eq!(
+        admin.scalar("SELECT (to_regnamespace('git_rs_cache') IS NULL)::text"),
+        "true",
+        "dedicated empty cache DB only"
+    );
+    admin.sql(&format!(
+        "SET ROLE git_rs_cache;\n{}\n{}\n{}\nRESET ROLE;",
+        include_str!("../migrations/cache/001.sql"),
+        include_str!("../migrations/cache/002.sql"),
+        include_str!("../migrations/cache/003.sql")
+    ));
+    let config = CacheConfig::new(id(), id());
+    admin.sql(&format!("SET ROLE git_rs_cache; SET search_path=git_rs_cache,pg_catalog; SELECT git_rs_cache.register_namespace('{}','{}',{},{}); RESET ROLE", config.namespace, config.owner, config.namespace_rows, config.namespace_bytes));
+    let bytes = b"\x28\xb5\x2f\xfdv3 raw magic must never be sniffed";
+    let key = seed_frozen_raw(&admin, &config, b"v3-magic", bytes);
+    let before = admin.scalar("SELECT md5(string_agg(id::text||encode(body,'hex')||encode(digest,'hex')||size::text,'' ORDER BY id)) FROM git_rs_cache.payloads");
+    let locker = Admin::new();
+    locker.sql("BEGIN; LOCK TABLE git_rs_cache.payloads IN ROW EXCLUSIVE MODE");
+    let operation = Operation::new(15);
+    let cancelled = operation.clone();
+    let cache = DerivedCache::open(config.clone()).unwrap();
+    let worker = std::thread::spawn(move || cancelled.enter(|| cache.migrate()));
+    admin.until("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='git-rs-cache' AND wait_event_type='Lock' AND query LIKE '%ADD COLUMN encoding%')::text");
+    operation.cancel();
+    assert!(worker.join().unwrap().is_err());
+    locker.sql("ROLLBACK");
+    admin.until("SELECT (NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='git-rs-cache' AND state<>'idle' AND query LIKE '%ADD COLUMN encoding%'))::text");
+    assert_eq!(
+        admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
+        "3"
+    );
+    assert_eq!(admin.scalar("SELECT count(*)::text FROM information_schema.columns WHERE table_schema='git_rs_cache' AND table_name='payloads' AND column_name='encoding'"), "0");
+
+    admin.sql("ALTER TABLE git_rs_cache.payloads ADD COLUMN encoding integer");
+    let cache = DerivedCache::open(config.clone()).unwrap();
+    assert!(
+        Operation::new(15).enter(|| cache.migrate()).is_err(),
+        "real duplicate-column DDL failure must roll back v4"
+    );
+    assert_eq!(
+        admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
+        "3"
+    );
+    admin.sql("ALTER TABLE git_rs_cache.payloads DROP COLUMN encoding");
+    let barrier = std::sync::Barrier::new(3);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let config = config.clone();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    Operation::new(15).enter(|| {
+                        barrier.wait();
+                        DerivedCache::open(config).unwrap().migrate()
+                    })
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+    });
+    Operation::new(15).enter(|| {
+        let cache = DerivedCache::open(config.clone()).unwrap();
+        cache.migrate().unwrap();
+        assert_eq!(admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"), "4");
+        assert_eq!(admin.scalar("SELECT md5(string_agg(id::text||encode(body,'hex')||encode(digest,'hex')||size::text,'' ORDER BY id)) FROM git_rs_cache.payloads"), before);
+        assert_eq!(admin.scalar("SELECT bool_and(encoding='raw-v1' AND stored_size IS NULL AND stored_digest IS NULL)::text FROM git_rs_cache.payloads"), "true");
+        cache.get_verified(&key, authority()).unwrap().unwrap().with_bytes(|actual| { assert_eq!(actual, bytes); Ok(()) }).unwrap();
+    });
 }
 
 #[test]

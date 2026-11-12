@@ -24,6 +24,10 @@ PG_CONTRACTS = {
     "binary_payload_reuses_across_independent_pools_and_never_bypasses_authority",
     "simultaneous_claims_have_one_live_owner_and_expired_tokens_cannot_return",
     "corrupt_inline_payload_is_a_miss_and_replacement_is_verified",
+    "physical_encoding_preserves_logical_bytes_quotas_and_default_inline_placement",
+    "compressed_public_load_rejects_storage_logical_and_frame_corruption_without_holds",
+    "old_raw_read_api_misses_compressed_rows_before_inserting_a_hold",
+    "compressed_maximum_logical_payload_is_bounded_independently_of_physical_size",
     "retirement_preserves_an_admitted_reader_and_expired_hold_cannot_consume",
     "cancelled_waiter_keeps_actual_work_admitted_and_second_waiter_receives_result",
     "cached_lookup_isolates_all_key_dimensions_and_stale_invalidation_cannot_remove_replacement",
@@ -210,6 +214,23 @@ class Fixture:
         assert parts[:3] == ["hit", str(size), hashlib.sha256(bytes([byte]) * size).hexdigest()], reply
         return parts[3]
 
+    def assert_stored_object(self, namespace, object_key, logical):
+        """Do not confuse compressed storage with decoded public payload bytes."""
+        encoding, size, digest, stored_size, stored_digest = self.sql(
+            "SELECT encoding||':'||size||':'||encode(digest,'hex')||':'||"
+            "coalesce(stored_size,size)||':'||encode(coalesce(stored_digest,digest),'hex') "
+            f"FROM git_rs_cache.payloads WHERE namespace='{namespace}' AND object_key='{object_key}'"
+        ).split(":")
+        stored = self.object_request("GET", "derived-test", object_key).stdout
+        assert int(size) == len(logical) and digest == hashlib.sha256(logical).hexdigest()
+        assert len(stored) == int(stored_size) and hashlib.sha256(stored).hexdigest() == stored_digest
+        if encoding == "raw-v1":
+            assert stored == logical
+        else:
+            assert encoding == "zstd-v1" and stored.startswith(b"\x28\xb5\x2f\xfd")
+            assert len(stored) < len(logical), "beneficial compression must be physical"
+        return stored
+
     def cross_process(self):
         for mode in ("same", "database", "cluster"):
             env = self.environment(mode)
@@ -285,12 +306,13 @@ class Fixture:
             process.close()
 
     def s3_reader_and_gc(self):
-        env = self.environment(GIT_RS_CACHE_GRACE_SECONDS="1")
+        env = self.environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_GRACE_SECONDS="1")
         ns = env["GIT_RS_CACHE_NAMESPACE"]
         a, b = self.process(env, "s3-reader"), self.process(env, "s3-gc")
         assert a.ask("claim large") == "claimed"
         assert a.ask("publish large 524288 81") == "true"
         payload = self.assert_hit(a.ask("hold large"), 524288, 81)
+        self.assert_stored_object(ns, f"cache/{ns}/{payload}", bytes([81]) * 524288)
         assert a.ask("invalidate large") == "true"
         assert b.ask("maintenance") == "owned"
         assert b.ask("retire") == "1"
@@ -302,7 +324,7 @@ class Fixture:
         assert b.ask("delete") == "1"
         assert self.object_request("GET", "derived-test", f"cache/{ns}/{payload}", ok=False).returncode != 0
         assert self.object_request("GET", "source-test", "repos/protected/sentinel").stdout == b"authoritative source sentinel\n"
-        fresh = self.environment("database")
+        fresh = self.environment("database", GIT_RS_CACHE_INLINE_BYTES="0")
         c = self.process(fresh, "cutover")
         assert c.ask("claim current") == "claimed"
         assert c.ask("publish current 524288 82") == "true"
@@ -348,11 +370,11 @@ class Fixture:
             proxy.arm("git_rs_cache.claim(", "commit")
             assert process.ask("claim ambiguous") == "claimed"
             assert proxy.hit.wait(timeout=5), "claim COMMIT fault did not fire"
-            proxy.arm("git_rs_cache.prepare_payload(", "commit")
+            proxy.arm("git_rs_cache.prepare_payload_v4(", "commit")
             assert process.ask("publish ambiguous 65536 73") == "true"
             assert proxy.hit.wait(timeout=5), "intent COMMIT fault did not fire"
             assert process.ask("claim publication") == "claimed"
-            proxy.arm("git_rs_cache.publish(", "commit")
+            proxy.arm("git_rs_cache.publish_v4(", "commit")
             assert process.ask("publish publication 65536 74") == "true"
             assert proxy.hit.wait(timeout=5), "publication COMMIT fault did not fire"
             self.assert_hit(process.ask("get publication"), 65536, 74)
@@ -392,7 +414,7 @@ class Fixture:
             proxy.close()
 
     def s3_body_faults_and_read_expiry(self):
-        env = self.environment()
+        env = self.environment(GIT_RS_CACHE_INLINE_BYTES="0")
         process = self.process(env, "s3-body-faults")
         ns = env["GIT_RS_CACHE_NAMESPACE"]
         for name in ("missing", "corrupt", "oversized"):
@@ -414,7 +436,7 @@ class Fixture:
         process.close()
         proxy = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.environment(GIT_RS_CACHE_READ_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
+            env = self.environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_READ_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
             ns = env["GIT_RS_CACHE_NAMESPACE"]
             process = self.process(env, "s3-expired-reader")
             assert process.ask("claim expiring") == "claimed"
@@ -434,7 +456,7 @@ class Fixture:
     def delete_permission_failure_is_retryable(self):
         proxy = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.environment(GIT_RS_CACHE_GRACE_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
+            env = self.environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_GRACE_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
             ns = env["GIT_RS_CACHE_NAMESPACE"]
             process = self.process(env, "gc-permissions")
             assert process.ask("claim retired") == "claimed"
@@ -449,13 +471,13 @@ class Fixture:
             assert process.ask("delete").startswith("error ")
             assert proxy.hit.wait(timeout=5), "cache DELETE permission fault was not exercised"
             assert self.sql(f"SELECT last_delete_at IS NULL FROM git_rs_cache.payloads WHERE namespace='{ns}'") == "t", "failed deletion must retain retry evidence"
-            assert self.object_request("GET", "derived-test", f"cache/{ns}/{payload}").stdout == bytes([87]) * 524288
+            self.assert_stored_object(ns, f"cache/{ns}/{payload}", bytes([87]) * 524288)
             for versioning in ("Enabled", "Suspended"):
                 proxy.arm("GET", "/derived-test?versioning", versioning)
                 reply = process.ask("delete")
                 assert "unversioned bucket" in reply, f"{versioning} policy must reject non-version-aware GC: {reply}"
                 assert proxy.hit.wait(timeout=5), "bucket versioning policy boundary was not exercised"
-                assert self.object_request("GET", "derived-test", f"cache/{ns}/{payload}").stdout == bytes([87]) * 524288
+                self.assert_stored_object(ns, f"cache/{ns}/{payload}", bytes([87]) * 524288)
                 assert self.sql(f"SELECT last_delete_at IS NULL FROM git_rs_cache.payloads WHERE namespace='{ns}'") == "t"
             assert process.ask("delete") == "1"
             assert self.object_request("GET", "derived-test", f"cache/{ns}/{payload}", ok=False).returncode != 0
@@ -468,7 +490,7 @@ class Fixture:
     def late_upload(self):
         proxy = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.environment(GIT_RS_CACHE_GRACE_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
+            env = self.environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_GRACE_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
             ns = env["GIT_RS_CACHE_NAMESPACE"]
             uploader, gc = self.process(env, "late-uploader"), self.process(env, "late-gc")
             assert uploader.ask("claim late") == "claimed"
@@ -486,7 +508,7 @@ class Fixture:
             assert gc.ask("delete") == "1"
             proxy.release.set()
             assert proxy.finished.wait(timeout=5)
-            assert self.object_request("GET", "derived-test", object_key).stdout == bytes([111]) * 524288
+            self.assert_stored_object(ns, object_key, bytes([111]) * 524288)
             self.sql(f"UPDATE git_rs_cache.payloads SET last_delete_at=clock_timestamp()-interval '31 seconds' WHERE namespace='{ns}'")
             assert gc.ask("delete") == "1", "late PUT must remain rediscoverable"
             assert self.object_request("GET", "derived-test", object_key, ok=False).returncode != 0
@@ -501,7 +523,7 @@ class Fixture:
     def slow_publication_keeps_ownership(self):
         proxy = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.environment(GIT_RS_CACHE_LEASE_SECONDS="1", GIT_RS_CACHE_JOB_SECONDS="10",
+            env = self.environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_LEASE_SECONDS="1", GIT_RS_CACHE_JOB_SECONDS="10",
                                    GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
             ns = env["GIT_RS_CACHE_NAMESPACE"]
             producer, waiter = self.process(env, "slow-publisher"), self.process(env, "slow-waiter")
@@ -526,7 +548,7 @@ class Fixture:
     def killed_after_put_and_committed_descriptor(self):
         proxy = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.environment(GIT_RS_CACHE_GRACE_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
+            env = self.environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_GRACE_SECONDS="1", GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
             ns = env["GIT_RS_CACHE_NAMESPACE"]
             publisher, gc = self.process(env, "put-crash"), self.process(env, "put-crash-gc")
             assert publisher.ask("claim accepted") == "claimed"
@@ -534,7 +556,7 @@ class Fixture:
             publisher.send("publish accepted 524288 88")
             assert proxy.hit.wait(timeout=5), "real PUT did not commit before the response gate"
             object_key = self.sql(f"SELECT object_key FROM git_rs_cache.payloads WHERE namespace='{ns}'")
-            assert self.object_request("GET", "derived-test", object_key).stdout == bytes([88]) * 524288
+            self.assert_stored_object(ns, object_key, bytes([88]) * 524288)
             publisher.child.kill()
             publisher.child.wait(timeout=5)
             self.sql(f"UPDATE git_rs_cache.jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE namespace='{ns}'")
@@ -556,7 +578,7 @@ class Fixture:
             ns = env["GIT_RS_CACHE_NAMESPACE"]
             publisher = self.process(env, "descriptor-crash")
             assert publisher.ask("claim committed") == "claimed"
-            proxy.arm("git_rs_cache.publish(", "commit-gate")
+            proxy.arm("git_rs_cache.publish_v4(", "commit-gate")
             publisher.send("publish committed 65536 89")
             assert proxy.hit.wait(timeout=5), "descriptor COMMIT gate did not observe ReadyForQuery"
             assert self.sql(f"SELECT state FROM git_rs_cache.directory WHERE namespace='{ns}'") == "ready"
@@ -617,7 +639,7 @@ class Fixture:
         # The label also recovers a container whose creation response was lost.
         ids = run(["docker", "ps", "-aq", "--filter", "label=git-rs.cache-fixture=" + self.identity]).stdout.decode().split()
         for cid in ids:
-            run(["docker", "rm", "-f", cid])
+            run(["docker", "rm", "-f", "-v", cid])
         assert not run(["docker", "ps", "-aq", "--filter", "label=git-rs.cache-fixture=" + self.identity]).stdout.strip()
         self.results["cleanup_errors"] = errors
         self.results["owned_containers_removed"] = True

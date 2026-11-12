@@ -165,17 +165,22 @@ that graph/index work is shared across all queries.
 
 `derived_cache` is connected to complete blame bodies and, with an explicit signing
 key, authenticates both complete-body descriptors and completed-work checkpoints.
-`cache-migrate` initializes/upgrades logged `git_rs_cache` tables to version 3
+`cache-migrate` initializes/upgrades logged `git_rs_cache` tables to version 4
 through an independent, bounded pool; source `migrate` is separate. Upgrades from
-cache v1 or v2 are forward-only, with each migration transactional. Version 3 adds
+cache v1, v2 or v3 are forward-only, with each migration transactional. Version 3 adds
 the jobs reverse lookup and planner-visible retention predicates without changing
-cache authority or retirement semantics. Old migrators reject v3; rollback,
+cache authority or retirement semantics. Version 4 adds explicit raw/zstd physical
+metadata with legacy raw-read compatibility. Old migrators reject v4; rollback,
 transactional index-build blocking and namespace ownership policy are
 documented in [operations](../OPERATIONS.md#cache-schema-upgrade-and-rollback).
 The metadata text-row limit remains 8,192 bytes; artifacts use parameterized binary
 transport. Keys include repository, security scope, object format, ordered inputs,
-options, representation and producer version. Only raw payload encoding is currently
-supported, so there is no implicit decompression or unbounded expansion.
+options, representation and producer version. Logical payload identity is independent
+of physical raw-v1/zstd-v1 encoding. Beneficial payloads use level 3, a 1 MiB window
+and a single checksummed frame; logical and stored lengths each retain the 8 MiB
+limit. Frame metadata, complete consumption and both digests are checked before
+logical bytes escape. Decoder/context/output reservations survive actual cleanup.
+Old raw APIs exclude compressed rows before read-hold acquisition.
 
 The caller supplies an `Access` implementation retaining an independently owned
 source hold and checking authorization/fences. A cache claim cannot replace it.

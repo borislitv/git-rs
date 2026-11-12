@@ -42,7 +42,13 @@ fn build(cache: &DerivedCache, key: &git_rs::derived_cache::ArtifactKey) -> Buil
 #[ignore = "requires owned cache PostgreSQL/S3"]
 fn checkpoint_swap_preserves_old_s3_reader_and_releases_only_build_pins() {
     Operation::new(60).enter(|| {
-        let (cache, namespace) = fixture();
+        let mut config = CacheConfig::new(id(), id());
+        config.inline_bytes = 0; // Physical compression must not bypass the S3/GC seam.
+        config.read_seconds = 60;
+        config.grace_seconds = 1;
+        let namespace = config.namespace.clone();
+        let cache = DerivedCache::open(config).unwrap();
+        cache.migrate().unwrap();
         let key = key(b"rolling-s3-units");
         let build = build(&cache, &key);
         let artifacts = BlameArtifacts::new(&cache);
@@ -52,6 +58,7 @@ fn checkpoint_swap_preserves_old_s3_reader_and_releases_only_build_pins() {
         let old_bytes = vec![17; 524288];
         let first = vec![artifacts.stage_chunk(&build, &old_bytes).unwrap().unwrap()];
         let v1 = artifacts.replace_checkpoint(&build, None, &first).unwrap().unwrap();
+        assert_eq!(admin.scalar(&format!("SELECT (p.encoding='zstd-v1' AND p.object_key IS NOT NULL AND p.stored_size<p.size AND e.size=p.size AND e.digest=p.digest)::text FROM git_rs_cache.manifest_children e JOIN git_rs_cache.payloads p ON p.namespace=e.namespace AND p.id=e.child WHERE e.namespace='{namespace}' AND e.parent='{}'", v1.payload_id())), "true", "checkpoint edges remain logical while the held child is compressed S3");
         drop(first);
         let old = artifacts.get_checkpoint_verified(&key, authority()).unwrap().unwrap();
         assert_eq!(old.version(), &v1);
@@ -312,7 +319,7 @@ fn checkpoint_expiry_during_child_fk_wait_rolls_back_swap_and_pin_release() {
     // The production one-second lock timeout would otherwise abort before a
     // generously future parent lease expires, falsely proving the final fence.
     // Change only this fixture function's lock-wait budget, never the DB clock.
-    let timeout_sql = "ALTER FUNCTION git_rs_cache.publish_checkpoint(uuid,uuid,bytea,uuid,bigint,uuid,bytea,integer,bytea,uuid,bigint,text[],bytea[],bigint[],integer)";
+    let timeout_sql = "ALTER FUNCTION git_rs_cache.publish_checkpoint_v4(uuid,uuid,bytea,uuid,bigint,uuid,bytea,integer,bytea,uuid,bigint,text[],bytea[],bigint[],integer)";
     observer.sql(&format!("{timeout_sql} SET lock_timeout='4s'"));
     locker.sql(&format!("UPDATE git_rs_cache.blame_builds SET lease_until=clock_timestamp()+interval '3 seconds' WHERE namespace='{namespace}'"));
     locker.sql(&format!("BEGIN; SELECT p.id FROM git_rs_cache.payloads p JOIN git_rs_cache.build_chunks c ON c.namespace=p.namespace AND c.child=p.id WHERE p.namespace='{namespace}' FOR UPDATE OF p"));

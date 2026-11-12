@@ -6,7 +6,11 @@ use crate::{
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
 use postgres_native_tls::MakeTlsConnector;
-use std::{future::Future, pin::pin, time::Duration};
+use std::{
+    future::Future,
+    pin::pin,
+    time::{Duration, Instant},
+};
 use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::{
     Row,
@@ -44,12 +48,17 @@ impl Postgres {
     }
 
     fn run<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
+        self.run_before(Instant::now() + Duration::from_secs(10), work)
+    }
+
+    fn run_before<T>(&self, deadline: Instant, work: impl Future<Output = Result<T>>) -> Result<T> {
         process::check_operation()?;
         let remaining = if process::Operation::current().is_some() {
             process::remaining()?.min(Duration::from_secs(10))
         } else {
             Duration::from_secs(10)
         };
+        let remaining = remaining.min(deadline.saturating_duration_since(Instant::now()));
         self.runtime.block_on(async {
             let mut work = pin!(tokio::time::timeout(remaining, work));
             let mut poll = tokio::time::interval(Duration::from_millis(10));
@@ -129,8 +138,13 @@ impl Postgres {
     }
 
     pub fn migrate(&self) -> Result<()> {
-        self.run(async {
-            let connection = self.acquire().await?;
+        // Keep ownership outside the interruptible future. Dropping that future
+        // and the last pool/runtime owner together can abort Checkout's spawned
+        // cancellation before PostgreSQL sees it, letting blocked DDL commit
+        // after the caller has already observed cancellation.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let connection = self.run_before(deadline, self.acquire())?;
+        let result = self.run_before(deadline, async {
             // Session ownership spans the independently transactional migration
             // files. An error/interruption destroys Checkout and releases this
             // lock; never recycle a session retaining migration authority.
@@ -185,7 +199,15 @@ impl Postgres {
                     .map_err(sql_error)?;
                 version = 3;
             }
-            if version != 3 {
+            if version == 3 {
+                connection
+                    .client()
+                    .batch_execute(include_str!("../../migrations/cache/004.sql"))
+                    .await
+                    .map_err(sql_error)?;
+                version = 4;
+            }
+            if version != 4 {
                 return Err(invalid("unsupported cache schema version"));
             }
             connection
@@ -193,8 +215,26 @@ impl Postgres {
                 .batch_execute("SELECT pg_advisory_unlock(91079170002); ROLLBACK; RESET ALL;")
                 .await
                 .map_err(sql_error)?;
-            connection.recycle();
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            connection.recycle();
+        } else {
+            // Independent bounded cleanup, never an extension of query or DDL
+            // authority. Await ROLLBACK so teardown cannot race a blocked COMMIT.
+            self.runtime.block_on(async {
+                let cancel = connection.client().cancel_token();
+                let tls = self.tls.clone();
+                let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                    cancel.cancel_query(tls).await?;
+                    connection.client().batch_execute("ROLLBACK").await
+                })
+                .await;
+                // Checkout's destructor schedules its final cancellation on
+                // this runtime; do not drop it after leaving block_on.
+                drop(connection);
+            });
+        }
+        result
     }
 }

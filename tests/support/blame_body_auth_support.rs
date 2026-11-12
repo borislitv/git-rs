@@ -15,6 +15,7 @@ use std::{
     },
     time::Duration,
 };
+use zstd::zstd_safe;
 
 #[derive(Default)]
 struct Observed {
@@ -174,8 +175,13 @@ impl CacheWriter {
         })
     }
     fn root(&self, namespace: &str, except: Option<&str>) -> StoredRoot {
-        let rows = self.query("SELECT p.id::text,p.body FROM git_rs_cache.payloads p JOIN git_rs_cache.manifest_roots m ON m.namespace=p.namespace AND m.payload=p.id JOIN git_rs_cache.directory d ON d.namespace=p.namespace AND d.payload=p.id WHERE p.namespace=$1::text::uuid AND m.kind=1 AND d.state='ready' AND ($2::text IS NULL OR p.id<>$2::text::uuid)", &[&namespace, &except]);
+        let rows = self.query("SELECT p.id::text,p.body,p.encoding FROM git_rs_cache.payloads p JOIN git_rs_cache.manifest_roots m ON m.namespace=p.namespace AND m.payload=p.id JOIN git_rs_cache.directory d ON d.namespace=p.namespace AND d.payload=p.id WHERE p.namespace=$1::text::uuid AND m.kind=1 AND d.state='ready' AND ($2::text IS NULL OR p.id<>$2::text::uuid)", &[&namespace, &except]);
         assert_eq!(rows.len(), 1, "exact complete-body root, not a checkpoint");
+        assert_eq!(
+            rows[0].get::<_, String>(2),
+            "raw-v1",
+            "bounded small descriptor remains raw, independently of compressed child storage"
+        );
         StoredRoot {
             id: rows[0].get(0),
             body: rows[0].get(1),
@@ -183,30 +189,73 @@ impl CacheWriter {
     }
     fn replace_root(&self, namespace: &str, root: &StoredRoot, bytes: &[u8]) {
         let digest = openssl::sha::sha256(bytes);
-        self.query("UPDATE git_rs_cache.payloads SET body=$3,digest=$4,size=octet_length($3::bytea) WHERE namespace=$1::text::uuid AND id=$2::text::uuid RETURNING id::text", &[&namespace, &root.id, &bytes, &&digest[..]]);
+        self.query("UPDATE git_rs_cache.payloads SET body=$3,digest=$4,size=octet_length($3::bytea),stored_size=NULL,stored_digest=NULL WHERE namespace=$1::text::uuid AND id=$2::text::uuid RETURNING id::text", &[&namespace, &root.id, &bytes, &&digest[..]]);
     }
     fn forge_inline(&self, namespace: &str, root: &StoredRoot) -> Vec<u8> {
-        let rows = self.query("SELECT p.id::text,p.body,p.object_key FROM git_rs_cache.manifest_children e JOIN git_rs_cache.payloads p ON p.namespace=e.namespace AND p.id=e.child WHERE e.namespace=$1::text::uuid AND e.parent=$2::text::uuid ORDER BY e.ordinal", &[&namespace, &root.id]);
+        let rows = self.query("SELECT p.id::text,p.body,p.object_key,p.encoding,p.size,p.digest,p.stored_size,p.stored_digest FROM git_rs_cache.manifest_children e JOIN git_rs_cache.payloads p ON p.namespace=e.namespace AND p.id=e.child WHERE e.namespace=$1::text::uuid AND e.parent=$2::text::uuid ORDER BY e.ordinal", &[&namespace, &root.id]);
         assert_eq!(
             rows.len(),
             1,
-            "small real porcelain must occupy one inline chunk"
+            "real porcelain must occupy one physically inline compressed chunk"
         );
         assert!(rows[0].get::<_, Option<String>>(2).is_none());
         let child: String = rows[0].get(0);
-        let mut body: Vec<u8> = rows[0].get(1);
+        assert_eq!(
+            rows[0].get::<_, String>(3),
+            "zstd-v1",
+            "the attack must reach real compressed storage"
+        );
+        let stored: Vec<u8> = rows[0].get(1);
+        assert_eq!(rows[0].get::<_, i64>(6), stored.len() as i64);
+        assert_eq!(rows[0].get::<_, Vec<u8>>(7), openssl::sha::sha256(&stored));
+        let logical_size = usize::try_from(rows[0].get::<_, i64>(4)).unwrap();
+        assert!(
+            logical_size <= 4 * 1024 * 1024,
+            "owned single-chunk fixture bound"
+        );
+        let mut body = vec![0; logical_size];
+        let mut decoder = zstd_safe::DCtx::try_create().unwrap();
+        assert_eq!(
+            decoder
+                .decompress(body.as_mut_slice(), stored.as_slice())
+                .unwrap(),
+            logical_size
+        );
+        assert!(body.len() >= 4096);
+        assert_eq!(rows[0].get::<_, i64>(4), body.len() as i64);
+        assert_eq!(rows[0].get::<_, Vec<u8>>(5), openssl::sha::sha256(&body));
         let offset = body
             .windows(b"Synthetic Author".len())
             .position(|part| part == b"Synthetic Author")
             .expect("real native author metadata");
         body[offset..offset + 16].copy_from_slice(b"Malicious Author");
         let digest = openssl::sha::sha256(&body);
+        // Test-owned safe dependency API, not application codec/FFI. Emit the
+        // complete checksum/content-size/window contract so trusted unsigned
+        // acceptance proves this is not merely an invalid compressed fixture.
+        let mut encoder = zstd_safe::CCtx::try_create().unwrap();
+        for parameter in [
+            zstd_safe::CParameter::CompressionLevel(3),
+            zstd_safe::CParameter::WindowLog(20),
+            zstd_safe::CParameter::NbWorkers(0),
+            zstd_safe::CParameter::ChecksumFlag(true),
+            zstd_safe::CParameter::ContentSizeFlag(true),
+        ] {
+            encoder.set_parameter(parameter).unwrap();
+        }
+        encoder
+            .set_pledged_src_size(Some(body.len() as u64))
+            .unwrap();
+        let mut forged = vec![0; zstd_safe::compress_bound(body.len())];
+        let written = encoder.compress2(forged.as_mut_slice(), &body).unwrap();
+        forged.truncate(written);
+        let stored_digest = openssl::sha::sha256(&forged);
         let mut manifest = root.body.clone();
         let offset = b"git-rs-complete-artifact\0\x01".len() + 5 + 4;
         manifest[offset..offset + 32].copy_from_slice(&digest);
         self.query("BEGIN", &[]);
-        self.query("UPDATE git_rs_cache.payloads SET body=$3,digest=$4 WHERE namespace=$1::text::uuid AND id=$2::text::uuid RETURNING id::text", &[&namespace, &child, &body, &&digest[..]]);
-        self.query("UPDATE git_rs_cache.manifest_children SET digest=$3 WHERE namespace=$1::text::uuid AND parent=$2::text::uuid RETURNING ordinal", &[&namespace, &root.id, &&digest[..]]);
+        self.query("UPDATE git_rs_cache.payloads SET body=$3,digest=$4,size=$5,stored_size=$6,stored_digest=$7 WHERE namespace=$1::text::uuid AND id=$2::text::uuid RETURNING id::text", &[&namespace, &child, &forged, &&digest[..], &(body.len() as i64), &(forged.len() as i64), &&stored_digest[..]]);
+        self.query("UPDATE git_rs_cache.manifest_children SET digest=$3,size=$4 WHERE namespace=$1::text::uuid AND parent=$2::text::uuid RETURNING ordinal", &[&namespace, &root.id, &&digest[..], &(body.len() as i64)]);
         self.replace_root(namespace, root, &manifest);
         self.query("COMMIT", &[]);
         body
@@ -224,7 +273,7 @@ fn authenticated_body_rejects_cache_role_forgery_after_all_ordinary_digests_are_
     let config = config();
     let first = Arc::new(Observed::default());
     let mut fixture =
-        source_support::Fixture::new(service(&config, Some(&[7; 32]), first.clone()), 2);
+        source_support::Fixture::new(service(&config, Some(&[7; 32]), first.clone()), 256);
     assert_eq!(read(&fixture, "bob"), fixture.expected);
     assert_eq!(read(&fixture, "bob"), fixture.expected);
     assert_eq!(

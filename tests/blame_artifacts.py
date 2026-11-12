@@ -21,6 +21,7 @@ from support.blame_artifact_faults import ArtifactProcess, ObjectProxy, PgProxy,
 
 
 V2_MIGRATION_CONTRACT = "v2_index_migration_cancellation_and_failure_preserve_retryable_state"
+V3_MIGRATION_CONTRACT = "v3_encoding_migration_cancel_ddl_failure_and_concurrent_retry_preserve_raw_bytes"
 
 
 def record_contracts(results, suite, names, result):
@@ -54,6 +55,8 @@ class Fixture(OpaqueFixture):
         return f"host=127.0.0.1 port={env['PGPORT']} user=postgres password=development-only dbname={env['PGDATABASE']}"
 
     def rust_contracts(self):
+        assert self.args.contract_filter not in (V2_MIGRATION_CONTRACT, V3_MIGRATION_CONTRACT), \
+            "dedicated schema contracts require --phase migration, not an already-upgraded shared DB"
         env = self.test_environment()
         for name, binary in (("blame_build", self.args.build_contract_binary),
                              ("blame_artifacts", self.artifact_binary),
@@ -64,6 +67,7 @@ class Fixture(OpaqueFixture):
             names = {line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")}
             names.discard("artifact_process")
             names.discard(V2_MIGRATION_CONTRACT)
+            names.discard(V3_MIGRATION_CONTRACT)
             selected = self.args.contract_filter
             if selected:
                 if selected not in names:
@@ -71,7 +75,7 @@ class Fixture(OpaqueFixture):
                 names = {selected}
             assert names, f"no {name} contracts discovered"
             command = [binary, "--ignored", "--test-threads=1", "--skip", "artifact_process",
-                       "--skip", V2_MIGRATION_CONTRACT]
+                       "--skip", V2_MIGRATION_CONTRACT, "--skip", V3_MIGRATION_CONTRACT]
             if selected:
                 command += ["--exact", selected]
             result = run(command, env=env, timeout=300, ok=False)
@@ -110,7 +114,7 @@ class Fixture(OpaqueFixture):
                 after = self.sql(f"SELECT token::text||':'||generation::text||':'||hard_until::text FROM git_rs_cache.{table} WHERE namespace='{namespace}'")
                 assert after == before, f"{function} confirmation reset its attempt/deadline"
 
-            proxy.arm("git_rs_cache.publish_manifest(", "commit-gate")
+            proxy.arm("git_rs_cache.publish_manifest_v4(", "commit-gate")
             process.send("publish confirmed")
             assert proxy.hit.wait(timeout=5), "manifest COMMIT boundary not reached"
             assert self.sql(f"SELECT count(*) FROM git_rs_cache.manifest_roots WHERE namespace='{namespace}'") == "1"
@@ -121,7 +125,7 @@ class Fixture(OpaqueFixture):
 
             assert process.ask("build crash") == "claimed"
             assert process.ask("stage crash 65536 74") == "staged"
-            proxy.arm("git_rs_cache.publish_manifest(", "commit-gate")
+            proxy.arm("git_rs_cache.publish_manifest_v4(", "commit-gate")
             process.send("publish crash")
             assert proxy.hit.wait(timeout=5)
             process.kill()
@@ -140,7 +144,7 @@ class Fixture(OpaqueFixture):
         proxy = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
             for expired in (False, True):
-                env = self.test_environment(GIT_RS_CACHE_READ_SECONDS="10", GIT_RS_CACHE_GRACE_SECONDS="1",
+                env = self.test_environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_READ_SECONDS="10", GIT_RS_CACHE_GRACE_SECONDS="1",
                     GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_address[1]}")
                 namespace = env["GIT_RS_CACHE_NAMESPACE"]
                 prefix = "expired" if expired else "live"
@@ -191,7 +195,7 @@ class Fixture(OpaqueFixture):
                 assert current.ask("stage current 524288 83") == "staged"
                 assert current.ask("publish current") == "true"
                 self.sql(f"UPDATE git_rs_cache.payloads SET last_delete_at=clock_timestamp()-interval '31 seconds' WHERE namespace='{namespace}'")
-                assert gc.ask("delete") == "2", "old GC re-deletes only its permanently retired external children"
+                assert gc.ask("delete") == "3", "forced-S3 root and both children remain permanently rediscoverable"
                 self.assert_complete(current.ask("get current"), [(524288, 83)])
                 current.close()
                 assert self.object_request("GET", "source-test", "repos/protected/sentinel").stdout == b"authoritative source sentinel\n"
@@ -205,7 +209,7 @@ class Fixture(OpaqueFixture):
         pg = PgProxy(self.env["PGPORT"])
         objects = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.test_environment(GIT_RS_CACHE_CONNECTIONS="1", GIT_RS_CACHE_LEASE_SECONDS="1",
+            env = self.test_environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_CONNECTIONS="1", GIT_RS_CACHE_LEASE_SECONDS="1",
                 GIT_RS_CACHE_JOB_SECONDS="8", GIT_RS_CACHE_PGPORT=str(pg.server_address[1]),
                 GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{objects.server_address[1]}")
             env.update(GIT_RS_TEST_BUILD_LEASE_SECONDS="1", GIT_RS_TEST_BUILD_HARD_SECONDS="15")
@@ -247,7 +251,7 @@ class Fixture(OpaqueFixture):
     def narrow_caller_and_late_put(self):
         objects = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.test_environment(GIT_RS_CACHE_GRACE_SECONDS="1",
+            env = self.test_environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_GRACE_SECONDS="1",
                 GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{objects.server_address[1]}")
             namespace = env["GIT_RS_CACHE_NAMESPACE"]
             process = self.artifact_process(env, "narrow-caller")
@@ -270,7 +274,7 @@ class Fixture(OpaqueFixture):
             assert gc.ask("delete") == "1"
             objects.release.set()
             assert objects.finished.wait(timeout=5)
-            assert self.object_request("GET", "derived-test", object_key).stdout == bytes([97]) * 524288
+            self.assert_stored_object(namespace, object_key, bytes([97]) * 524288)
             self.sql(f"UPDATE git_rs_cache.payloads SET last_delete_at=clock_timestamp()-interval '31 seconds' WHERE namespace='{namespace}'")
             assert gc.ask("delete") == "1", "a late PUT from a bound build must remain discoverable/re-deletable"
             assert self.object_request("GET", "derived-test", object_key, ok=False).returncode != 0
@@ -296,7 +300,7 @@ class Fixture(OpaqueFixture):
             self.assert_complete(reader.ask("checkpoint-hold work"), [(524288, 101)])
             for function, byte in (("claim_checkpoint", 102), ("publish_checkpoint", 103)):
                 assert writer.ask(f"stage work 524288 {byte}") == "staged"
-                proxy.arm("git_rs_cache." + function + "(", "commit-gate")
+                proxy.arm("git_rs_cache." + (function + "_v4" if function == "publish_checkpoint" else function) + "(", "commit-gate")
                 writer.send("checkpoint work")
                 assert proxy.hit.wait(timeout=5), f"{function} COMMIT gate was not reached"
                 attempt = self.sql(f"SELECT token::text||':'||generation::text||':'||hard_until::text FROM git_rs_cache.jobs WHERE namespace='{namespace}' AND checkpoint_write")
@@ -320,7 +324,7 @@ class Fixture(OpaqueFixture):
             # same complete bytes and parent. A must never confirm B's UUID just
             # because the digest matches. Both writes use real API/SQL sessions.
             assert writer.ask("stage work 524288 103") == "staged"
-            proxy.arm("git_rs_cache.publish_checkpoint(", "commit-gate")
+            proxy.arm("git_rs_cache.publish_checkpoint_v4(", "commit-gate")
             assert writer.ask("checkpoint-start work") == "started"
             assert proxy.hit.wait(timeout=5)
             root_a = self.sql(f"SELECT d.payload::text FROM git_rs_cache.directory d JOIN git_rs_cache.jobs j USING(namespace,key_hash) WHERE d.namespace='{namespace}' AND j.checkpoint_write")
@@ -336,7 +340,7 @@ class Fixture(OpaqueFixture):
             assert self.sql(f"SELECT d.payload::text FROM git_rs_cache.directory d JOIN git_rs_cache.jobs j USING(namespace,key_hash) WHERE d.namespace='{namespace}' AND j.checkpoint_write") == root_b[1]
             self.results["cases"]["same_digest_superseded_commit_never_confirms_later_uuid"] = "passed"
             assert writer.ask("stage work 524288 104") == "staged"
-            proxy.arm("git_rs_cache.publish_checkpoint(", "commit-gate")
+            proxy.arm("git_rs_cache.publish_checkpoint_v4(", "commit-gate")
             writer.send("checkpoint work")
             assert proxy.hit.wait(timeout=5)
             committed = self.sql(f"SELECT payload::text FROM git_rs_cache.directory d JOIN git_rs_cache.jobs j USING(namespace,key_hash) WHERE d.namespace='{namespace}' AND j.checkpoint_write")
@@ -357,7 +361,7 @@ class Fixture(OpaqueFixture):
     def checkpoint_gc_race(self):
         objects = ObjectProxy(self.port(self.s3, "7070/tcp"))
         try:
-            env = self.test_environment(GIT_RS_CACHE_READ_SECONDS="60", GIT_RS_CACHE_GRACE_SECONDS="1",
+            env = self.test_environment(GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_CACHE_READ_SECONDS="60", GIT_RS_CACHE_GRACE_SECONDS="1",
                 GIT_RS_TEST_BUILD_HARD_SECONDS="60", GIT_RS_TEST_BUILD_LEASE_SECONDS="60",
                 GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{objects.server_address[1]}")
             namespace = env["GIT_RS_CACHE_NAMESPACE"]
@@ -475,7 +479,8 @@ class Fixture(OpaqueFixture):
         assert legacy.ask("claim retained") == "claimed"
         assert legacy.ask("publish retained 65536 37") == "true"
         self.assert_hit(legacy.ask("hold retained"), 65536, 37)
-        upgrade_env = dict(env, GIT_RS_TEST_CACHE_ADMIN_DSN=self.admin_dsn(admin), GIT_RS_TEST_CACHE_SCHEMA_EXPECTED="1")
+        upgrade_env = dict(env, GIT_RS_TEST_CACHE_ADMIN_DSN=self.admin_dsn(admin),
+            GIT_RS_TEST_CACHE_SCHEMA_EXPECTED="1", GIT_RS_TEST_LEGACY_COMPRESSED_PROBE="1")
         locker = SqlLocker(self, admin, "v1-upgrade-lock", "LOCK TABLE git_rs_cache.jobs IN ACCESS SHARE MODE")
         with ThreadPoolExecutor(max_workers=1) as pool:
             upgrade = pool.submit(run, [self.args.build_contract_binary, "--ignored", "--exact",
@@ -490,10 +495,16 @@ class Fixture(OpaqueFixture):
         assert b"cache schema before upgrade: 1" in result.stdout
         self.assert_source_proof(admin, "v1-upgraded", source_before)
         self.assert_hit(legacy.ask("consume retained"), 65536, 37)
+        ns = env["GIT_RS_CACHE_NAMESPACE"]
+        assert self.sql(f"SELECT count(*) FROM git_rs_cache.payloads WHERE namespace='{ns}' AND encoding='zstd-v1'", admin) == "1"
+        holds = self.sql(f"SELECT count(*) FROM git_rs_cache.read_holds WHERE namespace='{ns}'", admin)
+        for _ in range(3):
+            assert legacy.ask("get new-compressed") == "miss", "actual pinned v1 runtime must never receive compressed storage"
+        assert self.sql(f"SELECT count(*) FROM git_rs_cache.read_holds WHERE namespace='{ns}'", admin) == holds, "cold old-runtime misses must not leak holds"
         functions = "SELECT md5(string_agg(pg_get_functiondef(p.oid),'' ORDER BY p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='git_rs_cache'"
         before = self.sql(functions, admin)
         old = run([self.args.legacy_binary, "cache-migrate"], env=env, ok=False)
-        assert old.returncode != 0, "old migrator must reject v3 rather than replace its functions"
+        assert old.returncode != 0, "old migrator must reject v4 rather than replace its functions"
         assert self.sql(functions, admin) == before
         outcomes = self.concurrent_migrators(env, admin, "v2-migrators")
         run([self.binary, "cache-migrate"], env=env)
@@ -504,7 +515,7 @@ class Fixture(OpaqueFixture):
         assert legacy.ask("consume retained").startswith("hit ")
         assert legacy.ask("release retained") == "ok"
         self.sql("UPDATE git_rs_cache.payloads SET delete_after=clock_timestamp()-interval '1 second'", admin)
-        assert legacy.ask("delete") == "1", "old runtime maintenance must remain safe across v3 upgrade"
+        assert legacy.ask("delete") == "1", "old runtime maintenance must remain safe across v4 upgrade"
         legacy.close()
         self.assert_source_proof(admin, "v2-idempotent", source_before)
 
@@ -517,7 +528,7 @@ class Fixture(OpaqueFixture):
         assert self.sql("SELECT to_regclass('git_rs_cache.schema_version') IS NULL", fresh_admin) == "t"
         outcomes = self.concurrent_migrators(fresh_env, fresh_admin, "fresh-migrators")
         run([self.binary, "cache-migrate"], env=fresh_env)
-        assert self.sql("SELECT version FROM git_rs_cache.schema_version", fresh_admin) == "3"
+        assert self.sql("SELECT version FROM git_rs_cache.schema_version", fresh_admin) == "4"
         assert self.sql("SELECT count(*) FROM git_rs_cache.namespaces", fresh_admin) == "1"
         self.assert_source_proof(fresh_admin, "fresh-v2", fresh_source_before)
         self.results["migration_outcomes"] = [result.returncode for result in outcomes]
@@ -534,11 +545,22 @@ class Fixture(OpaqueFixture):
         (self.base / "v2-upgrade.log").write_bytes(result.stdout + result.stderr)
         record_contracts(self.results, "blame_build", {V2_MIGRATION_CONTRACT}, result)
         self.assert_source_proof(v2_admin, "v2-upgraded", v2_source)
+        v3 = "blame_v3_" + uuid.uuid4().hex
+        self.sql(f"CREATE DATABASE {v3}; GRANT CREATE ON DATABASE {v3} TO git_rs_cache;")
+        v3_admin = dict(self.env, PGDATABASE=v3)
+        v3_source = self.prepare_source_proof(v3_admin, "v3-upgrade")
+        v3_env = dict(env, GIT_RS_TEST_CACHE_ADMIN_DSN=self.admin_dsn(v3_admin),
+            GIT_RS_CACHE_DSN=f"host=127.0.0.1 port={self.env['PGPORT']} user=git_rs_cache password=synthetic-cache-only dbname={v3}")
+        result = run([self.args.build_contract_binary, "--ignored", "--exact",
+            V3_MIGRATION_CONTRACT, "--nocapture"], env=v3_env, timeout=60)
+        (self.base / "v3-upgrade.log").write_bytes(result.stdout + result.stderr)
+        record_contracts(self.results, "blame_build", {V3_MIGRATION_CONTRACT}, result)
+        self.assert_source_proof(v3_admin, "v3-upgraded", v3_source)
         if self.args.opaque_contract_binary:
             self.run_contracts()
         else:
-            raise AssertionError("migration gate requires existing opaque contracts against v3")
-        self.results["cases"]["fresh_v1_v2_v3_concurrent_migrators_and_live_old_runtime"] = "passed"
+            raise AssertionError("migration gate requires existing opaque contracts against v4")
+        self.results["cases"]["fresh_v1_v2_v3_v4_concurrent_migrators_and_live_old_runtime"] = "passed"
 
     def concurrent_migrators(self, env, admin, name):
         locker = SqlLocker(self, admin, name + "-lock", "DO $$ BEGIN PERFORM pg_advisory_xact_lock(91079170002); END $$")

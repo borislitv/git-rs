@@ -431,7 +431,7 @@ impl BlameArtifacts {
                 let reader = config::identifier()?;
                 let started = Instant::now();
                 let rows = self.cache.inner.pg.query(
-                    "SELECT * FROM git_rs_cache.acquire_manifest_child($1::text::uuid,$2::text::uuid,$3::text::uuid,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9,$10)",
+                    "SELECT * FROM git_rs_cache.acquire_manifest_child_v4($1::text::uuid,$2::text::uuid,$3::text::uuid,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9,$10)",
                     &[&c.namespace, &c.owner, &root_hold.payload, &root_hold.reader, &(ordinal as i32), &reader,
                         &c.read_seconds, &(c.max_payload_bytes as i64), &(*size as i64), &&digest[..]], 1, 1024)?;
                 let child_key = key.body_chunk(digest);
@@ -584,9 +584,9 @@ impl ManifestCommit<'_> {
             .collect();
         let sizes: Vec<_> = self.chunks.iter().map(|chunk| chunk.len() as i64).collect();
         let sql = if self.checkpoint_payload.is_some() {
-            "SELECT git_rs_cache.publish_checkpoint($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9,$10::text::uuid,$11,$12::text[],$13::bytea[],$14::bigint[],$15)"
+            "SELECT git_rs_cache.publish_checkpoint_v4($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9,$10::text::uuid,$11,$12::text[],$13::bytea[],$14::bigint[],$15)"
         } else {
-            "SELECT git_rs_cache.publish_manifest($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9,$10::text::uuid,$11,$12::text[],$13::bytea[],$14::bigint[],$15)"
+            "SELECT git_rs_cache.publish_manifest_v4($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9,$10::text::uuid,$11,$12::text[],$13::bytea[],$14::bigint[],$15)"
         };
         cache.inner.pg.query(
             sql,

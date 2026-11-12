@@ -16,6 +16,19 @@ pub(crate) struct Reservation {
     budget: Arc<Budget>,
     amount: usize,
 }
+impl Reservation {
+    /// Transfer already admitted capacity to an owner without admitting it again.
+    pub fn take(&mut self, amount: usize) -> Result<Self> {
+        if amount > self.amount {
+            return Err(invalid("cache allocation exceeds admitted capacity"));
+        }
+        self.amount -= amount;
+        Ok(Self {
+            budget: self.budget.clone(),
+            amount,
+        })
+    }
+}
 impl Budget {
     pub fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -50,6 +63,36 @@ pub(crate) struct OwnedBytes {
     _reservation: Reservation,
 }
 impl OwnedBytes {
+    pub fn from_reserved(bytes: Vec<u8>, working: &mut Reservation) -> Result<Self> {
+        let reservation = working.take(bytes.capacity())?;
+        Ok(Self {
+            bytes,
+            _reservation: reservation,
+        })
+    }
+
+    /// Admission precedes allocation, including bounded capacity headroom.
+    /// Native/wire workspace has its own independent reservation.
+    pub fn allocate(size: usize, budget: &Arc<Budget>) -> Result<Self> {
+        process::check_operation()?;
+        let mut working = budget.reserve(
+            size.checked_add(size.min(65536))
+                .ok_or_else(|| invalid("cache allocation size overflow"))?,
+        )?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size)?;
+        let reservation = working.take(bytes.capacity())?;
+        let mut owner = Self {
+            bytes,
+            _reservation: reservation,
+        };
+        while owner.bytes.len() < size {
+            process::check_operation()?;
+            owner.bytes.resize((owner.bytes.len() + 65536).min(size), 0);
+        }
+        Ok(owner)
+    }
+
     pub fn new(bytes: Vec<u8>, budget: &Arc<Budget>) -> Result<Arc<Self>> {
         let reservation = budget.reserve(bytes.capacity())?;
         Ok(Arc::new(Self {

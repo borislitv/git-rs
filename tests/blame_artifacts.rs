@@ -50,13 +50,20 @@ fn complete_manifest_reuses_verified_chunks_across_independent_cache_pools() {
                 .publish(&build, ArtifactKind::CompleteBody, &chunks)
                 .unwrap()
         );
+        let admin = Admin::new();
+        admin.sql("SET ROLE git_rs_cache; SET search_path=git_rs_cache,pg_catalog");
+        assert_eq!(admin.scalar(&format!("SELECT (p.encoding='zstd-v1' AND p.object_key IS NULL AND p.stored_size<p.size AND p.size=524288 AND e.size=p.size AND e.digest=p.digest)::text FROM git_rs_cache.manifest_children e JOIN git_rs_cache.payloads p ON p.namespace=e.namespace AND p.id=e.child WHERE e.namespace='{}' AND e.ordinal=0", config.namespace)), "true", "compressible logical half-MiB chunk must fit default physical inline threshold");
         drop(chunks);
-        let independent = DerivedCache::open(config).unwrap();
+        let independent = DerivedCache::open(config.clone()).unwrap();
         let complete = BlameArtifacts::new(&independent)
             .get_verified(&key, ArtifactKind::CompleteBody, authority())
             .unwrap()
             .unwrap();
         assert_eq!(complete.len(), first.len() + second.len());
+        let ns = &config.namespace;
+        let holds = admin.scalar(&format!("SELECT count(*)::text FROM git_rs_cache.read_holds WHERE namespace='{ns}'"));
+        assert_eq!(admin.scalar(&format!("SELECT count(*)::text FROM git_rs_cache.manifest_roots m JOIN git_rs_cache.read_holds h ON h.namespace=m.namespace AND h.payload=m.payload JOIN git_rs_cache.manifest_children e ON e.namespace=m.namespace AND e.parent=m.payload AND e.ordinal=0 CROSS JOIN LATERAL git_rs_cache.acquire_manifest_child(m.namespace,'{}',m.payload,h.reader,e.ordinal,'{}',30,8388608,e.size,e.digest) old WHERE m.namespace='{ns}'", config.owner, id())), "0", "old child reader must miss compressed bytes under an actual root hold");
+        assert_eq!(admin.scalar(&format!("SELECT count(*)::text FROM git_rs_cache.read_holds WHERE namespace='{ns}'")), holds, "old child misses may not insert holds");
         complete
             .with_chunks(|actual| {
                 assert_eq!(actual.len(), 2);

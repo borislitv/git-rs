@@ -42,7 +42,11 @@
 - Actual jobs retain finite lifetime, source holds and admission through cleanup; each waiter
   owns its cancellation/deadline. Post-confirmed opt-in warming uses the same CPU pool and work
   admission, fresh authorized source and its own finite deadline; it cannot fail a confirmed push.
-- Cache v1-to-v2-to-v3 migration is independent and forward-only. Old migrators reject v3; rollback
+- Physical cache compression preserves logical keys, digests, signed descriptors and byte quotas.
+  Select raw-v1/zstd-v1 from explicit metadata, never payload magic. Bound stored/decoded bytes
+  independently, admit native workspace before creation, and retain owners through codec cleanup.
+  Old raw readers must reject compressed rows before acquiring read holds.
+- Cache v1-to-v2-to-v3-to-v4 migration is independent and forward-only. Old migrators reject v4; rollback
   requires caching disabled or a separate compatible cache schema/database and fresh owned prefix.
   Never infer old-writer quiescence from schema rejection or reuse retired payload identities.
 - Keep the retained-child helper and retirement's expanded predicates semantically aligned.

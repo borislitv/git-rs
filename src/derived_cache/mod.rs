@@ -2,6 +2,7 @@
 //! reader ownership remain with the caller; cache leases never grant source access.
 mod artifacts;
 mod build;
+mod codec;
 mod config;
 mod coordinator;
 mod key;
@@ -113,7 +114,7 @@ impl DerivedCache {
         let reader = config::identifier()?;
         let started = Instant::now();
         let rows = self.inner.pg.query(
-            "SELECT * FROM git_rs_cache.acquire_read($1::text::uuid,$2::text::uuid,$3,$4,$5::text::uuid,$6,$7)",
+            "SELECT * FROM git_rs_cache.acquire_read_v4($1::text::uuid,$2::text::uuid,$3,$4,$5::text::uuid,$6,$7)",
             &[&c.namespace, &c.owner, &&key.hash[..], &key.canonical, &reader, &c.read_seconds, &(c.max_payload_bytes as i64)], 1, 1024)?;
         self.load_read(key, access, reader, started, rows)
     }
@@ -131,9 +132,6 @@ impl DerivedCache {
             return Ok(None);
         };
         let id: String = row.try_get(0)?;
-        let digest: Vec<u8> = row.try_get(1)?;
-        let size = usize::try_from(row.try_get::<_, i64>(2)?)?;
-        let object_key: Option<String> = row.try_get(3)?;
         let lifetime = u64::try_from(row.try_get::<_, i64>(4)?.max(0))?;
         let hold = ReadHold {
             cache: self.inner.clone(),
@@ -141,35 +139,58 @@ impl DerivedCache {
             payload: id.clone(),
             deadline: started + Duration::from_millis(lifetime),
         };
-        let _working = self.inner.budget.reserve(size.saturating_mul(4) + 65536)?;
-        let loaded = (|| -> Result<Vec<u8>> {
+        let loaded = (|| -> Result<OwnedBytes> {
             hold.check()?;
-            let bytes = if let Some(object_key) = object_key {
-                self.inner
+            let metadata = codec::Metadata::parse(
+                row.try_get(5)?,
+                row.try_get(2)?,
+                row.try_get(1)?,
+                row.try_get(6)?,
+                row.try_get(7)?,
+                c.max_payload_bytes,
+            )?;
+            let object_key: Option<&str> = row.try_get(3)?;
+            // Binary PG protocol/Row and HTTP transfer scratch remain real
+            // allocations. Admit conservatively before fetching the stored body.
+            let mut wire = self.inner.budget.reserve(
+                metadata
+                    .stored_size
+                    .checked_mul(4)
+                    .and_then(|size| size.checked_add(65536))
+                    .ok_or_else(|| invalid("cache wire allocation overflow"))?,
+            )?;
+            let data = if let Some(object_key) = object_key {
+                let bytes = self
+                    .inner
                     .objects
                     .as_ref()
                     .ok_or_else(|| invalid("cache object storage not configured"))?
-                    .get(&object_key, size)?
+                    .get(object_key, metadata.stored_size)?;
+                if metadata.encoding == codec::Encoding::Raw {
+                    metadata.verify_stored(&bytes)?;
+                    metadata.verify_logical(&bytes)?;
+                    OwnedBytes::from_reserved(bytes, &mut wire)?
+                } else {
+                    codec::decode(&bytes, &metadata, &self.inner.budget)?
+                }
             } else {
+                let stored_size = i32::try_from(metadata.stored_size)?;
                 let rows = self.inner.pg.query(
                     "SELECT p.body FROM git_rs_cache.payloads p JOIN git_rs_cache.read_holds h ON h.namespace=p.namespace AND h.payload=p.id WHERE p.namespace=$1::text::uuid AND p.id=$2::text::uuid AND h.reader=$3::text::uuid AND h.lease_until>clock_timestamp() AND octet_length(p.body)=$4",
-                    &[&c.namespace, &id, &hold.reader, &(size as i32)], 1, size)?;
+                    &[&c.namespace, &id, &hold.reader, &stored_size], 1, metadata.stored_size)?;
                 let row = rows
                     .first()
                     .ok_or_else(|| invalid("cache payload absent or expired"))?;
-                row.try_get::<_, &[u8]>(0)?.to_vec()
+                codec::decode(row.try_get::<_, &[u8]>(0)?, &metadata, &self.inner.budget)?
             };
-            if bytes.len() != size || hash(&bytes)?[..] != digest {
-                return Err(invalid("cache payload integrity mismatch"));
-            }
             hold.check()?;
-            Ok(bytes)
+            Ok(data)
         })();
         match loaded {
-            Ok(bytes) => {
+            Ok(data) => {
                 access.check(key)?;
                 Ok(Some(Payload {
-                    data: OwnedBytes::new(bytes, &self.inner.budget)?,
+                    data: Arc::new(data),
                     hold: Some(Arc::new(hold)),
                     access,
                     key: key.clone(),
@@ -253,22 +274,35 @@ impl DerivedCache {
         if bytes.len() > c.max_payload_bytes {
             return Err(invalid("artifact payload limit exceeded"));
         }
-        let external = bytes.len() > c.inline_bytes;
+        let encoded = codec::encode(bytes, &self.inner.budget, c.max_payload_bytes)?;
+        let metadata = &encoded.metadata;
+        let stored = encoded.bytes();
+        let external = stored.len() > c.inline_bytes;
         if external && self.inner.objects.is_none() {
             return Err(invalid(
                 "large cache payload requires separate cache S3 configuration",
             ));
         }
-        let _working = self.inner.budget.reserve(bytes.len() * 4 + 65536)?;
-        let digest = hash(bytes)?;
+        // PG binary parameter encoding and the S3 sealed memfd are not zero-copy.
+        // The physical candidate and native context have separate owned charges.
+        let _working = self.inner.budget.reserve(
+            stored
+                .len()
+                .checked_mul(4)
+                .and_then(|size| size.checked_add(65536))
+                .ok_or_else(|| invalid("cache upload allocation overflow"))?,
+        )?;
+        let digest = metadata.logical_digest;
         let id = match manifest.and_then(|manifest| manifest.checkpoint_payload) {
             Some(id) => id.to_owned(),
             None => config::identifier()?,
         };
         let prepare = || {
             self.inner.pg.query(
-            "SELECT git_rs_cache.prepare_payload($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9)",
-            &[&c.namespace, &c.owner, &&claim.key.hash[..], &claim.token, &claim.generation, &id, &&digest[..], &(bytes.len() as i64), &external], 1, 64)
+            "SELECT git_rs_cache.prepare_payload_v4($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8,$9,$10,$11,$12)",
+            &[&c.namespace, &c.owner, &&claim.key.hash[..], &claim.token, &claim.generation, &id,
+                &&digest[..], &(metadata.logical_size as i64), &external, &metadata.encoding.as_str(),
+                &&metadata.stored_digest[..], &(metadata.stored_size as i64)], 1, 64)
         };
         let prepared = prepare().or_else(|_| {
             process::check_operation()?;
@@ -283,7 +317,11 @@ impl DerivedCache {
                 .objects
                 .as_ref()
                 .expect("validated cache S3 configuration");
-            let result = objects.put(&format!("{}{id}", c.object_prefix()), bytes, &digest);
+            let result = objects.put(
+                &format!("{}{id}", c.object_prefix()),
+                stored,
+                &metadata.stored_digest,
+            );
             let confirmed = result.is_ok();
             // The durable intent precedes PUT. Preserve ambiguous outcomes even
             // when the request/owner expired while the remote store accepted it.
@@ -295,12 +333,12 @@ impl DerivedCache {
         }
         process::check_operation()?;
         access.check(&claim.key)?;
-        let inline = (!external).then_some(bytes);
+        let inline = (!external).then_some(stored);
         let published = if let Some(manifest) = manifest {
             manifest.commit(self, claim, &id, inline)
         } else {
             self.inner.pg.query(
-            "SELECT git_rs_cache.publish($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8)",
+            "SELECT git_rs_cache.publish_v4($1::text::uuid,$2::text::uuid,$3,$4::text::uuid,$5,$6::text::uuid,$7,$8)",
             &[&c.namespace, &c.owner, &&claim.key.hash[..], &claim.token, &claim.generation, &id, &inline, &c.ttl_seconds], 1, 64)
         };
         match published {
@@ -308,8 +346,10 @@ impl DerivedCache {
             Err(error) => {
                 process::check_operation()?;
                 let rows = self.inner.pg.query(
-                    "SELECT EXISTS(SELECT 1 FROM git_rs_cache.directory d JOIN git_rs_cache.payloads p ON p.namespace=d.namespace AND p.id=d.payload WHERE d.namespace=$1::text::uuid AND d.key_hash=$2 AND d.payload=$3::text::uuid AND p.digest=$4 AND d.state='ready' AND p.state='live' AND d.expires_at>clock_timestamp())",
-                    &[&c.namespace, &&claim.key.hash[..], &id, &&digest[..]], 1, 64)?;
+                    "SELECT EXISTS(SELECT 1 FROM git_rs_cache.directory d JOIN git_rs_cache.payloads p ON p.namespace=d.namespace AND p.id=d.payload JOIN git_rs_cache.jobs j ON j.namespace=d.namespace AND j.key_hash=d.key_hash WHERE d.namespace=$1::text::uuid AND d.key_hash=$2 AND d.payload=$3::text::uuid AND p.digest=$4 AND p.size=$5 AND p.encoding=$6 AND coalesce(p.stored_digest,p.digest)=$7 AND coalesce(p.stored_size,p.size)=$8 AND j.canonical=$9 AND p.token=$10::text::uuid AND p.generation=$11 AND (p.object_key IS NOT NULL)=$12 AND d.state='ready' AND p.state='live' AND d.expires_at>clock_timestamp())",
+                    &[&c.namespace, &&claim.key.hash[..], &id, &&digest[..], &(metadata.logical_size as i64),
+                        &metadata.encoding.as_str(), &&metadata.stored_digest[..], &(metadata.stored_size as i64),
+                        &claim.key.canonical, &claim.token, &claim.generation, &external], 1, 64)?;
                 if rows[0].try_get::<_, bool>(0)? {
                     Ok(true)
                 } else {

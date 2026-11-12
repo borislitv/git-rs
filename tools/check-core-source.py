@@ -2,6 +2,7 @@
 """Read-only audit of the pinned owned Git dependency, lock and optional checkout."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -13,6 +14,17 @@ REPOSITORY = "https://github.com/borislitv/gitoxide"
 GITOXIDE_REV = "7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
 CODEC_REPOSITORY = "https://github.com/borislitv/iconv-native-rs"
 CODEC_REV = "f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"
+ZSTD_REPOSITORY = "https://github.com/borislitv/zstd-rs"
+ZSTD_REV = "66f4b27ef27742d3df45826bc85c4ed423483cf0"
+ZSTD_NATIVE_REV = "f8745da6ff1ad1e7bab384bd1f9d742439278e99"
+ZSTD_PACKAGES = {"zstd": "0.14.3", "zstd-safe": "8.2.0", "zstd-sys": "2.1.2+zstd.1.5.7"}
+ZSTD_LICENSES = {"zstd": "BSD-3-Clause", "zstd-safe": "BSD-3-Clause",
+                 "zstd-sys": "BSD-3-Clause AND BSD-2-Clause"}
+ZSTD_FEATURES = {"zstd": ["experimental", "vendored"],
+                 "zstd-safe": ["alloc", "experimental", "std", "vendored"],
+                 "zstd-sys": ["experimental", "std", "vendored"]}
+ZSTD_NOTICES = ["LICENSE", "zstd-safe/LICENSE", "zstd-safe/zstd-sys/LICENSE",
+                "zstd-safe/zstd-sys/LICENSE.BSD-2-Clause", "zstd-safe/zstd-sys/LICENSE.BSD-3-Clause"]
 
 
 def git(root, *args):
@@ -20,7 +32,80 @@ def git(root, *args):
                           capture_output=True, text=True, timeout=20).stdout.strip()
 
 
-def audit(root, dependency=None, codec_dependency=None):
+def audit_zstd(root, manifests, lock, dependency=None, metadata=None):
+    if "ZSTD_SYS_USE_PKG_CONFIG" in os.environ:
+        raise ValueError("ZSTD_SYS_USE_PKG_CONFIG must be absent, even when set to 0")
+    provenance = json.loads((root / "docs/zstd-source.json").read_text())
+    native = provenance["native"]
+    if (provenance["source"] != {"git": ZSTD_REPOSITORY, "rev": ZSTD_REV}
+            or provenance["packages"] != ZSTD_PACKAGES
+            or provenance["licenses"] != ZSTD_LICENSES
+            or provenance["notices_in_source"] != ZSTD_NOTICES
+            or provenance["fork_provenance_in_source"] != "zstd-safe/FORK_PROVENANCE.md"
+            or provenance["upstream"] != {"git": "https://github.com/gyscos/zstd-rs",
+                                          "rev": "fa82b4c286e9a95e6681e59df5d0892ed89e75b9"}
+            or provenance["default_features"] is not False
+            or provenance["features"] != ZSTD_FEATURES["zstd"]
+            or provenance["resolved_features"] != ZSTD_FEATURES
+            or provenance["forbidden_environment"] != ["ZSTD_SYS_USE_PKG_CONFIG"]):
+        raise ValueError("zstd provenance requires the qualified owned pin, features and licenses")
+    if native != {"git": "https://github.com/facebook/zstd", "rev": ZSTD_NATIVE_REV,
+                  "version": "1.5.7", "path": "zstd-safe/zstd-sys/zstd",
+                  "license": "BSD-3-Clause OR GPL-2.0-only", "selected_license": "BSD-3-Clause",
+                  "notices_in_source": ["LICENSE", "COPYING"]}:
+        raise ValueError("zstd native provenance differs")
+    required = {"git": ZSTD_REPOSITORY, "rev": ZSTD_REV, "default-features": False,
+                "features": ZSTD_FEATURES["zstd"]}
+    direct = []
+    for index, manifest in enumerate(manifests):
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for name, spec in manifest.get(section, {}).items():
+                if name in ZSTD_PACKAGES or (isinstance(spec, dict) and spec.get("package") in ZSTD_PACKAGES):
+                    if index != 0 or section != "dependencies" or name != "zstd" or spec != required:
+                        raise ValueError("zstd requires one normal root Git dependency with exact minimal features")
+                    direct.append(name)
+    if direct != ["zstd"]:
+        raise ValueError("zstd requires one normal root Git dependency with exact minimal features")
+    source = f"git+{ZSTD_REPOSITORY}?rev={ZSTD_REV}#{ZSTD_REV}"
+    packages = [p for p in lock["package"] if p["name"] in ZSTD_PACKAGES]
+    if (len(packages) != 3 or {p["name"]: p["version"] for p in packages} != ZSTD_PACKAGES
+            or any(p.get("source") != source for p in packages)):
+        raise ValueError("zstd requires three unique same-revision owned Git lock packages")
+    if metadata is not None:
+        graph = json.loads(metadata.read_text())
+        ids = {p["id"]: p["name"] for p in graph["packages"] if p["name"] in ZSTD_PACKAGES}
+        resolved = {ids[n["id"]]: sorted(n["features"]) for n in graph["resolve"]["nodes"] if n["id"] in ids}
+        if (len(ids) != 3 or resolved != ZSTD_FEATURES
+                or any(p.get("source") != source or p["version"] != ZSTD_PACKAGES[p["name"]]
+                       for p in graph["packages"] if p["id"] in ids)):
+            raise ValueError("zstd resolved Cargo source/features differ from the minimal profile")
+    if dependency is not None:
+        if (git(dependency, "rev-parse", "HEAD") != ZSTD_REV
+                or git(dependency, "remote", "get-url", "origin").removesuffix(".git") != ZSTD_REPOSITORY
+                or git(dependency, "status", "--porcelain", "--untracked-files=no")):
+            raise ValueError("external zstd checkout is not the clean qualified owned revision")
+        paths = {"zstd": "Cargo.toml", "zstd-safe": "zstd-safe/Cargo.toml",
+                 "zstd-sys": "zstd-safe/zstd-sys/Cargo.toml"}
+        for name, path in paths.items():
+            package = tomllib.loads((dependency / path).read_text())["package"]
+            if package["version"] != ZSTD_PACKAGES[name] or package["license"] != ZSTD_LICENSES[name]:
+                raise ValueError(f"{name}: external zstd package identity/license differs")
+        native_root = dependency / native["path"]
+        if (git(dependency, "ls-tree", "HEAD", native["path"]) !=
+                f"160000 commit {ZSTD_NATIVE_REV}\t{native['path']}"
+                or git(native_root, "rev-parse", "HEAD") != ZSTD_NATIVE_REV
+                or git(native_root, "status", "--porcelain", "--untracked-files=no")
+                or git(dependency, "config", "--file", ".gitmodules", "--get",
+                       "submodule.zstd-safe/zstd-sys/zstd.url") != native["git"]):
+            raise ValueError("external zstd native submodule is not the clean pinned gitlink")
+        notices = [dependency / p for p in provenance["notices_in_source"]]
+        notices += [native_root / p for p in native["notices_in_source"]]
+        notices.append(dependency / provenance["fork_provenance_in_source"])
+        if any(not path.is_file() for path in notices):
+            raise ValueError("external zstd license/provenance notice missing")
+
+
+def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, metadata=None):
     provenance = json.loads((root / "docs/gitoxide-source.json").read_text())
     source = provenance["source"]
     rev = source["rev"]
@@ -57,6 +142,7 @@ def audit(root, dependency=None, codec_dependency=None):
         if "patch" in manifest or "replace" in manifest:
             raise ValueError("dependency overrides must not bypass the pinned source")
     lock = tomllib.loads((root / "Cargo.lock").read_text())
+    audit_zstd(root, manifests, lock, zstd_dependency, metadata)
     codecs = [p for p in lock["package"] if p["name"] == "iconv-native"]
     if codec_direct != 1 or len(codecs) != 1 or codecs[0].get("source") != codec_source or codecs[0]["version"] != "0.1.0":
         raise ValueError("missing, duplicate or inconsistent codec Git lock identity")
@@ -97,7 +183,9 @@ def audit(root, dependency=None, codec_dependency=None):
             raise ValueError("external codec license/notice differs")
     print(f"Core source audit passed: {len(packages)} Gitoxide packages, {REPOSITORY}@{rev}"
           + ("; external checkout/licenses verified" if dependency else "")
-          + f"; codec {CODEC_REPOSITORY}@{CODEC_REV}")
+          + f"; codec {CODEC_REPOSITORY}@{CODEC_REV}"
+          + f"; zstd {ZSTD_REPOSITORY}@{ZSTD_REV} (3 packages)"
+          + ("; resolved zstd features verified" if metadata else ""))
 
 
 def main():
@@ -105,8 +193,11 @@ def main():
     parser.add_argument("--project-root", type=Path, default=ROOT)
     parser.add_argument("--dependency-root", type=Path)
     parser.add_argument("--codec-root", type=Path)
+    parser.add_argument("--zstd-root", type=Path)
+    parser.add_argument("--cargo-metadata", type=Path,
+                        help="cargo metadata --locked --format-version 1 output; verifies feature unification")
     args = parser.parse_args()
-    audit(args.project_root, args.dependency_root, args.codec_root)
+    audit(args.project_root, args.dependency_root, args.codec_root, args.zstd_root, args.cargo_metadata)
 
 
 if __name__ == "__main__":

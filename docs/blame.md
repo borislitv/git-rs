@@ -142,6 +142,13 @@ authorized source. Signing mode never falls back to unsigned acceptance. This
 protects against a cache writer without the signing key, not a compromised producer
 or signing-key holder. Source authorization and final response fences remain required.
 
+The generic cache may physically compress body and checkpoint chunks with zstd.
+Descriptors and MACs still bind the logical lengths/digests, while separate stored
+metadata validates the compressed frame. A writer who repairs both layers of
+ordinary checksums still cannot repair the independent body MAC. Compression may
+move a chunk below the PostgreSQL inline threshold; logical quota charges stay
+unchanged. See [physical cache limits](../OPERATIONS.md#independently-configured-derived-artifacts).
+
 Rotate the key by provisioning a new protected file and restarting/reloading all
 producer instances. New signers reject old checkpoints and complete bodies as
 optional misses. An
