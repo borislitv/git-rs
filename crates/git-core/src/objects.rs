@@ -9,6 +9,34 @@ use gix_object::{Header, Kind};
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub(crate) const MAX_METADATA_HEADER_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_METADATA_OBJECT_BYTES: usize = 128 * 1024 * 1024;
+
+/// Return the physical header prefix, including its blank-line separator. A
+/// continuation line (even " \n") is not a separator. Truncated input within
+/// the bound is left to the maintained kind-specific parser, as before.
+pub(crate) fn metadata_header_end(bytes: &[u8], limit: usize, control: &Control) -> Result<usize> {
+    let limit = limit.min(MAX_METADATA_HEADER_BYTES);
+    let mut previous_lf = false;
+    let mut consumed = 0;
+    for chunk in bytes[..bytes.len().min(limit)].chunks(8 * 1024) {
+        control.check()?;
+        for &byte in chunk {
+            consumed += 1;
+            if previous_lf && byte == b'\n' {
+                control.check()?;
+                return Ok(consumed);
+            }
+            previous_lf = byte == b'\n';
+        }
+    }
+    control.check()?;
+    if bytes.len() > limit {
+        return Err(invalid("metadata header byte limit exceeded"));
+    }
+    Ok(bytes.len())
+}
+
 pub(crate) fn invalid(message: &'static str) -> Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
 }
@@ -77,8 +105,9 @@ pub struct SnapshotIdentity {
 #[derive(Clone, Copy, Debug)]
 pub struct ReadLimits {
     pub max_object_bytes: usize,
-    /// Whole commit/tag bound. Trees use max_object_bytes and the same shared
-    /// capacity budget as other physical object bodies, not this metadata cap.
+    /// Commit/tag header-section bound, including the separator and continuation
+    /// lines, at most 64 KiB. Messages use the separate physical object bound
+    /// (at most 128 MiB), with the same shared capacity budget as trees/blobs.
     pub max_metadata_bytes: usize,
     pub max_graph_objects: usize,
     pub max_graph_edges: usize,
@@ -113,7 +142,7 @@ impl Default for ReadLimits {
     fn default() -> Self {
         Self {
             max_object_bytes: 128 * 1024 * 1024,
-            max_metadata_bytes: 1024 * 1024,
+            max_metadata_bytes: MAX_METADATA_HEADER_BYTES,
             max_graph_objects: 100_000,
             max_graph_edges: 1_000_000,
             max_delta_depth: 64,
@@ -251,11 +280,20 @@ impl VerifiedObject {
         if self.id() != requested {
             return Err(invalid("verified object identity mismatch"));
         }
-        if self.as_slice().len() > limits.max_object_bytes {
+        let metadata = matches!(self.kind, Kind::Commit | Kind::Tag);
+        let object_limit = if metadata {
+            limits.max_object_bytes.min(MAX_METADATA_OBJECT_BYTES)
+        } else {
+            limits.max_object_bytes
+        };
+        if self.as_slice().len() > object_limit {
             return Err(invalid("object byte limit exceeded"));
         }
         if let Some(plan) = self.pack_plan {
-            plan.validate(limits)?;
+            plan.validate(ReadLimits {
+                max_object_bytes: object_limit,
+                ..limits
+            })?;
         }
         let shared = match &self.backing {
             VerifiedBacking::Owned(data) => data.shares_budget(budget),
@@ -263,6 +301,9 @@ impl VerifiedObject {
         };
         if !shared {
             return Err(invalid("verified object budget identity mismatch"));
+        }
+        if metadata {
+            metadata_header_end(self.as_slice(), limits.max_metadata_bytes, control)?;
         }
         control.check()?;
         Ok(())
@@ -461,11 +502,6 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         if object.kind != kind {
             return Err(invalid("unexpected object type"));
         }
-        if matches!(kind, Kind::Commit | Kind::Tag)
-            && object.data.as_slice().len() > self.limits.max_metadata_bytes
-        {
-            return Err(invalid("metadata byte limit exceeded"));
-        }
         Ok(object)
     }
 
@@ -490,11 +526,6 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         let initial = self
             .object(start)?
             .ok_or_else(|| invalid("missing lookup root"))?;
-        if initial.kind == Kind::Commit
-            && initial.data.as_slice().len() > self.limits.max_metadata_bytes
-        {
-            return Err(invalid("metadata byte limit exceeded"));
-        }
         let mut tree_id = match initial.kind {
             Kind::Tree => start.to_owned(),
             Kind::Commit => {

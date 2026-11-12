@@ -327,3 +327,80 @@ fn woof_terminal_refs_above_the_object_read_limit_do_not_hide_reachable_commits(
     );
     assert_eq!(budget.used(), 0);
 }
+
+#[test]
+fn large_metadata_tag_messages_peel_with_bounded_headers_and_physical_kind_checks() {
+    for header_bytes in [57_345, 65_535, 65_536, 65_537] {
+        let mut source = source();
+        let root = commit(&mut source, &[], 1, &"message".repeat(10_000));
+        let mut bytes = format!("object {root}\ntype commit\ntag ").into_bytes();
+        bytes.resize(header_bytes - 2, b't');
+        bytes.extend_from_slice(b"\n\n");
+        bytes.extend_from_slice(&vec![b'm'; 70_000]);
+        bytes.extend_from_slice(b"\n-----BEGIN PGP SIGNATURE-----\nopaque\n");
+        let tag = gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Tag, &bytes).unwrap();
+        source.objects.insert(tag, (Kind::Tag, bytes));
+        let broken = format!(
+            "object {root}\ntype tree\ntag wrong\n\n{}",
+            "message".repeat(10_000)
+        );
+        let wrong =
+            gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Tag, broken.as_bytes()).unwrap();
+        source
+            .objects
+            .insert(wrong, (Kind::Tag, broken.into_bytes()));
+        let malformed = format!(
+            "object {root}\ntype commit\ntag malformed\n continuation\n\n{}",
+            "message".repeat(10_000)
+        );
+        let malformed_id =
+            gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Tag, malformed.as_bytes())
+                .unwrap();
+        source
+            .objects
+            .insert(malformed_id, (Kind::Tag, malformed.into_bytes()));
+        let identity = source.identity.clone();
+        let budget = CapacityBudget::new(4 * 1024 * 1024);
+        let ctl = Control::new(Instant::now() + Duration::from_secs(10));
+        let session = SnapshotSession::open(
+            source,
+            &identity,
+            ctl.clone(),
+            budget.clone(),
+            ReadLimits {
+                max_metadata_bytes: 64 * 1024,
+                ..ReadLimits::default()
+            },
+        )
+        .unwrap();
+        let result = session.reachable_from_refs([(b"refs/tags/large".as_slice(), tag)]);
+        if header_bytes <= 65_536 {
+            let visible =
+                result.expect("large tag and commit messages must not consume header allowance");
+            assert_eq!(visible.iter().collect::<Vec<_>>(), vec![root]);
+        } else {
+            assert!(result.is_err(), "the complete tag header must fit 64 KiB");
+        }
+        assert_eq!(budget.used(), 0);
+        let error = session
+            .reachable_from_refs([(b"refs/tags/wrong".as_slice(), wrong)])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("tag target type mismatch"));
+        assert!(
+            session
+                .reachable_from_refs([(b"refs/tags/malformed".as_slice(), malformed_id)])
+                .is_err()
+        );
+        ctl.cancel();
+        let error = session
+            .reachable_from_refs([(b"refs/tags/large".as_slice(), tag)])
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<git_rs_core::StopReason>(),
+            Some(&git_rs_core::StopReason::Cancelled)
+        );
+        assert_eq!(budget.used(), 0);
+    }
+}

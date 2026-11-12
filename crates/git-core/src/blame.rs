@@ -11,6 +11,7 @@ use gix_object::{Find, FindHeader, Header, Kind};
 use hashbrown::HashTable;
 use sha2::{Digest, Sha256};
 
+use crate::objects::{MAX_METADATA_HEADER_BYTES, MAX_METADATA_OBJECT_BYTES};
 use crate::{
     CapacityBudget, CapacityBuffer, CapacityError, CapacityReservation, Control, ReadLimits,
     SnapshotSession, StopReason, VerifiedObjectProvider,
@@ -24,7 +25,6 @@ pub use gix_blame::Tuning as BlameTuning;
 pub const MAX_BLOB_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_COMMITS: usize = 1_000_000;
-pub(crate) const MAX_COMMIT_BYTES: usize = 64 * 1024;
 // Match the pinned vendor's total-object bound, not its per-name metadata bound.
 const MAX_TREE_BYTES: usize = 128 * 1024 * 1024;
 // Fixed attribute/filter-selection metadata constructed by the pinned Platform
@@ -144,7 +144,7 @@ impl BlameOptions {
     pub fn read_limits(&self) -> ReadLimits {
         ReadLimits {
             max_object_bytes: MAX_BLOB_BYTES,
-            max_metadata_bytes: MAX_COMMIT_BYTES,
+            max_metadata_bytes: MAX_METADATA_HEADER_BYTES,
             max_graph_objects: MAX_COMMITS,
             max_graph_edges: 8_000_000,
             ..ReadLimits::default()
@@ -401,9 +401,9 @@ impl<P: VerifiedObjectProvider> FindHeader for FindBridge<'_, P> {
                     return Err(BlameError::BlobTooLarge);
                 }
                 if matches!(header.kind, Kind::Commit | Kind::Tag)
-                    && header.size > MAX_COMMIT_BYTES as u64
+                    && header.size > MAX_METADATA_OBJECT_BYTES as u64
                 {
-                    return Err(BlameError::Corrupt("metadata byte limit exceeded"));
+                    return Err(BlameError::Corrupt("metadata object byte limit exceeded"));
                 }
                 if header.kind == Kind::Tree
                     && header.size > self.session.limits.max_object_bytes.min(MAX_TREE_BYTES) as u64
@@ -771,8 +771,8 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         if header.kind != Kind::Commit {
             return Err(BlameError::InvalidRequest);
         }
-        if header.size > MAX_COMMIT_BYTES as u64 {
-            return Err(BlameError::Corrupt("commit metadata limit"));
+        if header.size > MAX_METADATA_OBJECT_BYTES as u64 {
+            return Err(BlameError::Corrupt("commit object byte limit exceeded"));
         }
         let commit = self
             .required(request.commit, Kind::Commit)

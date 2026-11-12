@@ -230,7 +230,17 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 }
                 tags.insert(id, self)?;
                 let object = self.required(&id, Kind::Tag)?;
-                let tag = gix_object::TagRef::from_bytes(object.data.as_slice(), id.kind())?;
+                let header_end = crate::objects::metadata_header_end(
+                    object.data.as_slice(),
+                    self.limits.max_metadata_bytes,
+                    &self.control,
+                )?;
+                // Peeling uses the validated header only. Parsing the opaque
+                // message/signature would scan a large body without control.
+                let tag = gix_object::TagRef::from_bytes(
+                    &object.data.as_slice()[..header_end],
+                    id.kind(),
+                )?;
                 let target = tag.target();
                 let header = self
                     .header(&target)?

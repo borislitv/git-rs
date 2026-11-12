@@ -1,9 +1,8 @@
 //! NativeRootV1 line-porcelain. Bytes are assembled privately in admitted chunks;
 //! only a complete, validated body can escape this module.
 
-use crate::blame::{
-    BlameError, CompleteBlame, MAX_BODY_BYTES, MAX_COMMIT_BYTES, ProducerVersion, source_error,
-};
+use crate::blame::{BlameError, CompleteBlame, MAX_BODY_BYTES, ProducerVersion, source_error};
+use crate::objects::MAX_METADATA_OBJECT_BYTES;
 use crate::{
     CapacityBudget, CapacityBuffer, CapacityError, CapacityReservation, Control, SnapshotSession,
     VerifiedObjectProvider,
@@ -402,10 +401,18 @@ fn subject<'a>(message: &'a [u8], control: &Control) -> Result<&'a [u8], BlameEr
         let line = message[start..end]
             .strip_suffix(b"\n")
             .unwrap_or(&message[start..end]);
-        if !line
-            .iter()
-            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | 11 | 12))
-        {
+        let mut blank = true;
+        for chunk in line.chunks(POLL) {
+            control.check()?;
+            if !chunk
+                .iter()
+                .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | 11 | 12))
+            {
+                blank = false;
+                break;
+            }
+        }
+        if !blank {
             return Ok(line);
         }
         start = end;
@@ -490,7 +497,7 @@ pub(crate) fn commit_metadata<P: VerifiedObjectProvider>(
         .header(id)
         .map_err(|e| source_error(e.as_ref()))?
         .ok_or(BlameError::Corrupt("missing attributed commit"))?;
-    if header.kind != Kind::Commit || header.size > MAX_COMMIT_BYTES as u64 {
+    if header.kind != Kind::Commit || header.size > MAX_METADATA_OBJECT_BYTES as u64 {
         return Err(BlameError::Corrupt(
             "attributed commit metadata bound or type",
         ));

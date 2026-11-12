@@ -330,6 +330,43 @@ fn annotated_refs_peel_physically_but_blame_requires_an_explicit_commit() {
 }
 
 #[test]
+fn large_metadata_messages_on_nested_tags_and_their_commit_match_native() {
+    let mut fixture = Fixture::new();
+    let mut message = vec![b'\n'; 70_000];
+    message.extend_from_slice(b"First nonblank subject\n");
+    let root = fixture.commit(&[(b"file", b"line\n", "100644")], &[], 1, &message, None);
+    let mut tip = root;
+    for kind in [gix_object::Kind::Commit, gix_object::Kind::Tag] {
+        let mut bytes = format!(
+            "object {tip}\ntype {kind}\ntag release\ntagger T <t@example.invalid> 1 +0000\n\n"
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&vec![b'm'; 70_000]);
+        bytes.extend_from_slice(b"\n-----BEGIN PGP SIGNATURE-----\nopaque\n");
+        tip = fixture.insert(gix_object::Kind::Tag, &bytes);
+    }
+    fixture.git(
+        &["update-ref", "refs/tags/large", &tip.to_string()],
+        None,
+        b"",
+    );
+    fixture.git(&["fsck", "--strict"], None, b"");
+    let budget = CapacityBudget::new(8 * 1024 * 1024);
+    let session = fixture.session(budget.clone(), control());
+    let visible = session
+        .reachable_from_refs([(b"refs/tags/large".as_slice(), tip)])
+        .expect("physical nested tags may carry separately bounded large messages");
+    assert_eq!(visible.iter().collect::<Vec<_>>(), vec![root]);
+    drop(visible);
+    drop(session);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(
+        render(&fixture, root, b"file", &BlameOptions::default()),
+        fixture.native(tip, b"file")
+    );
+}
+
+#[test]
 fn rename_edit_raw_paths_and_previous_fields_match_native_bytes() {
     let mut fixture = Fixture::new();
     let before: &[u8] = b"old\t\xff";

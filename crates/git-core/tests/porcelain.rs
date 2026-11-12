@@ -61,6 +61,156 @@ fn summary_uses_native_blame_first_nonblank_line_not_pretty_paragraph_folding() 
 }
 
 #[test]
+fn large_metadata_messages_preserve_native_summary_and_complete_reencoding() {
+    let mut whitespace = vec![b' '; 70_000];
+    whitespace.extend_from_slice(b"\n\t\r\n Subject  \r\nbody\n");
+    let mut latin = b"caf\xe9\n".to_vec();
+    latin.extend_from_slice(&vec![0xe9; 70_000]);
+    let mut invalid = b"price \x80\n".to_vec();
+    invalid.extend_from_slice(&vec![0x80; 70_000]);
+    invalid.push(0x81); // CP1252 fails after the subject and multiple windows.
+    let mut nul = b"visible\0hidden\n".to_vec();
+    nul.extend_from_slice(&vec![b'x'; 70_000]);
+    let mut fixture = Fixture::new();
+    for (encoding, message) in [
+        (None, whitespace),
+        (Some("ISO-8859-1"), latin),
+        (Some("CP1252"), invalid),
+        (Some("UTF-8"), nul),
+    ] {
+        let root = fixture.commit(
+            &[(b"file", b"before\nanchor\n", "100644")],
+            &[],
+            1,
+            &message,
+            encoding,
+        );
+        let tip = fixture.commit(
+            &[(b"file", b"after\nanchor\n", "100644")],
+            &[root],
+            2,
+            b"Small child\n",
+            None,
+        );
+        for commit in [root, tip] {
+            let native = fixture.native(commit, b"file");
+            if encoding == Some("CP1252") {
+                assert!(
+                    native
+                        .windows(b"summary price \x80\n".len())
+                        .any(|w| w == b"summary price \x80\n")
+                );
+            }
+            assert_eq!(
+                render(&fixture, commit, b"file", &BlameOptions::default()),
+                native,
+                "large metadata message with encoding {encoding:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn large_metadata_headers_count_continuations_and_the_separator_at_64_kib() {
+    let mut fixture = Fixture::new();
+    let blob = fixture.insert(gix_object::Kind::Blob, b"line\n");
+    let tree = fixture.tree(&[(b"file", "100644", blob)]);
+    for header_bytes in [57_345, 65_535, 65_536, 65_537] {
+        let mut bytes = format!("tree {tree}\nauthor A <a@example.invalid> 1 +0000\ncommitter C <c@example.invalid> 1 +0000\ngpgsig signature\n \n ").into_bytes();
+        bytes.resize(header_bytes - 2, b'x');
+        bytes.extend_from_slice(b"\n\n");
+        assert_eq!(bytes.len(), header_bytes);
+        bytes.extend_from_slice(b"Subject\n");
+        let commit = fixture.insert(gix_object::Kind::Commit, &bytes);
+        let budget = CapacityBudget::new(8 * 1024 * 1024);
+        let ctl = control();
+        let session = fixture.session(budget.clone(), ctl.clone());
+        assert_eq!(session.object(&commit).is_ok(), header_bytes <= 65_536);
+        let result = session.blame_complete(
+            BlameRequest {
+                commit: &commit,
+                path: b"file",
+            },
+            &BlameOptions::default(),
+        );
+        if header_bytes <= 65_536 {
+            let complete = result.expect("a bounded multiline header may have a separate message");
+            let output = Porcelain::encode_complete(&complete, &ctl, &budget, 1024).unwrap();
+            assert_eq!(
+                output.chunks().flatten().copied().collect::<Vec<_>>(),
+                fixture.native(commit, b"file")
+            );
+        } else {
+            assert!(
+                matches!(result, Err(BlameError::Corrupt(_))),
+                "the separator itself must fit the header cap"
+            );
+        }
+        drop(session);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
+fn large_metadata_subjects_keep_exact_output_capacity_and_cancellation_boundaries() {
+    let mut fixture = Fixture::new();
+    let commit = fixture.commit(
+        &[(b"file", b"line\n", "100644")],
+        &[],
+        1,
+        &vec![b'x'; 70_000],
+        None,
+    );
+    let native = fixture.native(commit, b"file");
+    assert!(native.len() > 70_000);
+    let budget = CapacityBudget::new(8 * 1024 * 1024);
+    let ctl = control();
+    let session = fixture.session(budget.clone(), ctl.clone());
+    let blame = session
+        .blame_complete(
+            BlameRequest {
+                commit: &commit,
+                path: b"file",
+            },
+            &BlameOptions::default(),
+        )
+        .expect("a large subject is message data, not a large header");
+    let held = budget.used();
+    assert_eq!(
+        Porcelain::encode_complete(&blame, &ctl, &budget, native.len() - 1).err(),
+        Some(BlameError::OutputTooLarge)
+    );
+    assert_eq!(budget.used(), held);
+    let output = Porcelain::encode_complete(&blame, &ctl, &budget, native.len()).unwrap();
+    assert_eq!(
+        output.chunks().flatten().copied().collect::<Vec<_>>(),
+        native
+    );
+    drop(output);
+    ctl.cancel();
+    assert_eq!(
+        Porcelain::encode_complete(&blame, &ctl, &budget, native.len()).err(),
+        Some(BlameError::Stopped(StopReason::Cancelled))
+    );
+    drop(blame);
+    drop(session);
+    assert_eq!(budget.used(), 0);
+    let tiny = CapacityBudget::new(64 * 1024);
+    let session = fixture.session(tiny.clone(), control());
+    assert!(matches!(
+        session.blame_complete(
+            BlameRequest {
+                commit: &commit,
+                path: b"file"
+            },
+            &BlameOptions::default()
+        ),
+        Err(BlameError::Capacity(_))
+    ));
+    assert_eq!(tiny.used(), 0);
+}
+
+#[test]
 fn supported_declared_encodings_are_lossless_against_native_bytes() {
     let mut fixture = Fixture::new();
     for (encoding, message) in [

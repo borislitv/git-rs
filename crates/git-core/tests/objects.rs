@@ -239,6 +239,88 @@ fn woof_tree_lookup_uses_the_object_bound_not_the_commit_metadata_bound() {
 }
 
 #[test]
+fn large_metadata_commit_lookup_separates_header_and_whole_object_admission() {
+    for over_limit in [false, true] {
+        let mut source = provider();
+        let blob = insert(&mut source, Kind::Blob, b"small\n");
+        let mut bytes = b"100644 file\0".to_vec();
+        bytes.extend_from_slice(blob.as_bytes());
+        let tree = insert(&mut source, Kind::Tree, &bytes);
+        let mut bytes = format!("tree {tree}\nauthor A <a@example.invalid> 1 +0000\ncommitter C <c@example.invalid> 1 +0000\n\n").into_bytes();
+        bytes.resize(100_000, b'm');
+        let commit = insert(&mut source, Kind::Commit, &bytes);
+        let budget = CapacityBudget::new(256 * 1024);
+        let session = open(
+            source,
+            budget.clone(),
+            ReadLimits {
+                max_object_bytes: 100_000 - usize::from(over_limit),
+                max_metadata_bytes: 64 * 1024,
+                ..ReadLimits::default()
+            },
+        );
+        let result = session.lookup_blob(&commit, b"file");
+        if over_limit {
+            assert!(
+                result.is_err(),
+                "a large message must still obey the physical object bound"
+            );
+        } else {
+            let (id, object) = result
+                .expect("small commit headers must permit a separately admitted message")
+                .unwrap();
+            assert_eq!(id, blob);
+            assert_eq!(object.data.as_slice(), b"small\n");
+        }
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
+fn large_metadata_whole_objects_cannot_exceed_128_mib_with_looser_caller_limits() {
+    for kind in [Kind::Commit, Kind::Tag] {
+        let mut source = provider();
+        let tree = insert(&mut source, Kind::Tree, b"");
+        let small = format!(
+            "tree {tree}\nauthor A <a@example.invalid> 1 +0000\ncommitter C <c@example.invalid> 1 +0000\n\nSmall\n"
+        );
+        let target = insert(&mut source, Kind::Commit, small.as_bytes());
+        let mut bytes = if kind == Kind::Commit {
+            small.into_bytes()
+        } else {
+            format!("object {target}\ntype commit\ntag large\n\n").into_bytes()
+        };
+        let size = 128 * 1024 * 1024 + 1;
+        bytes.resize(size, b'm');
+        let id = insert(&mut source, kind, &bytes);
+        drop(bytes);
+        let budget = CapacityBudget::new(256 * 1024 * 1024);
+        let identity = source.identity.clone();
+        let session = SnapshotSession::open(
+            source,
+            &identity,
+            Control::new(Instant::now() + Duration::from_secs(180)),
+            budget.clone(),
+            ReadLimits {
+                max_object_bytes: size,
+                ..ReadLimits::default()
+            },
+        )
+        .unwrap();
+        // Do not format a 128 MiB unexpected Ok body into a failure log.
+        let error = match session.object(&id) {
+            Err(error) => error,
+            Ok(_) => panic!("metadata body over 128 MiB must not be accepted"),
+        };
+        assert!(
+            error.to_string().contains("object byte limit exceeded"),
+            "expected object-size denial, not an unrelated error: {error}"
+        );
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
 fn cancelled_session_cannot_read_headers_or_bodies() {
     let source = provider();
     let identity = source.identity.clone();
