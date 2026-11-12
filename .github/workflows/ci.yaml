@@ -279,7 +279,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: borislitv/zstd-rs
-          ref: 66f4b27ef27742d3df45826bc85c4ed423483cf0
+          ref: a6adf4a49ab3b43e2b0279a4257f79dcc164478f
           path: .local/zstd-rs
           submodules: recursive
           persist-credentials: false

@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs"] 
 tokio-postgres = "0.7.18"
 tokio-util = { version = "0.7", features = ["io"] }
 tracing-appender = { version = "0.2.5", default-features = false }
-zstd = { git = "https://github.com/borislitv/zstd-rs", rev = "66f4b27ef27742d3df45826bc85c4ed423483cf0", default-features = false, features = ["experimental", "vendored"] }
+zstd = { git = "https://github.com/borislitv/zstd-rs", rev = "a6adf4a49ab3b43e2b0279a4257f79dcc164478f", default-features = false, features = ["experimental", "vendored"] }
 
 [lints.rust]
 unsafe_code = "forbid"

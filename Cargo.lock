@@ -3071,7 +3071,7 @@ checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 [[package]]
 name = "zstd"
 version = "0.14.3"
-source = "git+https://github.com/borislitv/zstd-rs?rev=66f4b27ef27742d3df45826bc85c4ed423483cf0#66f4b27ef27742d3df45826bc85c4ed423483cf0"
+source = "git+https://github.com/borislitv/zstd-rs?rev=a6adf4a49ab3b43e2b0279a4257f79dcc164478f#a6adf4a49ab3b43e2b0279a4257f79dcc164478f"
 dependencies = [
  "zstd-safe",
 ]
@@ -3079,7 +3079,7 @@ dependencies = [
 [[package]]
 name = "zstd-safe"
 version = "8.2.0"
-source = "git+https://github.com/borislitv/zstd-rs?rev=66f4b27ef27742d3df45826bc85c4ed423483cf0#66f4b27ef27742d3df45826bc85c4ed423483cf0"
+source = "git+https://github.com/borislitv/zstd-rs?rev=a6adf4a49ab3b43e2b0279a4257f79dcc164478f#a6adf4a49ab3b43e2b0279a4257f79dcc164478f"
 dependencies = [
  "zstd-sys",
 ]
@@ -3087,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "zstd-sys"
 version = "2.1.2+zstd.1.5.7"
-source = "git+https://github.com/borislitv/zstd-rs?rev=66f4b27ef27742d3df45826bc85c4ed423483cf0#66f4b27ef27742d3df45826bc85c4ed423483cf0"
+source = "git+https://github.com/borislitv/zstd-rs?rev=a6adf4a49ab3b43e2b0279a4257f79dcc164478f#a6adf4a49ab3b43e2b0279a4257f79dcc164478f"
 dependencies = [
  "cc",
  "pkg-config",

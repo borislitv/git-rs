@@ -16,7 +16,7 @@ CODEC_REPO = "https://github.com/borislitv/iconv-native-rs"
 CODEC_REV = "f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"
 CODEC_SOURCE = f"git+{CODEC_REPO}?rev={CODEC_REV}#{CODEC_REV}"
 ZSTD_REPO = "https://github.com/borislitv/zstd-rs"
-ZSTD_REV = "66f4b27ef27742d3df45826bc85c4ed423483cf0"
+ZSTD_REV = "a6adf4a49ab3b43e2b0279a4257f79dcc164478f"
 ZSTD_SOURCE = f"git+{ZSTD_REPO}?rev={ZSTD_REV}#{ZSTD_REV}"
 ZSTD_PACKAGES = {"zstd": "0.14.3", "zstd-safe": "8.2.0", "zstd-sys": "2.1.2+zstd.1.5.7"}
 

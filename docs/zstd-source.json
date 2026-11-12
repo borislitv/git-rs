@@ -1,7 +1,7 @@
 {
   "source": {
     "git": "https://github.com/borislitv/zstd-rs",
-    "rev": "66f4b27ef27742d3df45826bc85c4ed423483cf0"
+    "rev": "a6adf4a49ab3b43e2b0279a4257f79dcc164478f"
   },
   "upstream": {
     "git": "https://github.com/gyscos/zstd-rs",
