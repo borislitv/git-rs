@@ -165,9 +165,22 @@ fn migration_preserves_existing_opaque_bytes_and_is_idempotent() {
 fn v2_index_migration_cancellation_and_failure_preserve_retryable_state() {
     let admin = Admin::new();
     assert_eq!(
+        admin.scalar("SELECT (to_regnamespace('git_rs_cache') IS NULL)::text"),
+        "true",
+        "dedicated migration fixture requires a fresh cache schema"
+    );
+    // Bind the released fixtures to this sealed test binary. The runtime test
+    // image intentionally ships tests, not the repository's migration sources.
+    admin.sql(&format!(
+        "SET ROLE git_rs_cache;\n{}\n{}\nRESET ROLE;",
+        include_str!("../migrations/cache/001.sql"),
+        include_str!("../migrations/cache/002.sql"),
+    ));
+    assert_eq!(
         admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
         "2"
     );
+    println!("installed embedded frozen cache migrations: 001 -> 002");
     let config = CacheConfig::new(id(), id());
     admin.sql(&format!("SET ROLE git_rs_cache; SELECT git_rs_cache.register_namespace('{}','{}',{},{}); RESET ROLE;", config.namespace, config.owner, config.namespace_rows, config.namespace_bytes));
     let cache = DerivedCache::open(config.clone()).unwrap();

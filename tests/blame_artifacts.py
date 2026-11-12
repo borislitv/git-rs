@@ -521,13 +521,12 @@ class Fixture(OpaqueFixture):
         assert self.sql("SELECT count(*) FROM git_rs_cache.namespaces", fresh_admin) == "1"
         self.assert_source_proof(fresh_admin, "fresh-v2", fresh_source_before)
         self.results["migration_outcomes"] = [result.returncode for result in outcomes]
-        # Install the exact released v2 state; editing 002 alone cannot upgrade it.
+        # The sealed dedicated test bootstraps exact released v1/v2 SQL into this
+        # fresh database; runtime images need no repository migration files.
         v2 = "blame_v2_" + uuid.uuid4().hex
         self.sql(f"CREATE DATABASE {v2}; GRANT CREATE ON DATABASE {v2} TO git_rs_cache;")
         v2_admin = dict(self.env, PGDATABASE=v2)
         v2_source = self.prepare_source_proof(v2_admin, "v2-upgrade")
-        for migration in ("001", "002"):
-            self.sql("SET ROLE git_rs_cache; " + (Path(__file__).resolve().parents[1] / "migrations" / "cache" / (migration + ".sql")).read_text(), v2_admin)
         v2_env = dict(env, GIT_RS_TEST_CACHE_ADMIN_DSN=self.admin_dsn(v2_admin),
             GIT_RS_CACHE_DSN=f"host=127.0.0.1 port={self.env['PGPORT']} user=git_rs_cache password=synthetic-cache-only dbname={v2}")
         result = run([self.args.build_contract_binary, "--ignored", "--exact",
