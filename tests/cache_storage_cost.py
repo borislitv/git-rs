@@ -218,10 +218,17 @@ class CostFixture(Fixture):
             args.budget.read_bytes()).hexdigest(), cells=[], coverage={
                 "local_hot_policy": "No retained L1; first read of each key, repeated process shared-cache reads, restarted reader; PG/OS buffers not flushed",
                 "wire": "Actual forwarded plaintext cache TCP bytes including protocol framing; excludes source, monitoring, replication, NIC retransmits and TLS",
+                "payload_io_bytes": ("Logical materialization/digest counts and metadata-derived stored "
+                    "IO lower bounds for successful reads/writes, weighted by each artifact's reads; "
+                    "not wire-counter replacements"),
                 "copies": "Exact fixture file bytes materialized and digest input bytes; production SQL/S3/allocator/kernel copies not instrumented",
                 "replication": "Real physical streaming standby of fresh source/cache primary; sampled byte lag plus final replay fence, not failover/HA",
                 "source": "Real metadata::snapshot concurrent with cache IO; synthetic callback authorization only; serving authorization deferred",
-                "storage": "Fresh cache database per cell, logged tables, default TOAST policy; no cache maintenance deletion during measurement",
+                "storage": ("Fresh cache database per cell, logged tables, default TOAST policy; "
+                    "logical quota separate from raw/zstd stored bytes; all-pg forces inline and "
+                    "pg-s3 forces S3 even for compressed frames; post-cell layout/hash audit uses "
+                    "monitoring SQL outside active IO/wire sampling; no cache maintenance deletion "
+                    "during measurement"),
             })
 
     @contextmanager
@@ -449,6 +456,8 @@ SELECT json_build_object(
         pg = WireProxy("127.0.0.1", self.env["PGPORT"])
         s3 = WireProxy("127.0.0.1", self.port(self.s3, "7070/tcp"))
         self.proxies.extend((pg, s3))
+        # Compare physical placement, not the production default/crossover:
+        # compressed frames also remain external in the pg-s3 arm.
         env = dict(self.env, GIT_RS_CACHE_NAMESPACE=str(uuid.uuid4()),
                    GIT_RS_CACHE_OWNER=str(uuid.uuid4()), GIT_RS_CACHE_CONNECTIONS="2",
                    GIT_RS_CACHE_INLINE_BYTES=str(8 * 1024 * 1024 if mode == "all-pg" else 0),
@@ -464,6 +473,8 @@ SELECT json_build_object(
         wire_before = [pg.snapshot(), s3.snapshot()]
         lsn = self.sql("SELECT pg_current_wal_lsn()")
         result = {"mode": mode, "profile": profile, "size": size,
+                  "inline_threshold_bytes": int(env["GIT_RS_CACHE_INLINE_BYTES"]),
+                  "expected_payloads": [],
                   "latency_ms": {}, "lag_bytes": [], "primary_resources": [],
                   "primary_before": self.primary_metrics()}
         self.results["cells"].append(result)
@@ -488,6 +499,14 @@ SELECT json_build_object(
                     t = time.monotonic()
                     reply = reader.ask("get " + name).split()
                     require(reply[:3] == ["hit", str(size), digest], "independent digest mismatch")
+                    require(len(reply) == 4, "persisted payload identity missing")
+                    if n == 0:
+                        result["expected_payloads"].append({"id": reply[3],
+                            "logical_size": size, "logical_digest": digest,
+                            "reads": 1 + b["reuse_reads_per_artifact"]})
+                    else:
+                        require(reply[3] == result["expected_payloads"][-1]["id"],
+                                "reuse changed persisted payload identity")
                     (cold if n == 0 else reuse).append((time.monotonic() - t) * 1000)
                 result["lag_bytes"].append(self.lag())
             # A cache hit must not invoke the file loader (path deliberately absent).
@@ -512,6 +531,7 @@ SELECT json_build_object(
                         "sustained reuse lost or corrupted an artifact")
                 sustained.append((time.monotonic() - t) * 1000)
             result["active_io_seconds"] = time.monotonic() - start
+            result["expected_payloads"][0]["reads"] += 2 + len(sustained)
             probe.stop.set()
             # Resource samples may extend to the declared minimum window, but
             # idle padding is never included in authoritative-source quantiles.
@@ -537,7 +557,16 @@ SELECT json_build_object(
         after = self.database_metrics(admin)
         result["payload_layout"] = json.loads(self.sql("SELECT json_build_object("
             "'rows',count(*),'inline_bytes',COALESCE(sum(octet_length(body)),0),"
-            "'object_rows',count(object_key),'declared_bytes',COALESCE(sum(size),0)) "
+            "'object_rows',count(object_key),'declared_bytes',COALESCE(sum(size),0),"
+            "'stored_bytes',COALESCE(sum(coalesce(stored_size,size)),0),"
+            "'capacity_bytes',(SELECT coalesce(sum(used_bytes),0) FROM git_rs_cache.namespaces),"
+            "'payloads',coalesce(json_agg(json_build_object("
+            "'id',id,'logical_size',size,'logical_digest',encode(digest,'hex'),"
+            "'encoding',encoding,'stored_size',coalesce(stored_size,size),"
+            "'stored_digest',encode(coalesce(stored_digest,digest),'hex'),"
+            "'physical_fields_present',stored_size IS NOT NULL AND stored_digest IS NOT NULL,"
+            "'inline_size',octet_length(body),'inline_digest',encode(sha256(body),'hex'),"
+            "'object_key',object_key) ORDER BY id),'[]'::json)) "
             "FROM git_rs_cache.payloads WHERE state='live'", admin))
         result["storage_before"], result["storage_after"] = before, after
         result["relation_growth_bytes"] = after["relation_bytes"] - before["relation_bytes"]
@@ -565,9 +594,53 @@ SELECT json_build_object(
         layout = row["payload_layout"]
         require(layout["rows"] == b["writes_per_cell"] and layout["declared_bytes"] == size,
                 "payload set incomplete or duplicated")
+        require(layout["capacity_bytes"] == size, "logical capacity accounting mismatch")
+        require(row["mode"] in ("all-pg", "pg-s3"), "unknown storage policy")
+        threshold = 8 * 1024 * 1024 if row["mode"] == "all-pg" else 0
+        require(row["inline_threshold_bytes"] == threshold, "fixture physical threshold mismatch")
+        expected = {p["id"]: p for p in row["expected_payloads"]}
+        payloads = layout["payloads"]
+        require(len(expected) == len(row["expected_payloads"]) == len(payloads) == b["writes_per_cell"]
+                and {p["id"] for p in payloads} == set(expected), "payload identities incomplete or duplicated")
+        require(row["profile"] in ("random", "repeated-block"), "unknown payload profile")
+        encoding = "raw-v1" if row["profile"] == "random" else "zstd-v1"
+        stored, stored_reads, logical_reads = 0, 0, 0
+        for payload in payloads:
+            known = expected[payload["id"]]
+            require(payload["logical_size"] == known["logical_size"] == row["size"]
+                    and payload["logical_digest"] == known["logical_digest"],
+                    "logical payload metadata mismatch")
+            require(payload["encoding"] == encoding, "payload encoding/profile mismatch")
+            physical = payload["stored_size"]
+            digest = payload["stored_digest"]
+            require(isinstance(digest, str) and len(digest) == 64
+                    and all(c in "0123456789abcdef" for c in digest), "stored digest metadata invalid")
+            if encoding == "raw-v1":
+                require(physical == row["size"] and digest == known["logical_digest"],
+                        "raw physical identity differs from logical metadata")
+            else:
+                require(payload["physical_fields_present"] and 0 < physical < row["size"],
+                        "compressed stored metadata missing or not beneficial")
+            if row["mode"] == "all-pg":
+                require(payload["object_key"] is None and payload["inline_size"] == physical
+                        and payload["inline_digest"] == digest and physical <= threshold,
+                        "inline storage policy or physical integrity mismatch")
+            else:
+                require(bool(payload["object_key"]) and payload["inline_size"] is None
+                        and payload["inline_digest"] is None and physical > threshold,
+                        "S3 storage policy not exercised")
+            stored += physical
+            stored_reads += physical * known["reads"]
+            logical_reads += known["logical_size"] * known["reads"]
+        require(layout["stored_bytes"] == stored, "stored byte accounting mismatch")
         require((layout["inline_bytes"], layout["object_rows"]) ==
-                ((size, 0) if row["mode"] == "all-pg" else (0, b["writes_per_cell"])),
+                ((stored, 0) if row["mode"] == "all-pg" else (0, b["writes_per_cell"])),
                 "payload storage policy not exercised")
+        require(row["fixture_materialized_bytes"] == size
+                and row["verified_digest_input_bytes"] == logical_reads,
+                "logical materialization/digest accounting mismatch")
+        row["payload_io_bytes"] = {"logical_write": size, "logical_read": logical_reads,
+                                   "stored_write": stored, "stored_read": stored_reads}
         require(len(row["source_errors"]) <= b["source_errors_max"], "source request failed")
         require(row["source_latency_ms"]["count"] >= b["minimum_source_samples"], "too few source samples")
         require(row["source_latency_ms"]["p99"] <= min(b["source_p99_ms_max"],
@@ -592,10 +665,11 @@ SELECT json_build_object(
                 b["primary_memory_headroom_fraction_min"], "primary memory headroom exhausted")
         pg, s3 = row["wire_bytes"]["pg"], row["wire_bytes"]["s3"]
         if row["mode"] == "all-pg":
-            require(sum(s3.values()) == 0 and pg["request"] >= size,
+            require(sum(s3.values()) == 0 and pg["request"] >= stored
+                    and pg["response"] >= stored_reads,
                     "all-PG transport did not carry the payloads exclusively")
         else:
-            require(s3["request"] >= size and s3["response"] >= row["verified_digest_input_bytes"],
+            require(s3["request"] >= stored and s3["response"] >= stored_reads,
                     "S3 transport missing measured payload IO")
 
     def close(self):
