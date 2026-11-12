@@ -153,9 +153,85 @@ fn migration_preserves_existing_opaque_bytes_and_is_idempotent() {
         assert!(cache.publish(&claim,authority().as_ref(),b"opaque bytes before upgrade").unwrap());
         cache.migrate().unwrap();
         cache.migrate().unwrap();
-        assert_eq!(admin.scalar("SELECT version::text FROM git_rs_cache.schema_version WHERE singleton"),"2");
+        assert_eq!(admin.scalar("SELECT version::text FROM git_rs_cache.schema_version WHERE singleton"),"3");
+        assert_eq!(admin.scalar("SELECT (i.indisvalid AND i.indisready AND pg_get_indexdef(i.indexrelid) LIKE '%(namespace, staged_payload)%' AND pg_get_expr(i.indpred,i.indrelid) = '((state = ''computing''::text) AND (staged_payload IS NOT NULL))')::text FROM pg_index i WHERE i.indexrelid='git_rs_cache.jobs_staged_payload'::regclass"),"true");
         cache.get_verified(&key,authority()).unwrap().unwrap().with_bytes(|bytes| {assert_eq!(bytes,b"opaque bytes before upgrade");Ok(())}).unwrap();
         claim_build_after_upgrade(&cache);
+    });
+}
+
+#[test]
+#[ignore = "requires a dedicated v2 PostgreSQL cache fixture"]
+fn v2_index_migration_cancellation_and_failure_preserve_retryable_state() {
+    let admin = Admin::new();
+    assert_eq!(
+        admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
+        "2"
+    );
+    let config = CacheConfig::new(id(), id());
+    admin.sql(&format!("SET ROLE git_rs_cache; SELECT git_rs_cache.register_namespace('{}','{}',{},{}); RESET ROLE;", config.namespace, config.owner, config.namespace_rows, config.namespace_bytes));
+    let cache = DerivedCache::open(config.clone()).unwrap();
+    let key = key(b"v2-before-upgrade");
+    let claim = Operation::new(15).enter(|| match cache.get_or_claim(&key, authority()).unwrap() {
+        Lookup::Claimed(claim) => claim,
+        _ => panic!("fresh artifact"),
+    });
+    Operation::new(15).enter(|| {
+        assert!(
+            cache
+                .publish(&claim, authority().as_ref(), b"preserved v2 bytes")
+                .unwrap()
+        )
+    });
+    let locker = Admin::new();
+    locker.sql("BEGIN; LOCK TABLE git_rs_cache.jobs IN ROW EXCLUSIVE MODE");
+    let operation = Operation::new(15);
+    let interrupted = operation.clone();
+    let worker = std::thread::spawn(move || interrupted.enter(|| cache.migrate()));
+    admin.until("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='git-rs-cache' AND wait_event_type='Lock' AND query LIKE '%CREATE INDEX jobs_staged_payload%')::text");
+    operation.cancel();
+    assert!(worker.join().unwrap().is_err());
+    locker.sql("ROLLBACK");
+    admin.until("SELECT (NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='git-rs-cache' AND query LIKE '%CREATE INDEX jobs_staged_payload%' AND state<>'idle'))::text");
+    assert_eq!(
+        admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
+        "2"
+    );
+    assert_eq!(
+        admin.scalar("SELECT (to_regclass('git_rs_cache.jobs_staged_payload') IS NULL)::text"),
+        "true"
+    );
+
+    // A real DDL failure, not an invented transport mock: leave a conflicting
+    // relation, verify rollback, remove only that fixture, then retry publicly.
+    admin.sql("CREATE TABLE git_rs_cache.jobs_staged_payload (fixture integer)");
+    let cache = DerivedCache::open(CacheConfig::new(id(), id())).unwrap();
+    assert!(Operation::new(15).enter(|| cache.migrate()).is_err());
+    assert_eq!(
+        admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
+        "2"
+    );
+    admin.sql("DROP TABLE git_rs_cache.jobs_staged_payload");
+    Operation::new(15).enter(|| {
+        cache.migrate().unwrap();
+        cache.migrate().unwrap();
+    });
+    assert_eq!(
+        admin.scalar("SELECT version::text FROM git_rs_cache.schema_version"),
+        "3"
+    );
+    // Source authority and the pre-upgrade cache namespace are unchanged.
+    let cache = DerivedCache::open(config).unwrap();
+    Operation::new(15).enter(|| {
+        cache
+            .get_verified(&key, authority())
+            .unwrap()
+            .unwrap()
+            .with_bytes(|bytes| {
+                assert_eq!(bytes, b"preserved v2 bytes");
+                Ok(())
+            })
+            .unwrap()
     });
 }
 

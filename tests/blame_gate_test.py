@@ -15,6 +15,43 @@ import unittest
 from unittest.mock import patch
 
 import blame_gate as gate
+from blame_artifacts import V2_MIGRATION_CONTRACT, record_contracts
+
+
+class ArtifactInventoryTests(unittest.TestCase):
+    @staticmethod
+    def outcome(count=1, code=0, ignored=0):
+        text = f"test result: ok. {count} passed; 0 failed; {ignored} ignored; 0 measured; 0 filtered out\n"
+        return subprocess.CompletedProcess([], code, text.encode(), b"")
+
+    def test_complete_inventory_requires_dedicated_execution_in_either_order(self):
+        general = {"ordinary_contract", "another_contract"}
+        expected = sorted(general | {V2_MIGRATION_CONTRACT})
+        for dedicated_first in (False, True):
+            with self.subTest(dedicated_first=dedicated_first):
+                results = {}
+                phases = [(general, self.outcome(2)), ({V2_MIGRATION_CONTRACT}, self.outcome())]
+                if dedicated_first:
+                    phases.reverse()
+                first_names, first_result = phases[0]
+                record_contracts(results, "blame_build", first_names, first_result)
+                self.assertNotEqual(results["contract_inventory"]["blame_build"], expected)
+                second_names, second_result = phases[1]
+                record_contracts(results, "blame_build", second_names, second_result)
+                # Later general selections preserve dedicated evidence; repeated
+                # reporting does not invent duplicate contract executions.
+                record_contracts(results, "blame_build", general, self.outcome(2))
+                self.assertEqual(results["contract_inventory"]["blame_build"], expected)
+
+    def test_failed_ignored_missing_or_wrong_count_selection_gets_no_credit(self):
+        missing = subprocess.CompletedProcess([], 0, b"", b"")
+        for result in (self.outcome(code=101), self.outcome(0),
+                       self.outcome(0, ignored=1), self.outcome(11), missing):
+            with self.subTest(result=result):
+                results = {}
+                with self.assertRaises(AssertionError):
+                    record_contracts(results, "blame_build", {V2_MIGRATION_CONTRACT}, result)
+                self.assertNotIn("contract_inventory", results)
 
 
 class GateTests(unittest.TestCase):

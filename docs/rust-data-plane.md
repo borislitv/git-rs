@@ -164,10 +164,13 @@ that graph/index work is shared across all queries.
 ## Storage and failure semantics
 
 `derived_cache` is connected to complete blame bodies and, with an explicit signing
-key, authenticated completed-work checkpoints. `cache-migrate` initializes/upgrades
-logged `git_rs_cache` tables to version 2 through an independent, bounded pool;
-source `migrate` is separate. The upgrade from cache v1 is transactional and
-forward-only. Old migrators reject v2; rollback and namespace ownership policy are
+key, authenticates both complete-body descriptors and completed-work checkpoints.
+`cache-migrate` initializes/upgrades logged `git_rs_cache` tables to version 3
+through an independent, bounded pool; source `migrate` is separate. Upgrades from
+cache v1 or v2 are forward-only, with each migration transactional. Version 3 adds
+the jobs reverse lookup and planner-visible retention predicates without changing
+cache authority or retirement semantics. Old migrators reject v3; rollback,
+transactional index-build blocking and namespace ownership policy are
 documented in [operations](../OPERATIONS.md#cache-schema-upgrade-and-rollback).
 The metadata text-row limit remains 8,192 bytes; artifacts use parameterized binary
 transport. Keys include repository, security scope, object format, ordered inputs,

@@ -177,7 +177,15 @@ impl Postgres {
                     .map_err(sql_error)?;
                 version = 2;
             }
-            if version != 2 {
+            if version == 2 {
+                connection
+                    .client()
+                    .batch_execute(include_str!("../../migrations/cache/003.sql"))
+                    .await
+                    .map_err(sql_error)?;
+                version = 3;
+            }
+            if version != 3 {
                 return Err(invalid("unsupported cache schema version"));
             }
             connection

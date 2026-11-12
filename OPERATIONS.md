@@ -205,7 +205,7 @@ its resource impact is qualified for the deployment.
 
 ### Cache schema upgrade and rollback
 
-The cache schema is now version 2; the authoritative source schema remains separate.
+The cache schema is now version 3; the authoritative source schema remains separate.
 Use this forward-only procedure with the dedicated cache role and explicit
 namespace/owner configuration:
 
@@ -213,21 +213,33 @@ namespace/owner configuration:
    old cache database/object-prefix ownership records and plan rollback isolation.
 2. Run `git-rs cache-migrate` using the new binary against the intended cache
    database. It serializes migration, creates v1 if absent, then transactionally
-   applies v1-to-v2. A failed upgrade transaction leaves an existing v1 unchanged.
-3. Verify version 2 and run the owned migration/functional acceptance harness before
+   applies v1-to-v2 and v2-to-v3 in order. Each failed upgrade transaction preserves
+   its preceding version; a retry resumes from that committed version.
+3. Verify version 3 and run the owned migration/functional acceptance harness before
    exposing new cache-backed features. Do not infer this from source `migrate` or
    ordinary non-ignored tests. The split public blame CI explicitly runs the
    migration harness; inspect its actual completed inventory and results.
 4. For rollback, do not downgrade tables or reset version numbers. An old
-   `cache-migrate` binary rejects v2. Existing old opaque-cache runtimes may still
+   v1/v2 `cache-migrate` binary rejects v3. Existing old opaque-cache runtimes may still
    have valid holds; rejection by their migrator is not proof that they stopped.
 5. Run the old application with caching disabled, or provision a separate
    old-version-compatible cache database/schema with a fresh namespace UUID/object
-   prefix and explicit ownership. A fresh UUID in the upgraded v2 database alone
-   does not make its schema v1-compatible. Never reuse old payload identities.
+   prefix and explicit ownership. A fresh UUID in the upgraded v3 database alone
+   does not make it compatible with an old migrator. Never reuse old payload identities.
 6. Retire old namespaces only after explicit writer/reader quiescence and the
    normal fenced read-hold/grace/deletion procedure. An empty replacement database
    cannot authorize deletion in the old object prefix.
+
+Version 3 adds a namespace/payload reverse index for computing jobs and makes the
+existing child-retention predicates visible to the retirement query planner. The
+index is created transactionally and blocks jobs writers while it builds. Busy or
+bloated databases can exceed the existing finite migration budget; failure rolls
+back that migration, and operators can retry after reducing contention. This is
+not an online-upgrade or universally bounded-latency promise. Existing clock,
+claim, live-reader/build-pin and irreversible-retirement checks remain required.
+Protected retirement still examines namespace candidates; a 64-row result limit
+does not mean only 64 candidates are examined. Tombstone accounting and namespace
+rotation requirements remain unchanged.
 
 ### Verification and publication limits
 

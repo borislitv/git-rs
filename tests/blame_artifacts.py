@@ -20,6 +20,18 @@ from derived_cache import Fixture as OpaqueFixture, Process as LegacyProcess, ru
 from support.blame_artifact_faults import ArtifactProcess, ObjectProxy, PgProxy, SqlLocker, disconnect_and_reject
 
 
+V2_MIGRATION_CONTRACT = "v2_index_migration_cancellation_and_failure_preserve_retryable_state"
+
+
+def record_contracts(results, suite, names, result):
+    """Credit only a successful, fully executed selection; merge fixture phases."""
+    assert result.returncode == 0, (result.stdout + result.stderr).decode()
+    summary = rf"^test result: ok\. {len(names)} passed; 0 failed; 0 ignored;"
+    assert re.search(summary.encode(), result.stdout, re.MULTILINE), "selected contracts did not all execute"
+    inventory = results.setdefault("contract_inventory", {})
+    inventory[suite] = sorted(set(inventory.get(suite, [])) | set(names))
+
+
 class Fixture(OpaqueFixture):
     def __init__(self, args):
         args.process_binary = args.legacy_process_binary or args.binary
@@ -51,20 +63,20 @@ class Fixture(OpaqueFixture):
             listed = run([binary, "--ignored", "--list"], env=env).stdout.decode()
             names = {line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")}
             names.discard("artifact_process")
+            names.discard(V2_MIGRATION_CONTRACT)
             selected = self.args.contract_filter
             if selected:
                 if selected not in names:
                     continue
                 names = {selected}
             assert names, f"no {name} contracts discovered"
-            command = [binary, "--ignored", "--test-threads=1", "--skip", "artifact_process"]
+            command = [binary, "--ignored", "--test-threads=1", "--skip", "artifact_process",
+                       "--skip", V2_MIGRATION_CONTRACT]
             if selected:
                 command += ["--exact", selected]
             result = run(command, env=env, timeout=300, ok=False)
             (self.base / (name + ".log")).write_bytes(result.stdout + result.stderr)
-            assert result.returncode == 0, (result.stdout + result.stderr).decode()
-            assert f"{len(names)} passed; 0 failed; 0 ignored".encode() in result.stdout
-            self.results.setdefault("contract_inventory", {})[name] = sorted(names)
+            record_contracts(self.results, name, names, result)
         if self.args.contract_filter:
             assert self.results.get("contract_inventory"), "unknown exact contract filter"
         self.results["cases"]["new_api_contracts"] = "passed"
@@ -481,7 +493,7 @@ class Fixture(OpaqueFixture):
         functions = "SELECT md5(string_agg(pg_get_functiondef(p.oid),'' ORDER BY p.oid)) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='git_rs_cache'"
         before = self.sql(functions, admin)
         old = run([self.args.legacy_binary, "cache-migrate"], env=env, ok=False)
-        assert old.returncode != 0, "old migrator must reject v2 rather than replace its functions"
+        assert old.returncode != 0, "old migrator must reject v3 rather than replace its functions"
         assert self.sql(functions, admin) == before
         outcomes = self.concurrent_migrators(env, admin, "v2-migrators")
         run([self.binary, "cache-migrate"], env=env)
@@ -492,7 +504,7 @@ class Fixture(OpaqueFixture):
         assert legacy.ask("consume retained").startswith("hit ")
         assert legacy.ask("release retained") == "ok"
         self.sql("UPDATE git_rs_cache.payloads SET delete_after=clock_timestamp()-interval '1 second'", admin)
-        assert legacy.ask("delete") == "1", "old runtime maintenance must remain safe across v2 upgrade"
+        assert legacy.ask("delete") == "1", "old runtime maintenance must remain safe across v3 upgrade"
         legacy.close()
         self.assert_source_proof(admin, "v2-idempotent", source_before)
 
@@ -505,15 +517,29 @@ class Fixture(OpaqueFixture):
         assert self.sql("SELECT to_regclass('git_rs_cache.schema_version') IS NULL", fresh_admin) == "t"
         outcomes = self.concurrent_migrators(fresh_env, fresh_admin, "fresh-migrators")
         run([self.binary, "cache-migrate"], env=fresh_env)
-        assert self.sql("SELECT version FROM git_rs_cache.schema_version", fresh_admin) == "2"
+        assert self.sql("SELECT version FROM git_rs_cache.schema_version", fresh_admin) == "3"
         assert self.sql("SELECT count(*) FROM git_rs_cache.namespaces", fresh_admin) == "1"
         self.assert_source_proof(fresh_admin, "fresh-v2", fresh_source_before)
         self.results["migration_outcomes"] = [result.returncode for result in outcomes]
+        # Install the exact released v2 state; editing 002 alone cannot upgrade it.
+        v2 = "blame_v2_" + uuid.uuid4().hex
+        self.sql(f"CREATE DATABASE {v2}; GRANT CREATE ON DATABASE {v2} TO git_rs_cache;")
+        v2_admin = dict(self.env, PGDATABASE=v2)
+        v2_source = self.prepare_source_proof(v2_admin, "v2-upgrade")
+        for migration in ("001", "002"):
+            self.sql("SET ROLE git_rs_cache; " + (Path(__file__).resolve().parents[1] / "migrations" / "cache" / (migration + ".sql")).read_text(), v2_admin)
+        v2_env = dict(env, GIT_RS_TEST_CACHE_ADMIN_DSN=self.admin_dsn(v2_admin),
+            GIT_RS_CACHE_DSN=f"host=127.0.0.1 port={self.env['PGPORT']} user=git_rs_cache password=synthetic-cache-only dbname={v2}")
+        result = run([self.args.build_contract_binary, "--ignored", "--exact",
+            V2_MIGRATION_CONTRACT, "--nocapture"], env=v2_env, timeout=60)
+        (self.base / "v2-upgrade.log").write_bytes(result.stdout + result.stderr)
+        record_contracts(self.results, "blame_build", {V2_MIGRATION_CONTRACT}, result)
+        self.assert_source_proof(v2_admin, "v2-upgraded", v2_source)
         if self.args.opaque_contract_binary:
             self.run_contracts()
         else:
-            raise AssertionError("migration gate requires existing opaque contracts against v2")
-        self.results["cases"]["fresh_v1_v2_concurrent_migrators_and_live_old_runtime"] = "passed"
+            raise AssertionError("migration gate requires existing opaque contracts against v3")
+        self.results["cases"]["fresh_v1_v2_v3_concurrent_migrators_and_live_old_runtime"] = "passed"
 
     def concurrent_migrators(self, env, admin, name):
         locker = SqlLocker(self, admin, name + "-lock", "DO $$ BEGIN PERFORM pg_advisory_xact_lock(91079170002); END $$")
