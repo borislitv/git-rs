@@ -10,6 +10,7 @@ pub mod graph;
 pub mod objects;
 pub mod pack;
 pub mod porcelain;
+pub mod receive;
 
 pub use blame::memo::MemoryMappingRequest;
 pub use blame::{

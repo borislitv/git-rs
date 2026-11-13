@@ -14,15 +14,18 @@ exclude = [".local/iconv-native", ".local/zstd-rs"]
 aws-credential-types = "1.3.1"
 aws-sigv4 = { version = "1.6.4", default-features = false, features = ["sign-http", "http1"] }
 deadpool-postgres = "0.14.2"
+flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 git-rs-core = { version = "0.1.0", path = "crates/git-core" }
-gix = { git = "https://github.com/borislitv/gitoxide", rev = "7ce87f63e03ef116cb2d3df097cd688e6d19c35b", version = "0.90.0", default-features = false, features = ["sha1"] }
+gix = { git = "https://github.com/borislitv/gitoxide", rev = "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3", version = "0.90.0", default-features = false, features = ["sha1"] }
+gix-packetline = { git = "https://github.com/borislitv/gitoxide", rev = "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3", version = "=0.24.1", default-features = false, features = ["blocking-io"] }
 memfd = "0.6.6"
 native-tls = "0.2"
 openssl = "0.10"
 percent-encoding = "2.3.2"
 postgres-native-tls = "0.5.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "stream"] }
+rustix = { version = "=1.1.6", default-features = false, features = ["std", "event", "fs", "net", "pipe"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs"] }
 tokio-postgres = "0.7.18"
 tokio-util = { version = "0.7", features = ["io"] }

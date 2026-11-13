@@ -1,11 +1,10 @@
 //! Bounded single-flight ownership around the common CPU executor. The job, not
 //! its first waiter, owns its independent finite deadline and admission.
 
-use crate::{Result, invalid, process};
-use git_rs_core::{CapacityBudget, Control, CpuExecutor, ExecutorConfig, JobOptions, SubmitError};
+use crate::{Result, cpu_jobs::CpuJobs, invalid, process};
+use git_rs_core::{CapacityBudget, Control, JobOptions, SubmitError};
 use std::{
     collections::HashMap,
-    ops::Deref,
     sync::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
@@ -13,17 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Per-job live capacity, shared by provider, decoder, vendor and serializer.
-/// Source mappings have separate catalog/file bounds. With a configured 2+1
-/// admission at most three completed/running owners can retain this allowance.
-pub const JOB_BYTES: usize = 1024 * 1024 * 1024;
+pub use crate::cpu_jobs::{Completed, JOB_BYTES};
 type Error = Arc<dyn std::error::Error + Send + Sync>;
 type JobResult<T> = Result<Option<Arc<Completed<T>>>>;
-
-pub struct Completed<T> {
-    value: T,
-    _permit: Arc<process::Permit>,
-}
 
 // Captures must be destroyed before actual admission on rejection/discard.
 struct Background<F> {
@@ -47,12 +38,6 @@ where
             operation.check()?;
             result
         })
-    }
-}
-impl<T> Deref for Completed<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.value
     }
 }
 
@@ -163,19 +148,18 @@ pub trait JobObserver: Send + Sync {
 /// Dropping/cancelling a running waiter does not cancel the independently owned
 /// derivation. Retain Completed through consumption to retain actual admission.
 pub struct Jobs<T> {
-    cpu: CpuExecutor,
+    cpu: Arc<CpuJobs>,
     flights: Mutex<Flights<T>>,
-    admission: Arc<process::Admission>,
     waiter_admission: Arc<process::Admission>,
     attached: Arc<AtomicUsize>,
     observer: Option<Arc<dyn JobObserver>>,
 }
 
 impl<T: Send + Sync + 'static> Jobs<T> {
-    /// Live work/result ownership and currently attached request waiters. These
+    /// Shared CPU work/result ownership and local attached request waiters. These
     /// counters expose admission, not an implementation-specific scheduling gate.
     pub fn admitted(&self) -> usize {
-        self.admission.active()
+        self.cpu.admitted()
     }
     pub fn waiters(&self) -> usize {
         self.attached.load(Ordering::Acquire)
@@ -190,20 +174,25 @@ impl<T: Send + Sync + 'static> Jobs<T> {
                 "blame capacity requires concurrency in 1..=4, waiters in 0..=3 and total <=4",
             ));
         }
-        let total = workers + queued;
-        // Submission must admit the first workers even before their threads have
-        // popped the queue. The separate work admission enforces running+queued.
-        Ok(Self {
-            cpu: CpuExecutor::new(ExecutorConfig {
-                workers,
-                queue_capacity: total,
-            })?,
+        Ok(Self::with_cpu(Arc::new(CpuJobs::new(workers, queued)?)))
+    }
+
+    /// Inject the application's existing runtime; never create a second pool.
+    /// Flights and waiter admission remain local, actual work/result admission
+    /// is shared with receive and independent warming.
+    pub fn with_cpu(cpu: Arc<CpuJobs>) -> Self {
+        Self {
+            cpu,
             flights: Mutex::new(HashMap::new()),
-            admission: process::Admission::new(total),
             waiter_admission: process::Admission::new(16),
             attached: Arc::new(AtomicUsize::new(0)),
             observer: None,
-        })
+        }
+    }
+
+    /// Cheap handle for constructor owners wiring another user of this pool.
+    pub fn cpu(&self) -> Arc<CpuJobs> {
+        self.cpu.clone()
     }
 
     /// Independent no-waiter work on the same pool and actual work admission.
@@ -216,7 +205,7 @@ impl<T: Send + Sync + 'static> Jobs<T> {
         if !(1..=3600).contains(&seconds) {
             return Err(invalid("invalid background deadline"));
         }
-        let Some(permit) = self.admission.try_admit() else {
+        let Some(permit) = self.cpu.admission.try_admit() else {
             return Ok(false);
         };
         let operation = process::Operation::new(seconds);
@@ -228,6 +217,7 @@ impl<T: Send + Sync + 'static> Jobs<T> {
         };
         match self
             .cpu
+            .executor
             .submit(control, JobOptions::default(), move |control, _| {
                 let _ = background.run(control);
                 Ok(())
@@ -275,7 +265,7 @@ impl<T: Send + Sync + 'static> Jobs<T> {
             let (flight, created) = if let Some(flight) = existing {
                 (flight, false)
             } else {
-                let Some(permit) = self.admission.try_admit() else {
+                let Some(permit) = self.cpu.admission.try_admit() else {
                     return Ok(None);
                 };
                 let operation = process::Operation::new(seconds);
@@ -308,7 +298,7 @@ impl<T: Send + Sync + 'static> Jobs<T> {
             let running = flight.clone();
             let operation = process::Operation::until(flight.control.deadline());
             let observer = self.observer.clone();
-            let submitted = self.cpu.submit(
+            let submitted = self.cpu.executor.submit(
                 flight.control.clone(),
                 JobOptions::default(),
                 move |control, _| {

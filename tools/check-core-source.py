@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only audit of the pinned owned Git dependency, lock and optional checkout."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/borislitv/gitoxide"
-GITOXIDE_REV = "7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+GITOXIDE_REV = "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3"
 CODEC_REPOSITORY = "https://github.com/borislitv/iconv-native-rs"
 CODEC_REV = "f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"
 ZSTD_REPOSITORY = "https://github.com/borislitv/zstd-rs"
@@ -25,6 +26,24 @@ ZSTD_FEATURES = {"zstd": ["experimental", "vendored"],
                  "zstd-sys": ["experimental", "std", "vendored"]}
 ZSTD_NOTICES = ["LICENSE", "zstd-safe/LICENSE", "zstd-safe/zstd-sys/LICENSE",
                 "zstd-safe/zstd-sys/LICENSE.BSD-2-Clause", "zstd-safe/zstd-sys/LICENSE.BSD-3-Clause"]
+RECEIVE_DEPENDENCIES = {
+    "gix-pack": {"version": "=0.77.0", "features": ["generate", "streaming-input"]},
+    "gix-packetline": {"version": "=0.24.1", "features": ["blocking-io"]},
+    "gix-validate": {"version": "=0.13.1"},
+}
+REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+GZIP_PACKAGES = {
+    "flate2": {"version": "1.1.10", "license": "MIT OR Apache-2.0",
+               "checksum": "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"},
+    "zlib-rs": {"version": "0.6.8", "license": "Zlib",
+                "checksum": "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"},
+}
+GZIP_FEATURES = {"flate2": ["any_impl", "any_zlib", "zlib-rs"],
+                 "zlib-rs": ["c-allocator", "default", "rust-allocator", "std"]}
+RUSTIX_CHECKSUM = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
+RUSTIX_LICENSE = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+RUSTIX_FEATURES = ["std", "event", "fs", "net", "pipe"]
+RUSTIX_RESOLVED_FEATURES = ["alloc", "default", "event", "fs", "net", "pipe", "std"]
 
 
 def git(root, *args):
@@ -105,14 +124,85 @@ def audit_zstd(root, manifests, lock, dependency=None, metadata=None):
             raise ValueError("external zstd license/provenance notice missing")
 
 
-def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, metadata=None):
+def audit_gzip(root, manifests, lock, metadata=None, registry=None):
+    provenance = json.loads((root / "docs/gzip-source.json").read_text())
+    if (provenance["source"] != REGISTRY_SOURCE or provenance["default_features"] is not False
+            or provenance["features"] != ["zlib-rs"] or provenance["resolved_features"] != GZIP_FEATURES):
+        raise ValueError("gzip requires the qualified registry/backend feature profile")
+    if manifests[0].get("dependencies", {}).get("flate2") != {
+            "version": "=1.1.10", "default-features": False, "features": ["zlib-rs"]}:
+        raise ValueError("gzip requires the exact root flate2 zlib-rs dependency without defaults")
+    for name, expected in GZIP_PACKAGES.items():
+        declared = provenance["packages"][name]
+        if any(declared[key] != value for key, value in expected.items()):
+            raise ValueError(f"{name}: gzip provenance identity/license differs")
+        packages = [p for p in lock["package"] if p["name"] == name]
+        if (len(packages) != 1 or packages[0].get("source") != REGISTRY_SOURCE
+                or packages[0]["version"] != expected["version"]
+                or packages[0].get("checksum") != expected["checksum"]):
+            raise ValueError(f"{name}: gzip registry lock identity differs")
+        if registry is not None:
+            path = registry / f"{name}-{expected['version']}"
+            package = tomllib.loads((path / "Cargo.toml").read_text())["package"]
+            if (package["version"] != expected["version"] or package["license"] != expected["license"]
+                    or package["repository"] != declared["upstream"]
+                    or any(not (path / notice).is_file() for notice in declared["notices_in_source"])):
+                raise ValueError(f"{name}: external gzip manifest/license/notice differs")
+    if metadata is not None:
+        graph = json.loads(metadata.read_text())
+        packages = [p for p in graph["packages"] if p["name"] in GZIP_PACKAGES]
+        ids = {p["id"]: p["name"] for p in packages}
+        features = {ids[n["id"]]: sorted(n["features"]) for n in graph["resolve"]["nodes"] if n["id"] in ids}
+        if (len(packages) != 2 or features != GZIP_FEATURES
+                or any(p.get("source") != REGISTRY_SOURCE or p["version"] != GZIP_PACKAGES[p["name"]]["version"]
+                       or p["license"] != GZIP_PACKAGES[p["name"]]["license"] for p in packages)):
+            raise ValueError("gzip resolved Cargo source/version/license/backend features differ")
+
+
+def audit_rustix(root, manifests, lock, metadata=None, dependency=None):
+    provenance = json.loads((root / "docs/rustix-source.json").read_text())
+    expected = {"source": REGISTRY_SOURCE, "version": "1.1.6", "checksum": RUSTIX_CHECKSUM,
+                "license": RUSTIX_LICENSE, "upstream": "https://github.com/bytecodealliance/rustix",
+                "notices_in_source": ["LICENSE-APACHE", "LICENSE-Apache-2.0_WITH_LLVM-exception", "LICENSE-MIT", "COPYRIGHT"],
+                "default_features": False, "features": RUSTIX_FEATURES,
+                "resolved_features": RUSTIX_RESOLVED_FEATURES}
+    if provenance != expected:
+        raise ValueError("rustix requires the qualified registry/license/feature provenance")
+    if manifests[0].get("dependencies", {}).get("rustix") != {
+            "version": "=1.1.6", "default-features": False, "features": RUSTIX_FEATURES}:
+        raise ValueError("rustix requires the exact root I/O dependency without defaults")
+    packages = [p for p in lock["package"] if p["name"] == "rustix"]
+    if (len(packages) != 1 or packages[0]["version"] != "1.1.6"
+            or packages[0].get("source") != REGISTRY_SOURCE or packages[0].get("checksum") != RUSTIX_CHECKSUM):
+        raise ValueError("rustix registry lock identity differs")
+    if metadata is not None:
+        graph = json.loads(metadata.read_text())
+        packages = [p for p in graph["packages"] if p["name"] == "rustix"]
+        ids = {p["id"] for p in packages}
+        features = [sorted(n["features"]) for n in graph["resolve"]["nodes"] if n["id"] in ids]
+        if (len(packages) != 1 or packages[0]["version"] != "1.1.6"
+                or packages[0].get("source") != REGISTRY_SOURCE or packages[0]["license"] != RUSTIX_LICENSE
+                or features != [RUSTIX_RESOLVED_FEATURES]):
+            raise ValueError("rustix resolved Cargo source/license/I/O features differ")
+    if dependency is not None:
+        manifest = tomllib.loads((dependency / "Cargo.toml").read_text())
+        package = manifest["package"]
+        if (package["name"] != "rustix" or package["version"] != "1.1.6"
+                or package["license"] != RUSTIX_LICENSE or package["repository"] != expected["upstream"]
+                or not set(RUSTIX_FEATURES) <= manifest["features"].keys()
+                or any(not (dependency / notice).is_file() for notice in expected["notices_in_source"])):
+            raise ValueError("external rustix version/license/features/notices differ")
+
+
+def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, metadata=None, gzip_registry=None,
+          rustix_dependency=None):
     provenance = json.loads((root / "docs/gitoxide-source.json").read_text())
     source = provenance["source"]
     rev = source["rev"]
     if source["git"] != REPOSITORY or not re.fullmatch(r"[0-9a-f]{40}", rev):
         raise ValueError("Gitoxide requires the owned repository and a full immutable revision")
     if rev != GITOXIDE_REV:
-        raise ValueError("Gitoxide requires the qualified completed-mapping revision")
+        raise ValueError("Gitoxide requires the qualified mapping and admitted-receive revision")
     if provenance["licenses"] != {"default_gitoxide": "MIT OR Apache-2.0", "gix-imara-diff": "Apache-2.0"}:
         raise ValueError("Gitoxide license identity differs")
     expected = f"git+{REPOSITORY}?rev={rev}#{rev}"
@@ -121,7 +211,11 @@ def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, me
         raise ValueError("codec requires the qualified immutable owned pin and original license")
     codec_source = f"git+{CODEC_REPOSITORY}?rev={CODEC_REV}#{CODEC_REV}"
     manifests = [tomllib.loads((root / path).read_text()) for path in
-                 ("Cargo.toml", "crates/git-core/Cargo.toml")]
+                  ("Cargo.toml", "crates/git-core/Cargo.toml")]
+    for name, profile in RECEIVE_DEPENDENCIES.items():
+        required = {"git": REPOSITORY, "rev": rev, "default-features": False, **profile}
+        if manifests[1].get("dependencies", {}).get(name) != required:
+            raise ValueError(f"{name}: receive requires the exact normal owned dependency/profile")
     direct = set()
     codec_direct = 0
     for manifest in manifests:
@@ -141,8 +235,13 @@ def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, me
                     direct.add(name)
         if "patch" in manifest or "replace" in manifest:
             raise ValueError("dependency overrides must not bypass the pinned source")
+    if manifests[0].get("dependencies", {}).get("gix-packetline") != {
+            "git": REPOSITORY, "rev": rev, "default-features": False, **RECEIVE_DEPENDENCIES["gix-packetline"]}:
+        raise ValueError("receive requires the exact root packetline blocking-io dependency")
     lock = tomllib.loads((root / "Cargo.lock").read_text())
     audit_zstd(root, manifests, lock, zstd_dependency, metadata)
+    audit_gzip(root, manifests, lock, metadata, gzip_registry)
+    audit_rustix(root, manifests, lock, metadata, rustix_dependency)
     codecs = [p for p in lock["package"] if p["name"] == "iconv-native"]
     if codec_direct != 1 or len(codecs) != 1 or codecs[0].get("source") != codec_source or codecs[0]["version"] != "0.1.0":
         raise ValueError("missing, duplicate or inconsistent codec Git lock identity")
@@ -152,6 +251,27 @@ def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, me
         raise ValueError("missing or duplicate Gitoxide lock packages")
     if any(p.get("source") != expected for p in packages):
         raise ValueError("registry, mixed revision or alternate Gitoxide source in Cargo.lock")
+    # The digest covers compact sorted-key JSON records, sorted by package name.
+    closure = sorted(({"name": p["name"], "version": p["version"],
+                       "license": provenance["licenses"].get(p["name"], provenance["licenses"]["default_gitoxide"])}
+                      for p in packages), key=lambda p: p["name"])
+    closure_hash = hashlib.sha256(json.dumps(closure, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if len(packages) != provenance["resolved_package_count"] or closure_hash != provenance["resolved_packages_sha256"]:
+        raise ValueError("Gitoxide resolved package/version/license closure differs")
+    if metadata is not None:
+        graph = json.loads(metadata.read_text())
+        resolved = [p for p in graph["packages"] if p["name"] == "gix" or p["name"].startswith("gix-")]
+        ids = {p["id"]: p["name"] for p in resolved}
+        if (len(resolved) != len(packages)
+                or sorted((p["name"], p["version"], p.get("source")) for p in resolved) !=
+                   sorted((p["name"], p["version"], p.get("source")) for p in packages)
+                or any(p["license"] != provenance["licenses"].get(p["name"], provenance["licenses"]["default_gitoxide"])
+                       for p in resolved)):
+            raise ValueError("Gitoxide resolved Cargo source/version/license graph differs")
+        features = {ids[n["id"]]: n["features"] for n in graph["resolve"]["nodes"] if n["id"] in ids}
+        for name, profile in RECEIVE_DEPENDENCIES.items():
+            if not set(profile.get("features", [])) <= set(features.get(name, [])):
+                raise ValueError(f"{name}: receive features missing from resolved Cargo graph")
     if (root / "vendor").exists():
         raise ValueError("copied dependency source must not remain in the application")
     if dependency is not None:
@@ -164,11 +284,13 @@ def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, me
         for notice in provenance["notices_in_source"]:
             if not (dependency / notice).is_file():
                 raise ValueError(f"external source license notice missing: {notice}")
-        for package in ("gix", "gix-imara-diff"):
-            manifest = tomllib.loads((dependency / package / "Cargo.toml").read_text())
-            expected_license = provenance["licenses"].get(package, provenance["licenses"]["default_gitoxide"])
-            if manifest["package"]["license"] != expected_license:
-                raise ValueError(f"{package}: external license differs")
+        for package in closure:
+            manifest = tomllib.loads((dependency / package["name"] / "Cargo.toml").read_text())["package"]
+            if manifest["license"] != package["license"] or manifest["version"] != package["version"]:
+                raise ValueError(f"{package['name']}: external version/license differs")
+        for path, digest in provenance["controlled_source_sha256"].items():
+            if hashlib.sha256((dependency / path).read_bytes()).hexdigest() != digest:
+                raise ValueError(f"{path}: controlled receive source hash differs")
         origin = provenance["imara_origin"]
         ledger = (dependency / origin["ledger_in_source"]).read_text()
         if origin["rev"] not in ledger or origin["git"] not in ledger:
@@ -185,6 +307,8 @@ def audit(root, dependency=None, codec_dependency=None, zstd_dependency=None, me
           + ("; external checkout/licenses verified" if dependency else "")
           + f"; codec {CODEC_REPOSITORY}@{CODEC_REV}"
           + f"; zstd {ZSTD_REPOSITORY}@{ZSTD_REV} (3 packages)"
+          + "; gzip flate2 1.1.10 / zlib-rs 0.6.8"
+          + "; rustix 1.1.6 I/O profile"
           + ("; resolved zstd features verified" if metadata else ""))
 
 
@@ -194,10 +318,14 @@ def main():
     parser.add_argument("--dependency-root", type=Path)
     parser.add_argument("--codec-root", type=Path)
     parser.add_argument("--zstd-root", type=Path)
+    parser.add_argument("--gzip-registry-root", type=Path,
+                        help="registry source directory containing flate2-1.1.10 and zlib-rs-0.6.8")
+    parser.add_argument("--rustix-root", type=Path)
     parser.add_argument("--cargo-metadata", type=Path,
                         help="cargo metadata --locked --format-version 1 output; verifies feature unification")
     args = parser.parse_args()
-    audit(args.project_root, args.dependency_root, args.codec_root, args.zstd_root, args.cargo_metadata)
+    audit(args.project_root, args.dependency_root, args.codec_root, args.zstd_root, args.cargo_metadata,
+          args.gzip_registry_root, args.rustix_root)
 
 
 if __name__ == "__main__":

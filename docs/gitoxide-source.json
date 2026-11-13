@@ -15,10 +15,26 @@
     "gix-imara-diff/LICENSE"
   ],
   "pull_request": "https://github.com/borislitv/gitoxide/pull/2",
-  "qualified_snapshot": "Stage 5 completed MappingMemo, bounded fixed-work polling, linear immutable trace roots, exclusive prepared-token leases, bounded single-origin hunk reuse, request-local raw input pair preservation, lazy controlled indentation preparation and real hook-free raw mapping work accounting (C7)",
+  "qualified_snapshot": "Completed MappingMemo and bounded blame controls (C7), controlled single-pack framing, OFS entry-start validation, controlled borrowed tree iteration, pre-allocation admitted ingest with retained pack/index owners, checked finite OFS/object-size/data-offset arithmetic and maintained controlled path-component validation; fork-qualified APIs, not application receive-cutover qualification",
+  "resolved_package_count": 49,
+  "resolved_packages_sha256": "5de07bc366f57b97c05b0de77092abfc1a6ee3d449de733e2cfdcfbe86ce319d",
+  "controlled_source_sha256": {
+    "gix-object/src/tree/ref_iter.rs": "43273bf5a09c3d55e0d37d17217a6032943bf19ad83628c1f9a806e6928b135b",
+    "gix-pack/src/bundle/write/admitted.rs": "d1871f3adc9d8815b0046a6daaeb6aa66134e08396c9f46e589e6225cbf064a6",
+    "gix-pack/src/bundle/write/controlled.rs": "9ad179d504b10f6bff1972e2f55fb80d6d54817cd04e3fd9d869578462441286",
+    "gix-pack/src/bundle/write/mod.rs": "6570e9b85c5a2f21845b2ae396c2f89e2f006c7528bf0271117070a82c8b86b9",
+    "gix-pack/src/data/entry/decode.rs": "8297bd2b0327ed84f3efea2f0eb0c24708fbcc85f13c3ed886c1143299eff0df",
+    "gix-pack/src/data/file/decode/entry.rs": "bf73318f7fc65e8d5f91db74a35e215c7f83ebccae7523eb1f58187372a9261a",
+    "gix-pack/src/index/encode.rs": "29a793ef75d137f6e4dedf4e3d7a248a88e2ca522a90ab55738f63f48b170f4d",
+    "gix-pack/src/lib.rs": "7f270930ebb278f94513b437302ce5c1587188202723d47e2adee735332fcfac",
+    "gix-pack/src/memory.rs": "e03c87b55187929a258d9f1f58b5abe3e90c3a1422fa6aced6158730fb426e68",
+    "gix-utils/src/decode.rs": "273ae0c4068c28c931dd5974ab849602e8b8d2d507d81e63c6cb546da81aab5a",
+    "gix-validate/src/path.rs": "4e309ac9f1eff3722eaf672f7f47b7bb7ead167d16c88bf127f58044c7930948",
+    "gix-zlib/src/lib.rs": "bf5534bb7f9336b87ac7cfc5fa0caab1bc7e98ca4592e18da1f4d56c6a3c9407"
+  },
   "source": {
     "git": "https://github.com/borislitv/gitoxide",
-    "rev": "7ce87f63e03ef116cb2d3df097cd688e6d19c35b"
+    "rev": "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3"
   },
   "upstream": {
     "base": "dd39fb66e3b1551c9fe849043e39b357a9799ca1",

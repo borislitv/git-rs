@@ -124,6 +124,9 @@ impl Default for Blame {
     }
 }
 impl Blame {
+    pub fn cpu(&self) -> Arc<crate::cpu_jobs::CpuJobs> {
+        self.jobs.cpu()
+    }
     pub fn admitted(&self) -> usize {
         self.jobs.admitted()
     }

@@ -1,0 +1,11 @@
+{
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "1.1.6",
+  "checksum": "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa",
+  "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+  "upstream": "https://github.com/bytecodealliance/rustix",
+  "notices_in_source": ["LICENSE-APACHE", "LICENSE-Apache-2.0_WITH_LLVM-exception", "LICENSE-MIT", "COPYRIGHT"],
+  "default_features": false,
+  "features": ["std", "event", "fs", "net", "pipe"],
+  "resolved_features": ["alloc", "default", "event", "fs", "net", "pipe", "std"]
+}

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod blame;
 pub mod blob;
 pub mod cache;
+pub mod cpu_jobs;
 mod database;
 pub mod derived_cache;
 pub mod engine;
@@ -14,6 +15,8 @@ pub mod metadata;
 pub mod metrics;
 pub mod process;
 pub mod protocol;
+pub mod receive;
+pub mod receive_io;
 mod repository;
 pub mod scratch;
 
