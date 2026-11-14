@@ -29,7 +29,9 @@ def render(helm, values=None, *, file=None, error=None):
         result = subprocess.run(command + ["--values", str(path)], capture_output=True,
                                 text=True, timeout=30)
     if error:
-        assert result.returncode and error in result.stderr, (values, error, result.stderr)
+        # Helm 4 reports schema paths as JSON pointers; Helm 3 uses literal keys.
+        diagnostic = result.stderr.replace("~1", "/").replace("~0", "~")
+        assert result.returncode and error in diagnostic, (values, error, result.stderr)
         return []
     assert result.returncode == 0, result.stderr
     documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
