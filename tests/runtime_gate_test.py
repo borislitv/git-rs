@@ -77,7 +77,7 @@ class ClusterStartupContracts(unittest.TestCase):
 
     def test_node_readiness_does_not_accept_an_ignored_or_overridden_shim_setting(self):
         for config in ("version = 3", '[plugins."io.containerd.shim.v1.manager"]\nenv = ["GOMAXPROCS=2"]'):
-            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "shim processor bound"):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "shim launcher setting"):
                 self.start(config)
 
     def test_effective_shim_setting_allows_the_bound_cluster_to_be_returned(self):

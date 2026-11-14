@@ -293,7 +293,7 @@ def start_cluster(token, slice_name, cpus, pod_root, deadline, local):
         "--config", "/var/lib/rancher/k3s/agent/etc/containerd/config.toml", "config", "dump"],
         timeout=max(0.1, min(5, deadline - time.monotonic()))))
     env = merged.get("plugins", {}).get("io.containerd.shim.v1.manager", {}).get("env")
-    gate.require(env == ["GOMAXPROCS=1"], "containerd shim processor bound is not configured")
+    gate.require(env == ["GOMAXPROCS=1"], "containerd shim launcher setting is not configured")
     cluster_cgroups(identity, pod_root)
     return identity
 

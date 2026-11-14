@@ -1,6 +1,6 @@
 version = 3
 
-# containerd appends GOMAXPROCS=2 when launching shims. Its manager's explicit
-# environment is applied afterwards, unlike the parent K3s environment.
+# Limit the shim launcher through the manager's explicit environment. The runc
+# shim server's later reexec retains its own upstream scheduler policy.
 [plugins."io.containerd.shim.v1.manager"]
 env = ["GOMAXPROCS=1"]

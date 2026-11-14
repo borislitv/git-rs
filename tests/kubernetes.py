@@ -205,6 +205,9 @@ def maintenance_contract(cluster, runtime, values, values_path, install, client)
             "-d", "git_rs", "-v", "ON_ERROR_STOP=1", "-c", query).stdout.decode().strip()
 
     assert sql("SELECT version FROM git_rs.schema_version") == "2", "upgrade schema before enabling workers"
+    # The preceding upgrades exercised the migration hook already. This is the
+    # separate schema-first worker enablement, not another concurrent migration.
+    values["migration"] = {"enabled": False}
     values["maintenance"] = {"enabled": True, "replicaCount": 2, "cacheBytes": 8 * 1024 * 1024,
         "scratch": {"medium": "Memory", "sizeLimit": "64Mi"},
         "resources": {"requests": {"cpu": "25m", "memory": "64Mi", "ephemeral-storage": "64Mi"},
