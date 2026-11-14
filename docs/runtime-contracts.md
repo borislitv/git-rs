@@ -63,8 +63,12 @@ service/slice and records new descendant cgroups in the kernel before successful
 `sched_process_exec` events, including short-lived helpers. A successful-exec probe
 must be observed before the work child is released. Tracer errors, lost-event
 diagnostics, missing cgroup joins, truncated/oversized records and premature event
-streams fail the gate. Executable paths and cgroup IDs are recorded; argv,
-environment variables and credential values are not.
+streams fail the gate. Requested executable paths, the kernel-installed executable
+dentry basename and cgroup IDs are recorded; argv, environment variables and
+credential values are not. The kernel basename identifies descriptor-based reexecs
+without racing a later `/proc/<pid>/exe` lookup. Both requested and installed names
+are checked for native Git; backend coverage and the program inventory use the
+installed name. Missing or malformed installed identities fail the gate.
 
 Exact-owner Docker create events bind container IDs to the revision-matched image
 roles. A resource-version Kubernetes pod watch starts before Helm hooks and records

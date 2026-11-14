@@ -150,7 +150,8 @@ tracepoint:cgroup:cgroup_mkdir {
   }
 }
 tracepoint:sched:sched_process_exec /has_key(@owned, cgroup)/ {
-  printf("E\\t%llu\\t%d\\t%s\\n", cgroup, pid, str(args.filename));
+  printf("E\\t%llu\\t%d\\t%s\\t%s\\n", cgroup, pid, str(args.filename),
+         str(curtask->mm->exe_file->f_path.dentry->d_name.name));
 }
 END { printf("Z\\n"); }
 '''.replace("CONTROLLER", controller).replace("GROUP", group).replace("LENGTH", str(len(group) + 1))
@@ -211,10 +212,12 @@ def inspect_trace(local, group, images, phase):
             groups[key] = fields[2]
             runtime.gate.require(len(groups) <= MAX_CGROUPS, "process cgroup count exceeded its bound")
         elif fields[0] == "E":
-            runtime.gate.require(len(fields) == 4 and fields[1].isdigit() and fields[2].isdigit()
-                                 and 0 < int(fields[2]) < 2**31 and 0 < len(fields[3]) < 1023,
+            runtime.gate.require(len(fields) == 5 and fields[1].isdigit() and fields[2].isdigit()
+                                 and 0 < int(fields[2]) < 2**31 and 0 < len(fields[3]) < 1023
+                                 and 0 < len(fields[4]) <= 255 and "/" not in fields[4]
+                                 and fields[4] not in {".", ".."},
                                  "invalid or truncated process exec event")
-            executions.append((int(fields[1]), fields[3]))
+            executions.append((int(fields[1]), fields[3], fields[4]))
             runtime.gate.require(len(executions) <= MAX_EXECS, "successful-exec count exceeded its bound")
         else:
             runtime.gate.require(fields == ["Z"], "unexpected process tracer output")
@@ -222,19 +225,23 @@ def inspect_trace(local, group, images, phase):
     runtime.gate.require(0 < len(groups) <= MAX_CGROUPS and len(executions) <= MAX_EXECS and ended == 1,
                          "incomplete or oversized process lifecycle trace")
     observed, native_clients, backend_programs = False, 0, set()
-    for identity, executable in executions:
+    for identity, executable, name in executions:
         runtime.gate.require(identity in groups, "exec has no recorded cgroup")
         path = groups[identity]
         containers = {match[1] for part in PurePosixPath(path).parts
                       if (match := re.fullmatch(r"(?:docker-|cri-containerd-)?([0-9a-f]{64})(?:\.scope)?", part))}
-        name = PurePosixPath(executable).name
         if executable == str(local / "exec-probe"):
             observed = True
         # A checkout directory such as git-rs-fixture is not an executable. Git
         # helpers are recognized by basename or their actual git-core directory.
-        native = (name in {"git", "gitk", "scalar", "gitweb.cgi"}
-                  or (name.startswith("git-") and name != "git-rs")
-                  or "git-core" in PurePosixPath(executable).parts)
+        requested = PurePosixPath(executable).name
+        # OpenSSH reexecutes its session/auth binary through an open descriptor.
+        # The syscall path may be /proc/self/fd/6; the kernel's installed exe
+        # dentry still identifies the actual program, without a /proc PID race.
+        native = (any(value in {"git", "gitk", "scalar", "gitweb.cgi"}
+                      or (value.startswith("git-") and value != "git-rs")
+                      for value in (name, requested))
+                   or "git-core" in PurePosixPath(executable).parts)
         if native:
             runtime.gate.require(bool(containers & clients) and not bool(containers & backends),
                                  "native Git executed outside a bound external client/oracle")
@@ -328,7 +335,8 @@ def trace(args, arguments):
                     while b"\n" in pending:
                         line, _, tail = pending.partition(b"\n")
                         pending[:] = tail
-                        if line.startswith(b"E\t") and line.split(b"\t")[-1] == os.fsencode(local / "exec-probe"):
+                        fields = line.split(b"\t")
+                        if len(fields) == 5 and fields[0] == b"E" and fields[3] == os.fsencode(local / "exec-probe"):
                             ready = local / "trace-ready"
                             if not ready.exists():
                                 descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

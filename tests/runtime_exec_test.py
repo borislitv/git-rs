@@ -23,8 +23,9 @@ class ExecEvidenceContracts(unittest.TestCase):
         self.backend, self.client = "b" * 64, "c" * 64
         self.group = "/git-rs-blame-synthetic123.slice"
         self.rows = [f"C\t1\t{self.group}/owned.service", f"C\t2\t{self.group}/docker-{self.backend}.scope",
-                     f"C\t3\t{self.group}/docker-{self.client}.scope", f"E\t1\t11\t{self.local}/exec-probe",
-                     "E\t2\t12\t/usr/local/bin/git-rs", "E\t3\t13\t/usr/lib/git-core/git-remote-http", "Z"]
+                     f"C\t3\t{self.group}/docker-{self.client}.scope", f"E\t1\t11\t{self.local}/exec-probe\ttrue",
+                     "E\t2\t12\t/usr/local/bin/git-rs\tgit-rs",
+                     "E\t3\t13\t/usr/lib/git-core/git-remote-http\tgit-remote-http", "Z"]
         self.events = []
         for identity, image in ((self.backend, "runtime"), (self.client, "oracle")):
             self.events.append({"Type": "container", "Action": "create", "Actor": {"ID": identity, "Attributes": {
@@ -49,24 +50,51 @@ class ExecEvidenceContracts(unittest.TestCase):
     def test_a_single_short_native_helper_in_the_backend_or_controller_invalidates_the_gate(self):
         for group in (1, 2):
             with self.subTest(group=group):
-                self.rows.insert(-1, f"E\t{group}\t14\t/usr/lib/git-core/git-upload-pack")
+                self.rows.insert(-1, f"E\t{group}\t14\t/usr/lib/git-core/git-upload-pack\tgit-upload-pack")
                 with self.assertRaisesRegex(ValueError, "outside a bound external"):
                     self.inspect()
                 self.rows.pop(-2)
 
     def test_oracle_ssh_bridge_is_not_server_execution_coverage(self):
-        self.rows[4] = "E\t3\t12\t/usr/local/bin/git-rs"
+        self.rows[4] = "E\t3\t12\t/usr/local/bin/git-rs\tgit-rs"
+        with self.assertRaisesRegex(ValueError, "coverage missing"):
+            self.inspect()
+
+    def test_descriptor_reexec_of_the_actual_ssh_session_is_identified(self):
+        self.rows.insert(-1, "E\t2\t14\t/proc/self/fd/6\tsshd-session")
+        self.assertEqual(self.inspect()["bound_backend_programs"], ["git-rs", "sshd-session"])
+
+    def test_descriptor_native_git_is_rejected_even_behind_an_allowed_requested_name(self):
+        original = list(self.rows)
+        for executable in ("/proc/self/fd/6", "/dev/fd/7", "/usr/local/bin/git-rs"):
+            with self.subTest(executable=executable):
+                self.rows = list(original)
+                self.rows.insert(-1, f"E\t2\t14\t{executable}\tgit")
+                with self.assertRaisesRegex(ValueError, "outside a bound external"):
+                    self.inspect()
+
+    def test_descriptor_unknown_backend_and_invalid_kernel_names_are_rejected(self):
+        original = list(self.rows)
+        for name in ("unknown-worker", "", "a" * 256, "path/sshd-session", ".", ".."):
+            with self.subTest(name=name):
+                self.rows = list(original)
+                self.rows.insert(-1, f"E\t2\t14\t/proc/self/fd/6\t{name}")
+                with self.assertRaises(ValueError):
+                    self.inspect()
+
+    def test_descriptor_client_execution_does_not_supply_backend_coverage(self):
+        self.rows[4] = "E\t3\t12\t/proc/self/fd/6\tgit-rs"
         with self.assertRaisesRegex(ValueError, "coverage missing"):
             self.inspect()
 
     def test_istio_requires_actual_runtime_execution_as_well_as_native_client_work(self):
-        self.rows[4] = "E\t3\t12\t/usr/local/bin/git-rs"
+        self.rows[4] = "E\t3\t12\t/usr/local/bin/git-rs\tgit-rs"
         with self.assertRaisesRegex(ValueError, "coverage missing"):
             self.inspect("istio")
 
     def test_an_unknown_backend_program_and_a_neighbor_container_id_are_rejected(self):
         original = list(self.rows)
-        self.rows[4] = "E\t2\t12\t/usr/local/bin/renamed-worker"
+        self.rows[4] = "E\t2\t12\t/usr/local/bin/renamed-worker\trenamed-worker"
         with self.assertRaisesRegex(ValueError, "unexpected backend"):
             self.inspect()
         self.rows = original
@@ -118,7 +146,7 @@ class ExecEvidenceContracts(unittest.TestCase):
                 if fault == "middle":
                     self.rows.insert(-1, "")
                 elif fault == "late-exec":
-                    self.rows.append("E\t2\t14\t/usr/local/bin/git-rs")
+                    self.rows.append("E\t2\t14\t/usr/local/bin/git-rs\tgit-rs")
                 else:
                     self.rows.extend(["", "", ""])
                 with self.assertRaises(ValueError):
