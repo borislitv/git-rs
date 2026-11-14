@@ -129,6 +129,7 @@ RUN python3 -m venv /opt/test-python \
     && /opt/test-python/bin/pip install --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0 \
     && mkdir -p /opt/git-rs/.local && chown 10001:10001 /opt/git-rs/.local && chmod 0700 /opt/git-rs/.local
 COPY tests /opt/git-rs/tests
+COPY Cargo.toml /opt/git-rs/Cargo.toml
 COPY charts/git-rs /opt/git-rs/charts/git-rs
 COPY tools/check-runtime-boundaries.py /opt/git-rs/tools/
 ENV PATH="/opt/test-python/bin:${PATH}" LANG=C LC_ALL=C
