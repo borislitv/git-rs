@@ -99,6 +99,34 @@ def bound_image(cluster, image, revision, role):
     return {"docker_id": identity, "reference": reference, "cri_id": imported["status"]["id"]}
 
 
+def bound_dependency(cluster, image):
+    assert re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", image), "pinned dependency image required"
+    identity = json.loads(command(["docker", "image", "inspect", image]).stdout)[0]["Id"]
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", identity), "immutable dependency image ID required"
+    repository = "git-rs.fixture.invalid/dependency"
+    alias = repository + ":" + identity.removeprefix("sha256:")
+    existing = command(["docker", "image", "inspect", alias], ok=False)
+    created = bool(existing.returncode)
+    if created:
+        command(["docker", "tag", identity, alias])
+    try:
+        assert json.loads(command(["docker", "image", "inspect", alias]).stdout)[0]["Id"] == identity
+        import_image(cluster, alias)
+        assert json.loads(command(["docker", "image", "inspect", alias]).stdout)[0]["Id"] == identity, "dependency changed during export"
+    finally:
+        if created:
+            assert json.loads(command(["docker", "image", "inspect", alias]).stdout)[0]["Id"] == identity, "refusing to remove a replaced dependency alias"
+            command(["docker", "image", "rm", alias])
+    rows = command(["docker", "exec", cluster, "ctr", "images", "list", "name==" + alias]).stdout.decode().splitlines()
+    matches = [row.split() for row in rows if row.split() and row.split()[0] == alias]
+    assert len(matches) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0][2]), "imported dependency manifest missing"
+    reference = repository + "@" + matches[0][2]
+    command(["docker", "exec", cluster, "ctr", "images", "tag", alias, reference])
+    imported = json.loads(command(["docker", "exec", cluster, "crictl", "inspecti", reference]).stdout)
+    assert identity in {imported["status"]["id"], matches[0][2]}, "imported dependency image identity changed"
+    return {"docker_id": identity, "reference": reference, "cri_id": imported["status"]["id"]}
+
+
 def assert_runtime_pods(cluster, image):
     pods = json.loads(cluster.kubectl("get", "pods", "-l",
         "app.kubernetes.io/instance=smoke,app.kubernetes.io/component=serving", "-o", "json").stdout)["items"]
@@ -149,7 +177,7 @@ def dependency(name, image, env, args, volumes, mounts, security=None):
                   "selector": {"matchLabels": {"fixture": name}},
                   "template": {"metadata": {"labels": {"fixture": name}}, "spec": {
                       "securityContext": security or {}, "automountServiceAccountToken": False,
-                      "containers": [{"name": name, "image": image, "args": args,
+                       "containers": [{"name": name, "image": image, "imagePullPolicy": "Never", "args": args,
                                       "env": [{"name": key, "value": value} for key, value in env.items()],
                                       "volumeMounts": mounts,
                                       "readinessProbe": {"tcpSocket": {"port": 5432 if name == "postgres" else 7070},
@@ -267,8 +295,8 @@ def exercise(args, base, cluster):
     runtime = bound_image(args.cluster_container, args.runtime_image, args.revision, "runtime")
     oracle = bound_image(args.cluster_container, args.oracle_image, args.revision, "external-client-oracle")
     assert runtime["docker_id"] != oracle["docker_id"]
-    for image in (PG_IMAGE, S3_IMAGE):
-        import_image(args.cluster_container, image)
+    dependencies = {name: bound_dependency(args.cluster_container, image)
+                    for name, image in (("postgres", PG_IMAGE), ("s3", S3_IMAGE))}
     config = yaml.safe_load(command(["docker", "exec", args.cluster_container, "kubectl",
                                      "config", "view", "--raw", "--flatten"]).stdout)
     inspection = json.loads(command(["docker", "inspect", args.cluster_container]).stdout)[0]
@@ -296,7 +324,7 @@ def exercise(args, base, cluster):
     ])
     tls_volume = {"name": "tls", "secret": {"secretName": "fixture-tls", "defaultMode": 0o440}}
     tls_mount = {"name": "tls", "mountPath": "/fixture-tls", "readOnly": True}
-    cluster.apply(dependency("postgres", PG_IMAGE,
+    cluster.apply(dependency("postgres", dependencies["postgres"]["reference"],
                              {"POSTGRES_USER": "git_rs", "POSTGRES_DB": "git_rs",
                               "POSTGRES_PASSWORD": "synthetic-password"},
                              ["-c", "ssl=on", "-c", "ssl_cert_file=/fixture-tls/tls.crt",
@@ -304,7 +332,7 @@ def exercise(args, base, cluster):
                              [tls_volume, {"name": "data", "emptyDir": {}}],
                              [tls_mount, {"name": "data", "mountPath": "/var/lib/postgresql"}],
                              {"runAsUser": 999, "runAsGroup": 999, "fsGroup": 999}))
-    cluster.apply(dependency("s3", S3_IMAGE,
+    cluster.apply(dependency("s3", dependencies["s3"]["reference"],
                              {"ROOT_ACCESS_KEY_ID": "test-access", "ROOT_SECRET_ACCESS_KEY": "synthetic-secret-key"},
                              ["--quiet", "--cert", "/fixture-tls/tls.crt", "--key", "/fixture-tls/tls.key",
                               "posix", "/data"],

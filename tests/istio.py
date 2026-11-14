@@ -20,7 +20,7 @@ import yaml
 
 from integration import PG_IMAGE, ROOT, S3_IMAGE, command
 from istio_artifacts import ARTIFACTS, GATEWAY_API, IMAGES, ISTIO, artifacts, digest, prepare_artifacts, read_artifact
-from kubernetes import Cluster, bound_image, dependency, import_image
+from kubernetes import Cluster, bound_dependency, bound_image, dependency, import_image
 from kubernetes_processes import PodProcessWatch
 
 APP = "git-app"
@@ -169,8 +169,8 @@ def exercise(args, base, distribution, watchers):
     oracle = bound_image(args.cluster_container, args.oracle_image, args.revision, "external-client-oracle")
     # Subscribe before application Helm hooks or init containers can execute.
     watchers.append(PodProcessWatch(app, base, {"runtime": runtime, "external-client-oracle": oracle}))
-    for image in [PG_IMAGE, S3_IMAGE]:
-        import_image(args.cluster_container, image)
+    dependencies = {name: bound_dependency(args.cluster_container, image)
+                    for name, image in (("postgres", PG_IMAGE), ("s3", S3_IMAGE))}
     certificate(base)
     tls = {"tls.crt": (base / "tls.crt").read_bytes(), "tls.key": (base / "tls.key").read_bytes()}
     ingress.apply([ingress.secret("gateway-tls", tls), {
@@ -189,13 +189,13 @@ def exercise(args, base, distribution, watchers):
                 "metadata": {"name": "strict"}, "spec": {"mtls": {"mode": "STRICT"}}}])
     volume = {"name": "tls", "secret": {"secretName": "fixture-tls", "defaultMode": 0o440}}
     mount = {"name": "tls", "mountPath": "/fixture-tls", "readOnly": True}
-    fixtures = dependency("postgres", PG_IMAGE, {
+    fixtures = dependency("postgres", dependencies["postgres"]["reference"], {
         "POSTGRES_USER": "git_rs", "POSTGRES_DB": "git_rs", "POSTGRES_PASSWORD": "synthetic-password"},
         ["-c", "ssl=on", "-c", "ssl_cert_file=/fixture-tls/tls.crt", "-c", "ssl_key_file=/fixture-tls/tls.key"],
         [volume, {"name": "data", "emptyDir": {}}],
         [mount, {"name": "data", "mountPath": "/var/lib/postgresql"}],
         {"runAsUser": 999, "runAsGroup": 999, "fsGroup": 999})
-    fixtures += dependency("s3", S3_IMAGE, {
+    fixtures += dependency("s3", dependencies["s3"]["reference"], {
         "ROOT_ACCESS_KEY_ID": "test-access", "ROOT_SECRET_ACCESS_KEY": "synthetic-secret-key"},
         ["--quiet", "--cert", "/fixture-tls/tls.crt", "--key", "/fixture-tls/tls.key", "posix", "/data"],
         [volume, {"name": "data", "emptyDir": {}}], [mount, {"name": "data", "mountPath": "/data"}])
