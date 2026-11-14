@@ -104,12 +104,14 @@ fn both_v1_upgrade_and_v2_refresh_replace_an_obsolete_publish_implementation() -
             metadata::sql("CREATE OR REPLACE FUNCTION publish(p_repo uuid,p_operation uuid,p_principal text,p_commands bytea,p_epoch bigint,p_lease uuid,p_names bytea[],p_old bytea[],p_new bytea[],p_fast_forward boolean[]) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN 777; END $$;")?;
             metadata::migrate()?;
             let error = metadata::sql(&query).expect_err("refresh must replace the obsolete permissive body");
-            assert!(error.to_string().contains("SQLSTATE P0001") && error.to_string().contains("invalid command fields"), "{error}");
+            assert_eq!(error.to_string(), "PostgreSQL operation failed (SQLSTATE P0001)", "SQL diagnostics must not disclose statement data");
             assert_eq!(metadata::sql("SELECT (SELECT count(*) FROM operations),(SELECT count(*) FROM ref_updates),(SELECT count(*) FROM refs);")?.trim(), "0\t0\t0");
             let after = metadata::snapshot("migration/publish", "alice", true)?;
             assert_eq!((after.generation, after.storage_epoch, after.refs),
                 (before.generation, before.storage_epoch, before.refs.clone()));
         }
+        assert_eq!(metadata::sql(&query.replace("ARRAY[NULL::boolean]", "ARRAY[true]"))?.trim(), "1", "the refreshed implementation must accept the otherwise identical valid publication");
+        assert_eq!(metadata::sql("SELECT (SELECT count(*) FROM operations),(SELECT count(*) FROM ref_updates),(SELECT count(*) FROM refs);")?.trim(), "1\t1\t1");
         Ok(())
     })
 }
