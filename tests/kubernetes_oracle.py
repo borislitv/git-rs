@@ -10,14 +10,39 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
+import time
 
 
 BASE = Path("/work/oracle")
 SECRETS = Path("/oracle-secrets")
 PAYLOAD = b"synthetic Kubernetes/SSH payload\n" * 16384
 HTTP_PAYLOAD = b"authenticated chart HTTP push\n"
+
+
+def wait_idle(addresses, seconds=10):
+    assert len(addresses) == 2, "observe both serving replicas before a serial request"
+    deadline = time.monotonic() + seconds
+    while True:
+        idle = True
+        for address in addresses:
+            peer = http.client.HTTPConnection(address, timeout=3)
+            try:
+                peer.request("GET", "/metrics")
+                response = peer.getresponse()
+                body = response.read(1024 * 1024 + 1)
+                assert response.status == 200 and len(body) <= 1024 * 1024, "invalid serving metrics response"
+                counts = re.findall(rb"^git_rs_active_requests ([0-9]+)$", body, re.MULTILINE)
+                assert len(counts) == 1, "missing or ambiguous serving request inventory"
+                idle &= int(counts[0]) == 0
+            finally:
+                peer.close()
+        if idle:
+            return
+        assert time.monotonic() < deadline, "prior serial serving request did not finish cleanup"
+        time.sleep(.01)
 
 
 def command(arguments, *, env=None, data=None, ok=True):
@@ -137,6 +162,10 @@ def exercise(args):
     elif args.phase == "upgrade":
         expected = json.loads(state_path.read_text())["head"].encode()
         for url, client_env in ((ssh_url, env), (http_url, environment(args, http=True))):
+            # The SSH bridge can deliver its terminal protocol record before
+            # the backend has dropped its held source and actual CPU permit.
+            # Establish the serial precondition without retrying native Git.
+            wait_idle(args.serving_address)
             rows = command(["/usr/bin/git", "ls-remote", url, "refs/heads/main"], env=client_env).stdout.split()
             assert rows == [expected, b"refs/heads/main"], rows
     return {"phase": args.phase, **json.loads(state_path.read_text())}
@@ -148,6 +177,7 @@ def main():
     parser.add_argument("--address", required=True)
     parser.add_argument("--ssh-port", type=int, required=True)
     parser.add_argument("--http-port", type=int, required=True)
+    parser.add_argument("--serving-address", action="append", default=[])
     parser.add_argument("--s3-endpoint", required=True)
     parser.add_argument("--maintenance-address", action="append", default=[])
     print(json.dumps(exercise(parser.parse_args())))

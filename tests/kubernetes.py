@@ -393,10 +393,16 @@ def exercise(args, base, cluster):
     cluster.kubectl("wait", "--for=condition=Ready", "pod/native-oracle", "--timeout=60s")
 
     def client(phase, extra=()):
+        addresses = []
+        if phase == "upgrade":
+            pods = json.loads(cluster.kubectl("get", "pods", "-l",
+                "app.kubernetes.io/instance=smoke,app.kubernetes.io/component=serving", "-o", "json").stdout)["items"]
+            assert len(pods) == 2 and all(not pod["metadata"].get("deletionTimestamp") for pod in pods)
+            addresses = [part for pod in pods for part in ("--serving-address", pod["status"]["podIP"] + ":8081")]
         result = cluster.kubectl("exec", "native-oracle", "--", "/usr/bin/python3", "-B",
             "/opt/git-rs/tests/kubernetes_oracle.py", phase, "--address", address,
             "--ssh-port", str(ssh_port), "--http-port", str(http_port),
-            "--s3-endpoint", f"https://s3.{cluster.namespace}.svc:7070", *extra)
+            "--s3-endpoint", f"https://s3.{cluster.namespace}.svc:7070", *addresses, *extra)
         return json.loads(result.stdout)
 
     client("bucket")
