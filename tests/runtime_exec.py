@@ -191,10 +191,16 @@ def inspect_trace(local, group, images, phase):
                                  "Kubernetes process image identity differs")
             (clients if role == "external-client-oracle" else backends).add(value["id"])
     runtime.gate.require(not clients.intersection(backends), "client and backend process identities overlap")
-    groups, executions, ended = {}, [], 0
+    groups, executions, ended, padding = {}, [], 0, 0
     data = read(observer / "exec.trace", owner=0, mode=0o600)
     runtime.gate.require(data.endswith("\n"), "truncated process trace stream")
     for line in data.splitlines():
+        if not line and ended == 1:
+            # bpftrace emits two terminal blank lines after END, even with -q.
+            padding += 1
+            runtime.gate.require(padding <= 2, "excess process trace terminal spacing")
+            continue
+        runtime.gate.require(ended == 0, "process trace record after end marker")
         fields = line.split("\t")
         if fields[0] == "C":
             runtime.gate.require(len(fields) == 3 and fields[1].isdigit() and len(fields[2]) < 1023

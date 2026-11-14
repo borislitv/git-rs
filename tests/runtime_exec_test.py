@@ -103,6 +103,27 @@ class ExecEvidenceContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete"):
             self.inspect()
 
+    def test_bpftrace_terminal_spacing_preserves_complete_execution_evidence(self):
+        self.rows.extend(["", ""])
+        result = self.inspect()
+        self.assertTrue(result["probe_seen"])
+        self.assertEqual(result["external_native_execs"], 1)
+        self.assertEqual(result["bound_backend_programs"], ["git-rs"])
+
+    def test_blank_records_before_end_and_records_after_end_are_not_decoration(self):
+        original = list(self.rows)
+        for fault in ("middle", "late-exec", "extra-padding"):
+            with self.subTest(fault=fault):
+                self.rows = list(original)
+                if fault == "middle":
+                    self.rows.insert(-1, "")
+                elif fault == "late-exec":
+                    self.rows.append("E\t2\t14\t/usr/local/bin/git-rs")
+                else:
+                    self.rows.extend(["", "", ""])
+                with self.assertRaises(ValueError):
+                    self.inspect()
+
 
 class FilesystemContracts(unittest.TestCase):
     def setUp(self):
