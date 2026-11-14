@@ -50,6 +50,40 @@ class Daemon:
             del self.containers[identity]
 
 
+class ClusterStartupContracts(unittest.TestCase):
+    def start(self, config):
+        identity = "1" * 64
+
+        def output(argv, **_):
+            if argv[:2] == ["docker", "ps"]:
+                return ""
+            if argv[:2] == ["docker", "create"]:
+                return identity
+            if argv[3:5] == ["kubectl", "version"]:
+                return '{"serverVersion":{"gitVersion":"v1.37.2+k3s1"}}'
+            self.assertEqual(argv[3:], ["containerd", "--config",
+                "/var/lib/rancher/k3s/agent/etc/containerd/config.toml", "config", "dump"])
+            return config
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(runtime.gate, "output", side_effect=output), \
+                patch.object(runtime.gate, "command"), \
+                patch.object(runtime.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"True")), \
+                patch.object(runtime, "cluster_cgroups") as groups:
+            result = runtime.start_cluster("a" * 32, "owned.slice", "24,25", "/owned/pods",
+                time.monotonic() + 20, Path(directory))
+            groups.assert_called_once_with(identity, "/owned/pods")
+            return result
+
+    def test_node_readiness_does_not_accept_an_ignored_or_overridden_shim_setting(self):
+        for config in ("version = 3", '[plugins."io.containerd.shim.v1.manager"]\nenv = ["GOMAXPROCS=2"]'):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "shim processor bound"):
+                self.start(config)
+
+    def test_effective_shim_setting_allows_the_bound_cluster_to_be_returned(self):
+        self.assertEqual(self.start('[plugins."io.containerd.shim.v1.manager"]\nenv = ["GOMAXPROCS=1"]'), "1" * 64)
+
+
 class SupervisorContracts(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

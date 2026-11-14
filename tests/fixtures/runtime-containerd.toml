@@ -1,0 +1,6 @@
+version = 3
+
+# containerd appends GOMAXPROCS=2 when launching shims. Its manager's explicit
+# environment is applied afterwards, unlike the parent K3s environment.
+[plugins."io.containerd.shim.v1.manager"]
+env = ["GOMAXPROCS=1"]

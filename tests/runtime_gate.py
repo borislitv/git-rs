@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 import blame_gate as gate
 from cache_gate import contracts
@@ -263,6 +264,7 @@ def start_cluster(token, slice_name, cpus, pod_root, deadline, local):
     identity = gate.output(["docker", "create", "--name", name, "--pull=never", "--privileged",
         "--cgroupns=host", "--cgroup-parent", slice_name, "--cpuset-cpus", cpus, "--cpus", ".5",
         "--memory", "1024m", "--memory-swap", "1024m", "--pids-limit", "128", "--env", "GOMAXPROCS=1",
+        "--mount", f"type=bind,src={ROOT / 'tests/fixtures/runtime-containerd.toml'},dst=/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/runtime-gate.toml,readonly",
         "--label", gate.LABEL + token, "--publish", "127.0.0.1::6443",
         "--tmpfs", "/run", "--tmpfs", "/var/run", "--entrypoint", "/bin/sh", K3S,
         "-ec", 'mkdir -p "$1"; shift; exec /bin/k3s "$@"', "fixture-entrypoint",
@@ -285,6 +287,13 @@ def start_cluster(token, slice_name, cpus, pod_root, deadline, local):
     version = json.loads(gate.output(["docker", "exec", identity, "kubectl", "version", "-o", "json"]))
     gate.require(re.fullmatch(r"v1\.37\.[0-9]+(?:[+.-].*)?", version["serverVersion"]["gitVersion"]),
                  "runtime contracts require Kubernetes 1.37")
+    # Inspect the merged configuration: the parent environment alone cannot
+    # override containerd's shim command defaults.
+    merged = tomllib.loads(gate.output(["docker", "exec", identity, "containerd",
+        "--config", "/var/lib/rancher/k3s/agent/etc/containerd/config.toml", "config", "dump"],
+        timeout=max(0.1, min(5, deadline - time.monotonic()))))
+    env = merged.get("plugins", {}).get("io.containerd.shim.v1.manager", {}).get("env")
+    gate.require(env == ["GOMAXPROCS=1"], "containerd shim processor bound is not configured")
     cluster_cgroups(identity, pod_root)
     return identity
 
