@@ -163,7 +163,7 @@ fn ssh_done_terminates_at_the_protocol_boundary_without_waiting_for_stdin_eof() 
 }
 
 #[test]
-fn v2_ls_refs_preserves_delimiters_symrefs_and_stateless_response_end() -> Result<()> {
+fn v2_ls_refs_preserves_delimiters_symrefs_and_only_the_server_flush() -> Result<()> {
     let (mut session, tip, _, _) = fixture(Version::V2)?;
     let mut request = Vec::new();
     packet(b"command=ls-refs\n", &mut request);
@@ -178,7 +178,7 @@ fn v2_ls_refs_preserves_delimiters_symrefs_and_stateless_response_end() -> Resul
         format!("{tip} HEAD symref-target:refs/heads/main\n").as_bytes(),
         &mut expected,
     );
-    expected.extend_from_slice(b"00000002");
+    expected.extend_from_slice(b"0000");
     assert_eq!(output, expected);
     let delimiter = request
         .windows(4)
@@ -192,6 +192,54 @@ fn v2_ls_refs_preserves_delimiters_symrefs_and_stateless_response_end() -> Resul
             .is_err()
     );
     assert!(rejected.is_empty());
+    Ok(())
+}
+
+#[test]
+fn v2_acknowledgments_and_pack_end_at_flush_without_remote_helper_framing() -> Result<()> {
+    for done in [false, true] {
+        let (mut session, tip, _, budget) = fixture(Version::V2)?;
+        let mut request = Vec::new();
+        packet(b"command=fetch\n", &mut request);
+        request.extend_from_slice(b"0001");
+        packet(format!("want {tip}\n").as_bytes(), &mut request);
+        if done {
+            packet(b"done\n", &mut request);
+        }
+        request.extend_from_slice(b"0000");
+        let mut output = Vec::new();
+        session.run(&mut request.as_slice(), &mut output, true)?;
+        let mut wire = output.as_slice();
+        if done {
+            assert_eq!(
+                git_rs::protocol::read_packet(&mut wire)?.unwrap(),
+                b"packfile\n"
+            );
+            let mut pack = Vec::new();
+            while let Some(packet) = git_rs::protocol::read_packet(&mut wire)? {
+                assert_eq!(packet[0], 1, "pack data uses sideband channel one");
+                pack.extend_from_slice(&packet[1..]);
+            }
+            assert!(pack.starts_with(b"PACK\0\0\0\x02\0\0\0\x03"));
+            assert_eq!(
+                ranges::hash(&pack[..pack.len() - 20])?.as_slice(),
+                &pack[pack.len() - 20..]
+            );
+        } else {
+            assert_eq!(
+                git_rs::protocol::read_packet(&mut wire)?.unwrap(),
+                b"acknowledgments\n"
+            );
+            assert_eq!(git_rs::protocol::read_packet(&mut wire)?.unwrap(), b"NAK\n");
+            assert!(git_rs::protocol::read_packet(&mut wire)?.is_none());
+        }
+        assert!(
+            wire.is_empty(),
+            "HTTP carries no remote-helper response-end packet"
+        );
+        drop(session);
+        assert_eq!(budget.used(), 0);
+    }
     Ok(())
 }
 

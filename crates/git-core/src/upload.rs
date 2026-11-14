@@ -295,9 +295,8 @@ impl<P: VerifiedObjectProvider> UploadSession<P> {
                 complete = true;
             }
         }
-        if stateless {
-            encode::response_end_to_write(&mut *output)?;
-        }
+        // Server responses terminate at their flush. The stateless remote-curl
+        // helper supplies response-end to its caller; it is not an HTTP body packet.
         output.flush()?;
         Ok(!complete)
     }
