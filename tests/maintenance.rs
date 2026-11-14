@@ -182,6 +182,65 @@ fn retired_keys_are_permanent_and_cannot_be_staged_or_attached_again() -> Result
 
 #[test]
 #[ignore = "requires an exclusively owned disposable PostgreSQL database; run serially"]
+fn qualified_catalog_writes_ignore_the_callers_search_path() -> Result<()> {
+    Operation::new(120).enter(|| {
+        metadata::migrate()?;
+        // Existing v2 databases must receive the corrected execution context
+        // through the same refresh path, without rebuilding their source tables.
+        metadata::sql("ALTER FUNCTION maintenance_protect_key() RESET search_path;
+                       ALTER FUNCTION maintenance_retirement() RESET search_path;
+                       ALTER FUNCTION maintenance_compact_enqueue() RESET search_path;")?;
+        metadata::migrate()?;
+        for (ordinal, path) in ["public, pg_catalog", "pg_temp, public, pg_catalog"]
+            .into_iter()
+            .enumerate()
+        {
+            let slug = format!("maintenance/search-path-{}", git_rs::scratch::identifier()?);
+            metadata::create(&slug, "alice")?;
+            let repo = text(&metadata::snapshot(&slug, "alice", false)?.id);
+            let operation = text(&git_rs::scratch::identifier()?);
+            let prefix = text(&format!("synthetic/search-path/{ordinal}/"));
+            let shadows = if ordinal == 0 {
+                ""
+            } else {
+                "CREATE TEMP TABLE repositories(id uuid,generation bigint) ON COMMIT DROP;
+                 CREATE TEMP TABLE packs(repo_id uuid) ON COMMIT DROP;
+                 CREATE TEMP TABLE retired_objects(object_key text) ON COMMIT DROP;
+                 CREATE TEMP TABLE staged_objects(object_key text,retired_at timestamptz) ON COMMIT DROP;"
+            };
+            let state = metadata::sql(&format!(
+                "BEGIN; SET LOCAL search_path={path}; {shadows}
+                 INSERT INTO git_rs.staged_objects(repo_id,operation_id,object_key,state)
+                     VALUES({repo}::uuid,{operation}::uuid,{prefix}||'retired.pack','planned');
+                 INSERT INTO git_rs.packs(repo_id,operation_id,native_hash,pack_key,idx_key,
+                     pack_digest,idx_digest,pack_size,idx_size,generation)
+                     SELECT {repo}::uuid,{operation}::uuid,lpad(n::text,40,'0'),
+                         {prefix}||n||'.pack',{prefix}||n||'.idx',repeat('a',64),repeat('b',64),32,1096,0
+                     FROM generate_series(1,8) n;
+                 INSERT INTO git_rs.retired_objects(repo_id,object_key,retired_epoch,retirement_operation,reason)
+                     VALUES({repo}::uuid,{prefix}||'retired.pack',0,{operation}::uuid,'contract');
+                 SELECT
+                     (SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}::uuid),
+                     (SELECT count(*) FROM git_rs.staged_objects WHERE repo_id={repo}::uuid AND retired_at IS NOT NULL),
+                     (SELECT count(*) FROM git_rs.maintenance_jobs WHERE repo_id={repo}::uuid AND kind='retire_gc'),
+                     (SELECT count(*) FROM git_rs.maintenance_jobs WHERE repo_id={repo}::uuid AND kind='compact');
+                 COMMIT;"
+            ))?;
+            assert_eq!(state.trim(), "8\t1\t1\t1", "catalog, retirement and enqueue must use source tables for {path}");
+            for insert in [
+                format!("INSERT INTO git_rs.staged_objects(repo_id,operation_id,object_key,state) VALUES({repo}::uuid,{operation}::uuid,{prefix}||'retired.pack','planned');"),
+                format!("INSERT INTO git_rs.packs(repo_id,operation_id,native_hash,pack_key,idx_key,pack_digest,idx_digest,pack_size,idx_size,generation) VALUES({repo}::uuid,{operation}::uuid,repeat('f',40),{prefix}||'retired.pack',{prefix}||'new.idx',repeat('a',64),repeat('b',64),32,1096,0);")
+            ] {
+                rejected(&format!("BEGIN; SET LOCAL search_path={path}; {shadows} {insert} COMMIT;"));
+            }
+            assert_eq!(metadata::sql(&format!("SELECT count(*) FROM packs WHERE repo_id={repo}::uuid;"))?.trim(), "8", "rejected key reuse must not publish another pack");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires an exclusively owned disposable PostgreSQL database; run serially"]
 fn null_limits_cannot_disable_bounded_scans_or_change_a_live_tuple() -> Result<()> {
     Operation::new(120).enter(|| {
         let leader = Leader::acquire()?;

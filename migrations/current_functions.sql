@@ -220,7 +220,11 @@ BEGIN
     RETURN result;
 END $$;
 
-CREATE OR REPLACE FUNCTION maintenance_protect_key() RETURNS trigger LANGUAGE plpgsql AS $$
+-- Qualified catalog writes may come from sessions without the application's
+-- startup options. Resolve trigger queries in the source schema, with temporary
+-- relations explicitly last so they cannot shadow authoritative source tables.
+CREATE OR REPLACE FUNCTION maintenance_protect_key() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, git_rs, pg_temp AS $$
 BEGIN
     PERFORM 1 FROM repositories WHERE id=NEW.repo_id FOR UPDATE;
     IF TG_TABLE_NAME='packs' THEN
@@ -236,7 +240,8 @@ CREATE TRIGGER maintenance_pack_nonreuse BEFORE INSERT OR UPDATE ON packs FOR EA
 DROP TRIGGER IF EXISTS maintenance_stage_nonreuse ON staged_objects;
 CREATE TRIGGER maintenance_stage_nonreuse BEFORE INSERT ON staged_objects FOR EACH ROW EXECUTE FUNCTION maintenance_protect_key();
 
-CREATE OR REPLACE FUNCTION maintenance_retirement() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION maintenance_retirement() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, git_rs, pg_temp AS $$
 BEGIN
     IF TG_OP='DELETE' OR (TG_OP='UPDATE' AND
         (NEW.object_key IS DISTINCT FROM OLD.object_key OR NEW.repo_id IS DISTINCT FROM OLD.repo_id
@@ -253,7 +258,8 @@ CREATE TRIGGER maintenance_retired_identity BEFORE UPDATE OR DELETE ON retired_o
 DROP TRIGGER IF EXISTS maintenance_retired_enqueue ON retired_objects;
 CREATE TRIGGER maintenance_retired_enqueue AFTER INSERT ON retired_objects FOR EACH ROW EXECUTE FUNCTION maintenance_retirement();
 
-CREATE OR REPLACE FUNCTION maintenance_compact_enqueue() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION maintenance_compact_enqueue() RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, git_rs, pg_temp AS $$
 DECLARE g bigint;
 BEGIN
     SELECT generation INTO STRICT g FROM repositories WHERE id=NEW.repo_id;
