@@ -843,14 +843,35 @@ impl git_rs::blame::Observer for SourceGate {
 fn owned_source_native_parity_lazy_selected_packs_and_batched_sql() {
     use git_rs::blame::{Blame, Response};
     let fixture = source_support::Fixture::new(Blame::default(), 1000);
+    assert_ne!(fixture.selected, fixture.unrelated);
+    // Keep index/header/trailer probes valid but damage every physical entry's
+    // payload. Eager unrelated decoding/full-pack authentication must fail; lazy
+    // selection must still return complete native-compatible attribution.
+    let corrupt_payload = |hash: &str| {
+        let native = fixture.root.join("native");
+        let mut bytes =
+            std::fs::read(native.join(format!("objects/pack/pack-{hash}.pack"))).unwrap();
+        let end = bytes.len() - 20;
+        for byte in &mut bytes[12..end] {
+            *byte ^= 0xff;
+        }
+        let path = native.join(format!("corrupt-{hash}.pack"));
+        std::fs::write(&path, bytes).unwrap();
+        let key = fixture.sql(&format!(
+            "SELECT pack_key FROM packs WHERE repo_id={}::uuid AND native_hash={}",
+            git_rs::metadata::text(&fixture.repo),
+            git_rs::metadata::text(hash),
+        ));
+        fixture.put(key.trim(), &path);
+    };
+    corrupt_payload(&fixture.unrelated);
     let sql = source_support::metric("sql");
     let body = fixture.complete();
     assert_eq!(fixture.leases(), 1);
     let files = fixture.source_files();
-    assert!(files.contains(&format!("pack-{}.pack", fixture.selected)));
     assert!(
-        !files.contains(&format!("pack-{}.pack", fixture.unrelated)),
-        "unrelated pack was eagerly downloaded"
+        files.is_empty(),
+        "range-backed source materialized a request repository: {files:?}"
     );
     assert!(
         fixture.engine.cache.allocated() > 0,
@@ -872,7 +893,8 @@ fn owned_source_native_parity_lazy_selected_packs_and_batched_sql() {
                 1,
                 "source released before output acknowledgment"
             );
-            assert!(!self.fixture.source_files().is_empty());
+            assert!(self.fixture.source_files().is_empty());
+            assert!(self.fixture.engine.cache.allocated() > 0);
             self.acknowledged = true;
             Ok(())
         }
@@ -913,6 +935,23 @@ fn owned_source_native_parity_lazy_selected_packs_and_batched_sql() {
                 .engine
                 .blame(&fixture.slug, "carol", &fixture.request()))
             .is_err()
+    );
+    assert_eq!(fixture.leases(), 0);
+    // The same corruption is decisive when it affects the selected pack. Use a
+    // cold engine so the control acquires/decodes source, not a completed
+    // coalesced job whose output would recheck the previous source hold.
+    corrupt_payload(&fixture.selected);
+    let fresh = git_rs::engine::Engine {
+        blame: Blame::default(),
+        store: fixture.engine.store.clone(),
+        cache: Arc::new(git_rs::cache::Cache::new(1024 * 1024, 1024 * 1024)),
+        operation_seconds: 10,
+    };
+    assert!(
+        Operation::new(10)
+            .enter(|| fresh.blame(&fixture.slug, "bob", &fixture.request()))
+            .is_err(),
+        "selected source corruption was not detected"
     );
     assert_eq!(fixture.leases(), 0);
 }
