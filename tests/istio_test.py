@@ -70,16 +70,32 @@ class PlatformImageContracts(unittest.TestCase):
     def test_platform_binding_accepts_only_the_exact_imported_config_or_manifest(self):
         reference = "docker.io/istio/pilot:synthetic"
         config, manifest = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        immutable = "docker.io/istio/pilot@" + manifest
+        cluster = ["docker", "exec", "owned-cluster"]
         for before in (config, manifest, "sha256:" + "c" * 64):
             with self.subTest(docker_id=before):
-                replies = [json.dumps([{"Id": before}]).encode(), json.dumps([{"Id": before}]).encode(),
-                           ("REF TYPE DIGEST SIZE\n" + reference + " manifest " + manifest + " 1\n").encode(),
-                           json.dumps({"status": {"id": config}}).encode()]
+                registered = set()
+
+                def command(arguments):
+                    if arguments == ["docker", "image", "inspect", reference]:
+                        body = json.dumps([{"Id": before}]).encode()
+                    elif arguments == cluster + ["ctr", "images", "list", "name==" + reference]:
+                        body = ("REF TYPE DIGEST SIZE\n" + reference + " manifest " + manifest + " 1\n").encode()
+                    elif arguments == cluster + ["ctr", "images", "tag", reference, immutable]:
+                        registered.add(immutable)
+                        body = b""
+                    elif arguments == cluster + ["crictl", "inspecti", immutable]:
+                        self.assertIn(immutable, registered, "CRI lookup requires the immutable imported alias")
+                        body = json.dumps({"status": {"id": config}}).encode()
+                    else:
+                        self.fail(f"unexpected image command: {arguments}")
+                    return SimpleNamespace(stdout=body)
+
                 with patch.object(istio, "import_image"), \
-                        patch.object(istio, "command", side_effect=[SimpleNamespace(stdout=body) for body in replies]):
+                        patch.object(istio, "command", side_effect=command):
                     if before in {config, manifest}:
                         bound = istio.platform_image("owned-cluster", reference)
-                        self.assertEqual(bound, {"docker_id": before, "reference": "docker.io/istio/pilot@" + manifest,
+                        self.assertEqual(bound, {"docker_id": before, "reference": immutable,
                                                  "cri_id": config})
                     else:
                         with self.assertRaisesRegex(AssertionError, "image identity changed"):
