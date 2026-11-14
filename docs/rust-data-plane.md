@@ -2,11 +2,15 @@
 
 ## Required boundary
 
-The target server uses maintained Rust Git libraries rather than the Git CLI for
-wire protocols, object and pack handling, graph validation, history and blame.
-Native Git remains an independent client and semantic oracle in the test harness.
-The current implementation is partway through this migration; the runtime image
-still requires Git until every remaining boundary below is replaced and qualified.
+The server uses maintained Rust Git libraries for wire framing, objects, packs,
+deltas, graph traversal and blame. The application owns bounded server negotiation,
+authorization, storage access and confirmed atomic publication. Native Git remains
+an independent client and semantic oracle in a separate image. The production
+image has no Git executable, helper directory, client repository or worker fallback.
+
+This document describes the source contracts and verification definitions. A
+source implementation or CI workflow does not establish that its current image,
+dependency graph, failure paths or performance have passed qualification.
 
 Safe Rust, byte-oriented Git names, request cancellation and bounded resources
 remain requirements. The target is one shared Rust core with cooperative checks
@@ -14,65 +18,39 @@ inside long-running algorithms. Complete blame now runs directly in that core;
 external blame-worker selection is obsolete and rejected at serving startup.
 Cooperative in-process cancellation is not a hard realtime cancellation boundary.
 
-## Current replacement map
+## Production boundaries
 
-| Boundary | Current implementation | Replacement gate |
+| Boundary | Rust implementation | Required verification |
 | --- | --- | --- |
-| Empty request repository | `gix` bare initialization with isolated configuration | Native-readable SHA-1 layout; private cleanup; no copied hooks or request state |
-| Snapshot refs and HEAD | `gix-ref` transactions and validated byte-exact HEAD; PostgreSQL remains authoritative | Exact byte-oriented refs, arbitrary default branch, empty/unborn repository, no reflogs |
-| Ref-name validation | `gix` reference validation at command parsing and validation | Native-compatible valid and invalid names, including non-UTF-8 names |
-| Snapshot/blame object kind and size | `gix-pack`/`gix-odb` physical header-only reads | Native-exact loose/ref-delta headers, sealed RAM links, missing-object and cancellation checks, bounded-memory regression |
-| Blame path, metadata and ancestry reads | Rust `SnapshotSession` over verified physical objects | Byte-oriented literal paths, exact object identity and exhaustive ancestry; native maintenance paths remain separate debt |
-| Push ingestion and validation | Native receive-pack/index-pack/fsck | Streaming Rust ingestion; strict validation of every incoming object; authenticated existing bases; complete graph closure |
-| Fetch and negotiation | Native upload-pack/http-backend | Ordinary clients over HTTP/SSH; protocol versions, tags, notes and shallow behavior qualified explicitly |
+| Snapshot refs and HEAD | Leased PostgreSQL snapshot, byte-oriented advertisement, maintained ref-name validation | Default/unborn branch, tags, notes, non-UTF-8 refs, no filesystem restoration |
+| Physical object access | `RangePackSet`, admitted indexes and bounded immutable ranges | Exact object identities, CRC/checksum rules, cross-pack REF/OFS bases, missing/corrupt source recovery |
+| Blame path, metadata and ancestry | `SnapshotSession` over the same physical provider | Literal byte paths, header-only preflight, exhaustive ancestry and native-compatible output |
+| Push ingestion and validation | Maintained controlled stream ingestion, strict physical validation and typed closure | Every entry including duplicate/unreachable objects, thin bases, `.gitmodules`, current SQL authorization |
+| Fetch and negotiation | Rust upload session and maintained packet-line/pack primitives | HTTP/SSH v0/v1/v2, shallow/deepen/merge behavior, complete pack/index acceptance |
 | Complete blame | Pinned Rust core, NativeRootV1 whole-file Myers and complete porcelain | Native oracle equivalence, general graph/rename behavior, bounded complete response, source fencing and cooperative cancellation |
-| Backup and history maintenance | Native Git commands plus database fencing | Verified compatible backup/restore, ownership, fencing and durable retirement |
+| History and backup | Maintained admitted topological traversal, Rust bundle envelope and streaming pack writer | Complete ordered history equality, independently verified bundle/restore, leased output ownership |
+| Truncation and compaction | Admitted rewrite/catalog selection, multipart output and exact SQL journal | Verified pre-rewrite backup, all-catalog object preservation, stale/unknown publication and reader fencing |
+| Source cleanup | Durable jobs, advisory Kubernetes candidacy and PostgreSQL fence | Least-privilege named Lease, monotonic authority, cancellation/drain, permanent retirement and late PUT reconciliation |
 
-`gix` 0.90.0 supplies useful object, pack, ref, traversal and blame components.
-Its pinned `gix-protocol` 0.68.0 documents client handshake and fetch operations;
-it is not a drop-in receive-pack/upload-pack server. Server negotiation, session
-state, streaming and atomic publication integration require their own tested
-implementation. Do not replace standard binary formats with ad hoc parsers.
+No request bare repository, checkout, hook/config execution or pack-file/tmpfs
+bridge is required. Protocol strings such as `git-upload-pack` and
+`git-receive-pack` remain ordinary Git wire identifiers, not executable dispatch.
+The core supports SHA-1 only and fails explicitly at admission/format limits.
+It does not substitute whole-pack allocation for filesystem materialization.
 
-The pinned `gix-ref` 0.69.1 symbolic-target writer formats names through `Display`,
-which replaces non-UTF-8 bytes. Snapshot restoration therefore validates the full
-target with the library, then writes the small HEAD record as raw bytes in the
-unexposed, request-exclusive workspace. A native oracle checks the resulting HEAD
-and all restored refs, including non-UTF-8 branch names.
-
-The pinned `gix-odb` 0.87.0 directory discovery excludes symlinked pack indexes.
-Snapshot header checks instead open the application-owned, catalog-verified
-pack/index pairs through `gix-pack`. This preserves zero-copy links to sealed
-RAM cache entries and their request-lifetime pins. Library header decoding checks
-physical existence and branch target types without inflating complete blobs;
-loose objects and delta bases remain supported. These checks do not replace the
-strict ingestion and graph validation required before publication.
-
-Blame uses the same physical header reader for its commit-kind and uncompressed
-blob-size preflight; those checks no longer execute `cat-file`. A synthetic test
-reads loose and sealed-RAM ref-delta blobs around the 128 MiB payload limit in a
-child with a 96 MiB address-space limit, so replacing a header probe with full
-body inflation fails. This test limit is not a serving-process RSS or hard
-cancellation guarantee. Published reachability, literal path resolution and the
-annotation computation now use the Rust core as well. Push tip checks remain part
-of the native ingestion/validation boundary. Receive-pack, upload-pack/http-backend,
-backup and history maintenance still require the native runtime.
-
-Newly migrated paths must not invoke Git as a hidden fallback. Existing native
-paths remain explicit migration debt; they are not evidence that the final
-Rust-only boundary has been met. Compatibility must be preserved through each
-replacement rather than by disabling strict validation or narrowing accepted
-repository shapes.
+Header probes establish physical type/size without inflating a full large blob.
+Strict ingestion still validates all physical incoming objects before publication;
+a header probe, CRC, index lookup or connectivity check alone is not equivalent.
 
 ## Shared core foundation
 
 `crates/git-core` provides the versioned `git-rs-core` library. Its
-`SnapshotSession`/`SnapshotOdb` accepts an explicitly pinned physical object provider
-and verifies object identity. The root `Scratch::snapshot_odb` adapter preserves
-sealed pack/index mappings and source ownership through full reads, cross-pack
-delta resolution, byte-oriented paths and exhaustive commit ancestry. An absent
-physical empty tree stays absent. `reachable_from_refs` enumerates commits, not the
-complete tree/blob closure needed by a future pack writer or strict receiver.
+`SnapshotSession`/`SnapshotOdb` accepts a leased physical object provider and verifies
+object identity. The root `Source`/`RangeStore` adapter preserves source authority,
+budget identity and reader pins through byte paths and cross-pack delta resolution.
+An absent physical empty tree stays absent. Typed object selection distinguishes
+commit reachability from complete tree/blob/tag closure. Compaction enumerates the
+complete catalog, including physically present unreachable objects.
 
 `CpuExecutor` has a fixed worker count, bounded queue and request-local `Control`.
 Dropping a completion `Ticket` does not cancel independently owned work; explicit
@@ -82,32 +60,18 @@ until the worker has finished cleanup. `CapacityBudget` accounts for live backin
 capacity, including retained results; it is not an RSS or allocator-overhead metric.
 Arbitrary callbacks, panic hooks and destructors still require bounded behavior.
 
-Gitoxide is a normal Git dependency pinned to the owned
-[`borislitv/gitoxide` fork](https://github.com/borislitv/gitoxide/pull/2), revision
-`7ce87f63e03ef116cb2d3df097cd688e6d19c35b` (C7 completed MappingMemo,
-bounded fixed-work polling, linear immutable trace-root maintenance and exclusive
-prepared-token leases, bounded single-origin hunk reuse and request-local raw
-input pair preservation and lazy controlled indentation preparation). The original
-complete admitted indentation dictionary is built only on the first maintained
-heuristic request and reused across both passes; no request does no dictionary
-work. Scoring, tie preference, polling and public heuristic signatures are unchanged.
-Raw mapping edges and fresh diff computations are counted independently of optional
-memo hooks. Hook-free accounting creates no producer identity, wire slot or cache;
-unchanged and empty fast paths do not manufacture mapping work from commit counts.
-Successful no-rewrite traversal, including consumer
-Break, can retain the existing two-resource raw pair within the request. Entry
-provenance reset and rewrite/error/stop/panic cleanup preserve source isolation;
-this does not add a cache or extend the platform's request lifetime.
-`docs/gitoxide-source.json` records its upstream base, licenses and imara origin;
-original source, notices, tests and changes remain in that repository, not copied
-into this application. The source audit and locked package graph reject mixed
-registry/fork or revision identities. Controlled pack, zlib, diff,
-tokenization and blame entrypoints expose inner-loop cancellation and admission;
-configuration is request-local rather than operational environment mutation.
-The physical provider discovers indexes and acquires selected packs on demand for
-blame, preserving source holds and verified RAM pins. Owner-aware decoder buffers,
-completed mapping hooks and byte-exact complete porcelain are integrated with the
-root serving path. This does not replace native receive/upload or backup handling.
+Gitoxide is a normal dependency pinned by full revision to the owned
+[`borislitv/gitoxide` fork](https://github.com/borislitv/gitoxide/pull/2).
+`docs/gitoxide-source.json`, Cargo manifests and lockfile must agree on that
+revision, upstream base, licenses and imara origin. Changes and upstream tests
+remain in the fork, not copied into application source. The source audit rejects
+mixed registry/fork or revision identities. See [dependency sources](dependency-sources.md).
+
+Controlled pack, zlib, traversal, diff, tokenization and blame entrypoints expose
+inner-loop cancellation and capacity admission. Admitted topological traversal
+uses maintained Gitoxide ordering, not a timestamp-pruned or breadth-first
+substitute. Optional completed mapping reuse does not change scoring or tie rules;
+raw mapping edges and fresh computations are counted independently of memo hooks.
 
 Production constructs `BlameOptions::default()`: all five qualified `BlameTuning` switches
 (`reuse_line_tokens`, `retain_current_input_tokens`, `reuse_unchanged_runs`,
@@ -122,16 +86,11 @@ Git dependency; its source identity is recorded in `docs/codec-source.json`.
 Runtime verification binds the GNU libc iconv profile and actual GNU C/ASCII
 thread codeset before serving/cache use. Native compatibility oracles use LC_ALL=C.
 
-The C7 all-on profile passed the synthetic 2000-commit/20000-line performance
-qualification: three prepared runs had a 4.443925 s median against the 5 s gate,
-and three fresh hosted runs had a 4.391570 s median against the 8 s gate. Each
-successful output matched all 6346057 native porcelain bytes; hosted runs observed
-1999 actual mapping edges/computations and zero hits. All three full tokens-off
-negative runs reached the unchanged 20 s deadline. Limits were a shared 1 GiB job,
-256 MiB prepared/32 MiB hosted decoder budgets, and an aggregate ceiling of
-4 GiB, 2 CPUs and 256 tasks. These are synthetic qualification results, not general
-latency guarantees or a Stage 5 release. Full joined functional/authentication,
-destructive-runtime and real-image CI qualification remain pending.
+The profile has historical synthetic native-parity/performance qualification.
+Those measurements bind their recorded sources, executables, producer and resource
+envelope; they do not qualify subsequent range-source, traversal, maintenance or
+image changes. Preserve the profile and unchanged budgets while qualifying the
+joined implementation. Synthetic timing is not a full-repository or HA guarantee.
 
 Run `make check` for the source audit, workspace formatting, strict Clippy and
 application/core tests that are not ignored. `make vendor-check` separately
@@ -142,8 +101,8 @@ explicit Gitoxide doctests, plus codec library/tests and strict Clippy. CI check
 out those immutable pins; build output remains under the application's target
 directory. Cargo fetches the
 same immutable source for application and Docker builds. Root contract tests cover
-real sealed-RAM links, cross-pack bases,
-wrong-object rejection, no-growth caller buffers, source lifetimes and cancellation.
+RAM pins, cross-pack bases, wrong-object rejection, no-growth caller buffers,
+source lifetimes, invalidation races and cancellation.
 These gates do not establish a Git-free runtime, hard realtime cancellation,
 full-repository performance or production deployment readiness.
 
@@ -154,12 +113,13 @@ branches, merges, renames, tags and nonmonotonic commit timestamps. Single-path 
 linear-history optimizations need complete semantic alternatives. Test varied
 history shapes and unrelated-path changes as well as large-file stress cases.
 
-Native transport/maintenance still materializes the complete live pack catalog.
-Blame instead uses demand-driven verified index/pack acquisition, with bounds of
-4096 refs, 1 MiB of ref names, 4096 indexes, 128 MiB selected index bytes and
-12 GiB selected pack/index bytes. Metadata retains its separate <=128 MiB bound.
-This is bounded source access, not a claim that every repository fits one job or
-that graph/index work is shared across all queries.
+Data-plane paths use demand-driven indexes and 4 MiB immutable ranges, bounded by
+4096 refs, 1 MiB ref names, 4096 packs and 128 MiB aggregate index bytes. An
+individual source pack is at most 12 GiB; it is not loaded as one buffer. Encoded
+pack reuse first authenticates its full catalogued byte stream in bounded ranges
+and retains proof only for that job. Metadata has a separate <=128 MiB bound.
+Decoder, graph, selection, output and overlap capacity remain independently charged.
+These bounds do not promise every repository fits one job or shared graph work.
 
 ## Storage and failure semantics
 
@@ -189,11 +149,11 @@ job lifetime. Publication is conditional; ambiguous publication is confirmed usi
 its exact key/payload/digest. This is optional derivation, not a source transaction.
 
 Inline payloads and S3 GETs are bounded and verified before immutable RAM ownership.
-The S3 upload uses sealed memfd staging, never a persistent local cache. Cache S3
+S3 uploads borrow bounded admitted buffers, never a persistent local cache. Cache S3
 configuration is explicit and separate from source storage. Durable upload intents,
 read holds, irreversible retirement and never-reused keys protect reclamation.
-`CacheMaintenance` is a library interface using its own cache-database claim; the
-elected source-maintenance Deployment is a later integration.
+`CacheMaintenance` uses its independent cache-database claim. The elected
+source-maintenance Deployment never borrows that claim as source authority.
 
 The opaque-artifact `Coordinator` coalesces local requests, owns actual-work permits
 and source holds after waiter cancellation, and uses a finite independent operation
@@ -202,7 +162,7 @@ bounded loops. This is not a general hard-stop guarantee for arbitrary callbacks
 the Git-core executor must qualify every inner algorithm separately.
 
 The root blame scheduler gives actual work a finite independent lifetime and owns
-its source hold, scratch and admission through cleanup and complete response
+its source hold, buffers and admission through cleanup and complete response
 consumption. Each waiter retains its own cancellation/deadline. The last queued
 waiter's departure cancels queued work; a departed running waiter cannot cancel
 other waiters or release the job's source early. Source authorization, generation
@@ -246,7 +206,7 @@ These checks do not qualify general Git derivation, serving integration or HA.
 
 ### Current CI coverage and publication gaps
 
-The cache CI job invokes the older `cache_gate.py` controller.
+The cache CI job invokes the independent `cache_gate.py` controller.
 `make check` does not execute ignored contracts. The separate blame gate discovers
 the exact ignored-test inventory from each compiled suite's `--ignored --list`,
 including nested runtime modules, and records the selected names in its sealed
@@ -256,31 +216,30 @@ manifest. It excludes only the named subprocess helpers `artifact_process`,
 There is no fixed contract-count acceptance threshold. These contracts require
 explicit owned fixtures. The split job wires `tests/blame_artifacts.py` for
 contracts/faults/migration; its legacy phase requires real old binaries and their
-verified hashes. The complete actual public gate locally passed 58 selected
-contracts, 11 artifact/migration groups, four runtime scenarios plus their parent,
-and 31 focused serving checks. Cached-image build through completed measurement
-took 954.561 seconds, including orchestration, under the 20-minute budget.
-A green ordinary workspace test is not migration evidence.
+verified hashes. An ordinary green workspace test is not migration evidence.
 
 CI now separates `blame-images` from `blame`: each job retains a 20-minute ceiling.
-The former uses bounded legacy Docker workers for both exact shared-base targets,
-then saves both immutable IDs into one uncompressed layer-deduplicated archive.
+The former uses bounded Docker workers for four commit-bound image roles, then
+saves their immutable IDs in one uncompressed layer-deduplicated archive.
 The same workflow/run/attempt artifact contains its SHA256 and current commit;
 the latter job verifies archive descriptor/config image IDs and checkout before
 loading, then retains separate 900-second preparation and measurement units.
 Image-build/Cargo downloads and existing runtime fixtures use host networking; image
-inspection remains offline. Cold image builds, artifact upload/download and the
-first exact-HEAD hosted split run remain pending, not inferred from cached local
-qualification. No deadline/resource limit is raised to accommodate those costs.
+inspection remains offline. Exact-HEAD qualification must retain real artifact
+transport, inventory, outcomes and cleanup evidence. Historical success is not a
+verdict for a changed checkout. No deadline/resource limit is raised for those costs.
 
-Native integration CI invokes the full integration harness and its concurrency
-path; the split blame job additionally invokes focused `--blame-core-only` mode
-using the shipped release executable. Root/checkpoint functional and
-actual-work reuse proofs do not establish a Stage 5/8 production performance result.
-There is no such performance result yet. Re-run joined-source functional,
-authentication, migration and isolated runtime-codec gates before publication;
-qualify performance and deployment/HA independently. Do not present existing CI
-as coverage of every new contract.
+The runtime gate consumes prebuilt inputs in separate attested systemd units for
+filesystem inventory, serial PostgreSQL source/maintenance contracts, integration,
+receive, dependency failures, candidate Lease behavior and real Kubernetes smoke.
+Fresh Kubernetes 1.37 containers, controllers, backends, PG/S3 and actual CRI tasks
+must fit the same aggregate envelope. External clients never share their Git
+installation or repositories with a backend. See [runtime contracts](runtime-contracts.md).
+
+Root/checkpoint functional and actual-work reuse proofs do not establish general
+production performance. Qualify the complete implementation, real-image lifecycle,
+native semantics and performance before publication; deployment HA remains a
+separate acceptance scope. Do not present workflow wiring as executed coverage.
 
 PostgreSQL remains authoritative for refs, authorization, catalog and fencing;
 immutable S3 objects hold pack/index bytes. Computation changing from Git CLI to

@@ -335,8 +335,17 @@ fn published_long_refs_remain_readable() {
                 format!("refs/heads/{component}/{component}/{component}/{component}/{index:049}");
             assert_eq!(name.len(), protocol::MAX_REF);
             if index == 0 {
-                process::capture(process::git().args(["check-ref-format", &name]), b"", 4096)
+                let status = Command::new("/usr/bin/git")
+                    .env_clear()
+                    .env("HOME", "/nonexistent")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .args(["check-ref-format", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
                     .unwrap();
+                assert!(status.success(), "external native ref-format oracle");
             }
             protocol::write_packet(
                 &mut wire,
@@ -469,6 +478,76 @@ fn namespace_range_check_rejects_only_descendants_and_rolls_back() {
 
 #[test]
 #[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn null_publication_fences_and_command_fields_cannot_authorize_writes() {
+    process::Operation::new(120).enter(|| {
+        metadata::migrate().unwrap();
+        let slug = format!("metadata/null-{}", git_rs::scratch::identifier().unwrap());
+        metadata::create(&slug, "alice").unwrap();
+        let snapshot = metadata::snapshot(&slug, "alice", true).unwrap();
+        let _lease = Barrier::acquire(&snapshot.id, false).unwrap();
+        let repo = metadata::text(&snapshot.id);
+        let operation = metadata::text(&git_rs::scratch::identifier().unwrap());
+        let lease = format!("(SELECT id FROM repository_leases WHERE repo_id={repo}::uuid)");
+        let names = "ARRAY[convert_to('refs/heads/main','UTF8')]";
+        let old = "ARRAY[decode(repeat('00',20),'hex')]";
+        let new = "ARRAY[decode(repeat('11',20),'hex')]";
+        for (epoch, names, old, new, forward) in [
+            ("NULL", names, old, new, "ARRAY[true]"),
+            ("0", "NULL::bytea[]", old, new, "ARRAY[true]"),
+            ("0", names, "NULL::bytea[]", new, "ARRAY[true]"),
+            ("0", names, old, new, "ARRAY[NULL]::boolean[]"),
+            ("0", names, "ARRAY[NULL]::bytea[]", new, "ARRAY[true]"),
+        ] {
+            let error = metadata::sql(&format!("SELECT publish({repo}::uuid,{operation}::uuid,'alice',''::bytea,{epoch},{lease},{names},{old},{new},{forward});")).unwrap_err();
+            assert!(error.to_string().contains("SQLSTATE P0001"), "{error}");
+            let after = metadata::snapshot(&slug, "alice", true).unwrap();
+            assert_eq!((after.generation, after.storage_epoch, after.refs.len(), after.packs.len()), (0, 0, 0, 0));
+            assert_eq!(metadata::sql(&format!("SELECT count(*) FROM operations WHERE repo_id={repo}::uuid;")).unwrap().trim(), "0");
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn lease_expiry_during_catalog_attachment_rolls_back_the_entire_publication() {
+    process::Operation::new(120).enter(|| {
+        metadata::migrate().unwrap();
+        let nonce = git_rs::scratch::identifier().unwrap();
+        let slug = format!("metadata/late-lease-{nonce}");
+        metadata::create(&slug, "alice").unwrap();
+        let snapshot = metadata::snapshot(&slug, "alice", true).unwrap();
+        let lease = Barrier::acquire(&snapshot.id, false).unwrap();
+        let name = format!("expire_source_{nonce}");
+        struct Trigger(String);
+        impl Drop for Trigger {
+            fn drop(&mut self) {
+                let _cleanup = process::Operation::new(5).enter(|| metadata::sql(&format!(
+                    "DROP TRIGGER IF EXISTS {} ON packs; DROP FUNCTION IF EXISTS {}();", self.0, self.0)));
+            }
+        }
+        metadata::sql(&format!(
+            "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN IF NEW.repo_id={}::uuid THEN UPDATE repository_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE repo_id=NEW.repo_id; END IF; RETURN NEW; END $body$; CREATE TRIGGER {name} BEFORE INSERT ON packs FOR EACH ROW EXECUTE FUNCTION {name}();",
+            metadata::text(&snapshot.id))).unwrap();
+        let _trigger = Trigger(name);
+        let operation = git_rs::scratch::identifier().unwrap();
+        let pack = metadata::Pack {
+            hash: "1".repeat(40), pack_key: format!("repos/{}/operations/{operation}/output.pack", snapshot.id),
+            idx_key: format!("repos/{}/operations/{operation}/output.idx", snapshot.id),
+            pack_digest: "a".repeat(64), idx_digest: "b".repeat(64), pack_size: 32, idx_size: 1096,
+        };
+        let result = metadata::publish(&snapshot, &lease, &operation, "alice", &[Update {
+            old: Oid::ZERO, new: Oid([1; 20]), name: b"refs/heads/main".to_vec(),
+        }], &[true], &[pack]);
+        assert!(result.is_err(), "an initially live lease must be rechecked after catalog/trigger work");
+        let after = metadata::snapshot(&slug, "alice", true).unwrap();
+        assert_eq!((after.generation, after.storage_epoch, after.refs.len(), after.packs.len()), (0, 0, 0, 0));
+        assert_eq!(metadata::sql(&format!("SELECT count(*) FROM operations WHERE repo_id={}::uuid;", metadata::text(&snapshot.id))).unwrap().trim(), "0");
+        lease.check().expect("rollback also restores the lease's original live state");
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
 fn failed_late_catalog_query_never_returns_a_partial_snapshot() {
     metadata::migrate().unwrap();
     let slug = format!(
@@ -480,7 +559,14 @@ fn failed_late_catalog_query_never_returns_a_partial_snapshot() {
     // header and refs, but its final catalog query cannot complete. The request
     // deadline must fail the snapshot rather than accept that partial stdout.
     let repo = metadata::snapshot(&slug, "alice", false).unwrap().id;
-    let mut locker = process::Guard::new(
+    struct Locker(std::process::Child);
+    impl Drop for Locker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut locker = Locker(
         Command::new("/usr/bin/psql")
             .args(["-X", "-qAt", "-v", "ON_ERROR_STOP=1"])
             .stdin(Stdio::piped())

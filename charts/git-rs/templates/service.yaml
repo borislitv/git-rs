@@ -13,6 +13,7 @@ spec:
   type: {{ .Values.service.type }}
   selector:
     {{- include "git-rs.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: serving
   ports:
     {{- if .Values.ssh.enabled }}
     - name: ssh

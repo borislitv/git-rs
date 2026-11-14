@@ -102,6 +102,9 @@ pub enum Phase {
     CheckpointImported,
     CheckpointInstalled,
     CheckpointPublished,
+    BodyBuildClaimed,
+    BodyBuildPending,
+    BodyBuildUnavailable,
 }
 /// In-process observation outside source/cache/workset/scheduler locks. Callbacks
 /// must honor the original control/deadline, including the statistics callback.
@@ -216,8 +219,6 @@ impl Blame {
     }
     fn environment(&self, engine: &Engine) -> derive::Environment {
         derive::Environment {
-            root: engine.scratch_root.clone(),
-            threads: engine.pack_threads,
             store: engine.store.clone(),
             files: engine.cache.clone(),
             derived: self.cache.clone(),
@@ -364,20 +365,27 @@ impl Engine {
         &self,
         slug: &str,
         principal: &str,
-        snapshot: &crate::metadata::Snapshot,
-        generation: u64,
-        operation: &str,
-        commands: &[crate::protocol::Update],
+        receipt: crate::receive::Receipt,
     ) -> WarmDisposition {
-        self.blame.try_warm_confirmed(
-            self.blame.environment(self),
-            slug,
-            principal,
-            snapshot,
-            generation,
-            operation,
-            commands,
-        )
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let pending = receipt.after_cleanup(|snapshot, generation, operation, commands| {
+                self.blame.prepare_warm_confirmed(
+                    self.blame.environment(self),
+                    slug,
+                    principal,
+                    snapshot,
+                    generation,
+                    operation,
+                    commands,
+                )
+            });
+            match pending {
+                Some(Ok(task)) => self.blame.submit_warm(task),
+                Some(Err(disposition)) => disposition,
+                None => WarmDisposition::NoTarget,
+            }
+        }))
+        .unwrap_or(WarmDisposition::Rejected)
     }
 }
 struct SourceAccess {

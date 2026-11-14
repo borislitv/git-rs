@@ -13,7 +13,7 @@ use rustix::{
     net::{RecvFlags, SendFlags, SocketType, recv, send, sockopt},
 };
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     os::{
         fd::{AsFd, OwnedFd},
         unix::net::UnixStream,
@@ -211,6 +211,55 @@ impl Read for ReceiveInput {
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+}
+
+/// Owned stream output with the admission's original cancellation/deadline.
+/// Readiness never licenses a blocking send: MSG_DONTWAIT is per-call and no
+/// shared descriptor flags are changed. No global stdout lock or worker exists.
+pub struct StreamOutput {
+    fd: OwnedFd,
+    control: IoControl,
+}
+
+impl StreamOutput {
+    pub fn new(fd: OwnedFd, control: IoControl) -> io::Result<Self> {
+        control.check()?;
+        if FileType::from_raw_mode(fstat(&fd)?.st_mode) != FileType::Socket
+            || sockopt::socket_type(&fd)? != SocketType::STREAM
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output requires a stream socket",
+            ));
+        }
+        Ok(Self { fd, control })
+    }
+}
+
+impl Write for StreamOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.control.ready(&self.fd, PollFlags::OUT)?;
+            match send(
+                &self.fd,
+                &bytes[..bytes.len().min(CHUNK)],
+                SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+            ) {
+                Ok(count) => {
+                    self.control.check()?;
+                    return Ok(count);
+                }
+                Err(Errno::INTR | Errno::AGAIN) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.control.check()
     }
 }
 

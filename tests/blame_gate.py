@@ -37,7 +37,14 @@ EXCLUDE = {"blame_artifacts": {"artifact_process"},
            "blame_core": {"runtime_support::runtime_child"}}
 ROOT_RUNTIME = "runtime_support::owned_source_runtime_fences_ready_cache_http_response_staging_and_publication"
 HARNESS_FILES = ("tests/blame_gate.py", "tests/blame_artifacts.py", "tests/derived_cache.py",
-                 "tests/integration.py", "tests/blame_concurrency.py",
+                  "tests/integration.py", "tests/blame_concurrency.py",
+                  "tests/runtime_process.py", "tests/maintenance_fixture.py",
+                   "tests/runtime_gate.py", "tests/runtime_exec.py", "tests/kubernetes.py",
+                   "tests/istio.py", "tests/istio_artifacts.py",
+                  "tests/kubernetes_processes.py", "tests/kubernetes_oracle.py",
+                   "tests/leader_dependency.py", "tests/failures.py", "tests/maintenance.py", "tests/receive_integration.py",
+                   "tests/cache_matrix.py", "tests/fixtures/cache-matrix.json", "tests/cache_storage_cost.py",
+                  "tools/check-runtime-boundaries.py",
                  "tests/support/cache_faults.py", "tests/support/blame_artifact_faults.py",
                  "tests/cache_gate.py")
 LABEL = "git-rs.blame-gate="
@@ -116,7 +123,7 @@ def load_manifest(bundle):
     require(manifest["git_source"] == GIT_SOURCE, "wrong runtime Git provenance")
     require(manifest["builder_packages"] == manifest["runtime_packages"],
             "build/runtime OS package closure differs")
-    for key in ("runtime_image", "builder_image"):
+    for key in ("runtime_image", "builder_image", "server_image", "server_fixture_image"):
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", manifest[key]), "mutable image reference")
     required = {"current", "fixture", "cache_process", "legacy", "legacy_process", *SUITES}
     require(set(manifest["binaries"]) == required, "incomplete prebuilt binary set")
@@ -243,6 +250,9 @@ def prepare_bundle(args):
     revision = checkout_identity(ROOT)
     checkout_identity(legacy, LEGACY_COMMIT)
     builder, runtime = image_id(args.builder_image), image_id(args.image)
+    from runtime_process import inspect_image
+    server = inspect_image(os.environ["GIT_RS_TEST_RUNTIME_IMAGE"], revision, "runtime")
+    server_fixture = inspect_image(os.environ["GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE"], revision, "runtime-fixture")
     for image in (builder, runtime):
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", image), "immutable image ID required")
     packages = [image_output(image, ["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"])
@@ -283,7 +293,8 @@ def prepare_bundle(args):
                 "legacy": {"repository": LEGACY_REPOSITORY, "commit": LEGACY_COMMIT,
                            "cargo_manifest_sha256": digest(legacy / "Cargo.toml"),
                            "cargo_lock_sha256": digest(legacy / "Cargo.lock")},
-                "runtime_image": runtime, "builder_image": builder,
+                 "runtime_image": runtime, "builder_image": builder,
+                 "server_image": server, "server_fixture_image": server_fixture,
                 "builder_packages": hashlib.sha256(packages[0].encode()).hexdigest(),
                 "runtime_packages": hashlib.sha256(packages[1].encode()).hexdigest(),
                 "git_source": provenance, "binaries": records, "inventory": names,
@@ -322,26 +333,31 @@ def verify_limits(directory):
     require(0 < count <= 2, "aggregate CPU affinity must select at most two CPUs")
 
 
-def verify_unit(unit, slice_name, cleanup_command="blame_gate.py cleanup"):
+def verify_unit(unit, slice_name, cleanup_command="blame_gate.py cleanup", *, deadline=None):
+    def bounded_output(argv):
+        timeout = 30 if deadline is None else min(5, deadline - time.monotonic())
+        require(timeout > 0, "unit attestation absolute deadline expired")
+        return output(argv, timeout=timeout)
+
     token = invocation()
     require(re.fullmatch(SLICE_PATTERN, slice_name), "dedicated gate slice required")
     require(re.fullmatch(r"git-rs-blame-[a-zA-Z0-9_-]{8,80}\.service", unit), "owned gate unit required")
     fields = ("InvocationID", "ControlGroup", "Slice", "RuntimeMaxUSec", "TimeoutStopUSec",
               "KillMode", "ExecStopPost")
-    text = output(["systemctl", "show", unit, *["--property=" + x for x in fields]])
+    text = bounded_output(["systemctl", "show", unit, *["--property=" + x for x in fields]])
     props = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     require(props["InvocationID"] == token and props["Slice"] == slice_name, "unit ownership mismatch")
     require(0 < seconds(props["RuntimeMaxUSec"]) <= RUNTIME_SECONDS, "unit runtime exceeds 900s")
     require(0 < seconds(props["TimeoutStopUSec"]) <= 40 and props["KillMode"] == "control-group",
             "bounded control-group shutdown required")
     require(cleanup_command in props["ExecStopPost"], "independent cleanup required")
-    group = output(["systemctl", "show", slice_name, "--property=ControlGroup", "--value"])
+    group = bounded_output(["systemctl", "show", slice_name, "--property=ControlGroup", "--value"])
     require(group.startswith("/") and ".." not in Path(group).parts
             and props["ControlGroup"].startswith(group + "/"), "unit is outside aggregate slice")
     require(Path("/proc/self/cgroup").read_text().strip() == "0::" + props["ControlGroup"],
             "controller is not in its attested systemd unit")
     verify_limits(Path("/sys/fs/cgroup") / group.lstrip("/"))
-    require(output(["docker", "info", "--format", "{{.CgroupDriver}} {{.CgroupVersion}}"])
+    require(bounded_output(["docker", "info", "--format", "{{.CgroupDriver}} {{.CgroupVersion}}"])
             == "systemd 2", "systemd Docker cgroup-v2 driver required")
     return token
 
@@ -389,10 +405,15 @@ def run_gate(args):
                      "--volume", "/var/run/docker.sock:/var/run/docker.sock",
                      "--volume", f"{shutil.which('docker')}:/usr/bin/docker:ro",
                      "--volume", f"{bundle}:/gate:ro",
-                     "--volume", f"{local}:/opt/git-rs/.local:rw",
+                      "--volume", f"{local}:/opt/git-rs/.local:rw",
                      "--tmpfs", "/tmp:rw,nosuid,size=512m,mode=1777",
                      "--env", "INVOCATION_ID=" + token, "--env", "GIT_RS_GATE_SLICE=" + args.slice,
-                     "--env", "LANG=C", "--env", "LC_ALL=C",
+                      "--env", "LANG=C", "--env", "LC_ALL=C",
+                      "--env", "GIT_RS_TEST_HOST_ROOT=" + str(local),
+                      "--env", "GIT_RS_TEST_CONTROLLER_ROOT=/opt/git-rs/.local",
+                      "--env", "GIT_RS_TEST_RUNTIME_IMAGE=" + manifest["server_image"],
+                      "--env", "GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE=" + manifest["server_fixture_image"],
+                      "--env", "GIT_RS_TEST_REVISION=" + manifest["current_commit"],
                      "--entrypoint", "/usr/bin/python3", manifest["runtime_image"],
                      "-B", "/opt/git-rs/tests/blame_gate.py", "inside"],
                     timeout=max(1, RUNTIME_SECONDS - (time.monotonic() - started)),
@@ -413,11 +434,11 @@ def docker_proxy(arguments):
     token = invocation()
     slice_name = os.environ.get("GIT_RS_GATE_SLICE", "")
     require(re.fullmatch(SLICE_PATTERN, slice_name), "missing aggregate slice")
-    if arguments and arguments[0] == "run":
+    if arguments and arguments[0] in {"run", "create"}:
         forbidden = ("--cgroup-parent", "--privileged", "--cgroupns", "--pid")
         require(not any(a.split("=", 1)[0] in forbidden for a in arguments[1:]),
                 "fixture attempted to escape aggregate cgroup")
-        arguments = ["run", "--cgroup-parent", slice_name, "--pull=never",
+        arguments = [arguments[0], "--cgroup-parent", slice_name, "--pull=never",
                      "--label", LABEL + token, *arguments[1:]]
     os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
     os.environ.pop("DOCKER_CONTEXT", None)

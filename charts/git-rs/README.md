@@ -85,11 +85,11 @@ one-second lifetime. Align gateway timeouts with an explicitly increased request
 termination remains a crash-safe stop rather than graceful request draining. Per-object S3 and
 PostgreSQL limits are documented in [operations](../../OPERATIONS.md).
 
-`packThreads` defaults to one and accepts integers 1–4. It sets native Git's per-request
-`pack.threads` through `GIT_RS_PACK_THREADS`; zero/automatic host-CPU detection is not accepted.
-Choose a value within the backend's CPU and memory budget, accounting for up to four admitted
-requests and per-worker delta-base caches/object buffers. It does not increase container quotas
-or the sidecar/dependency budget. Strict incoming validation and publication semantics still apply.
+`cpu.concurrency`/`cpu.waiters` configure the shared receive/upload/blame/history
+runtime: default one worker/no queue, maximum four total slots. Four transport
+admissions are not four independent CPU pools. These values do not increase pod,
+sidecar or dependency quotas. `packThreads`, `GIT_RS_PACK_THREADS` and the old serving
+`scratch` values are rejected; serving uses bounded immutable ranges and RAM.
 
 `debugTimings: true` sets `GIT_RS_DEBUG_TIMINGS=1` only on the backend and rolls its pods. It is
 disabled by default. The bounded lossy writer emits correlated fixed-field diagnostics; monitor
@@ -115,25 +115,37 @@ not as a deployable external profile. Gateway attachment, `Accepted`/`ResolvedRe
 TLS trust and real native Git through Istio require runtime verification; Helm rendering proves
 none of them. The example uses reserved domains and must be configured before installation.
 
-### Optional real Istio verification
+### Real Istio verification
 
-On a Linux Docker host with an already built `git-rs:dev` production image, run
-`python3 tests/istio.py --helm /path/to/helm3` (or `make istio HELM=/path/to/helm3`).
-It requires privileged Docker, reachable Docker bridge addresses, Git, curl, OpenSSL, Python
-and PyYAML, plus public artifact/image access. It exclusively creates `git-rs-istio-test`, refuses
-an existing container with that name, and removes its own container/volumes on exit. It never
-attaches to the separate Kubernetes/benchmark fixture. `--keep-on-failure` is for explicit debugging.
+On a Linux Docker host, prepare revision-bound production, runtime-fixture and
+external oracle images, a prebuilt Linux Helm executable and public inputs with
+`make istio-prepare`. Pull the dependencies listed by
+`python3 -B tests/runtime_gate.py images --phase istio` outside measurement.
+Run `make istio HELM=/path/to/helm RUNTIME_IMAGE=... RUNTIME_FIXTURE_IMAGE=... ORACLE_IMAGE=...`
+inside the root-observed systemd unit described in
+[runtime contracts](../../docs/runtime-contracts.md), with `RUNTIME_GATE_UNIT` and
+`RUNTIME_GATE_SLICE` identifying that unit and its bounded slice. CI runs this same
+phase with Helm 4.3.1. The supervisor owns a fresh immutable cluster identity,
+aggregate resource limits, successful-exec tracing and independent crash cleanup.
+Prepared charts/CRDs and the hash-bound Helm input are read-only; Git, curl,
+OpenSSL, Python and PyYAML belong to the external oracle image. Private reports
+remain after failure; the cluster is drained rather than kept running for debugging.
 
 The test pins/checksums official Istio 1.31.3 distribution charts and Gateway API v1.7.0 standard
-CRDs on k3s v1.37.2+k3s1. It supplies a platform-owned HTTPS Gateway, CA-signed certificate,
+CRDs on k3s v1.37.2+k3s1. It imports prepared pilot/proxy images and binds their
+actual config/manifest digests with pull policy `Never`. It supplies a platform-owned HTTPS Gateway, CA-signed certificate,
 STRICT mTLS and gateway-principal authorization policy outside the application chart. It checks
 current-generation Gateway `Accepted`/`Programmed` and HTTPRoute `Accepted`/`ResolvedRefs`,
 then performs native Git push/clone and restart readback with strict CA/hostname verification and
 Secret-backed HTTP Basic. Negative controls reject an untrusted CA, absent/wrong credentials,
 spoofed identity headers and non-mesh plaintext traffic. Destination telemetry must show the
 gateway principal and `mutual_tls`; actual Envoy route configuration must have no retry policy.
-These checks passed with Helm 3.22.1. This is an isolated routing/security integration check,
+Historical checks used Helm 3.22.1; changed runtime/oracle images require fresh results.
+This is an isolated routing/security integration check,
 not a production deployment, load benchmark, CNPG failover or storage-retention proof.
+The fixture sets `migration.podAnnotations.sidecar.istio.io/inject` to the string
+`"false"` so a long-running injected proxy cannot keep the finite migration Job
+alive. Its PostgreSQL connection still verifies TLS independently of the mesh.
 
 ### Breaking values migration
 
@@ -177,7 +189,7 @@ and PTYs are disabled. All clients use the OpenSSH login `git-rs`.
 
 The backend runs as UID/GID 10001 with no capabilities and a read-only root filesystem. The SSH
 listener uses root only for authentication/privilege separation, with `SETUID`, `SETGID` and
-`SYS_CHROOT`. An unprivileged init container prepares private scratch/socket directories; a
+`SYS_CHROOT`. An unprivileged init container prepares the private socket directory; a
 capability-free root init container copies the host key to a root-private RAM volume so `fsGroup`
 does not make its live key group-readable. Account for this in namespace admission policy.
 
@@ -227,6 +239,43 @@ A post-install/post-upgrade Job serializes schema initialization and verifies th
 For a preinitialized database, `migration.enabled=false` disables it. Serving replicas do not run
 migrations. Do not route client traffic until the Helm operation and migration Job have succeeded.
 
+### Separate elected maintenance
+
+Maintenance is disabled by default. First upgrade the source schema with
+`maintenance.enabled=false` and verify committed schema v2. Then apply the same
+image digest with `examples/maintenance.yaml` and the configured platform values.
+The post-upgrade migration hook runs after ordinary resources; do not enable
+workers in the first upgrade and wait for them to migrate their own schema.
+
+The chart creates a separate two-replica `<fullname>-maintenance` Deployment,
+maintenance-only ServiceAccount/Role/RoleBinding and kept `<fullname>-source`
+Lease. Its spec is empty; Helm must not own holder identity, transitions or times.
+The Role permits only GET/PATCH on that exact name, not list/watch/create/delete.
+The maintenance ServiceAccount must differ from serving. Automount is false;
+only the explicit finite token/CA/namespace projection reaches the worker.
+
+Kubernetes candidacy is advisory; PostgreSQL's confirmed monotonic fence and
+DB-clock lease authorize source mutations. Jobs have separate fresh tokens,
+claim generations, bounded retry/dead-letter state and immutable result journals.
+`git-rs cleanup REPO OWNER [--wait SECONDS]` enqueues a durable job; the serving
+command never deletes objects or starts an unfenced worker. Compaction preserves
+all catalog objects, including unreachable ones. Automatic reachability GC needs
+an explicit retention/backup-root policy and otherwise dead-letters.
+
+Both eligible standbys can be ready with an empty queue. `/leaderz` separately
+reports locally confirmed authority. Loss/uncertainty cancels actual work;
+shutdown drains it before releasing PostgreSQL/Kubernetes ownership. Default
+shutdown is 90 seconds with termination grace 110; validated lease/heartbeat
+margins must not be reduced independently.
+
+Maintenance scratch is explicit private ephemeral storage: default Memory 2 GiB,
+or `maintenance.scratch.medium: ""` for node-backed storage, never a repository
+PVC. Default worker resources (1 CPU/4 GiB memory/3 GiB ephemeral limit) and
+512 MiB range cache are provisional. Qualify memory including tmpfs, overlapping
+buffers, standby replicas and rollout surge; values do not prove a workload fits.
+See [operations](../../OPERATIONS.md#elected-source-maintenance-and-schema-upgrade)
+for environment controls, errors and upgrade/rollback ownership requirements.
+
 Use a TCP load balancer for SSH or a controlled local port-forward for evaluation. Port 22 maps
 to sidecar port 2222. Verify the server host key before using the shared account:
 
@@ -243,5 +292,5 @@ copy. Identity-map Secrets are read by the authorization helper on authenticatio
 updates follow Kubernetes propagation delays. Rotate database/S3 credentials with a controlled
 rollout because they are process environment values.
 
-See [operations and recovery](https://github.com/borislitv/git-rs/blob/v0.1.0-rc.2/OPERATIONS.md)
+See [operations and recovery](../../OPERATIONS.md)
 for backup/truncation semantics, resource limits and unverified production properties.

@@ -1,5 +1,22 @@
 # Independent review and qualification
 
+## Current source boundary
+
+The current source uses range-backed Rust object access and one admitted CPU pool
+for receive, upload, blame, history and administration. Source maintenance uses
+same-binary workers, advisory named-Lease candidacy and durable PostgreSQL fences.
+Production code has no native Git factory, hook broker or request-repository bridge.
+`GIT_RS_BLAME_WORKER` and `GIT_RS_PACK_THREADS` are rejected obsolete settings.
+
+These changes require a fresh integrated review and qualification. The prebuilt
+[runtime checks](runtime-contracts.md) combine stopped-image inventories with an
+external successful-exec observer, real CRI image identity and exact-owned cleanup.
+Written checks and zero subprocess counters are not an executed Git-free verdict.
+The review and test observations below are historical; they remain bound to their
+original implementation and do not establish results for the changed checkout.
+
+## Historical review record
+
 The rc.3 changes received separate review passes for metadata/publication/history and for
 transport/authentication/resource ownership, followed by integration and deployment review.
 These are engineering checks, not a security certification or production HA acceptance.
@@ -141,7 +158,7 @@ content readback and hold-release checks. This is an opt-in wall-clock regressio
 extend the possible maintenance delay after a crash; they do not add graceful
 shutdown draining or establish comparative throughput or production HA.
 
-### Bounded native Git workers
+### Historical native Git worker configuration
 
 `GIT_RS_PACK_THREADS` and chart `packThreads` explicitly select one through four
 native pack workers per request, retaining the default of one. Invalid, automatic
@@ -242,11 +259,18 @@ install or modify platform resources in an application's production environment.
 
 ## Residual limitations
 
-Requests still materialize the complete catalog. The RAM cache bound is not a bound on total
-subprocess memory, metadata, scratch or node resources. The backend does not implement graceful
-request draining, lazy object access, version-aware purge, automatic compaction, coordinated PITR,
-Git LFS or filtered clones. Production CNPG failover and Ceph/RGW durability/retention require
-separate acceptance. An isolated routing test does not establish production mesh policy.
+Lazy source ranges, bounded indexes and streaming packs replace whole-catalog file
+materialization. Their capacity accounting and RAM cache limits are not whole-process
+RSS, allocator-overhead or node-resource bounds. Compaction and irreversible-key
+cleanup have source implementations and still require stale-owner, crash, storage,
+resource and real-cluster qualification. Automatic full reachability GC remains
+disabled pending explicit retention/backup-root policy; versioned and unknown
+buckets remain deletion-blocked. Maintenance has a bounded stop protocol, which
+does not establish general serving-request drain or a failover SLA.
+
+Coordinated PITR, Git LFS and filtered clones are not implemented. Production CNPG
+failover and Ceph/RGW durability/retention require separate acceptance. An isolated
+routing test does not establish production mesh policy.
 
 Performance must be measured against the intended workload with all dependencies included.
 See [benchmark methodology](benchmarking.md); passing correctness tests does not establish a

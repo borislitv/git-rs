@@ -74,7 +74,7 @@ CREATE TABLE repository_leases (
     expires_at timestamptz NOT NULL
 );
 CREATE INDEX ON repository_leases (repo_id, expires_at);
-ELSIF NOT (SELECT count(*)=1 AND min(version)=1 FROM schema_version) THEN
+ELSIF NOT (SELECT count(*)=1 AND min(version) IN (1,2) FROM schema_version) THEN
     RAISE EXCEPTION 'unsupported metadata schema version';
 END IF;
 END $initialize$;
@@ -97,10 +97,11 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM repository_leases WHERE id = p_lease AND repo_id = p_repo
                    AND NOT exclusive AND expires_at > clock_timestamp())
     THEN RAISE EXCEPTION 'request lease unavailable'; END IF;
-    IF r.storage_epoch <> p_epoch THEN RAISE EXCEPTION 'storage epoch changed'; END IF;
+    IF r.storage_epoch IS DISTINCT FROM p_epoch THEN RAISE EXCEPTION 'storage epoch changed'; END IF;
     SELECT * INTO previous FROM operations WHERE id = p_operation;
     IF FOUND THEN
-        IF previous.repo_id <> p_repo OR previous.principal <> p_principal OR previous.commands <> p_commands THEN
+        IF previous.repo_id IS DISTINCT FROM p_repo OR previous.principal IS DISTINCT FROM p_principal
+           OR previous.commands IS DISTINCT FROM p_commands THEN
             RAISE EXCEPTION 'operation identity conflict';
         END IF;
         -- A WAL-producing synchronous confirmation, also used after unknown COMMIT.
@@ -109,19 +110,28 @@ BEGIN
     END IF;
     SELECT * INTO permission FROM permissions WHERE repo_id = p_repo AND principal = p_principal;
     IF NOT FOUND OR permission.role = 'reader' THEN RAISE EXCEPTION 'write denied'; END IF;
-    IF cardinality(p_names) NOT BETWEEN 1 AND 10000 OR cardinality(p_old) <> cardinality(p_names)
-       OR cardinality(p_new) <> cardinality(p_names) OR cardinality(p_fast_forward) <> cardinality(p_names)
+    IF cardinality(p_names) IS NULL OR cardinality(p_names) NOT BETWEEN 1 AND 10000
+       OR cardinality(p_old) IS DISTINCT FROM cardinality(p_names)
+       OR cardinality(p_new) IS DISTINCT FROM cardinality(p_names)
+       OR cardinality(p_fast_forward) IS DISTINCT FROM cardinality(p_names)
+       OR array_ndims(p_names) IS DISTINCT FROM 1 OR array_lower(p_names,1) IS DISTINCT FROM 1
+       OR array_ndims(p_old) IS DISTINCT FROM 1 OR array_lower(p_old,1) IS DISTINCT FROM 1
+       OR array_ndims(p_new) IS DISTINCT FROM 1 OR array_lower(p_new,1) IS DISTINCT FROM 1
+       OR array_ndims(p_fast_forward) IS DISTINCT FROM 1 OR array_lower(p_fast_forward,1) IS DISTINCT FROM 1
        OR EXISTS (SELECT 1 FROM unnest(p_names) n GROUP BY n HAVING count(*) > 1)
     THEN RAISE EXCEPTION 'invalid command list'; END IF;
     FOR i IN 1..cardinality(p_names) LOOP
+        IF p_names[i] IS NULL OR p_old[i] IS NULL OR p_new[i] IS NULL OR p_fast_forward[i] IS NULL
+           OR octet_length(p_old[i])<>20 OR octet_length(p_new[i])<>20
+        THEN RAISE EXCEPTION 'invalid command fields'; END IF;
         IF substring(p_names[i] FROM 1 FOR octet_length(permission.write_prefix)) <> permission.write_prefix
         THEN RAISE EXCEPTION 'ref write denied'; END IF;
         SELECT oid INTO current_oid FROM refs WHERE repo_id = p_repo AND name = p_names[i];
         IF coalesce(current_oid, zero_oid) <> p_old[i] THEN RAISE EXCEPTION 'stale old OID'; END IF;
-        IF p_names[i] = r.default_ref AND (p_new[i] = zero_oid OR NOT p_fast_forward[i])
+        IF p_names[i] = r.default_ref AND (p_new[i] = zero_oid OR p_fast_forward[i] IS NOT TRUE)
         THEN RAISE EXCEPTION 'default branch protected'; END IF;
         IF permission.role = 'writer' AND
-           (p_new[i] = zero_oid OR NOT p_fast_forward[i] OR
+           (p_new[i] = zero_oid OR p_fast_forward[i] IS NOT TRUE OR
             (substring(p_names[i] FROM 1 FOR 10) = convert_to('refs/tags/', 'UTF8') AND p_old[i] <> zero_oid))
         THEN RAISE EXCEPTION 'maintainer permission required'; END IF;
     END LOOP;

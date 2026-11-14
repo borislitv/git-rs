@@ -21,15 +21,10 @@ use git_rs_core::{
     blame::{BlameError, BlameOptions, BlameRequest},
     porcelain::Porcelain,
 };
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub(super) struct Environment {
-    pub root: PathBuf,
-    pub threads: u8,
     pub store: Store,
     pub files: Arc<Cache>,
     pub derived: Option<DerivedCache>,
@@ -76,7 +71,7 @@ pub(super) fn derive(
     observe(&env.observer, Phase::Preparing, control)?;
     let operation = process::Operation::current()
         .ok_or_else(|| invalid("missing independent blame operation"))?;
-    let source = Source::acquire(&env.root, env.threads, &slug, &principal, operation)?;
+    let source = Source::acquire(&slug, &principal, false, operation, budget)?;
     if let Some(expected) = &expected
         && (source.snapshot.id != expected.repository
             || source.snapshot.generation != expected.generation
@@ -101,6 +96,7 @@ pub(super) fn derive(
         env.files,
         budget.clone(),
         options.read_limits(),
+        control,
     )?
     .with_workset(work.clone());
     let session = SnapshotSession::open(
@@ -178,7 +174,7 @@ pub(super) fn derive(
     };
     source.check()?;
     let seconds = control.remaining().as_secs().min(3600) as i32;
-    let body_build = if let Some(cache) = env.derived.as_ref().filter(|_| seconds > 0) {
+    let body_claim = if let Some(cache) = env.derived.as_ref().filter(|_| seconds > 0) {
         optional_cache(control, || {
             BlameBuilds::new(cache).claim(
                 &body_key,
@@ -189,13 +185,15 @@ pub(super) fn derive(
                 },
             )
         })?
-        .and_then(|claim| match claim {
-            BuildLookup::Claimed(build) => Some(build),
-            BuildLookup::Pending => None,
-        })
     } else {
         None
     };
+    let (body_build, phase) = match body_claim {
+        Some(BuildLookup::Claimed(build)) => (Some(build), Phase::BodyBuildClaimed),
+        Some(BuildLookup::Pending) => (None, Phase::BodyBuildPending),
+        None => (None, Phase::BodyBuildUnavailable),
+    };
+    observe(&env.observer, phase, control)?;
     let checkpoint_build = checkpoints.as_ref().and_then(Checkpoints::build);
     let attempted = std::cell::Cell::new(false);
     let mut outcome = None;

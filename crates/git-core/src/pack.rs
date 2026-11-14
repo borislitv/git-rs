@@ -16,6 +16,9 @@ mod acceleration;
 pub use acceleration::{CachedObject, DecoderCacheStats, DecoderOptions};
 use acceleration::{EntryCache, Key, Runtime, Workspace};
 
+#[path = "pack_ranges.rs"]
+pub mod ranges;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackLocation {
     pub pack: usize,

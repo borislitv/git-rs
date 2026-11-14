@@ -15,6 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 /// An operator opts in to ONE literal percent-encoded path, not a repository scan.
@@ -88,10 +89,11 @@ struct Hint {
     _confirmed_operation: String,
 }
 // Owner order keeps bounded warm admission through environment/hint cleanup.
-struct Task {
+pub(super) struct Task {
     environment: Environment,
     hint: Hint,
     policy: WarmPolicy,
+    deadline: Instant,
     _warm: process::Permit,
 }
 impl Task {
@@ -142,7 +144,7 @@ impl Blame {
     /// lease, reads a tree or contacts SQL/S3. Only owned bounded hints cross the
     /// confirmed boundary. Panics are observations, not a failed confirmed push.
     #[allow(clippy::too_many_arguments)] // Mirrors the confirmed publication context.
-    pub(super) fn try_warm_confirmed(
+    pub(super) fn prepare_warm_confirmed(
         &self,
         environment: Environment,
         slug: &str,
@@ -151,16 +153,16 @@ impl Blame {
         generation: u64,
         operation: &str,
         commands: &[Update],
-    ) -> WarmDisposition {
+    ) -> std::result::Result<Task, WarmDisposition> {
         catch_unwind(AssertUnwindSafe(|| {
             let Some(policy) = &self.warming else {
-                return WarmDisposition::Disabled;
+                return Err(WarmDisposition::Disabled);
             };
             if environment.derived.is_none() || environment.writer.is_none() {
-                return WarmDisposition::Disabled;
+                return Err(WarmDisposition::Disabled);
             }
             if slug.len() > 4096 || principal.len() > 256 || operation.len() > 36 {
-                return WarmDisposition::Rejected;
+                return Err(WarmDisposition::Rejected);
             }
             // At most 128 command names / 64 KiB are inspected. No tree/ref scan.
             let mut scanned_bytes = 0usize;
@@ -178,10 +180,10 @@ impl Blame {
                         && command.name.len() <= 4096
                 })
             else {
-                return WarmDisposition::NoTarget;
+                return Err(WarmDisposition::NoTarget);
             };
             let Some(warm) = policy.admission.try_admit() else {
-                return WarmDisposition::Busy;
+                return Err(WarmDisposition::Busy);
             };
             let task = Task {
                 environment,
@@ -196,13 +198,22 @@ impl Blame {
                     _confirmed_operation: operation.to_owned(),
                 },
                 policy: policy.clone(),
+                deadline: Instant::now() + Duration::from_secs(30),
                 _warm: warm,
             };
-            // Independent 30s absolute deadline is assigned HERE, before queueing.
-            // Queue time consumes it; no new budget/deadline is made on dequeue.
+            Ok(task)
+        }))
+        .unwrap_or(Err(WarmDisposition::Rejected))
+    }
+
+    pub(super) fn submit_warm(&self, task: Task) -> WarmDisposition {
+        catch_unwind(AssertUnwindSafe(|| {
+            // The independent deadline starts when the hint is prepared, so
+            // receive cleanup and queueing consume it rather than resetting it.
+            let deadline = task.deadline;
             match self
                 .jobs
-                .try_background(30, move |control, budget| task.run(control, budget))
+                .try_background_until(deadline, move |control, budget| task.run(control, budget))
             {
                 Ok(true) => WarmDisposition::Submitted,
                 Ok(false) => WarmDisposition::Busy,

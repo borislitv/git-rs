@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bound legacy Docker workers and transfer two commit-bound CI images."""
+"""Bound Docker build workers and transfer commit-bound build, oracle and server images."""
 import argparse
 import hashlib
 import json
@@ -12,7 +12,7 @@ import tarfile
 import blame_gate as gate
 
 ROOT = gate.ROOT
-TARGETS = ("test-fixture-build", "test")
+TARGETS = ("test-fixture-build", "test", "release", "test-server")
 ENV = dict(os.environ, DOCKER_BUILDKIT="0", DOCKER_HOST="unix:///var/run/docker.sock")
 ENV.pop("DOCKER_CONTEXT", None)
 
@@ -72,7 +72,7 @@ def image_id(value):
 def build(args):
     gate.verify_unit(args.unit, slice_name(args.slice),
                      cleanup_command="blame_images.py cleanup --slice " + args.slice)
-    gate.checkout_identity(ROOT)
+    revision = gate.checkout_identity(ROOT)
     help_text = output(["docker", "build", "--help"])
     for option in ("--cgroup-parent", "--cpu-period", "--cpu-quota", "--cpuset-cpus",
                    "--memory-swap", "--force-rm", "--iidfile", "--network", "--target"):
@@ -83,6 +83,7 @@ def build(args):
     cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
     try:
         run(["docker", "build", "--target", args.target, "--tag", args.tag,
+             "--build-arg", "VCS_REF=" + revision,
              "--network", "host", "--cgroup-parent", args.slice, "--cpuset-cpus", cpus,
              "--cpu-period", "100000", "--cpu-quota", "180000", "--memory", "3712m",
              "--memory-swap", "3712m", "--force-rm", "--iidfile", iid, ROOT],
@@ -99,7 +100,7 @@ def export(args):
     archive = args.directory / "images.tar"
     gate.require(not archive.exists(), "image archive already exists")
     run(["docker", "image", "save", "--output", archive, *ids.values()], timeout=180, check=True)
-    manifest = {"format": 1, "commit": revision, "images": ids,
+    manifest = {"format": 2, "commit": revision, "images": ids,
                 "dockerfile_sha256": gate.digest(ROOT / "Dockerfile"),
                 "archive_sha256": gate.digest(archive), "archive_bytes": archive.stat().st_size}
     (args.directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -111,11 +112,11 @@ def load(args):
     manifest_file = args.directory / "manifest.json"
     gate.require(manifest_file.stat().st_size <= 64 * 1024, "image bundle manifest too large")
     manifest = json.loads(manifest_file.read_text())
-    gate.require(manifest["format"] == 1 and manifest["commit"] == revision, "wrong image bundle commit")
+    gate.require(manifest["format"] == 2 and manifest["commit"] == revision, "wrong image bundle commit")
     gate.require(manifest["dockerfile_sha256"] == gate.digest(ROOT / "Dockerfile"), "wrong Dockerfile")
     gate.require(set(manifest["images"]) == set(TARGETS), "wrong image targets")
     ids = {target: image_id(manifest["images"][target]) for target in TARGETS}
-    gate.require(len(set(ids.values())) == 2, "image targets must be distinct")
+    gate.require(len(set(ids.values())) == len(TARGETS), "image targets must be distinct")
     archive = args.directory / "images.tar"
     gate.require(archive.stat().st_size == manifest["archive_bytes"]
                  and gate.digest(archive) == manifest["archive_sha256"], "image archive checksum mismatch")
@@ -127,8 +128,8 @@ def load(args):
             gate.require(member.isfile() and 0 <= member.size <= limit, "invalid archive metadata")
             return stream.extractfile(member).read()
         records = json.loads(metadata("manifest.json", 64 * 1024))
-        gate.require(len(records) == 2 and all(not row.get("RepoTags") for row in records),
-                     "archive must contain only two untagged image IDs")
+        gate.require(len(records) == len(TARGETS) and all(not row.get("RepoTags") for row in records),
+                     "archive must contain exactly the declared untagged image IDs")
         actual = {"sha256:" + hashlib.sha256(metadata(row["Config"], 1024 * 1024)).hexdigest()
                   for row in records}
         identities = [actual]
@@ -138,7 +139,7 @@ def load(args):
             # archive representations, then require the daemon's exact ID below.
             index = json.loads(metadata("index.json", 64 * 1024))
             descriptors = index["manifests"]
-            gate.require(len(descriptors) == 2, "wrong OCI image inventory")
+            gate.require(len(descriptors) == len(TARGETS), "wrong OCI image inventory")
             configs, manifests = set(), set()
             for descriptor in descriptors:
                 identity = image_id(descriptor["digest"])
@@ -157,6 +158,9 @@ def load(args):
     with args.env_file.open("a") as stream:
         stream.write("BLAME_GATE_BUILDER_IMAGE=" + ids["test-fixture-build"] + "\n")
         stream.write("BLAME_GATE_IMAGE=" + ids["test"] + "\n")
+        stream.write("GIT_RS_TEST_RUNTIME_IMAGE=" + ids["release"] + "\n")
+        stream.write("GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE=" + ids["test-server"] + "\n")
+        stream.write("GIT_RS_TEST_REVISION=" + revision + "\n")
     print(json.dumps({"verified_commit": revision, "images": ids}))
 
 

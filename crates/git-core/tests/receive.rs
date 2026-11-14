@@ -3,8 +3,8 @@
 
 use git_rs_core::objects::Result;
 use git_rs_core::receive::{
-    CommandBatch, CommandLimits, IncomingObjects, ReceiveLimits, ReceiveSession, RefSnapshot,
-    WarningKind,
+    CommandBatch, CommandLimits, CommandSection, IncomingObjects, ReceiveLimits, ReceiveSession,
+    RefSnapshot, WarningKind,
 };
 use git_rs_core::{
     CapacityBudget, Control, Object, ReadLimits, SnapshotIdentity, SnapshotSession,
@@ -205,6 +205,275 @@ impl Fixture {
 
 fn zero() -> ObjectId {
     ObjectId::null(gix_hash::Kind::Sha1)
+}
+
+#[test]
+fn native_separator_is_accepted_without_weakening_capability_boundaries() {
+    let f = Fixture::new();
+    let id = physical(Kind::Blob, b"data".to_vec()).id;
+    let caps = b" report-status side-band-64k atomic object-format=sha1 agent=git/2.56.0-Linux";
+    let batch = f.batch(&command_bytes(&[(zero(), id, b"refs/tags/native")], caps));
+    assert_eq!(batch.raw_capabilities(), caps);
+    assert!(
+        batch.capabilities().report_status()
+            && batch.capabilities().sideband()
+            && batch.capabilities().atomic()
+    );
+    drop(batch);
+    for caps in [
+        b"  report-status".as_slice(),
+        b" report-status ",
+        b" report-status report-status",
+        b"\treport-status",
+        b" report-status\0atomic",
+        b" push-options",
+    ] {
+        let bytes = command_bytes(&[(zero(), id, b"refs/tags/native")], caps);
+        assert!(
+            CommandBatch::read(
+                &mut bytes.as_slice(),
+                &f.control,
+                f.budget.clone(),
+                CommandLimits::default()
+            )
+            .is_err()
+        );
+    }
+    let bytes = command_bytes(&[(zero(), id, b"refs/tags/native")], b" report-status");
+    assert!(
+        CommandBatch::read(
+            &mut bytes.as_slice(),
+            &f.control,
+            f.budget.clone(),
+            CommandLimits {
+                max_capability_bytes: 13,
+                ..Default::default()
+            }
+        )
+        .is_err(),
+        "raw separator byte must remain charged"
+    );
+    assert_eq!(f.budget.used(), 0);
+}
+
+#[test]
+fn empty_command_flush_has_a_typed_noop_without_reading_pack_or_eof() {
+    let f = Fixture::new();
+    let mut input = Cursor::new(b"0000unread".to_vec());
+    let section = CommandSection::read(
+        &mut input,
+        &f.control,
+        f.budget.clone(),
+        CommandLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(section, CommandSection::Noop(_)));
+    assert_eq!(input.position(), 4);
+    drop(section);
+    assert_eq!(f.budget.used(), 0);
+    for bytes in [b"".as_slice(), b"000", b"0001", b"0002"] {
+        let mut input = bytes;
+        assert!(
+            CommandSection::read(
+                &mut input,
+                &f.control,
+                f.budget.clone(),
+                CommandLimits::default()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn gitmodules_review_counterexample_is_rejected_before_a_validation_witness() {
+    let blob = physical(
+        Kind::Blob,
+        b"[submodule \"x\"]\n\tpath = -evil\n\turl = https://example.invalid/x\n".to_vec(),
+    );
+    assert_eq!(
+        blob.id.to_string(),
+        "f7c64f494ac830a8bd41d82d4f3d18b7d5445854"
+    );
+    let mut tree_bytes = b"100644 .gitmodules\0".to_vec();
+    tree_bytes.extend_from_slice(blob.id.as_slice());
+    let tree = physical(Kind::Tree, tree_bytes);
+    assert_eq!(
+        tree.id.to_string(),
+        "176b92700401d61c379c2d2f25301830b54c50f1"
+    );
+    let commit = physical(Kind::Commit, b"tree 176b92700401d61c379c2d2f25301830b54c50f1\nauthor A <a@example.invalid> 1 +0000\ncommitter A <a@example.invalid> 1 +0000\n\nfixture\n".to_vec());
+    assert_eq!(
+        commit.id.to_string(),
+        "f403f05e85af6a54fb5a5890c750a915e7d83875"
+    );
+    let f = Fixture::new();
+    let objects = [blob, tree, commit.clone()];
+    let batch = f.batch(&command_bytes(
+        &[(zero(), commit.id, b"refs/heads/main")],
+        b"report-status",
+    ));
+    let actual = f.session(&objects, ReceiveLimits::default()).run(
+        batch,
+        &Refs(BTreeMap::new()),
+        &mut f.incoming(&objects),
+    );
+    assert!(
+        actual.is_err(),
+        "strict .gitmodulesPath content must not authorize a receive"
+    );
+    drop(actual);
+    assert!(f.dropped.load(Ordering::Acquire));
+    assert_eq!(f.budget.used(), 0);
+}
+
+// Expected outcomes are native Git 2.56.0 strict-index observations, not a
+// reimplementation of the validator. Malformed config is a non-fatal warning.
+fn gitmodules_cases() -> Vec<(&'static str, &'static [u8], bool, bool)> {
+    vec![
+        ("valid", b"[submodule \"x\"]\npath = sub\nurl = https://example.invalid/x\n", true, false),
+        ("option path", b"[submodule \"x\"]\npath = -evil\n", false, false),
+        ("option url", b"[submodule \"x\"]\nurl = -evil\n", false, false),
+        ("parent path", b"[submodule \"x\"]\npath = ../escape\n", true, false),
+        ("dotgit path", b"[submodule \"x\"]\npath = .git\n", true, false),
+        ("nested dotgit", b"[submodule \"x\"]\npath = dir/.git/config\n", true, false),
+        ("absolute path", b"[submodule \"x\"]\npath = /absolute\n", true, false),
+        ("windows path", b"[submodule \"x\"]\npath = C:/absolute\n", true, false),
+        ("backslash path", b"[submodule \"x\"]\npath = \"dir\\\\sub\"\n", true, false),
+        ("double slash", b"[submodule \"x\"]\npath = dir//sub\n", true, false),
+        ("quoted space", b"[submodule \"x\"]\npath = \" -evil\"\n", true, false),
+        ("parent name", b"[submodule \"../x\"]\npath = sub\n", false, false),
+        ("empty name", b"[submodule \"\"]\npath = sub\n", false, false),
+        ("ext helper", b"[submodule \"x\"]\nurl = ext::sh -c evil\n", true, false),
+        ("relative url", b"[submodule \"x\"]\nurl = ../other\n", true, false),
+        ("percent LF", b"[submodule \"x\"]\nurl = https://example.invalid/a%0ab\n", false, false),
+        ("percent CR", b"[submodule \"x\"]\nurl = https://example.invalid/a%0Db\n", true, false),
+        ("escaped LF", b"[submodule \"x\"]\nurl = \"https://example.invalid/a\\nb\"\n", false, false),
+        ("escaped tab", b"[submodule \"x\"]\nurl = \"https://example.invalid/a\\tb\"\n", true, false),
+        ("escaped CR", b"[submodule \"x\"]\nurl = \"https://example.invalid/a\rb\"\n", true, false),
+        ("encoded NUL before LF", b"[submodule \"x\"]\nurl = ../a%00b%0ac\n", false, false),
+        ("literal NUL before LF", b"[submodule \"x\"]\nurl = ../a\0b%0ac\n", true, false),
+        ("backslash relative escape", b"[submodule \"x\"]\nurl = \"..\\\\:host\"\n", false, false),
+        ("normalized removed newline", b"[submodule \"x\"]\nurl = https://example.invalid/a%0ab/../safe\n", true, false),
+        ("normalized malformed removed escape", b"[submodule \"x\"]\nurl = https://example.invalid/a%zz/../safe\n", false, false),
+        ("command update", b"[submodule \"x\"]\nupdate = !evil\n", false, false),
+        ("arbitrary update", b"[submodule \"x\"]\nupdate = whatever\n", true, false),
+        ("malformed", b"[submodule \"x\"\npath = sub\n", true, true),
+        ("old header", b"[submodule.x]\npath = sub\nurl = ../x\n", true, false),
+        ("mixed case", b"[SUBMODULE \"x\"]\nPATH = -evil\n", false, false),
+        ("duplicate path", b"[submodule \"x\"]\npath = -evil\npath = good\n", false, false),
+        ("duplicate url", b"[submodule \"x\"]\nurl = -evil\nurl = ../good\n", false, false),
+        ("duplicate update", b"[submodule \"x\"]\nupdate = !evil\nupdate = checkout\n", false, false),
+        ("valid duplicate", b"[submodule \"x\"]\npath = good\npath = other\n", true, false),
+        ("include not expanded", b"[include]\npath = /does/not/exist\n[submodule \"x\"]\npath = good\n", true, false),
+        ("implicit path", b"[submodule \"x\"]\npath\n", true, false),
+        ("implicit url", b"[submodule \"x\"]\nurl\n", true, false),
+        ("implicit update", b"[submodule \"x\"]\nupdate\n", true, false),
+        ("NUL value", b"[submodule \"x\"]\npath = good\0-evil\n", true, false),
+        ("NUL suffix", b"[submodule \"x\"]\npath = good\n\0[submodule \"y\"]\npath = -evil\n", true, true),
+        ("folding", b";comment\n[submodule \"x\"]\npath = sub\\\nmodule #comment\nurl = \"../up\\tstream\"\n", true, false),
+        ("bad suffix cannot hide path", b"[submodule \"x\"]\npath = -evil\n[broken\n", false, true),
+        ("bad suffix cannot hide url", b"[submodule \"x\"]\nurl = -evil\n[broken\n", false, true),
+        ("bad suffix cannot hide update", b"[submodule \"x\"]\nupdate = !evil\n[broken\n", false, true),
+    ]
+}
+
+fn gitmodules_tree(blob: ObjectId, name: &[u8]) -> Physical {
+    let mut bytes = b"100644 ".to_vec();
+    bytes.extend_from_slice(name);
+    bytes.push(0);
+    bytes.extend_from_slice(blob.as_slice());
+    physical(Kind::Tree, bytes)
+}
+
+#[test]
+fn gitmodules_config_policy_checks_all_values_and_preserves_historical_warnings() {
+    let mut mismatches = Vec::new();
+    for (label, bytes, accepted, warning) in gitmodules_cases() {
+        let f = Fixture::new();
+        let blob = physical(Kind::Blob, bytes.to_vec());
+        let tree = gitmodules_tree(blob.id, b".gitmodules");
+        let objects = [blob, tree.clone()];
+        let batch = f.batch(&command_bytes(&[(zero(), tree.id, b"refs/tags/tree")], b""));
+        let result = f.session(&objects, ReceiveLimits::default()).run(
+            batch,
+            &Refs(BTreeMap::new()),
+            &mut f.incoming(&objects),
+        );
+        if result.is_ok() != accepted {
+            mismatches.push(format!(
+                "{label}: expected accepted={accepted}, actual={:?}",
+                result.as_ref().err()
+            ));
+        }
+        if let Ok(result) = &result
+            && result
+                .warnings()
+                .iter()
+                .any(|entry| entry.kind == WarningKind::GitmodulesParse)
+                != warning
+        {
+            mismatches.push(format!("{label}: expected parse warning={warning}"));
+        }
+        drop(result);
+        assert_eq!(f.budget.used(), 0, "{label}");
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
+fn gitmodules_context_cannot_be_skipped_by_ordinary_prior_visits_or_old_blobs() {
+    for name in [
+        b".gitmodules".as_slice(),
+        b".GITMODULES",
+        b".gitmodules ",
+        b".gitmodules:stream",
+        b".\xe2\x80\x8cgitmodules",
+        b"dir\\.gitmodules",
+    ] {
+        for old_blob in [false, true] {
+            let f = Fixture::new();
+            let blob = physical(Kind::Blob, b"[submodule \"x\"]\npath = -evil\n".to_vec());
+            let tree = gitmodules_tree(blob.id, name);
+            // The only requested root is the ordinary blob. The dangerous tree
+            // is unreachable incoming data, possibly referencing an old blob.
+            let objects = [blob.clone(), tree.clone()];
+            let incoming = if old_blob {
+                vec![tree]
+            } else {
+                objects.to_vec()
+            };
+            let batch = f.batch(&command_bytes(
+                &[(zero(), blob.id, b"refs/tags/ordinary")],
+                b"",
+            ));
+            let result = f.session(&objects, ReceiveLimits::default()).run(
+                batch,
+                &Refs(BTreeMap::new()),
+                &mut f.incoming(&incoming),
+            );
+            assert!(result.is_err(), "name={name:?}, old={old_blob}");
+            drop(result);
+            assert!(f.dropped.load(Ordering::Acquire));
+            assert_eq!(f.budget.used(), 0);
+        }
+    }
+    let f = Fixture::new();
+    let blob = physical(Kind::Blob, b"[submodule \"x\"]\npath = -evil\n".to_vec());
+    let tree = gitmodules_tree(blob.id, b"ordinary");
+    let objects = [blob, tree.clone()];
+    let batch = f.batch(&command_bytes(
+        &[(zero(), tree.id, b"refs/tags/ordinary")],
+        b"",
+    ));
+    let result = f.session(&objects, ReceiveLimits::default()).run(
+        batch,
+        &Refs(BTreeMap::new()),
+        &mut f.incoming(&objects),
+    );
+    assert!(result.is_ok(), "ordinary blobs must remain opaque");
+    drop(result);
+    assert_eq!(f.budget.used(), 0);
 }
 
 #[test]

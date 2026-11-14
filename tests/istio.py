@@ -1,38 +1,28 @@
 #!/usr/bin/env python3
-"""Native Git through a real HTTPS Istio Gateway in an exclusively owned k3s.
+"""External native clients through HTTPS Istio in a supervisor-owned aggregate.
 
-Requires Docker (privileged containers), Helm 3, Git, OpenSSL, PyYAML and network
-access to public release artifacts/images. Never attaches to an existing cluster.
-All credentials and data are synthetic. The owned cluster is removed on exit
-unless explicitly retained for failure debugging with --keep-on-failure.
+Prepare checksum-pinned public artifacts separately. The measured phase consumes
+prebuilt server/oracle inputs and the supervisor's fresh Kubernetes 1.37 cluster;
+its independent cleanup owns cluster shutdown and actual CRI task drain.
 """
 import argparse
 import base64
-import hashlib
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
-import tarfile
+import re
+import sys
 import tempfile
 import time
-import urllib.request
 
 import yaml
 
 from integration import PG_IMAGE, ROOT, S3_IMAGE, command
-from kubernetes import Cluster, dependency, import_image
+from istio_artifacts import ARTIFACTS, GATEWAY_API, IMAGES, ISTIO, artifacts, digest, prepare_artifacts, read_artifact
+from kubernetes import Cluster, bound_image, dependency, import_image
+from kubernetes_processes import PodProcessWatch
 
-K3S = "rancher/k3s:v1.37.2-k3s1"
-ISTIO = "1.31.3"
-GATEWAY_API = "v1.7.0"
-ARTIFACTS = {
-    "istio-1.31.3-linux-amd64.tar.gz": (
-        "https://github.com/istio/istio/releases/download/1.31.3/istio-1.31.3-linux-amd64.tar.gz",
-        "b32bba09bc6138d738fd19a09ef6d0fcdd5c5c013efeb72969663c24a2bddd47"),
-    "gateway-api-v1.7.0.yaml": (
-        "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml",
-        "4e2602c4cbe1afbc394d86f4ac6522e1a5263b01133bba1e40a6d1a549e753a1"),
-}
 APP = "git-app"
 INGRESS = "ingress"
 HOST = "git.example.invalid"
@@ -49,19 +39,59 @@ def wait(check, description, seconds=180):
     raise AssertionError(f"timed out: {description}")
 
 
-def artifacts(cache):
-    cache.mkdir(parents=True, exist_ok=True)
-    for name, (url, digest) in ARTIFACTS.items():
-        path = cache / name
-        if not path.exists():
-            with urllib.request.urlopen(url, timeout=90) as response:
-                path.write_bytes(response.read())
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, f"checksum: {name}"
-    # Helm uses the official charts shipped in this checksum-pinned distribution,
-    # not a copied/reimplemented control-plane manifest or a mutable repo index.
-    with tarfile.open(cache / "istio-1.31.3-linux-amd64.tar.gz") as archive:
-        archive.extractall(cache, filter="data")
-    return cache / "istio-1.31.3"
+def platform_image(cluster, reference):
+    before = json.loads(command(["docker", "image", "inspect", reference]).stdout)[0]["Id"]
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", before), "immutable platform image ID required"
+    import_image(cluster, reference)
+    assert json.loads(command(["docker", "image", "inspect", reference]).stdout)[0]["Id"] == before, "platform image changed during import"
+    rows = command(["docker", "exec", cluster, "ctr", "images", "list", "name==" + reference]).stdout.decode().splitlines()
+    matches = [row.split() for row in rows if row.split() and row.split()[0] == reference]
+    assert len(matches) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0][2]), "imported Istio manifest missing"
+    bound = reference.rsplit(":", 1)[0] + "@" + matches[0][2]
+    imported = json.loads(command(["docker", "exec", cluster, "crictl", "inspecti", bound]).stdout)
+    # Classic Docker identifies a config; its containerd image store identifies
+    # the OCI manifest. Both must join this exact imported image, not a tag alone.
+    assert before in {imported["status"]["id"], matches[0][2]}, "imported Istio image identity changed"
+    return {"docker_id": before, "reference": bound, "cri_id": imported["status"]["id"]}
+
+
+def finish(base, report, watchers):
+    original, failures = sys.exception(), []
+    for watcher in watchers:
+        try:
+            watcher.close()
+        except BaseException as error:
+            failures.append(error)
+    if failures:
+        report.update(status="failed", lifecycle_errors=[type(error).__name__ for error in failures])
+    report["cleanup"] = "cluster and CRI drain owned by the outer runtime supervisor"
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=".report-", dir=base)
+        with os.fdopen(descriptor, "w") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(json.dumps(report, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, base / "report.json")
+        parent = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except BaseException as error:
+        failures.append(error)
+    finally:
+        if temporary is not None:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except BaseException as error:
+                failures.append(error)
+    if failures:
+        if original is not None:
+            original.add_note("Istio lifecycle/report cleanup also failed: " + ", ".join(type(error).__name__ for error in failures))
+        else:
+            raise BaseExceptionGroup("Istio lifecycle/report cleanup failed", failures)
 
 
 def read(cluster, resource):
@@ -98,7 +128,7 @@ def certificate(base):
              base / "extensions", "-out", base / "tls.crt"])
 
 
-def exercise(args, base, distribution):
+def exercise(args, base, distribution, watchers):
     app, ingress = Cluster(args.cluster_container, APP), Cluster(args.cluster_container, INGRESS)
     wait(lambda: command(["docker", "exec", args.cluster_container, "kubectl", "get", "--raw",
                           "/readyz"], ok=False).returncode == 0, "owned k3s API")
@@ -108,7 +138,7 @@ def exercise(args, base, distribution):
         app.kubectl("create", "namespace", namespace)
     app.kubectl("label", "namespace", APP, "istio-injection=enabled")
     app.kubectl("apply", "--server-side", "-f", "-",
-                data=(args.artifacts / "gateway-api-v1.7.0.yaml").read_bytes())
+                data=read_artifact(args.artifacts, "gateway-api-" + GATEWAY_API + ".yaml"))
     inspection = json.loads(command(["docker", "inspect", args.cluster_container]).stdout)[0]
     config = yaml.safe_load(app.kubectl("config", "view", "--raw", "--flatten").stdout)
     api_port = inspection["NetworkSettings"]["Ports"]["6443/tcp"][0]["HostPort"]
@@ -117,9 +147,16 @@ def exercise(args, base, distribution):
     kubeconfig.write_text(yaml.safe_dump(config))
     kubeconfig.chmod(0o600)
     helm = [args.helm, "--kubeconfig", kubeconfig]
+    platform = {name: platform_image(args.cluster_container, reference) for name, reference in zip(("pilot", "proxy"), IMAGES)}
     platform_values = base / "istiod.yaml"
-    platform_values.write_text(yaml.safe_dump({"gatewayClasses": {"istio": {
-        "service": {"spec": {"type": "NodePort"}}}}}))
+    platform_values.write_text(yaml.safe_dump({
+        "image": platform["pilot"]["reference"], "autoscaleEnabled": False, "replicaCount": 1,
+        "resources": {"requests": {"cpu": "50m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}},
+        "global": {"imagePullPolicy": "Never", "proxy": {"image": platform["proxy"]["reference"],
+            "resources": {"requests": {"cpu": "25m", "memory": "32Mi"}, "limits": {"cpu": "250m", "memory": "256Mi"}}},
+            "proxy_init": {"image": platform["proxy"]["reference"]}},
+        "meshConfig": {"defaultConfig": {"concurrency": 1}},
+        "gatewayClasses": {"istio": {"service": {"spec": {"type": "NodePort"}}}}}))
     print(f"Installing official Istio {ISTIO}, Gateway API {GATEWAY_API}", flush=True)
     for release, chart, extra in [
         ("istio-base", "base", []),
@@ -127,7 +164,11 @@ def exercise(args, base, distribution):
     ]:
         command([*helm, "install", release, distribution / "manifests/charts" / chart,
                  "-n", "istio-system", "--wait", "--timeout", "120s", *extra])
-    for image in [args.image, PG_IMAGE, S3_IMAGE]:
+    runtime = bound_image(args.cluster_container, args.image, args.revision, "runtime")
+    oracle = bound_image(args.cluster_container, args.oracle_image, args.revision, "external-client-oracle")
+    # Subscribe before application Helm hooks or init containers can execute.
+    watchers.append(PodProcessWatch(app, base, {"runtime": runtime, "external-client-oracle": oracle}))
+    for image in [PG_IMAGE, S3_IMAGE]:
         import_image(args.cluster_container, image)
     certificate(base)
     tls = {"tls.crt": (base / "tls.crt").read_bytes(), "tls.key": (base / "tls.key").read_bytes()}
@@ -160,12 +201,16 @@ def exercise(args, base, distribution):
     for doc in fixtures:
         if doc["kind"] == "Deployment":
             doc["spec"]["template"]["metadata"]["annotations"] = {"sidecar.istio.io/inject": "false"}
+            doc["spec"]["template"]["spec"]["containers"][0]["resources"] = {
+                "requests": {"cpu": "25m", "memory": "32Mi"}, "limits": {"cpu": "250m", "memory": "256Mi"}}
     app.apply(fixtures)
     for name in ["postgres", "s3"]:
         app.kubectl("rollout", "status", "deployment/" + name, "--timeout=120s")
-    repository, tag = args.image.rsplit(":", 1)
+    repository, digest = runtime["reference"].rsplit("@", 1)
     values = {"fullnameOverride": "backend", "replicaCount": 2,
-              "image": {"repository": repository, "tag": tag, "pullPolicy": "Never"},
+              "cacheBytes": 8 * 1024 * 1024,
+              "migration": {"podAnnotations": {"sidecar.istio.io/inject": "false"}},
+              "image": {"repository": repository, "digest": digest, "pullPolicy": "Never"},
               "ssh": {"enabled": False}, "cnpg": {"enabled": False}, "objectBucket": {"enabled": False},
               "http": {"enabled": True, "credentialsSecret": "fixture-http"},
               "httpRoute": {"enabled": True, "parentRefs": [{"name": "public-gateway", "namespace": INGRESS,
@@ -173,8 +218,7 @@ def exercise(args, base, distribution):
               "postgresql": {"host": f"postgres.{APP}.svc", "passwordSecret": "fixture-pg", "serverCASecret": "fixture-ca"},
               "s3": {"endpoint": f"https://s3.{APP}.svc:7070", "bucket": "packs", "credentialsSecret": "fixture-s3", "caSecret": "fixture-ca"},
               "resources": {"requests": {"cpu": "50m", "memory": "64Mi", "ephemeral-storage": "256Mi"},
-                            "limits": {"cpu": "1", "memory": "512Mi", "ephemeral-storage": "2Gi"}},
-              "scratch": {"sizeLimit": "1Gi"}}
+                            "limits": {"cpu": "1", "memory": "512Mi", "ephemeral-storage": "2Gi"}}}
     values_path = base / "values.yaml"
     values_path.write_text(yaml.safe_dump(values))
     command([*helm, "install", "smoke", ROOT / "charts/git-rs", "-n", APP,
@@ -210,8 +254,21 @@ def exercise(args, base, distribution):
     for pod in backends:
         containers = pod["spec"]["containers"] + pod["spec"].get("initContainers", [])
         assert any(c["name"] == "istio-proxy" for c in containers), "sidecar injection missing"
-    app.kubectl("exec", "-i", "deployment/backend", "-c", "backend", "--", "curl", "--disable", "--silent",
-                "--fail", "--cacert", "/etc/git-rs/s3-ca/ca.crt", "--request", "PUT", "--config", "-",
+    app.apply([{"apiVersion": "v1", "kind": "Pod", "metadata": {
+        "name": "plaintext-probe", "annotations": {"sidecar.istio.io/inject": "false"}},
+        "spec": {"automountServiceAccountToken": False, "restartPolicy": "Never", "activeDeadlineSeconds": 900,
+            "securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001},
+            "containers": [{"name": "probe", "image": oracle["reference"], "imagePullPolicy": "Never",
+                "command": ["/usr/bin/tini", "--", "/usr/bin/sleep", "900"],
+                "securityContext": {"readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False,
+                                    "capabilities": {"drop": ["ALL"]}},
+                "resources": {"requests": {"cpu": "25m", "memory": "32Mi"},
+                              "limits": {"cpu": "250m", "memory": "128Mi"}},
+                "volumeMounts": [{"name": "ca", "mountPath": "/fixture-ca", "readOnly": True}]}],
+            "volumes": [{"name": "ca", "secret": {"secretName": "fixture-ca", "defaultMode": 0o440}}]}}])
+    app.kubectl("wait", "--for=condition=Ready", "pod/plaintext-probe", "--timeout=60s")
+    app.kubectl("exec", "-i", "plaintext-probe", "--", "curl", "--disable", "--silent",
+                "--fail", "--cacert", "/fixture-ca/ca.crt", "--request", "PUT", "--config", "-",
                 data=(f'url = "https://s3.{APP}.svc:7070/packs"\naws-sigv4 = "aws:amz:us-east-1:s3"\n'
                       'user = "test-access:synthetic-secret-key"\n').encode())
     app.kubectl("exec", "deployment/backend", "-c", "backend", "--", "git-rs", "create", "team/project", "alice")
@@ -273,11 +330,6 @@ def exercise(args, base, distribution):
                and b'istio_requests_total{' in line and b'reporter="destination"' in line
                for line in metrics.splitlines()), "missing gateway-to-backend mutual TLS telemetry"
     # A non-mesh client with otherwise valid app credentials cannot bypass STRICT.
-    app.apply([{"apiVersion": "v1", "kind": "Pod", "metadata": {
-        "name": "plaintext-probe", "annotations": {"sidecar.istio.io/inject": "false"}},
-        "spec": {"automountServiceAccountToken": False, "restartPolicy": "Never", "containers": [
-            {"name": "probe", "image": args.image, "imagePullPolicy": "Never", "command": ["sleep", "600"]}]}}])
-    app.kubectl("wait", "--for=condition=Ready", "pod/plaintext-probe", "--timeout=60s")
     plaintext = app.kubectl("exec", "plaintext-probe", "--", "curl", "--disable", "--silent", "--show-error", "--max-time", "5",
                             "-H", auth, f"http://backend:8080/team/project.git/info/refs?service=git-upload-pack", ok=False)
     assert plaintext.returncode in {52, 56}, ("expected STRICT connection rejection, not DNS/setup failure",
@@ -293,8 +345,8 @@ def exercise(args, base, distribution):
     assert (base / "cold-clone/payload.txt").read_bytes() == payload
     assert command(["git", "-C", base / "cold-clone", "rev-parse", "HEAD"], env=env).stdout == expected
     report = {"status": "passed", "k3s": read(app, "nodes")["items"][0]["status"]["nodeInfo"]["kubeletVersion"],
-              "istio": ISTIO, "gateway_api": GATEWAY_API, "image": command([
-                  "docker", "inspect", args.image, "--format", "{{.Id}}"]).stdout.decode().strip(),
+              "istio": ISTIO, "gateway_api": GATEWAY_API, "runtime": runtime, "external_probe": oracle,
+              "platform_images": platform,
               "helm": command([args.helm, "version", "--short"]).stdout.decode().strip(),
               "gateway": "Accepted + Programmed (current generation)",
               "http_route": "Accepted + ResolvedRefs (current generation)",
@@ -305,46 +357,52 @@ def exercise(args, base, distribution):
               "plaintext_probe_exit": plaintext.returncode,
               "artifacts_sha256": {name: digest for name, (_, digest) in ARTIFACTS.items()}}
     print(json.dumps(report, indent=2), flush=True)
+    return report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--helm", default="helm", help="official Helm 3 executable")
-    parser.add_argument("--image", default="git-rs:dev", help="existing local production image; never rebuilt")
-    parser.add_argument("--cluster-container", default="git-rs-istio-test", choices=["git-rs-istio-test"],
-                        help="exclusive disposable cluster name; existing containers are never reused")
+    parser.add_argument("--helm", default="helm", help="prebuilt Helm executable")
+    parser.add_argument("--image", default=os.environ.get("GIT_RS_TEST_RUNTIME_IMAGE"), help="existing production runtime; never rebuilt")
+    parser.add_argument("--oracle-image", default=os.environ.get("BLAME_GATE_IMAGE"), help="prebuilt external native-client image")
+    parser.add_argument("--revision", default=os.environ.get("GIT_RS_TEST_REVISION"))
+    parser.add_argument("--cluster-container", help="immutable cluster ID created by the runtime supervisor")
     parser.add_argument("--artifacts", type=Path, default=ROOT / ".local/istio-artifacts")
-    parser.add_argument("--keep-on-failure", action="store_true",
-                        help="retain only this owned disposable cluster for explicit debugging")
+    parser.add_argument("--prepare", action="store_true", help="download pinned public artifacts outside measurement")
+    parser.add_argument("--fixture-dir", type=Path)
     args = parser.parse_args()
-    assert command(["docker", "container", "inspect", args.cluster_container], ok=False).returncode != 0, \
-        "refusing to reuse or remove an existing cluster"
-    distribution = artifacts(args.artifacts)
-    with tempfile.TemporaryDirectory(prefix="istio-", dir=ROOT / ".local") as directory:
+    if args.prepare:
+        prepare_artifacts(args.artifacts)
+        return
+    from blame_gate import invocation, LABEL
+    from runtime_process import cluster_cgroups
+    token = invocation()
+    assert re.fullmatch(r"[0-9a-f]{64}", args.cluster_container or ""), "supervisor-owned immutable cluster ID required"
+    cluster = json.loads(command(["docker", "inspect", args.cluster_container]).stdout)[0]
+    assert cluster["Id"] == args.cluster_container and (cluster["Config"].get("Labels") or {}).get(LABEL[:-1]) == token
+    root = os.environ["GIT_RS_TEST_POD_CGROUP_ROOT"]
+    cluster_cgroups(args.cluster_container, root)
+    assert args.image and args.oracle_image and re.fullmatch(r"[0-9a-f]{40}", args.revision or "")
+    assert digest(args.helm) == os.environ["GIT_RS_TEST_HELM_SHA256"], "prebuilt Helm identity changed"
+    assert command(["git", "--version"]).stdout == b"git version 2.56.0\n", "run the external client with the pinned native Git"
+    if args.fixture_dir:
+        args.fixture_dir.mkdir(mode=0o700)
+        context = nullcontext(str(args.fixture_dir))
+    else:
+        context = tempfile.TemporaryDirectory(prefix="istio-", dir=ROOT / ".local")
+    with context as directory:
         base = Path(directory)
-        container_id = None
-        failed = False
+        watchers = []
+        report = {"status": "running", "revision": args.revision, "cleanup": False}
         try:
-            container_id = command(["docker", "create", "--name", args.cluster_container, "--privileged",
-                                    "--label", "git-rs.test=istio", "--tmpfs", "/run", "--tmpfs", "/var/run",
-                                    "-p", "127.0.0.1::6443", K3S, "server", "--disable=traefik",
-                                    "--disable=servicelb", "--disable=gateway-api-crd",
-                                    "--disable=metrics-server", "--disable=local-storage"]).stdout.decode().strip()
-            command(["docker", "start", container_id])
-            exercise(args, base, distribution)
-        except Exception:
-            failed = True
-            if container_id:
-                for namespace in [APP, INGRESS, "istio-system"]:
-                    try:
-                        Cluster(args.cluster_container, namespace).logs()
-                    except Exception as error:
-                        print(f"diagnostics unavailable for {namespace}: {error}", flush=True)
+            distribution = artifacts(args.artifacts, base / "distribution")
+            report.update(exercise(args, base, distribution, watchers))
+            cluster_cgroups(args.cluster_container, root)
+        except BaseException as error:
+            report.update(status="failed", failure=type(error).__name__)
             raise
         finally:
-            if container_id and not (failed and args.keep_on_failure):
-                command(["docker", "stop", "--timeout", "30", container_id])
-                command(["docker", "rm", "-v", container_id])
+            finish(base, report, watchers)
 
 
 if __name__ == "__main__":

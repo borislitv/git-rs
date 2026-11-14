@@ -104,7 +104,8 @@ class GateTests(unittest.TestCase):
                                "cargo_manifest_sha256": "e" * 64,
                                "cargo_lock_sha256": "f" * 64},
                     "git_source": gate.GIT_SOURCE, "builder_packages": "same OS",
-                    "runtime_packages": "same OS", "runtime_image": "sha256:" + "a" * 64,
+                     "runtime_packages": "same OS", "runtime_image": "sha256:" + "a" * 64,
+                     "server_image": "sha256:" + "d" * 64, "server_fixture_image": "sha256:" + "f" * 64,
                     "builder_image": "sha256:" + "b" * 64, "binaries": binaries,
                     "harness_sources": {name: "c" * 64 for name in gate.HARNESS_FILES},
                     "inventory": {suite: [gate.ROOT_RUNTIME] if suite == "blame_core"
@@ -565,21 +566,23 @@ class GateTests(unittest.TestCase):
 
     def test_proxy_injects_parent_and_owner_without_touching_harness_arguments(self):
         env = {"INVOCATION_ID": "a" * 32, "GIT_RS_GATE_SLICE": "git-rs-blame-12345678.slice"}
-        with patch.dict(os.environ, env), patch.object(gate.os, "execv") as execute:
-            gate.docker_proxy(["run", "-d", "--memory", "256m", "pinned-fixture"])
-        argv = execute.call_args.args[1]
-        self.assertEqual(argv[:5], ["/usr/bin/docker", "run", "--cgroup-parent",
-                                   env["GIT_RS_GATE_SLICE"], "--pull=never"])
-        self.assertIn("git-rs.blame-gate=" + env["INVOCATION_ID"], argv)
-        self.assertEqual(argv[-4:], ["-d", "--memory", "256m", "pinned-fixture"])
+        for operation in ("run", "create"):
+            with self.subTest(operation=operation), patch.dict(os.environ, env), patch.object(gate.os, "execv") as execute:
+                gate.docker_proxy([operation, "--memory", "256m", "pinned-fixture"])
+            argv = execute.call_args.args[1]
+            self.assertEqual(argv[:5], ["/usr/bin/docker", operation, "--cgroup-parent",
+                                       env["GIT_RS_GATE_SLICE"], "--pull=never"])
+            self.assertIn("git-rs.blame-gate=" + env["INVOCATION_ID"], argv)
+            self.assertEqual(argv[-3:], ["--memory", "256m", "pinned-fixture"])
 
     def test_proxy_rejects_cgroup_escape_before_exec(self):
         env = {"INVOCATION_ID": "a" * 32, "GIT_RS_GATE_SLICE": "git-rs-blame-12345678.slice"}
-        for flag in ("--privileged", "--cgroup-parent=other.slice", "--pid=host"):
-            with self.subTest(flag=flag), patch.dict(os.environ, env), \
+        for operation, flag in ((operation, flag) for operation in ("run", "create")
+                                for flag in ("--privileged", "--cgroup-parent=other.slice", "--pid=host")):
+            with self.subTest(operation=operation, flag=flag), patch.dict(os.environ, env), \
                     patch.object(gate.os, "execv") as execute:
                 with self.assertRaisesRegex(ValueError, "escape"):
-                    gate.docker_proxy(["run", flag, "fixture"])
+                    gate.docker_proxy([operation, flag, "fixture"])
                 execute.assert_not_called()
 
     def test_docker_transport_is_pinned_to_the_attested_local_daemon(self):

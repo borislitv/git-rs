@@ -1,5 +1,4 @@
-//! Direct receive composition. Dispatch is deliberately not enabled here: the
-//! parent owns the Stage 8 fixture selection and subsequent qualified cutover.
+//! Direct receive composition for the normal HTTP and SSH transport entrypoints.
 //!
 //! Only `publish` can turn a private preparation into a receipt. Parsing, pack
 //! preparation and core semantic validation separately grant no publication right.
@@ -13,39 +12,43 @@ use crate::{
     engine::Engine,
     http, invalid,
     metadata::{self, Barrier, Snapshot},
-    process,
+    metrics::{self, Metric, Phase},
+    object_source::{RangeStore, Source as HeldSource},
     protocol::{Oid, Update},
     receive_io::{IoControl, ReceiveInput},
-    repository,
-    scratch::Scratch,
 };
 use git_rs_core::{
-    CapacityBudget, CapacityReservation, Control, ReadLimits, SnapshotIdentity, SnapshotSession,
-    receive::{CommandBatch, CommandLimits, ReceiveLimits, RefSnapshot},
+    CapacityBudget, CapacityBuffer, CapacityReservation, Control, ReadLimits, SnapshotSession,
+    receive::{CommandBatch, CommandLimits, CommandSection, ReceiveLimits, RefSnapshot},
 };
 use std::{
-    fs::{self, File},
-    io::{BufRead, BufReader, Seek, Write},
+    io::{BufRead, BufReader, Cursor, Write},
     os::fd::OwnedFd,
     sync::Arc,
 };
 
 mod budget;
 mod pack;
-mod transport;
+pub(crate) mod transport;
 pub mod wire;
 
-/// Held authorized source and private scratch. No cache-generation equality is
+/// Held authorized source and immutable memory/range storage. No cache-generation equality is
 /// imposed: SQL retains its existing old-OID/ACL/epoch/live-lease CAS semantics.
 /// Error/queue-discard cleanup may run Barrier's existing separate five-second
 /// metadata-only Drop under the actual work permit; acquisition never runs there.
 struct Source {
-    snapshot: Snapshot,
-    scratch: Scratch,
-    lease: Barrier,
+    held: Arc<HeldSource>,
+    store: Store,
+    cache: Arc<crate::cache::Cache>,
     principal: String,
     operation_id: String,
-    operation: Arc<process::Operation>,
+}
+
+impl std::ops::Deref for Source {
+    type Target = HeldSource;
+    fn deref(&self) -> &HeldSource {
+        &self.held
+    }
 }
 
 /// The actual runtime slot precedes source/scratch/body acquisition. Field order
@@ -74,18 +77,17 @@ impl<'cpu> ReceiveSession<'cpu> {
             auth::principal(principal)?;
             operation.check()?;
             io.control().check()?;
-            let (snapshot, lease) = metadata::leased_snapshot(slug, principal, true)?;
-            let scratch = engine.materialize(&snapshot)?;
+            let held =
+                HeldSource::acquire(slug, principal, true, operation.clone(), admitted.budget())?;
             let operation_id = crate::scratch::identifier()?;
             operation.check()?;
             io.control().check()?;
             Ok(Source {
-                snapshot,
-                scratch,
-                lease,
+                held,
+                store: engine.store.clone(),
+                cache: engine.cache.clone(),
                 principal: principal.to_owned(),
                 operation_id,
-                operation: operation.clone(),
             })
         })?;
         Ok(Self { source, admitted })
@@ -132,19 +134,27 @@ impl<'cpu> ReceiveSession<'cpu> {
             return Err(invalid("unsupported direct receive HTTP request"));
         }
         let encoding = transport::Encoding::parse(&cgi.encoding)?;
-        let _spool_capacity = self.admitted.budget().reservation(32 * 1024)?;
-        let mut file = transport::private_file(&self.source.scratch.path.join("receive-body"))?;
-        transport::copy_bounded(&mut request.body(input), &mut file, http::MAX_BODY, &|| {
-            self.source.operation.check()?;
-            self.admitted.io_control().control().check()?;
-            Ok(())
-        })?;
+        let io = self.admitted.io_control();
+        let mut body = self.admitted.budget().buffer(32 * 1024)?;
+        let mut output = transport::MemoryOutput {
+            bytes: &mut body,
+            control: io.control(),
+            limit: http::MAX_BODY as usize,
+        };
+        transport::copy_bounded(
+            &mut request.body(input),
+            &mut output,
+            http::MAX_BODY,
+            &|| {
+                self.source.operation.check()?;
+                self.admitted.io_control().control().check()?;
+                Ok(())
+            },
+        )?;
         self.source.operation.check()?;
-        file.rewind()?;
-        drop(_spool_capacity);
         self.admitted.run(HttpJob {
             source: self.source,
-            file,
+            body,
             encoding,
         })
     }
@@ -218,7 +228,7 @@ impl<'cpu> ReceiveDiscovery<'cpu> {
 /// construction is possible only after `http::Body` acknowledged completion.
 struct HttpJob {
     source: Source,
-    file: File,
+    body: CapacityBuffer,
     encoding: transport::Encoding,
 }
 
@@ -228,7 +238,7 @@ struct HttpJob {
 /// Normalized files are written only from those validated bytes. Their private
 /// scratch and old-source pins survive output, PUT, COMMIT and client output.
 pub struct Prepared {
-    validation: Result<ValidatedFiles>,
+    validation: Result<Preparation>,
     commands: CommandProjection,
     capabilities: git_rs_core::receive::Capabilities,
     control: Control,
@@ -236,35 +246,79 @@ pub struct Prepared {
     source: Source,
 }
 
-struct ValidatedFiles {
-    hash: Option<String>,
+enum Preparation {
+    Noop(git_rs_core::receive::Noop),
+    Changes(ValidatedPack),
+}
+
+fn noop(
+    source: Source,
+    token: git_rs_core::receive::Noop,
+    control: &Control,
+    capacity: &CapacityBudget,
+) -> Result<Prepared> {
+    control.check()?;
+    Ok(Prepared {
+        validation: Ok(Preparation::Noop(token)),
+        commands: CommandProjection {
+            updates: Vec::new(),
+            _capacity: capacity.reservation(0)?,
+        },
+        capabilities: Default::default(),
+        control: control.clone(),
+        capacity: capacity.clone(),
+        source,
+    })
+}
+
+struct ValidatedPack {
+    pack: Option<PackBytes>,
     fast_forward: Vec<bool>,
     _capacity: CapacityReservation,
+}
+
+struct PackBytes {
+    hash: String,
+    pack: gix::odb::pack::memory::OwnedBuffer<u8>,
+    index: gix::odb::pack::memory::OwnedBuffer<u8>,
 }
 
 impl CpuJob for HttpJob {
     type Output = Prepared;
 
-    fn run(mut self, control: &Control, capacity: &CapacityBudget) -> Result<Prepared> {
+    fn run(self, control: &Control, capacity: &CapacityBudget) -> Result<Prepared> {
         control.check()?;
         // Gzip works on finite private input on the *same* CPU runtime. HTTP
         // framing has completed already; decoder EOF must additionally validate
         // CRC/ISIZE, every concatenated member, and reject any non-member tail.
-        if self.encoding == transport::Encoding::Gzip {
-            let mut decoded =
-                transport::private_file(&self.source.scratch.path.join("receive-decoded"))?;
-            transport::decode_gzip(&mut self.file, &mut decoded, control, capacity)?;
-            decoded.rewind()?;
-            self.file = decoded;
-        }
-        let _reader_capacity = capacity.reservation(32 * 1024)?;
-        let mut input = BufReader::with_capacity(32 * 1024, self.file);
-        let commands = CommandBatch::read(
+        let body = if self.encoding == transport::Encoding::Gzip {
+            let mut decoded = capacity.buffer(32 * 1024)?;
+            let mut output = transport::MemoryOutput {
+                bytes: &mut decoded,
+                control,
+                limit: http::MAX_BODY as usize,
+            };
+            transport::decode_gzip(&mut Cursor::new(self.body), &mut output, control, capacity)?;
+            decoded
+        } else {
+            self.body
+        };
+        let mut input = Cursor::new(body);
+        let section = CommandSection::read(
             &mut input,
             control,
             capacity.clone(),
             CommandLimits::default(),
         )?;
+        let commands = match section {
+            CommandSection::Commands(commands) => commands,
+            CommandSection::Noop(token) => {
+                if !input.fill_buf()?.is_empty() {
+                    return Err(invalid("unexpected input after HTTP no-op"));
+                }
+                return noop(self.source, token, control, capacity);
+            }
+        };
         let capabilities = commands.capabilities();
         let updates = CommandProjection::from_batch(&commands, capacity, control)?;
         let validation = validate(
@@ -274,7 +328,8 @@ impl CpuJob for HttpJob {
             pack::Boundary::Http,
             control,
             capacity,
-        );
+        )
+        .map(Preparation::Changes);
         Ok(Prepared {
             validation,
             commands: updates,
@@ -302,12 +357,16 @@ impl CpuIoJob for SshJob {
         control.check()?;
         let _reader_capacity = capacity.reservation(32 * 1024)?;
         let mut input = BufReader::with_capacity(32 * 1024, input);
-        let commands = CommandBatch::read(
+        let section = CommandSection::read(
             &mut input,
             control,
             capacity.clone(),
             CommandLimits::default(),
         )?;
+        let commands = match section {
+            CommandSection::Commands(commands) => commands,
+            CommandSection::Noop(token) => return noop(self.source, token, control, capacity),
+        };
         let capabilities = commands.capabilities();
         let updates = CommandProjection::from_batch(&commands, capacity, control)?;
         let validation = validate(
@@ -317,7 +376,8 @@ impl CpuIoJob for SshJob {
             pack::Boundary::Ssh,
             control,
             capacity,
-        );
+        )
+        .map(Preparation::Changes);
         Ok(Prepared {
             validation,
             commands: updates,
@@ -400,22 +460,25 @@ fn validate(
     boundary: pack::Boundary,
     control: &Control,
     capacity: &CapacityBudget,
-) -> Result<ValidatedFiles> {
+) -> Result<ValidatedPack> {
     let limits = ReadLimits::default();
-    let identity = SnapshotIdentity {
-        source: session.snapshot.id.as_bytes().to_vec(),
-        generation: session.snapshot.generation.to_be_bytes().to_vec(),
-        object_hash: gix::hash::Kind::Sha1,
-    };
-    let old = repository::open_snapshot(
-        &session.scratch,
-        identity.clone(),
-        &session.lease,
+    let identity = session.identity();
+    let provider = RangeStore::open(
+        session.held.clone(),
+        session.store.clone(),
+        session.cache.clone(),
+        capacity.clone(),
+        limits,
+        control,
+    )?;
+    let old = SnapshotSession::open(
+        provider,
+        &identity,
         control.clone(),
         capacity.clone(),
         limits,
     )?;
-    let budget = budget::Budget::new(capacity.clone())?;
+    let budget = Arc::new(budget::Budget::new(capacity.clone())?);
     let resolve = |id: &gix::hash::oid, out: &mut [u8]| {
         let Some(object) = old
             .verified_object(id)
@@ -443,7 +506,7 @@ fn validate(
         &commands,
         boundary,
         limits,
-        &budget,
+        budget.as_ref(),
         &resolve,
         &|| vendor_check(control),
     )?;
@@ -461,41 +524,37 @@ fn validate(
         capacity.clone(),
         limits,
     )?;
-    let validated = git_rs_core::receive::ReceiveSession::new(snapshot, ReceiveLimits::default())?
-        .run(commands, &session.snapshot, &mut entries)?;
+    let validated = metrics::measure(Metric::Phase(Phase::Graph), || {
+        git_rs_core::receive::ReceiveSession::new(snapshot, ReceiveLimits::default())?.run(
+            commands,
+            &session.snapshot,
+            &mut entries,
+        )
+    })?;
     validated.check()?;
     let mut ff_capacity = capacity.reservation(validated.fast_forward().len())?;
     let mut fast_forward = Vec::new();
     fast_forward.try_reserve_exact(validated.fast_forward().len())?;
     ff_capacity.resize(fast_forward.capacity())?;
     fast_forward.extend_from_slice(validated.fast_forward());
-    let hash = if let Some(outcome) = &outcome {
-        if validated.incoming_objects() == 0 {
-            None
-        } else {
-            let hash = outcome.outcome.data_hash.to_string();
-            let directory = session.scratch.path.join("receive-output");
-            fs::create_dir(&directory)?;
-            // Private regular-file writes/flushes are byte/count bounded, with
-            // checks between 32 KiB chunks, not instantaneously preemptible OS
-            // I/O. A blocked filesystem or cleanup is not a stop acknowledgment.
-            for (extension, bytes) in [("pack", &outcome.pack[..]), ("idx", &outcome.index[..])] {
-                let mut file =
-                    transport::private_file(&directory.join(format!("pack-{hash}.{extension}")))?;
-                for chunk in bytes.chunks(32 * 1024) {
-                    control.check()?;
-                    file.write_all(chunk)?;
-                }
-                file.flush()?;
-            }
-            Some(hash)
-        }
-    } else {
-        None
-    };
+    let incoming = validated.incoming_objects();
     validated.check()?;
-    Ok(ValidatedFiles {
-        hash,
+    drop(validated);
+    drop(normalized);
+    let pack = if incoming == 0 {
+        None
+    } else {
+        let outcome =
+            outcome.ok_or_else(|| invalid("validated incoming objects have no structural pack"))?;
+        Some(PackBytes {
+            hash: outcome.outcome.data_hash.to_string(),
+            pack: outcome.pack.into_owned(budget.clone())?,
+            index: outcome.index.into_owned(budget.clone())?,
+        })
+    };
+    control.check()?;
+    Ok(ValidatedPack {
+        pack,
         fast_forward,
         _capacity: ff_capacity,
     })
@@ -511,7 +570,13 @@ fn vendor_check(control: &Control) -> gix::error::Result {
 /// socket write failure cannot change the stored publication result to rollback.
 pub struct Receipt {
     prepared: Completed<Prepared>,
-    publication: Result<u64>,
+    publication: Result<Publication>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publication {
+    Noop,
+    Published { generation: u64 },
 }
 
 /// The only PUT/SQL path. Consuming the shared runtime's output keeps its actual
@@ -519,34 +584,45 @@ pub struct Receipt {
 /// Store owns staged-before-PUT and metadata owns exact lost-COMMIT confirmation.
 pub fn publish(prepared: Completed<Prepared>, store: &Store) -> Receipt {
     let publication = prepared.source.operation.enter(|| {
-        let files = prepared
+        let preparation = prepared
             .validation
             .as_ref()
             .map_err(|_| invalid("receive validation rejected"))?;
+        let Preparation::Changes(files) = preparation else {
+            prepared.control.check()?;
+            prepared.source.operation.check()?;
+            return Ok(Publication::Noop);
+        };
         let session = &prepared.source;
         prepared.control.check()?;
         session.operation.check()?;
-        session.lease.check()?;
+        session.lease().check()?;
         let mut packs = Vec::new();
-        if let Some(hash) = &files.hash {
-            packs.push(store.upload(
-                &session.snapshot.id,
-                &session.operation_id,
-                &session.scratch.path.join("receive-output"),
-                hash,
-            )?);
+        if let Some(pack) = &files.pack {
+            packs.push(metrics::measure(Metric::Phase(Phase::Upload), || {
+                store.upload_bytes(
+                    &session.snapshot.id,
+                    &session.operation_id,
+                    &pack.hash,
+                    &pack.pack,
+                    &pack.index,
+                )
+            })?);
         }
         session.operation.check()?;
         prepared.control.check()?;
-        metadata::publish(
-            &session.snapshot,
-            &session.lease,
-            &session.operation_id,
-            &session.principal,
-            prepared.commands.updates(),
-            &files.fast_forward,
-            &packs,
-        )
+        metrics::measure(Metric::Phase(Phase::Publish), || {
+            metadata::publish(
+                &session.snapshot,
+                session.lease(),
+                &session.operation_id,
+                &session.principal,
+                prepared.commands.updates(),
+                &files.fast_forward,
+                &packs,
+            )
+        })
+        .map(|generation| Publication::Published { generation })
     });
     Receipt {
         prepared,
@@ -555,7 +631,28 @@ pub fn publish(prepared: Completed<Prepared>, store: &Store) -> Receipt {
 }
 
 impl Receipt {
-    pub fn publication(&self) -> std::result::Result<u64, &(dyn std::error::Error + Send + Sync)> {
+    /// Extract only a bounded owned post-confirmation hint, then destroy all
+    /// receive resources/holds before a caller can submit independent CPU work.
+    pub(crate) fn after_cleanup<T>(
+        self,
+        hint: impl FnOnce(&Snapshot, u64, &str, &[Update]) -> T,
+    ) -> Option<T> {
+        let pending = match self.publication() {
+            Ok(Publication::Published { generation }) => Some(hint(
+                &self.prepared.source.snapshot,
+                generation,
+                &self.prepared.source.operation_id,
+                self.prepared.commands.updates(),
+            )),
+            _ => None,
+        };
+        drop(self);
+        pending
+    }
+
+    pub fn publication(
+        &self,
+    ) -> std::result::Result<Publication, &(dyn std::error::Error + Send + Sync)> {
         self.publication
             .as_ref()
             .copied()

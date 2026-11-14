@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "scope": "ci-smoke",
+  "repetitions": 2,
+  "placements": ["disabled", "all-pg", "pg-s3"],
+  "profiles": ["derivation", "body"],
+  "fixture": {"commits": 12, "small_files": 12, "large_lines": 768, "branches": 3},
+  "paths": ["large.txt", "small/00.txt", "renamed.txt", "sparse/deep.txt"],
+  "limits": {
+    "cell_seconds": 60,
+    "request_seconds": 10,
+    "response_bytes": 2097152,
+    "minimum_source_samples": 3,
+    "source_p99_ms": 1000,
+    "source_baseline_factor": 5,
+    "source_baseline_allowance_ms": 100,
+    "replica_catchup_seconds": 10,
+    "daemon_rss_bytes": 943718400
+  }
+}

@@ -1,6 +1,6 @@
 FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS codec-base
-# One OS package transaction supplies both compilation and serving. Never copy
-# libc/gconv files piecemeal between independently upgraded distribution stages.
+# One OS package transaction supplies the ABI used by compilation and serving.
+# Runtime pruning below does not upgrade or copy libc/gconv files piecemeal.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        build-essential ca-certificates curl xz-utils libssl-dev pkg-config \
@@ -8,7 +8,22 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
        coreutils gnu-coreutils openssh-server tini libcurl4t64 libexpat1 libssl3t64 zlib1g perl \
        python3 python3-venv postgresql-client \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -f /etc/ssh/ssh_host_*
+     && rm -f /etc/ssh/ssh_host_* \
+     && mkdir -p /usr/share/git-rs \
+     && dpkg-query -W -f='${Package}\t${Version}\n' libc6 libc-bin libssl3t64 \
+        > /usr/share/git-rs/abi-packages.tsv
+
+FROM codec-base AS runtime-base
+RUN DEBIAN_FRONTEND=noninteractive apt-get --no-download purge -y --auto-remove \
+        build-essential curl xz-utils libssl-dev pkg-config libcurl4-openssl-dev \
+        libexpat1-dev zlib1g-dev gettext gnu-coreutils perl python3 python3-venv postgresql-client \
+    && dpkg-query -W -f='${Package}\t${Version}\n' libc6 libc-bin libssl3t64 > /tmp/abi-packages.tsv \
+    && cmp /usr/share/git-rs/abi-packages.tsv /tmp/abi-packages.tsv \
+    && rm /tmp/abi-packages.tsv \
+    && mkdir -p /run/sshd /var/empty/git-rs \
+    && groupadd -g 10001 git-rs \
+    && useradd -u 10001 -g 10001 -M -d /var/empty/git-rs -s /bin/sh -p '*' git-rs \
+    && dpkg-query -W -f='${Package}\t${Version}\n' > /usr/share/git-rs/packages.tsv
 
 FROM codec-base AS toolchain
 WORKDIR /tmp/rust
@@ -37,15 +52,24 @@ COPY Cargo.toml Cargo.lock Dockerfile ./
 COPY src ./src
 COPY migrations ./migrations
 COPY benches ./benches
-COPY tests/support/cache_process.rs ./tests/support/cache_process.rs
-COPY tests/support/blame_http.rs ./tests/support/blame_http.rs
+COPY tests/support ./tests/support
+COPY tests/receive_fixture.rs ./tests/receive_fixture.rs
 COPY crates/git-core ./crates/git-core
-COPY docs/gitoxide-source.json docs/codec-source.json ./docs/
-RUN cargo fetch --locked && cargo build --release --offline --locked
+COPY docs/*-source.json ./docs/
+COPY tools/check-core-source.py tools/dependency-notices.py ./tools/
+RUN python3 tools/check-core-source.py \
+    && cargo fetch --locked \
+    && cargo build --release --offline --locked \
+    && cargo metadata --format-version 1 --offline --locked > /tmp/cargo-metadata.json \
+    && python3 tools/dependency-notices.py --metadata /tmp/cargo-metadata.json --output /build/release-notices \
+    && rm /tmp/cargo-metadata.json
 
 FROM build AS test-fixture-build
-COPY tests/support/blame_prepared.rs tests/support/blame_work_observer.rs ./tests/support/
-RUN cargo build --release --offline --locked --example blame-http-fixture
+RUN cargo build --release --offline --locked --example blame-http-fixture \
+    && cargo test --release --offline --locked --test receive_fixture --no-run --message-format=json > /tmp/receive-artifacts.json \
+    && python3 -c 'import json,pathlib,shutil; rows=[json.loads(line) for line in pathlib.Path("/tmp/receive-artifacts.json").read_text().splitlines()]; found=[row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("target",{}).get("name")=="receive_fixture" and row.get("executable")]; assert len(found)==1; shutil.copyfile(found[0],"/build/target/release/receive-fixture")' \
+    && chmod 0555 /build/target/release/receive-fixture \
+    && rm /tmp/receive-artifacts.json
 
 FROM toolchain AS git-build
 WORKDIR /tmp/git
@@ -57,10 +81,21 @@ RUN curl --fail --show-error --location --max-time 180 --retry 3 \
     && make prefix=/usr gitexecdir=/usr/lib/git-core NO_TCLTK=YesPlease DESTDIR=/opt/git install \
     && /opt/git/usr/bin/git --version
 
-FROM codec-base AS runtime
-RUN rm -f /etc/ssh/ssh_host_* \
-    && mkdir -p /run/sshd /var/empty/git-rs \
-    && groupadd -g 10001 git-rs && useradd -u 10001 -g 10001 -M -d /var/empty/git-rs -s /bin/sh -p '*' git-rs
+FROM runtime-base AS runtime
+ARG VCS_REF
+COPY --from=build /build/target/release/git-rs /usr/local/bin/git-rs
+COPY --from=build /build/release-notices/ /usr/share/git-rs/dependencies/
+COPY docs/*-source.json /usr/share/git-rs/sources/
+LABEL org.opencontainers.image.source="https://github.com/borislitv/git-rs" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      io.git-rs.role="runtime"
+USER 10001:10001
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/git-rs"]
+
+# External native clients/oracles have their own build branch and filesystem.
+# No Git install, helper, package marker or source layer reaches `runtime`.
+FROM codec-base AS client-oracle
+ARG VCS_REF
 COPY --from=git-build /opt/git/usr/ /usr/
 RUN test "$(/usr/bin/git --version)" = "git version 2.56.0" \
     && test "$(/usr/bin/git --exec-path)" = /usr/lib/git-core \
@@ -70,20 +105,30 @@ RUN test "$(/usr/bin/git --version)" = "git version 2.56.0" \
     && printf '%s\n' 'git 2.56.0' \
        'source https://www.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz' \
        'sha256 26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3' \
-       > /usr/share/git-rs/git-source.txt
-COPY --from=build /build/target/release/git-rs /usr/local/bin/git-rs
-USER 10001:10001
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/git-rs"]
+       > /usr/share/git-rs/git-source.txt \
+    && groupadd -g 10001 git-rs \
+    && useradd -u 10001 -g 10001 -M -d /var/empty/git-rs -s /bin/sh -p '*' git-rs
+LABEL org.opencontainers.image.source="https://github.com/borislitv/git-rs" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      io.git-rs.role="external-client-oracle"
 
-FROM runtime AS test
-USER 0:0
+FROM runtime AS test-server
+COPY --from=test-fixture-build /build/target/release/examples/blame-http-fixture /usr/local/bin/examples/blame-http-fixture
+COPY --from=test-fixture-build /build/target/release/receive-fixture /usr/local/bin/tests/receive-fixture
+LABEL io.git-rs.role="runtime-fixture"
+
+FROM client-oracle AS test
+COPY --from=build /build/target/release/git-rs /usr/local/bin/git-rs
 COPY --from=test-fixture-build /build/target/release/examples/blame-http-fixture /usr/local/bin/examples/blame-http-fixture
 RUN python3 -m venv /opt/test-python \
     && /opt/test-python/bin/pip install --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0 \
     && mkdir -p /opt/git-rs/.local && chown 10001:10001 /opt/git-rs/.local && chmod 0700 /opt/git-rs/.local
 COPY tests /opt/git-rs/tests
+COPY charts/git-rs /opt/git-rs/charts/git-rs
+COPY tools/check-runtime-boundaries.py /opt/git-rs/tools/
 ENV PATH="/opt/test-python/bin:${PATH}" LANG=C LC_ALL=C
 WORKDIR /opt/git-rs
 USER 10001:10001
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/git-rs"]
 
 FROM runtime AS release

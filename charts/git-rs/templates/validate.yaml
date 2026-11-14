@@ -1,3 +1,21 @@
+{{- if gt (add (int .Values.cpu.concurrency) (int .Values.cpu.waiters)) 4 }}
+{{- fail "cpu.concurrency + cpu.waiters must be at most four" }}
+{{- end }}
+{{- if .Values.maintenance.enabled }}
+{{- $m := .Values.maintenance }}
+{{- if eq (include "git-rs.maintenanceServiceAccount" .) (include "git-rs.serviceAccount" .) }}
+{{- fail "maintenance service account must be distinct from serving" }}
+{{- end }}
+{{- if or (le (int $m.renewGraceSeconds) (add 10 (int $m.expirySafetySeconds))) (ge (add (int $m.renewGraceSeconds) 10 (int $m.expirySafetySeconds)) (int $m.leaseSeconds)) }}
+{{- fail "maintenance Kubernetes lease margins must exceed the ten-second API deadline plus safety" }}
+{{- end }}
+{{- if or (ge (add (mul 2 (int $m.heartbeatSeconds)) 5 (int $m.expirySafetySeconds)) (int $m.pgFenceLeaseSeconds)) (ge (add (mul 2 (int $m.heartbeatSeconds)) 5 2) (int $m.jobLeaseSeconds)) }}
+{{- fail "maintenance PG/job leases are too short for heartbeat and SQL deadline margins" }}
+{{- end }}
+{{- if le (int $m.terminationGracePeriodSeconds) (add (int $m.shutdownSeconds) 5) }}
+{{- fail "maintenance terminationGracePeriodSeconds must exceed shutdownSeconds by more than five seconds" }}
+{{- end }}
+{{- end }}
 {{- if and .Values.cnpg.backup.enabled (not .Values.cnpg.enabled) }}
 {{- fail "cnpg.backup requires cnpg.enabled" }}
 {{- end }}

@@ -8,11 +8,12 @@ use crate::{CapacityBudget, Control, Object, ReadLimits, SnapshotSession, Verifi
 use gix_hash::{ObjectId, oid};
 
 mod commands;
+mod gitmodules;
 mod semantics;
-mod storage;
+use crate::storage;
 mod walk;
 
-pub use commands::{Capabilities, Command, CommandBatch, CommandLimits};
+pub use commands::{Capabilities, Command, CommandBatch, CommandLimits, CommandSection, Noop};
 pub use semantics::{Warning, WarningKind};
 use storage::ChargedVec;
 

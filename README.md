@@ -5,7 +5,7 @@ Experimental stateless Git backend in safe Rust, backed by PostgreSQL and S3-com
 Ordinary Git clients connect through OpenSSH or authenticated Smart HTTP behind a TLS gateway.
 Application replicas have no persistent repository
 volume: PostgreSQL stores authoritative refs/permissions and S3 stores immutable native Git
-pack/idx objects. Requests use private scratch and bounded process memory. Optional
+pack/idx objects. Requests use bounded Rust-owned buffers and immutable object-store ranges. Optional
 independently configured PostgreSQL/S3 derived artifacts can share complete blame
 bodies and authenticated completed work; they never replace source authorization.
 
@@ -27,14 +27,15 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
 ```
 
 - Safe Rust with Tokio, tokio-postgres and a bounded SQL pool; `unsafe_code` is forbidden.
-  SQL runs in-process, with verified TLS and no SQL subprocess. Request initialization,
-  ref restoration and ref-name validation use isolated `gix` library operations.
+  SQL runs in-process, with verified TLS and no SQL subprocess. The shared core uses
+  maintained Gitoxide pack, delta, ref-name, graph, traversal and blame libraries.
   Blame path resolution, metadata, ancestry, attribution and complete porcelain run
   in the pinned Rust core over demand-acquired verified objects. Header probes do
   not inflate full blobs or spawn Git.
-  Wire protocols, pack/delta normalization and graph validation still use upstream Git.
-  The required [Rust server data plane](docs/rust-data-plane.md) records replacement gates;
-  native Git remains the compatibility client and test oracle in the target design.
+  Receive/upload protocols, strict ingestion, history and bundle output run in Rust.
+  The production image contains no native Git executable, helpers or client repositories;
+  native Git is an external compatibility client and test oracle. See the
+  [data-plane contracts and qualification scope](docs/rust-data-plane.md).
 - S3 uses a shared in-process HTTP client and the official AWS SigV4 signer. Pack transfers stream
   through bounded buffers; connections are reused, and cancellation drops partial responses.
   HTTPS verifies the certificate chain and hostname; requests do not follow redirects or retry.
@@ -43,11 +44,12 @@ OpenSSH sidecar -- restricted principal + private Unix socket --> safe Rust back
   including clients that do not request `--atomic`.
 - Readers/writers take durable database leases. Explicit maintenance requires an exclusive lease;
   connection loss leaves the lease until expiry rather than prematurely releasing a reader.
-- Concurrent requests share a bounded RAM LRU/singleflight cache. Request scratch is not reused as
-  a disk cache. Verified cache files are sealed Linux memfds, linked into private scratch and pinned
-  until the request finishes; cache hits do not copy pack/idx payloads. An empty library-generated
-  bare template is reused in RAM, before any request refs or hooks. Cold replicas reconstruct from SQL/S3.
-- Native `git bundle` backups and owner-only physical history truncation are available.
+- Concurrent operations share one bounded CPU runtime and a RAM LRU/singleflight range cache.
+  Evicted reader pins retain their actual capacity charge. No request bare repository,
+  pack-file materialization or filesystem cache is required; cold replicas read SQL/S3.
+- Rust-generated native-compatible bundles, ordered history and owner-only history truncation
+  preserve leased source ownership. Source cleanup is a durable job run by a separately elected
+  same-binary maintenance Deployment, never synchronous serving-path deletion.
 - Supported fetch behavior includes Git protocol v0/v1/v2, shallow clones, tags and notes.
   Smart HTTP verifies Secret-backed credentials for each request and applies the same repository
   permissions as SSH. An optional HTTPRoute attaches to an existing Istio Gateway API listener.
@@ -128,12 +130,21 @@ Prometheus request, phase, detailed stage, dependency, subprocess and cache metr
 at `/metrics` on the internal health listener. Opt-in correlated timing records use a bounded,
 lossy background writer. See [metrics, timing logs and scrape configuration](docs/metrics.md).
 
-## Build and verify
+## Prebuilt VM evaluation
 
-Requires Linux, Rust **1.99+**, OpenSSL development headers/pkg-config for builds, Git **2.56.0**,
-OpenSSH server/client, GNU coreutils **`/usr/bin/gnutimeout`** and `kill`.
-Ubuntu's coinstallable `gnu-coreutils` package supplies that explicit entrypoint: its default
-uutils `timeout` rejects legal non-UTF-8 ref arguments before Git sees them.
+Use the supplied Linux amd64 VM package to try push, clone, fetch, pull and complete
+blame without a Rust toolchain. Verify `SHA256SUMS`, load `git-rs-runtime.tar` and
+select the immutable image ID from `release.json`. The persistent launcher preserves
+its PostgreSQL/S3 volumes and credentials across stop/start. See the
+[VM instructions](examples/playground/README.md) for the complete two-client flow,
+loopback-only access, restart verification and explicit prebuilt-image upgrades.
+A package manifest binds inputs; release qualification evidence is separate.
+
+## Developer build and verification
+
+Requires Linux, Rust **1.99+**, Python **3.13+** and OpenSSL development headers/pkg-config for builds/checks.
+External compatibility fixtures use Git **2.56.0** and OpenSSH server/client in the
+separate `test` image. The production runtime does not install native Git or GNU timeout.
 Bounded-memory Rust tests also require util-linux **`/usr/bin/prlimit`**.
 Build and runtime use Ubuntu **26.04**. The Dockerfile
 checks official Rust/Git archive hashes, upgrades distribution packages and records the installed
@@ -144,68 +155,58 @@ from security freshness; scheduled rebuilds are still necessary.
 cargo fetch --locked
 cargo build --release --offline --locked
 make check
-docker build --target release -t git-rs:dev .
+docker build --build-arg "VCS_REF=$(git rev-parse HEAD)" --target release -t git-rs:dev .
 ```
 
 Black-box tests use only generated identities, synthetic repositories and disposable local
-PostgreSQL/Versity containers. They require Docker, Python 3.11+, curl with AWS SigV4 support for
-independent fixture administration, and the runtime programs above:
+PostgreSQL/Versity containers. CI transfers four commit-bound image roles: the
+builder, external client/oracle, production runtime and explicit Git-free fixture
+runtime. Qualification consumes these prebuilt inputs; it never builds inside a
+measurement phase. See [runtime contracts](docs/runtime-contracts.md) for the
+independent systemd bounds, serial SQL contracts, Kubernetes 1.37 and exact cleanup.
 
 ```sh
-make integration           # 64 MiB synthetic data, native Git/SSH and cold restart
-LANG=C LC_ALL=C python3 tests/integration.py --provision --large-mib 64 --debug-timings
-cargo build --release --locked --bin git-rs --example blame-http-fixture
-LANG=C LC_ALL=C python3 tests/integration.py --provision --binary target/release/git-rs --long-operations
-make failures              # real S3/PostgreSQL transport and maintenance faults
 make bench                 # release-mode RAM-cache microbenchmark
 python3 -m pip install PyYAML==6.0.3 jsonschema==4.26.0
 make chart                 # Helm 4.3.1 and 3.22.1 compatibility in CI
 python3 tests/chart.py --operator-schemas  # opt-in network check of public pinned CRD schemas
 ```
 
-The opt-in long-operation regression holds back a native-generated pack's final byte for
+The integration phase holds back a native-generated pack's final byte for
 125 seconds, then requires confirmed two-ref publication, native clone/fsck and lease release
 within a configured 180-second budget. CI includes this wall-clock deadline check.
-Native integration and dependency-fault fixtures exercise the maximum four-worker Git setting.
-
-`tests/kubernetes.py --cluster-container NAME --image git-rs:dev` uses an explicitly selected
-disposable Docker k3s cluster. It imports images and creates/deletes its own isolated namespace,
-generates TLS/SSH/HTTP credentials, installs and upgrades the chart, pushes/clones through native
-SSH and authenticated HTTP, rejects unknown identities and checks cold restart. It does not install CNPG/Rook or claim
-to verify their failover behavior. CI also runs native tests inside the Docker `test` target so
-they use the same pinned Git version as the runtime.
-
-Current CI is not complete coverage of the new blame/cache work: it runs the old
-bounded cache gate and ordinary workspace tests, but not the new ignored contracts
-or artifact/legacy-migration harness as a dedicated gate. See the
-[coverage inventory and publication gaps](docs/rust-data-plane.md#current-ci-coverage-and-publication-gaps).
-Functional root/memo proofs do not establish Stage 5/8 production performance;
-no such result or production HA qualification is available yet.
+The `test-server` image adds only explicitly selected observer/receive fixtures;
+ordinary serving still runs the unmodified production image. Kubernetes smoke uses
+an independent oracle pod, verifies runtime image digests, performs a schema-first
+maintenance enablement and checks standby readiness, leader replacement and queued
+cleanup. Candidate-only tests separately exercise named-Lease CAS/SSA/expiry behavior.
+These are verification definitions, not a successful-run or production HA claim;
+inspect the exact source, binary/image identities, inventory, outcomes and cleanup evidence.
 
 ## Current limits
 
-- Native transport/maintenance materializes the complete live pack catalog. Blame
-  demand-acquires verified indexes/packs within explicit source bounds; neither is
-  a substitute for repository sharding or full deployment qualification.
+- All data-plane paths use demand-acquired indexes and bounded immutable ranges.
+  Object selection, indexes, graph work, decoded objects and output share explicit
+  admission; exceeding a bound is an error, not a native fallback or whole-pack allocation.
 - Git SHA-1 repositories only; four admitted requests per serving process; operation deadline
-  defaults to 120 seconds and is configurable from 1 to 3600 seconds; snapshot admission up to
-  12 GiB; incoming pack/body up to 4 GiB. Durable holds cover the remaining operation plus a
+  defaults to 120 seconds and is configurable from 1 to 3600 seconds;
+  incoming pack/body up to 4 GiB. Durable holds cover the remaining operation plus a
   30-second cleanup margin; longer operations also extend crash-recovery maintenance delays.
-- `GIT_RS_PACK_THREADS` sets native Git's per-request `pack.threads` to `1..4`, default 1.
-  Choose it within the backend CPU/memory budget; four admitted requests can each use that many
-  workers, and Git's per-thread delta-base cache and object buffers need separate allowances.
+- `GIT_RS_PACK_THREADS` and `GIT_RS_BLAME_WORKER` are obsolete and rejected.
+  `GIT_RS_BLAME_CONCURRENCY`/`GIT_RS_BLAME_WAITERS` configure the shared CPU runtime:
+  default one worker/no queue, at most four total slots. Increasing admission does not raise quotas.
 - Blame defaults to one executing job and no queue, with a 128 MiB uncompressed-blob
   limit and a 256 MiB complete-output limit. Optional complete-body/checkpoint reuse
   still requires source holds and fresh fences. Jobs have finite independent lifetimes;
   waiters retain their individual deadlines. Warming is disabled by default.
-- Default cache 64 MiB, maximum cacheable entry 8 MiB, 4 KiB accounting increments and at most
-  256 live cache files, including fills and evicted reader pins. Linux `/proc/<pid>/fd` must be
-  accessible to same-UID native Git children. Memfd is not a no-swap or total-RSS guarantee;
-  subprocesses, metadata and scratch need additional resource allowances.
+- Default RAM range cache 64 MiB, maximum cacheable entry 8 MiB, 4 KiB accounting increments
+  and at most 256 lookup slots. Fills, metadata and evicted-but-live pins retain their charges.
+  This is backing-capacity accounting, not a process/pod RSS or allocator-overhead guarantee.
 - Default branch `main` is protected from deletion/rewind, including owner pushes. Read access
   is repository-wide; ref write prefixes do not hide objects or branches from readers.
-- The current schema is initialized/verified and its publication function refreshed. Future schema
-  upgrades need explicit migrations.
+- Source schema v2 adds durable maintenance fencing, jobs, result journals and permanent retired
+  identities. Upgrade it with maintenance disabled before enabling the separate worker Deployment;
+  downgrade to a schema-v1 binary is unsupported. Derived-cache migrations remain independent.
 - No Git LFS service, filtered clone promises, operator-managed
   coordinated PITR, version-aware object purge or automatic serving-path garbage collection.
 - Local integration tests do not prove CNPG synchronous failover, Ceph durability or recovery

@@ -4,13 +4,24 @@
 //! or interrupt state is used. Git object adapters are added separately.
 
 pub mod blame;
+pub mod bundle;
 pub mod control;
 pub mod executor;
 pub mod graph;
+pub mod history;
 pub mod objects;
 pub mod pack;
 pub mod porcelain;
 pub mod receive;
+pub mod selection;
+mod storage;
+pub mod upload;
+pub mod write_pack;
+
+/// Maximum catalog refs supported by authoritative publication and its readers.
+pub const MAX_REFS: usize = 10_000;
+/// Maximum byte length of a catalog ref name, independent of UTF-8 encoding.
+pub const MAX_REF_BYTES: usize = 1024;
 
 pub use blame::memo::MemoryMappingRequest;
 pub use blame::{

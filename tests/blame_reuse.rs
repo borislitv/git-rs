@@ -26,7 +26,7 @@ use std::{
 #[path = "support/blame_source_support.rs"]
 mod source_support;
 
-fn native(root: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+fn native_output(root: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
     let mut child = Command::new("timeout")
         .args(["--kill-after=2s", "20s", "git"])
         .arg("-C")
@@ -44,7 +44,10 @@ fn native(root: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
         .spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
-    let out = child.wait_with_output().unwrap();
+    child.wait_with_output().unwrap()
+}
+fn native(root: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+    let out = native_output(root, args, input);
     assert!(
         out.status.success(),
         "native fixture {args:?}: {}",
@@ -115,11 +118,12 @@ fn publish_history(fixture: &source_support::Fixture, tip: &str) {
         let pack = fixture
             .engine
             .store
-            .upload(
+            .upload_bytes(
                 &fixture.repo,
                 &operation,
-                &native_root.join("objects/pack"),
                 &hash,
+                &std::fs::read(native_root.join(format!("objects/pack/pack-{hash}.pack"))).unwrap(),
+                &std::fs::read(native_root.join(format!("objects/pack/pack-{hash}.idx"))).unwrap(),
             )
             .unwrap();
         metadata::publish(
@@ -223,9 +227,7 @@ fn checkpoint_reuse_child() {
         blame,
         store: git_rs::blob::Store::from_env().unwrap(),
         cache: Arc::new(git_rs::cache::Cache::new(1024 * 1024, 8 * 1024 * 1024)),
-        scratch_root: root.join("scratch"),
         operation_seconds: 120,
-        pack_threads: 1,
     };
     let query = Request::parse(&tip, "path=file").unwrap();
     let request_started = Instant::now();
@@ -471,8 +473,6 @@ impl HttpServer {
                 "--phase",
                 "source",
             ])
-            .arg("--scratch")
-            .arg(fixture.root.join("scratch"))
             .arg("--socket")
             .arg(fixture.root.join("serving.sock"))
             .arg("--control")
@@ -601,7 +601,8 @@ fn warm_push_gate(cache_outage: bool) {
     let native_root = fixture.root.join("native");
     let tip = history(&native_root, 3, &fixture.commit);
     let url = format!("http://{}/{}.git", server.address, fixture.slug);
-    // Only Engine::validate's real confirmed publish path can schedule this warm.
+    // Only the real confirmed receive path can schedule this warm. Default CPU
+    // capacity is one: receive ownership must be cleaned up before submission.
     native(
         &native_root,
         &[
@@ -694,9 +695,10 @@ fn warm_push_gate(cache_outage: bool) {
         "warm failure must not roll back or reject confirmed source publication"
     );
     drop(lease);
-    // Overflow schedules no second job, and does not wait for the first source.
+    // With CPU1/queue0, a paused warm owns the only shared slot. A new push is
+    // rejected before publication; it is not a confirmed push failed by warming.
     let third = history(&native_root, 5, &fixture.commit);
-    native(
+    let busy = native_output(
         &native_root,
         &[
             "push",
@@ -705,6 +707,14 @@ fn warm_push_gate(cache_outage: bool) {
             "refs/heads/history:refs/heads/main",
         ],
         b"",
+    );
+    assert!(
+        !busy.status.success(),
+        "shared admission cannot accept another push"
+    );
+    assert!(
+        !matches!(busy.status.code(), Some(124 | 137)),
+        "busy must not wait for the warm deadline"
     );
     assert_eq!(server.value("git_rs_fixture_blame_admitted"), 1);
     assert_eq!(server.value("git_rs_fixture_blame_waiters"), 0);
@@ -718,11 +728,12 @@ fn warm_push_gate(cache_outage: bool) {
         .unwrap();
     assert_eq!(
         snapshot.refs.get(b"refs/heads/main".as_slice()),
-        Some(&Oid::parse(third.as_bytes()).unwrap()),
-        "actual warm cancellation must not fail confirmed push"
+        Some(&Oid::parse(second.as_bytes()).unwrap()),
+        "a rejected new push must not change the previously confirmed publication"
     );
     drop(lease);
-    history(&native_root, 6, &fixture.commit);
+    // After actual warm cleanup, retry the same native push. It can confirm and
+    // schedule a new independent warm; failure of that warm cannot roll it back.
     native(
         &native_root,
         &[
@@ -739,6 +750,14 @@ fn warm_push_gate(cache_outage: bool) {
         server.value("git_rs_fixture_warm_failed") == 2
             && server.value("git_rs_fixture_blame_admitted") == 0
     });
+    let (snapshot, lease) = Operation::new(5)
+        .enter(|| metadata::leased_snapshot(&fixture.slug, "alice", false))
+        .unwrap();
+    assert_eq!(
+        snapshot.refs.get(b"refs/heads/main".as_slice()),
+        Some(&Oid::parse(third.as_bytes()).unwrap())
+    );
+    drop(lease);
     drop(server);
     assert_eq!(fixture.leases(), 0);
 }

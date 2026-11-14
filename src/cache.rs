@@ -1,215 +1,358 @@
+//! Bounded, immutable Rust-owned source bytes. Evicted reader pins and in-progress fills
+//! continue owning their actual capacity until their final reader is gone.
+
 use crate::{
     Result, invalid,
-    metrics::{self, CacheResult, Metric, Stage},
+    metrics::{self, CacheResult},
     process,
 };
-use memfd::{FileSeal, Memfd, MemfdOptions};
-use std::collections::HashMap;
-use std::fs::{File, Permissions};
-use std::io::Seek;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::Duration;
+use git_rs_core::{CapacityBudget, CapacityBuffer, CapacityReservation};
+use std::{
+    ops::Deref,
+    sync::{Arc, Condvar, Mutex, Weak},
+    time::Duration,
+};
 
-const PAGE_BYTES: usize = 4096;
-const MAX_FILES: usize = 256;
+const SLOTS: usize = 256;
+const MAX_KEY: usize = 2048;
 
-struct Budget {
-    bytes: AtomicUsize,
-    files: AtomicUsize,
+pub struct CachedBytes {
+    bytes: CapacityBuffer,
+    _metadata: CapacityReservation,
 }
 
-struct Reservation {
-    bytes: usize,
-    budget: Arc<Budget>,
+impl Deref for CachedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
 }
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
-        self.budget.files.fetch_sub(1, Ordering::AcqRel);
+impl AsRef<[u8]> for CachedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
     }
 }
 
-/// Immutable RAM-only backing shared by native and library readers. Every
-/// request linking this path retains the handle until all its readers finish.
-pub struct CachedFile {
-    _file: Memfd,
-    path: PathBuf,
-    size: usize,
-    _reservation: Reservation,
+struct Entry {
+    key: String,
+    tick: u64,
+    bytes: Arc<CachedBytes>,
 }
-impl CachedFile {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
+
+struct Flight {
+    key: String,
+    busy: Mutex<bool>,
+    finished: Condvar,
+    _metadata: CapacityReservation,
 }
 
 struct State {
-    entries: HashMap<String, (u64, Arc<CachedFile>)>,
-    flights: HashMap<String, Weak<Flight>>,
+    entries: [Option<Entry>; SLOTS],
+    flights: [Option<Weak<Flight>>; SLOTS],
     tick: u64,
-}
-struct Flight {
-    busy: Mutex<bool>,
-    finished: Condvar,
+    invalidation: u64,
 }
 
 struct Loading(Arc<Flight>);
 impl Drop for Loading {
     fn drop(&mut self) {
-        *self.0.busy.lock().expect("cache flight poisoned") = false;
+        *self
+            .0
+            .busy
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = false;
         self.0.finished.notify_all();
     }
 }
 
 pub struct Cache {
     state: Mutex<State>,
-    allocated: Arc<Budget>,
-    capacity: usize,
+    budget: CapacityBudget,
+    flight_budget: CapacityBudget,
     max_entry: usize,
 }
 
 impl Cache {
     pub fn new(capacity: usize, max_entry: usize) -> Self {
+        let flights = (capacity / 8).min(SLOTS * (std::mem::size_of::<Flight>() + MAX_KEY + 64));
         Self {
             state: Mutex::new(State {
-                entries: HashMap::new(),
-                flights: HashMap::new(),
+                entries: std::array::from_fn(|_| None),
+                flights: std::array::from_fn(|_| None),
                 tick: 0,
+                invalidation: 0,
             }),
-            allocated: Arc::new(Budget {
-                bytes: AtomicUsize::new(0),
-                files: AtomicUsize::new(0),
-            }),
-            capacity,
+            budget: CapacityBudget::new(capacity - flights),
+            flight_budget: CapacityBudget::new(flights),
             max_entry,
         }
     }
 
     pub fn allocated(&self) -> usize {
-        self.allocated.bytes.load(Ordering::Acquire)
+        self.budget.used() + self.flight_budget.used()
     }
 
-    /// None means bypass to request-private bounded streaming. The byte budget
-    /// rounds payloads to 4 KiB and includes fills and evicted reader-pinned
-    /// files. At most 256 live files are admitted, including fills and pins.
-    /// The loader writes exactly `size` bytes and verifies their identity before
-    /// returning. Growth/shrink seals bound the file even while it is filled.
+    /// Forget a rejected immutable source's lookup entries. Existing readers
+    /// still own their backing and charge; concurrent fills cannot reinstall an
+    /// entry across this invalidation boundary. No I/O runs under the table lock.
+    pub fn invalidate_prefix(&self, prefix: &str) {
+        let removed: [Option<Entry>; SLOTS] = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.invalidation = state.invalidation.wrapping_add(1);
+            std::array::from_fn(|index| {
+                if state.entries[index]
+                    .as_ref()
+                    .is_some_and(|entry| entry.key.starts_with(prefix))
+                {
+                    state.entries[index].take()
+                } else {
+                    None
+                }
+            })
+        };
+        drop(removed);
+    }
+
+    fn hit(&self, key: &str, size: usize) -> Result<Option<Arc<CachedBytes>>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.tick = state.tick.wrapping_add(1);
+        let tick = state.tick;
+        if let Some(entry) = state
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.key == key)
+        {
+            if entry.bytes.len() != size {
+                return Err(invalid("immutable source cache size changed"));
+            }
+            entry.tick = tick;
+            metrics::global().cache(CacheResult::Hit);
+            return Ok(Some(entry.bytes.clone()));
+        }
+        Ok(None)
+    }
+
+    fn evict(&self) -> bool {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let victim = state
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, entry)| entry.as_ref().map(|entry| (slot, entry)))
+                .filter(|(_, entry)| Arc::strong_count(&entry.bytes) == 1)
+                .min_by_key(|(_, entry)| entry.tick)
+                .map(|(slot, _)| slot);
+            victim.and_then(|slot| state.entries[slot].take())
+        };
+        // Backing deallocation/admission return never occurs under the table lock.
+        let evicted = removed.is_some();
+        drop(removed);
+        evicted
+    }
+
+    /// The loader fills an exact, admitted slice and verifies its required
+    /// identity. None means bounded private acquisition by the caller, not an
+    /// unadmitted allocation or an authority/membership fallback.
     pub fn get_or_load(
         &self,
         key: &str,
         size: usize,
-        load: impl FnOnce(&File) -> Result<()>,
-    ) -> Result<Option<Arc<CachedFile>>> {
-        process::check_operation()?;
-        let charge = size.checked_next_multiple_of(PAGE_BYTES);
-        if size == 0 || size > self.max_entry || charge.is_none_or(|bytes| bytes > self.capacity) {
+        load: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Option<Arc<CachedBytes>>> {
+        self.load(key, size, None, load)
+    }
+
+    pub fn get_or_load_controlled(
+        &self,
+        key: &str,
+        size: usize,
+        control: &git_rs_core::Control,
+        load: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Option<Arc<CachedBytes>>> {
+        self.load(key, size, Some(control), load)
+    }
+
+    fn load(
+        &self,
+        key: &str,
+        size: usize,
+        control: Option<&git_rs_core::Control>,
+        load: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Option<Arc<CachedBytes>>> {
+        let check = || -> Result<()> {
+            process::check_operation()?;
+            if let Some(control) = control {
+                control.check()?;
+            }
+            Ok(())
+        };
+        check()?;
+        if key.is_empty() || key.len() > MAX_KEY {
+            return Err(invalid("source cache key bound exceeded"));
+        }
+        if let Some(hit) = self.hit(key, size)? {
+            return Ok(Some(hit));
+        }
+        if size == 0 || size > self.max_entry {
             metrics::global().cache(CacheResult::Bypass);
             return Ok(None);
         }
-        let charge = charge.expect("admitted cache charge");
-        let flight = {
-            let mut state = self.state.lock().expect("cache state poisoned");
-            state.flights.retain(|_, flight| flight.strong_count() > 0);
-            if let Some(flight) = state.flights.get(key).and_then(Weak::upgrade) {
-                flight
+        let (flight, invalidation) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let mut found = None;
+            for slot in &mut state.flights {
+                if let Some(flight) = slot.as_ref().and_then(Weak::upgrade) {
+                    if flight.key == key {
+                        found = Some(flight);
+                    }
+                } else {
+                    *slot = None;
+                }
+            }
+            if let Some(flight) = found {
+                (flight, state.invalidation)
             } else {
+                let Some(slot) = state.flights.iter_mut().find(|slot| slot.is_none()) else {
+                    metrics::global().cache(CacheResult::Bypass);
+                    return Ok(None);
+                };
+                let Ok(mut metadata) = self
+                    .flight_budget
+                    .reservation(std::mem::size_of::<Flight>() + key.len() + 64)
+                else {
+                    metrics::global().cache(CacheResult::Bypass);
+                    return Ok(None);
+                };
+                let mut name = String::new();
+                name.try_reserve_exact(key.len())?;
+                metadata.resize(std::mem::size_of::<Flight>() + name.capacity() + 64)?;
+                name.push_str(key);
                 let flight = Arc::new(Flight {
+                    key: name,
                     busy: Mutex::new(false),
                     finished: Condvar::new(),
+                    _metadata: metadata,
                 });
-                state.flights.insert(key.into(), Arc::downgrade(&flight));
-                flight
+                *slot = Some(Arc::downgrade(&flight));
+                (flight, state.invalidation)
             }
         };
-        let mut busy = flight.busy.lock().expect("cache flight poisoned");
-        let wait = (*busy).then(|| metrics::Timer::start(Metric::CacheWait));
+        let mut busy = flight
+            .busy
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         while *busy {
-            process::check_operation()?;
+            check()?;
             busy = flight
                 .finished
                 .wait_timeout(busy, Duration::from_millis(10))
-                .expect("cache flight poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .0;
         }
-        process::check_operation()?;
-        if let Some(wait) = wait {
-            wait.finish(true);
+        check()?;
+        if let Some(hit) = self.hit(key, size)? {
+            return Ok(Some(hit));
         }
-        let mut state = self.state.lock().expect("cache state poisoned");
-        state.tick = state.tick.wrapping_add(1);
-        let tick = state.tick;
-        if let Some((last, buffer)) = state.entries.get_mut(key) {
-            if buffer.size != size {
-                return Err(invalid("cached object size mismatch"));
-            }
-            metrics::global().cache(CacheResult::Hit);
-            *last = tick;
-            return Ok(Some(buffer.clone()));
-        }
-        while self.allocated().saturating_add(charge) > self.capacity
-            || self.allocated.files.load(Ordering::Acquire) >= MAX_FILES
-        {
-            let Some(oldest) = state
-                .entries
-                .iter()
-                // Removing a reader-pinned entry cannot free its reservation.
-                // Keep it discoverable so other requests can reuse the same file
-                // rather than bypassing to another download of the same bytes.
-                .filter(|(_, (_, buffer))| Arc::strong_count(buffer) == 1)
-                .min_by_key(|(_, (tick, _))| tick)
-                .map(|(key, _)| key.clone())
-            else {
-                metrics::global().cache(CacheResult::Bypass);
-                return Ok(None);
-            };
-            state.entries.remove(&oldest);
-        }
-        self.allocated.bytes.fetch_add(charge, Ordering::AcqRel);
-        self.allocated.files.fetch_add(1, Ordering::AcqRel);
-        metrics::global().cache(CacheResult::Miss);
         *busy = true;
-        drop(state);
         drop(busy);
         let _loading = Loading(flight);
-        let reservation = Reservation {
-            bytes: charge,
-            budget: self.allocated.clone(),
-        };
-        let fill = metrics::Timer::start(Metric::Stage(Stage::CacheFill));
-        let file = MemfdOptions::default()
-            .allow_sealing(true)
-            .create("git-rs-object")?;
-        file.as_file().set_len(size as u64)?;
-        file.add_seals(&[FileSeal::SealGrow, FileSeal::SealShrink])?;
-        let mut output = file.as_file();
-        load(output)?;
-        if output.stream_position()? != size as u64 {
-            return Err(invalid("incomplete cache fill"));
+        let mut metadata = None;
+        for _ in 0..=SLOTS {
+            check()?;
+            if let Ok(reservation) = self
+                .budget
+                .reservation(std::mem::size_of::<CachedBytes>() + key.len() + 64)
+            {
+                metadata = Some(reservation);
+                break;
+            }
+            if !self.evict() {
+                break;
+            }
         }
-        process::check_operation()?;
-        file.add_seals(&[FileSeal::SealWrite, FileSeal::SealSeal])?;
-        file.as_file()
-            .set_permissions(Permissions::from_mode(0o400))?;
-        let buffer = Arc::new(CachedFile {
-            path: PathBuf::from(format!(
-                "/proc/{}/fd/{}",
-                std::process::id(),
-                file.as_raw_fd()
-            )),
-            _file: file,
-            size,
-            _reservation: reservation,
+        let Some(mut metadata) = metadata else {
+            metrics::global().cache(CacheResult::Bypass);
+            return Ok(None);
+        };
+        let mut data = None;
+        for _ in 0..=SLOTS {
+            check()?;
+            if let Ok(bytes) = self.budget.buffer(size) {
+                data = Some(bytes);
+                break;
+            }
+            if !self.evict() {
+                break;
+            }
+        }
+        let Some(mut bytes) = data else {
+            metrics::global().cache(CacheResult::Bypass);
+            return Ok(None);
+        };
+        let mut name = String::new();
+        name.try_reserve_exact(key.len())?;
+        metadata.resize(std::mem::size_of::<CachedBytes>() + name.capacity() + 64)?;
+        name.push_str(key);
+        for end in (0..size).step_by(32 * 1024) {
+            check()?;
+            bytes.resize(size.min(end + 32 * 1024), 0)?;
+        }
+        metrics::global().cache(CacheResult::Miss);
+        metrics::measure(metrics::Metric::Stage(metrics::Stage::CacheFill), || {
+            load(bytes.as_mut_slice())
+        })?;
+        check()?;
+        let bytes = Arc::new(CachedBytes {
+            bytes,
+            _metadata: metadata,
         });
-        let mut state = self.state.lock().expect("cache state poisoned");
-        state.tick = state.tick.wrapping_add(1);
-        let tick = state.tick;
-        state.entries.insert(key.into(), (tick, buffer.clone()));
-        drop(state);
-        fill.finish(true);
-        Ok(Some(buffer))
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.tick = state.tick.wrapping_add(1);
+            let tick = state.tick;
+            if state.invalidation == invalidation {
+                let slot = state.entries.iter().position(Option::is_none).or_else(|| {
+                    state
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, entry)| entry.as_ref().map(|entry| (slot, entry)))
+                        .filter(|(_, entry)| Arc::strong_count(&entry.bytes) == 1)
+                        .min_by_key(|(_, entry)| entry.tick)
+                        .map(|(slot, _)| slot)
+                });
+                slot.and_then(|slot| {
+                    state.entries[slot].replace(Entry {
+                        key: name,
+                        tick,
+                        bytes: bytes.clone(),
+                    })
+                })
+            } else {
+                None
+            }
+        };
+        // Slot pressure and byte pressure are independent. Destroy an unpinned
+        // victim outside the lock; if every slot is pinned, retain only this
+        // admitted reader's backing rather than hiding an unindexed cache owner.
+        drop(removed);
+        Ok(Some(bytes))
     }
 }

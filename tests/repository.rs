@@ -1,30 +1,47 @@
 #![forbid(unsafe_code)]
 
-use git_rs::{Result, metrics, protocol::Oid, scratch::Scratch};
-use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[path = "support/range_source.rs"]
+mod ranges;
+
+use git_rs::{Result, protocol::Oid};
+use git_rs_core::{
+    CapacityBudget, Control, ReadLimits,
+    upload::{UploadSession, Version},
+};
+use ranges::{Pack, Source, full, oid};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    os::unix::{ffi::OsStrExt, fs::DirBuilderExt},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
 struct Root(PathBuf);
-
 impl Root {
     fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!(
-            "git-rs-library-snapshot-{}",
+            "git-rs-range-snapshot-{}",
             git_rs::scratch::identifier()?
         ));
         fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
     }
+    fn bare(&self) -> Result<PathBuf> {
+        native(
+            &self.0,
+            &["init", "--bare", "--initial-branch=main", "oracle.git"],
+            b"",
+        )?;
+        Ok(self.0.join("oracle.git"))
+    }
 }
-
 impl Drop for Root {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).expect("remove owned snapshot fixture");
+        fs::remove_dir_all(&self.0).expect("remove owned native oracle");
     }
 }
 
@@ -63,74 +80,120 @@ fn native(path: &Path, arguments: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     Ok(result.stdout)
 }
 
+fn load_source(path: &Path) -> Result<Source> {
+    let mut indexes = fs::read_dir(path.join("objects/pack"))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    indexes.retain(|path| path.extension().is_some_and(|extension| extension == "idx"));
+    indexes.sort();
+    let packs = indexes
+        .into_iter()
+        .map(|index| Pack::from_bytes(fs::read(index.with_extension("pack"))?, fs::read(index)?))
+        .collect::<Result<Vec<_>>>()?;
+    assert!(
+        !packs.is_empty(),
+        "native oracle must supply a physical pack/index"
+    );
+    Ok(Source::new(packs))
+}
+
+fn pack(path: &Path, tips: &[u8]) -> Result<Source> {
+    let bytes = native(
+        path,
+        &[
+            "pack-objects",
+            "--stdout",
+            "--window=32",
+            "--depth=8",
+            "--no-delta-base-offset",
+        ],
+        tips,
+    )?;
+    native(path, &["index-pack", "--stdin"], &bytes)?;
+    load_source(path)
+}
+
+fn control() -> Control {
+    Control::new(Instant::now() + Duration::from_secs(30))
+}
+fn capacity() -> CapacityBudget {
+    CapacityBudget::new(16 * 1024 * 1024)
+}
+
+fn synthetic() -> Result<(Source, gix::ObjectId, gix::ObjectId)> {
+    let blob = oid(gix::objs::Kind::Blob, b"content\n")?;
+    let mut tree_bytes = b"100644 byte-\xff\0".to_vec();
+    tree_bytes.extend_from_slice(blob.as_slice());
+    let tree = oid(gix::objs::Kind::Tree, &tree_bytes)?;
+    let commit_bytes = format!("tree {tree}\nauthor A <a@example.invalid> 1 +0000\ncommitter A <a@example.invalid> 1 +0000\n\ninitial\n").into_bytes();
+    let commit = oid(gix::objs::Kind::Commit, &commit_bytes)?;
+    let source = Source::new(vec![Pack::new(&[
+        (blob, full(gix::objs::Kind::Blob, b"content\n")),
+        (tree, full(gix::objs::Kind::Tree, &tree_bytes)),
+        (commit, full(gix::objs::Kind::Commit, &commit_bytes)),
+    ])?]);
+    Ok((source, commit, blob))
+}
+
 #[test]
-fn snapshot_initialization_and_ref_restoration_do_not_execute_git() -> Result<()> {
-    let root = Root::new()?;
-    let scratch = Scratch::new(&root.0, 2)?;
-    let blob = native(
-        &scratch.path,
-        &["hash-object", "-w", "--stdin"],
-        b"content\n",
-    )?;
-    let blob = std::str::from_utf8(&blob)?.trim();
-    let tree = native(
-        &scratch.path,
-        &["mktree"],
-        format!("100644 blob {blob}\tfile.txt\n").as_bytes(),
-    )?;
-    let tree = std::str::from_utf8(&tree)?.trim();
-    let commit = native(&scratch.path, &["commit-tree", tree], b"initial\n")?;
-    let commit = Oid::parse(commit.trim_ascii())?;
+fn snapshot_ref_advertisement_preserves_byte_names_without_a_repository() -> Result<()> {
+    let (source, commit, blob) = synthetic()?;
     let refs = BTreeMap::from([
         (b"refs/heads/main".to_vec(), commit),
         (b"refs/heads/nested/branch".to_vec(), commit),
         (b"refs/heads/\xff".to_vec(), commit),
-        (b"refs/tags/release".to_vec(), commit),
-        (b"refs/tags/blob".to_vec(), Oid::parse(blob.as_bytes())?),
         (b"refs/notes/commits".to_vec(), commit),
+        (b"refs/tags/blob".to_vec(), blob),
+        (b"refs/tags/release".to_vec(), commit),
     ]);
-    scratch.restore_refs(&refs, b"refs/heads/\xff")?;
+    let budget = capacity();
+    let session = UploadSession::new(
+        source.open(control(), budget.clone(), ReadLimits::default())?,
+        refs.iter().map(|(name, id)| (name.as_slice(), *id)),
+        b"refs/heads/\xff",
+        Version::V0,
+    )?;
+    let mut wire = Vec::new();
+    session.advertise(false, &mut wire)?;
+    let mut input = wire.as_slice();
+    let mut lines = Vec::new();
+    while let Some(line) = git_rs::protocol::read_packet(&mut input)? {
+        lines.push(
+            line.split(|byte| *byte == 0)
+                .next()
+                .unwrap()
+                .trim_ascii_end()
+                .to_vec(),
+        );
+    }
+    assert!(input.is_empty());
     assert_eq!(
-        fs::read(scratch.path.join("HEAD"))?,
-        b"ref: refs/heads/\xff\n"
+        lines,
+        [
+            format!("{commit} HEAD").into_bytes(),
+            format!("{commit} refs/heads/main").into_bytes(),
+            format!("{commit} refs/heads/nested/branch").into_bytes(),
+            [format!("{commit} refs/heads/").as_bytes(), b"\xff"].concat(),
+            format!("{commit} refs/notes/commits").into_bytes(),
+            format!("{blob} refs/tags/blob").into_bytes(),
+            format!("{commit} refs/tags/release").into_bytes(),
+        ]
     );
-    assert!(!scratch.path.join("hooks").exists());
-    assert!(!scratch.path.join("logs").exists());
-    assert!(!scratch.path.join("index").exists());
-    let expected = refs
-        .iter()
-        .flat_map(|(name, oid)| {
-            let mut line = name.clone();
-            line.push(b' ');
-            line.extend_from_slice(oid.hex().as_bytes());
-            line.push(b'\n');
-            line
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        native(
-            &scratch.path,
-            &["for-each-ref", "--format=%(refname) %(objectname)"],
-            b"",
-        )?,
-        expected,
-        "native Git must read every restored byte-oriented ref exactly"
-    );
-    assert_eq!(
-        native(&scratch.path, &["rev-parse", "--is-bare-repository"], b"")?,
-        b"true\n"
-    );
-    let empty = Scratch::new(&root.0, 1)?;
-    empty.restore_refs(&BTreeMap::new(), b"refs/heads/unborn")?;
-    assert_eq!(
-        fs::read(empty.path.join("HEAD"))?,
-        b"ref: refs/heads/unborn\n"
-    );
-    let text = metrics::global().render(0, 0);
+    drop(session);
+    assert_eq!(budget.used(), 0);
+    let empty = UploadSession::new(
+        Source::new(Vec::new()).open(control(), budget.clone(), ReadLimits::default())?,
+        std::iter::empty(),
+        b"refs/heads/unborn",
+        Version::V0,
+    )?;
+    let mut wire = Vec::new();
+    empty.advertise(false, &mut wire)?;
+    let line = git_rs::protocol::read_packet(&mut wire.as_slice())?.unwrap();
+    assert!(line.starts_with(b"0000000000000000000000000000000000000000 capabilities^{}\0"));
     assert!(
-        text.lines()
-            .any(|line| line == "git_rs_subprocess_duration_seconds_count{program=\"git\"} 0"),
-        "snapshot initialization/restoration must be library-only, including the cold template"
+        line.windows(b"symref=HEAD:refs/heads/unborn".len())
+            .any(|part| part == b"symref=HEAD:refs/heads/unborn")
     );
     Ok(())
 }
@@ -150,14 +213,13 @@ fn invalid_git_ref_names_are_rejected_when_commands_are_parsed() {
         let command = format!("{} {} {name}", "0".repeat(40), "1".repeat(40));
         assert!(
             git_rs::protocol::Update::parse(command.as_bytes()).is_err(),
-            "reject malformed ref {name} before mutation or subprocess execution"
+            "malformed ref {name}"
         );
     }
 }
 
 #[test]
-fn invalid_snapshot_targets_are_rejected_before_any_refs_are_written() -> Result<()> {
-    let root = Root::new()?;
+fn invalid_snapshot_targets_are_rejected_before_advertisement() -> Result<()> {
     for invalid in [
         "missing",
         "missing-empty-tree",
@@ -165,19 +227,21 @@ fn invalid_snapshot_targets_are_rejected_before_any_refs_are_written() -> Result
         "bad-default",
         "bad-name",
     ] {
-        let scratch = Scratch::new(&root.0, 1)?;
-        let blob = native(&scratch.path, &["hash-object", "-w", "--stdin"], b"text\n")?;
-        let blob = Oid::parse(blob.trim_ascii())?;
+        let (source, _, blob) = synthetic()?;
+        let witness = source.witness();
         let mut refs = BTreeMap::from([(b"refs/tags/aa-valid".to_vec(), blob)]);
         let mut default_ref = b"refs/heads/main".as_slice();
         match invalid {
             "missing" => {
-                refs.insert(b"refs/tags/zz-missing".to_vec(), Oid([1; 20]));
+                refs.insert(
+                    b"refs/tags/zz-missing".to_vec(),
+                    gix::ObjectId::from([1; 20]),
+                );
             }
             "missing-empty-tree" => {
                 refs.insert(
                     b"refs/tags/zz-missing".to_vec(),
-                    Oid::parse(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?,
+                    gix::ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?,
                 );
             }
             "non-commit" => {
@@ -189,18 +253,23 @@ fn invalid_snapshot_targets_are_rejected_before_any_refs_are_written() -> Result
             }
             _ => unreachable!(),
         }
+        let budget = capacity();
+        let result = UploadSession::new(
+            source.open(control(), budget.clone(), ReadLimits::default())?,
+            refs.iter().map(|(name, id)| (name.as_slice(), *id)),
+            default_ref,
+            Version::V0,
+        );
         assert!(
-            scratch.restore_refs(&refs, default_ref).is_err(),
-            "invalid snapshot {invalid} must fail before restoring any ref"
+            result.is_err(),
+            "invalid catalog {invalid} must not yield an advertisable session"
         );
+        drop(result);
+        assert!(witness.upgrade().is_none());
         assert_eq!(
-            native(&scratch.path, &["for-each-ref"], b"")?,
-            b"",
-            "invalid snapshot {invalid} must leave the private ref store empty"
-        );
-        assert_eq!(
-            fs::read(scratch.path.join("HEAD"))?,
-            b"ref: refs/heads/main\n"
+            budget.used(),
+            0,
+            "rejected {invalid} must release all source metadata"
         );
     }
     Ok(())
@@ -226,7 +295,7 @@ fn ref_name_validation_matches_native_git_for_every_non_nul_byte() -> Result<()>
         assert_eq!(
             git_rs::protocol::Update::parse(&command).is_ok(),
             status.success(),
-            "byte-oriented ref validation differs for {name:?}"
+            "byte-oriented ref {name:?}"
         );
     }
     Ok(())
@@ -236,25 +305,19 @@ fn ref_name_validation_matches_native_git_for_every_non_nul_byte() -> Result<()>
 fn isolated_snapshot_ignores_git_environment() -> Result<()> {
     const CHILD: &str = "GIT_RS_SNAPSHOT_ISOLATION_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        let root = Root::new()?;
-        let scratch = Scratch::new(&root.0, 1)?;
-        assert_eq!(
-            fs::read(scratch.path.join("HEAD"))?,
-            b"ref: refs/heads/main\n"
-        );
-        scratch.restore_refs(&BTreeMap::new(), b"refs/heads/\xff")?;
-        assert_eq!(
-            fs::read(scratch.path.join("HEAD"))?,
-            b"ref: refs/heads/\xff\n"
-        );
-        assert!(!scratch.path.join("hooks").exists());
-        assert!(!scratch.path.join("index").exists());
-        assert!(!scratch.path.join("logs").exists());
-        assert!(scratch.path.join("objects/pack").is_dir());
+        let (source, commit, blob) = synthetic()?;
+        let budget = capacity();
+        let odb = source.open(control(), budget.clone(), ReadLimits::default())?;
+        let (id, object) = odb
+            .lookup_blob(&commit, b"byte-\xff")?
+            .expect("catalog-only byte lookup");
+        assert_eq!(id, blob);
+        assert_eq!(object.data.as_slice(), b"content\n");
         assert!(
-            !fs::read(scratch.path.join("config"))?
-                .windows(b"sha256".len())
-                .any(|window| window == b"sha256")
+            odb.object(&gix::ObjectId::from_hex(
+                b"4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            )?)?
+            .is_none()
         );
         return Ok(());
     }
@@ -278,7 +341,7 @@ fn isolated_snapshot_ignores_git_environment() -> Result<()> {
         .output()?;
     assert!(
         result.status.success(),
-        "isolated initialization/restoration with foreign Git environment: {} {}",
+        "foreign Git environment: {} {}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
@@ -288,17 +351,17 @@ fn isolated_snapshot_ignores_git_environment() -> Result<()> {
 }
 
 #[test]
-fn snapshot_refs_resolve_ref_delta_commits_in_sealed_ram_packs() -> Result<()> {
+fn snapshot_refs_resolve_native_ref_delta_commits_through_ranges() -> Result<()> {
     let root = Root::new()?;
-    let source = Scratch::new(&root.0, 1)?;
+    let path = root.bare()?;
     let blob = native(
-        &source.path,
+        &path,
         &["hash-object", "-w", "--stdin"],
         b"shared content\n",
     )?;
     let blob = std::str::from_utf8(&blob)?.trim();
     let tree = native(
-        &source.path,
+        &path,
         &["mktree"],
         format!("100644 blob {blob}\tfile.txt\n").as_bytes(),
     )?;
@@ -306,144 +369,53 @@ fn snapshot_refs_resolve_ref_delta_commits_in_sealed_ram_packs() -> Result<()> {
     let message = "repeated synthetic commit message\n".repeat(128);
     let mut commits: Vec<Oid> = Vec::new();
     for _ in 0..16 {
-        let mut arguments = vec!["commit-tree", tree];
+        let mut args = vec!["commit-tree", tree];
         let parent = commits.last().map(|id| id.hex());
         if let Some(parent) = &parent {
-            arguments.extend(["-p", parent.as_str()]);
+            args.extend(["-p", parent]);
         }
-        let commit = native(&source.path, &arguments, message.as_bytes())?;
+        let commit = native(&path, &args, message.as_bytes())?;
         commits.push(Oid::parse(commit.trim_ascii())?);
     }
-    let tips = commits.iter().map(|id| id.hex() + "\n").collect::<String>();
-    let pack = native(
-        &source.path,
-        &[
-            "pack-objects",
-            "--stdout",
-            "--revs",
-            "--window=32",
-            "--depth=8",
-            "--no-delta-base-offset",
-        ],
-        tips.as_bytes(),
-    )?;
-    native(&source.path, &["index-pack", "--stdin"], &pack)?;
-    let cache = git_rs::cache::Cache::new(1024 * 1024, 1024 * 1024);
-    let target = Scratch::new(&root.0, 1)?;
-    let mut pins = Vec::new();
-    for entry in fs::read_dir(source.path.join("objects/pack"))? {
-        let path = entry?.path();
-        if !matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("pack" | "idx")
-        ) {
-            continue;
-        }
-        if path.extension().is_some_and(|ext| ext == "idx") {
-            let inventory = native(
-                &source.path,
-                &["verify-pack", "-v", path.to_str().expect("fixture path")],
-                b"",
-            )?;
-            assert!(
-                inventory.split(|byte| *byte == b'\n').any(|line| {
-                    let fields = line
-                        .split(|byte| *byte == b' ')
-                        .filter(|field| !field.is_empty())
-                        .collect::<Vec<_>>();
-                    fields.len() == 7 && fields[1] == b"commit"
-                }),
-                "the native-generated pack must actually exercise delta-compressed commit headers"
-            );
-        }
-        let bytes = fs::read(&path)?;
-        let mut input = bytes.as_slice();
-        let pin = cache
-            .get_or_load(
-                path.to_str().expect("fixture path"),
-                bytes.len(),
-                |mut output| {
-                    std::io::copy(&mut input, &mut output)?;
-                    Ok(())
-                },
-            )?
-            .expect("small native pack/index must fit the RAM fixture");
-        let destination = target
-            .path
-            .join("objects/pack")
-            .join(path.file_name().expect("pack filename"));
-        std::os::unix::fs::symlink(pin.path(), &destination)?;
-        assert!(fs::symlink_metadata(destination)?.file_type().is_symlink());
-        pins.push(pin);
-    }
-    assert_eq!(
-        pins.len(),
-        2,
-        "both pack and index must remain pinned in sealed RAM"
-    );
-    let invalid = BTreeMap::from([
-        (b"refs/heads/aa-valid".to_vec(), commits[0]),
-        (
-            b"refs/heads/zz-not-a-commit".to_vec(),
-            Oid::parse(blob.as_bytes())?,
-        ),
-    ]);
-    assert!(target.restore_refs(&invalid, b"refs/heads/main").is_err());
-    assert_eq!(
-        native(&target.path, &["for-each-ref"], b"")?,
-        b"",
-        "a packed non-commit branch must fail before any valid ref is restored"
-    );
-    let mut refs = commits
-        .iter()
-        .enumerate()
-        .map(|(index, id)| (format!("refs/heads/branch-{index}").into_bytes(), *id))
-        .collect::<BTreeMap<_, _>>();
-    refs.insert(b"refs/tags/blob".to_vec(), Oid::parse(blob.as_bytes())?);
-    refs.insert(b"refs/tags/tree".to_vec(), Oid::parse(tree.as_bytes())?);
-    let restored = target.restore_refs(&refs, b"refs/heads/branch-15");
+    let ids = [
+        format!("{}\n", commits[15].hex()),
+        format!("{tree}\n{blob}\n"),
+        commits
+            .iter()
+            .take(15)
+            .map(|id| id.hex() + "\n")
+            .collect::<String>(),
+    ]
+    .concat();
+    let source = pack(&path, ids.as_bytes())?;
+    let index = fs::read_dir(path.join("objects/pack"))?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "idx"))
+        .unwrap();
+    let inventory = native(&path, &["verify-pack", "-v", index.to_str().unwrap()], b"")?;
     assert!(
-        restored.is_ok(),
-        "library snapshot restoration must read sealed RAM pack/index links: {restored:?}"
+        inventory.split(|byte| *byte == b'\n').any(|line| {
+            let fields = line
+                .split(|byte| *byte == b' ')
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>();
+            fields.len() == 7 && fields[1] == b"commit"
+        }),
+        "native fixture must contain actual delta-compressed commits"
     );
-    assert_eq!(
-        native(&target.path, &["rev-parse", "HEAD"], b"")?,
-        format!("{}\n", commits[15].hex()).as_bytes()
-    );
-    let limits = git_rs_core::ReadLimits {
-        max_decode_bytes: 128 * 1024,
-        ..Default::default()
-    };
-    let capacity = git_rs_core::CapacityBudget::new(2 * 1024 * 1024);
-    let control =
-        git_rs_core::Control::new(std::time::Instant::now() + std::time::Duration::from_secs(30));
-    let identity = git_rs_core::SnapshotIdentity {
-        source: b"synthetic-sealed-snapshot".to_vec(),
-        generation: b"one".to_vec(),
-        object_hash: gix::hash::Kind::Sha1,
-    };
-    let hold = std::sync::Arc::new(());
-    let weak_hold = std::sync::Arc::downgrade(&hold);
-    let odb = target.snapshot_odb(identity, hold, control.clone(), capacity.clone(), limits)?;
-    assert!(weak_hold.upgrade().is_some());
+    let witness = source.witness();
+    let budget = capacity();
+    let request = control();
+    let odb = source.open(request.clone(), budget.clone(), ReadLimits::default())?;
     let id = gix::ObjectId::from(commits[15].0);
-    assert!(
-        odb.pack_location(&id)?.is_some(),
-        "full reader must see symlinked sealed-RAM indexes"
-    );
-    let body = odb.object(&id)?.expect("physical packed commit");
+    assert!(odb.pack_location(&id)?.is_some());
+    let body = odb.object(&id)?.expect("native physical commit");
     assert_eq!(body.kind, gix::objs::Kind::Commit);
     assert_eq!(
         body.data.as_slice(),
-        native(
-            &source.path,
-            &["cat-file", "commit", &commits[15].hex()],
-            b""
-        )?
+        native(&path, &["cat-file", "commit", &commits[15].hex()], b"")?
     );
-    let (_, content) = odb
-        .lookup_blob(&id, b"file.txt")?
-        .expect("packed byte-path lookup");
+    let (_, content) = odb.lookup_blob(&id, b"file.txt")?.unwrap();
     assert_eq!(content.data.as_slice(), b"shared content\n");
     assert!(odb.is_ancestor(gix::ObjectId::from(commits[0].0).as_ref(), &id)?);
     assert_eq!(
@@ -452,201 +424,110 @@ fn snapshot_refs_resolve_ref_delta_commits_in_sealed_ram_packs() -> Result<()> {
         16
     );
     let mut output = odb.find_buffer(body.data.as_slice().len())?;
-    let found = odb
-        .find_in(&id, &mut output)?
-        .expect("verified Find interface");
-    assert_eq!(found.data, body.data.as_slice());
-    control.cancel();
+    assert_eq!(
+        odb.find_in(&id, &mut output)?.unwrap().data,
+        body.data.as_slice()
+    );
+    request.cancel();
     assert!(odb.object(&id).is_err());
     assert!(
-        weak_hold.upgrade().is_some(),
-        "cancel does not prematurely release the opaque source hold"
-    );
-    assert_eq!(
-        pins.len(),
-        2,
-        "cancellation does not release caller-held cache pins"
+        witness.upgrade().is_some(),
+        "cancellation is not source-release acknowledgment"
     );
     drop(output);
     drop(content);
     drop(body);
     drop(odb);
-    assert!(weak_hold.upgrade().is_none());
-    assert_eq!(capacity.used(), 0);
-    native(&target.path, &["fsck", "--strict", "--full"], b"")?;
+    assert!(witness.upgrade().is_none());
+    assert_eq!(budget.used(), 0);
+    native(&path, &["fsck", "--strict", "--full"], b"")?;
     Ok(())
 }
 
 #[test]
 fn physical_object_headers_match_native_types_and_sizes() -> Result<()> {
     let root = Root::new()?;
-    let scratch = Scratch::new(&root.0, 1)?;
-    let blob = native(
-        &scratch.path,
-        &["hash-object", "-w", "--stdin"],
-        b"a\0\r\n\xff",
-    )?;
+    let path = root.bare()?;
+    let blob = native(&path, &["hash-object", "-w", "--stdin"], b"a\0\r\n\xff")?;
     let blob = std::str::from_utf8(&blob)?.trim();
-    let empty_blob = native(&scratch.path, &["hash-object", "-w", "--stdin"], b"")?;
-    let empty_blob = std::str::from_utf8(&empty_blob)?.trim();
+    let empty = native(&path, &["hash-object", "-w", "--stdin"], b"")?;
+    let empty = std::str::from_utf8(&empty)?.trim();
     let tree = native(
-        &scratch.path,
+        &path,
         &["mktree"],
         format!("100644 blob {blob}\tfile.txt\n").as_bytes(),
     )?;
     let tree = std::str::from_utf8(&tree)?.trim();
-    let commit = native(&scratch.path, &["commit-tree", tree], b"header fixture\n")?;
+    let commit = native(&path, &["commit-tree", tree], b"header fixture\n")?;
     let commit = std::str::from_utf8(&commit)?.trim();
-    let tag = native(
-        &scratch.path,
-        &["mktag"],
-        format!(
-            "object {commit}\ntype commit\ntag synthetic\ntagger Synthetic Author <author@example.invalid> 946684800 +0000\n\nheader fixture\n"
-        )
-        .as_bytes(),
-    )?;
+    let tag = native(&path, &["mktag"], format!("object {commit}\ntype commit\ntag synthetic\ntagger Synthetic Author <author@example.invalid> 946684800 +0000\n\nheader fixture\n").as_bytes())?;
     let tag = std::str::from_utf8(&tag)?.trim();
+    let source = pack(
+        &path,
+        format!("{blob}\n{empty}\n{tree}\n{commit}\n{tag}\n").as_bytes(),
+    )?;
+    let request = control();
+    let odb = source.open(request.clone(), capacity(), ReadLimits::default())?;
     for (id, kind) in [
         (blob, gix::objs::Kind::Blob),
-        (empty_blob, gix::objs::Kind::Blob),
+        (empty, gix::objs::Kind::Blob),
         (tree, gix::objs::Kind::Tree),
         (commit, gix::objs::Kind::Commit),
         (tag, gix::objs::Kind::Tag),
     ] {
-        let native_size = native(&scratch.path, &["cat-file", "-s", id], b"")?;
-        let native_size = std::str::from_utf8(&native_size)?.trim().parse::<u64>()?;
-        let header = scratch
-            .object_header(Oid::parse(id.as_bytes())?)?
-            .expect("physical native fixture must exist");
-        assert_eq!(header.kind(), kind, "header type for {id}");
-        assert_eq!(header.size(), native_size, "header size for {id}");
+        let native_size = native(&path, &["cat-file", "-s", id], b"")?;
+        let header = odb
+            .header(&gix::ObjectId::from_hex(id.as_bytes())?)?
+            .unwrap();
+        assert_eq!(header.kind, kind);
+        assert_eq!(
+            header.size,
+            std::str::from_utf8(&native_size)?.trim().parse::<u64>()?
+        );
     }
-    assert!(scratch.object_header(Oid::ZERO)?.is_none());
+    assert!(odb.header(&gix::ObjectId::from([0; 20]))?.is_none());
+    request.cancel();
     assert!(
-        scratch
-            .object_header(Oid::parse(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?)?
-            .is_none(),
-        "a missing empty tree must not be synthesized"
+        odb.header(&gix::ObjectId::from_hex(blob.as_bytes())?)
+            .is_err()
     );
-    let operation = git_rs::process::Operation::new(30);
-    operation.cancel();
-    assert!(
-        operation
-            .enter(|| scratch.object_header(Oid::parse(blob.as_bytes()).expect("fixture OID")))
-            .is_err(),
-        "cancelled header reads must fail rather than return cached object metadata"
-    );
-    assert!(
-        git_rs::process::Operation::new(0)
-            .enter(|| scratch.object_header(Oid::ZERO))
-            .is_err(),
-        "expired missing-object reads must fail rather than report a successful miss"
-    );
+    assert!(odb.header(&gix::ObjectId::from([0; 20])).is_err());
     Ok(())
 }
 
 #[test]
-fn full_snapshot_loose_reads_use_byte_paths_and_ignore_config_and_alternates() -> Result<()> {
-    let root = Root::new()?;
-    let foreign = Scratch::new(&root.0, 1)?;
-    let foreign_blob = native(
-        &foreign.path,
-        &["hash-object", "-w", "--stdin"],
-        b"foreign\n",
-    )?;
-    let scratch = Scratch::new(&root.0, 1)?;
-    let bytes = b"a\0\r\n\xff";
-    let blob = native(&scratch.path, &["hash-object", "-w", "--stdin"], bytes)?;
-    let blob_text = std::str::from_utf8(&blob)?.trim();
-    let mut entry = format!("100644 blob {blob_text}\t").into_bytes();
-    entry.extend_from_slice(b"byte-\xff\0");
-    let tree = native(&scratch.path, &["mktree", "-z"], &entry)?;
-    let tree_text = std::str::from_utf8(&tree)?.trim();
-    let commit = native(&scratch.path, &["commit-tree", tree_text], b"byte paths\n")?;
-    fs::write(scratch.path.join("config"), b"[invalid configuration\n")?;
-    fs::write(
-        scratch.path.join("objects/info/alternates"),
-        format!("{}\n", foreign.path.join("objects").display()),
-    )?;
-    let control =
-        git_rs_core::Control::new(std::time::Instant::now() + std::time::Duration::from_secs(30));
-    let identity = git_rs_core::SnapshotIdentity {
-        source: b"synthetic-loose".to_vec(),
-        generation: b"one".to_vec(),
-        object_hash: gix::hash::Kind::Sha1,
-    };
-    let capacity = git_rs_core::CapacityBudget::new(64 * 1024);
-    let odb = scratch.snapshot_odb(
-        identity,
-        (),
-        control,
-        capacity.clone(),
-        git_rs_core::ReadLimits::default(),
-    )?;
-    let id = gix::ObjectId::from_hex(commit.trim_ascii())?;
-    let (found, object) = odb
-        .lookup_blob(&id, b"byte-\xff")?
-        .expect("physical byte-path blob");
-    assert_eq!(found, gix::ObjectId::from_hex(blob.trim_ascii())?);
-    assert_eq!(object.data.as_slice(), bytes);
-    assert_eq!(
-        odb.header(&found)?.expect("physical header").size,
-        bytes.len() as u64
-    );
-    let mut buffer = odb.find_buffer(bytes.len())?;
-    assert_eq!(
-        odb.find_in(&found, &mut buffer)?
-            .expect("Find loose bytes")
-            .data,
-        bytes
-    );
-    let mut undersized = Vec::new();
-    assert!(gix::objs::Find::try_find(&odb, &found, &mut undersized).is_err());
-    assert_eq!(
-        undersized.capacity(),
-        0,
-        "Find never secretly grows caller-owned storage"
-    );
-    assert!(
-        odb.object(gix::ObjectId::from_hex(foreign_blob.trim_ascii())?.as_ref())?
-            .is_none(),
-        "alternates are never consulted"
-    );
-    let empty_tree = gix::ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?;
-    assert!(odb.object(&empty_tree)?.is_none());
-    assert!(gix::objs::FindHeader::try_header(&odb, &empty_tree)?.is_none());
-    drop(buffer);
-    drop(object);
-    drop(odb);
-    assert_eq!(capacity.used(), 0);
-    Ok(())
-}
-
-#[test]
-fn large_loose_and_ref_delta_headers_fit_a_small_address_space() -> Result<()> {
+fn large_ref_delta_headers_fit_a_small_address_space() -> Result<()> {
     const SOURCE: &str = "GIT_RS_LARGE_HEADER_SOURCE";
     const CASES: &str = "GIT_RS_LARGE_HEADER_CASES";
     if let Some(source) = std::env::var_os(SOURCE) {
-        let root = Root::new()?;
-        let scratch = Scratch::new(&root.0, 1)?;
-        fs::remove_dir_all(scratch.path.join("objects"))?;
-        std::os::unix::fs::symlink(
-            Path::new(&source).join("objects"),
-            scratch.path.join("objects"),
-        )?;
+        let source = load_source(Path::new(&source))?;
+        let reads = source.reads.clone();
+        let budget = capacity();
+        let limits = ReadLimits {
+            max_object_bytes: git_rs::blame::MAX_BLOB as usize + 4096,
+            max_decode_bytes: 1024 * 1024 * 1024,
+            ..ReadLimits::default()
+        };
+        let odb = source.open(control(), budget.clone(), limits)?;
         for case in std::env::var(CASES)?.split(',') {
-            let (oid, size) = case.split_once(':').expect("expected native fixture case");
-            let header = scratch
-                .object_header(Oid::parse(oid.as_bytes())?)?
-                .expect("large physical blob must exist");
-            assert_eq!(header.kind(), gix::objs::Kind::Blob);
-            assert_eq!(header.size(), size.parse::<u64>()?, "large blob {oid}");
+            let (id, size) = case.split_once(':').unwrap();
+            let header = odb
+                .header(&gix::ObjectId::from_hex(id.as_bytes())?)?
+                .unwrap();
+            assert_eq!(header.kind, gix::objs::Kind::Blob);
+            assert_eq!(header.size, size.parse::<u64>()?);
         }
+        assert!(reads.largest.load(Ordering::Relaxed) <= 32 * 1024);
+        assert!(
+            reads.total.load(Ordering::Relaxed) < 1024 * 1024,
+            "header preflight must not read full 128 MiB objects"
+        );
+        drop(odb);
+        assert_eq!(budget.used(), 0);
         return Ok(());
     }
-
     let root = Root::new()?;
-    let source = Scratch::new(&root.0, 1)?;
+    let path = root.bare()?;
     let mut cases = Vec::new();
     for size in [
         git_rs::blame::MAX_BLOB - 1,
@@ -654,121 +535,59 @@ fn large_loose_and_ref_delta_headers_fit_a_small_address_space() -> Result<()> {
         git_rs::blame::MAX_BLOB + 1,
         git_rs::blame::MAX_BLOB + 4096,
     ] {
-        let path = root.0.join(format!("synthetic-{size}.bin"));
-        fs::File::create(&path)?.set_len(size)?;
-        let oid = native(
-            &source.path,
-            &["hash-object", "-w", path.to_str().expect("fixture path")],
-            b"",
-        )?;
-        let oid = std::str::from_utf8(&oid)?.trim().to_owned();
+        let file = root.0.join(format!("synthetic-{size}.bin"));
+        fs::File::create(&file)?.set_len(size)?;
+        let id = native(&path, &["hash-object", "-w", file.to_str().unwrap()], b"")?;
+        let id = std::str::from_utf8(&id)?.trim().to_owned();
         assert_eq!(
-            native(&source.path, &["cat-file", "-s", &oid], b"")?,
+            native(&path, &["cat-file", "-s", &id], b"")?,
             format!("{size}\n").as_bytes()
         );
-        cases.push((oid, size));
-        fs::remove_file(path)?;
+        cases.push((id, size));
+        fs::remove_file(file)?;
     }
-    let expected = cases
-        .iter()
-        .map(|(oid, size)| format!("{oid}:{size}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let check = |workspace: &Scratch| -> Result<()> {
-        let result = Command::new("/usr/bin/prlimit")
-            .args(["--as=100663296", "--core=0", "--"])
-            .arg(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "large_loose_and_ref_delta_headers_fit_a_small_address_space",
-                "--test-threads=1",
-            ])
-            .env("MALLOC_ARENA_MAX", "1")
-            .env(SOURCE, &workspace.path)
-            .env(CASES, &expected)
-            .output()?;
-        assert!(
-            result.status.success(),
-            "headers must fit a 96 MiB address space without inflating 128 MiB blobs: {} {}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
-        Ok(())
-    };
-    check(&source)?;
-
     let ids = cases
         .iter()
-        .map(|(oid, _)| oid.clone() + "\n")
+        .map(|(id, _)| id.clone() + "\n")
         .collect::<String>();
-    let pack = native(
-        &source.path,
-        &[
-            "-c",
-            "pack.windowMemory=512m",
-            "pack-objects",
-            "--stdout",
-            "--window=4",
-            "--depth=8",
-            "--no-delta-base-offset",
-        ],
-        ids.as_bytes(),
-    )?;
-    native(&source.path, &["index-pack", "--stdin"], &pack)?;
-    let cache = git_rs::cache::Cache::new(1024 * 1024, 1024 * 1024);
-    let target = Scratch::new(&root.0, 1)?;
-    let mut pins = Vec::new();
-    for entry in fs::read_dir(source.path.join("objects/pack"))? {
-        let path = entry?.path();
-        if !matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("pack" | "idx")
-        ) {
-            continue;
-        }
-        if path.extension().is_some_and(|ext| ext == "idx") {
-            let inventory = native(
-                &source.path,
-                &["verify-pack", "-v", path.to_str().expect("fixture index")],
-                b"",
-            )?;
-            assert!(
-                inventory.split(|byte| *byte == b'\n').any(|line| {
-                    let fields = line
-                        .split(|byte| *byte == b' ')
-                        .filter(|field| !field.is_empty())
-                        .collect::<Vec<_>>();
-                    fields.len() == 7 && fields[0] == cases[2].0.as_bytes() && fields[1] == b"blob"
-                }),
-                "the oversized target must actually be a native ref-delta, not an undeltified base"
-            );
-        }
-        let bytes = fs::read(&path)?;
-        let mut input = bytes.as_slice();
-        let pin = cache
-            .get_or_load(
-                path.to_str().expect("fixture pack"),
-                bytes.len(),
-                |mut output| {
-                    std::io::copy(&mut input, &mut output)?;
-                    Ok(())
-                },
-            )?
-            .expect("compressed fixture must fit sealed RAM");
-        std::os::unix::fs::symlink(
-            pin.path(),
-            target
-                .path
-                .join("objects/pack")
-                .join(path.file_name().expect("pack filename")),
-        )?;
-        pins.push(pin);
-    }
-    assert_eq!(
-        pins.len(),
-        2,
-        "keep both verified pack/index mappings pinned"
+    pack(&path, ids.as_bytes())?;
+    let index = fs::read_dir(path.join("objects/pack"))?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "idx"))
+        .unwrap();
+    let inventory = native(&path, &["verify-pack", "-v", index.to_str().unwrap()], b"")?;
+    assert!(
+        inventory.split(|byte| *byte == b'\n').any(|line| {
+            let fields = line
+                .split(|byte| *byte == b' ')
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>();
+            fields.len() == 7 && fields[0] == cases[2].0.as_bytes() && fields[1] == b"blob"
+        }),
+        "oversized target must actually use native REF_DELTA"
     );
-    check(&target)?;
+    let expected = cases
+        .iter()
+        .map(|(id, size)| format!("{id}:{size}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let result = Command::new("/usr/bin/prlimit")
+        .args(["--as=100663296", "--core=0", "--"])
+        .arg(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "large_ref_delta_headers_fit_a_small_address_space",
+            "--test-threads=1",
+        ])
+        .env("MALLOC_ARENA_MAX", "1")
+        .env(SOURCE, &path)
+        .env(CASES, expected)
+        .output()?;
+    assert!(
+        result.status.success(),
+        "headers must fit 96 MiB without full inflation: {} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     Ok(())
 }

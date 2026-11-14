@@ -1,8 +1,11 @@
 use super::*;
+use crate::cache::Cache;
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -274,25 +277,23 @@ fn failed_response_integrity_does_not_poison_a_later_complete_fill() {
         Reply::Complete(b"complete".to_vec()),
     ]);
     let store = server.store();
-    let cache = Cache::new(4096, 8);
-    let directory = Directory::new();
-    let destination = directory.0.join("object");
     let hash = crate::protocol::hex(&openssl::sha::sha256(b"complete"));
+    let budget = git_rs_core::CapacityBudget::new(1024 * 1024);
+    let control = git_rs_core::Control::new(std::time::Instant::now() + Duration::from_secs(5));
     for _ in 0..3 {
         assert!(
             store
-                .materialize("repo", "object.pack", &hash, 8, &destination, &cache)
+                .source_bytes("object.pack", 8, &hash, &control, &budget)
                 .is_err()
         );
-        assert!(!destination.exists());
-        assert_eq!(cache.allocated(), 0);
+        assert_eq!(budget.used(), 0);
     }
     let entry = store
-        .materialize("repo", "object.pack", &hash, 8, &destination, &cache)
-        .unwrap()
+        .source_bytes("object.pack", 8, &hash, &control, &budget)
         .unwrap();
-    assert_eq!(fs::read(&destination).unwrap(), b"complete");
-    assert_eq!(fs::read(entry.path()).unwrap(), b"complete");
+    assert_eq!(entry.as_slice(), b"complete");
+    drop(entry);
+    assert_eq!(budget.used(), 0);
     assert_eq!(server.finish().len(), 4);
 }
 
@@ -303,6 +304,57 @@ fn bucket_policy_response_cannot_grow_past_its_budget() {
     let server = Server::new(vec![Reply::Complete(policy)]);
     assert!(server.store().require_unversioned().is_err());
     assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn only_an_empty_versioning_policy_authorizes_physical_cleanup() {
+    for policy in [
+        b"<VersioningConfiguration/>".as_slice(),
+        b"<?xml version=\"1.0\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"> \n<!-- never enabled -->\n</VersioningConfiguration>",
+    ] {
+        let server = Server::new(vec![Reply::Complete(policy.to_vec())]);
+        server.store().require_unversioned().unwrap();
+        assert_eq!(server.finish().len(), 1);
+    }
+    for policy in [
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".as_slice(),
+        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+        b"<VersioningConfiguration><Status/></VersioningConfiguration>",
+        b"<VersioningConfiguration>unknown</VersioningConfiguration>",
+    ] {
+        let server = Server::new(vec![Reply::Complete(policy.to_vec())]);
+        let error = server.store().require_unversioned().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::xml::VersioningBlocked>()
+                .is_some(),
+            "{error}"
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[test]
+fn malformed_or_recursive_policy_responses_fail_closed() {
+    let mut events = b"<VersioningConfiguration>".to_vec();
+    for _ in 0..512 {
+        events.extend_from_slice(b"<!-- event -->");
+    }
+    events.extend_from_slice(b"</VersioningConfiguration>");
+    for policy in [
+        b"<!DOCTYPE VersioningConfiguration [<!ENTITY policy 'enabled'>]><VersioningConfiguration/>".to_vec(),
+        b"<?policy unknown?><VersioningConfiguration/>".to_vec(),
+        b"<VersioningConfiguration/><VersioningConfiguration/>".to_vec(),
+        b"<VersioningConfiguration></Other>".to_vec(),
+        b"<VersioningConfiguration>".to_vec(),
+        b"<Error><Code>AccessDenied</Code></Error>".to_vec(),
+        [b"<VersioningConfiguration/>".as_slice(), &[0xff]].concat(),
+        events,
+    ] {
+        let server = Server::new(vec![Reply::Complete(policy)]);
+        assert!(server.store().require_unversioned().is_err());
+        assert_eq!(server.finish().len(), 1);
+    }
 }
 
 #[test]
@@ -458,24 +510,23 @@ fn cancelling_s3_headers_or_body_releases_the_cache_fill_before_the_server_repli
             release: released,
         }]);
         let store = server.store();
-        let directory = Directory::new();
         let cache = Cache::new(4096, 8);
         let operation = process::Operation::new(30);
         thread::scope(|scope| {
             let cache = &cache;
             let operation = &operation;
-            let destination = directory.0.join("download");
             scope.spawn(move || {
                 let failed = operation.enter(|| {
-                    store
-                        .materialize(
-                            "repo",
-                            "object.pack",
-                            &crate::protocol::hex(&openssl::sha::sha256(b"complete")),
-                            8,
-                            &destination,
-                            cache,
-                        )
+                    let control = git_rs_core::Control::new(operation.deadline());
+                    cache
+                        .get_or_load_controlled("object.pack", 8, &control, |bytes| {
+                            store.source_into(
+                                "object.pack",
+                                &crate::protocol::hex(&openssl::sha::sha256(b"complete")),
+                                bytes,
+                                &control,
+                            )
+                        })
                         .is_err()
                 });
                 completed.send(failed).unwrap();
@@ -492,6 +543,5 @@ fn cancelling_s3_headers_or_body_releases_the_cache_fill_before_the_server_repli
             0,
             "cancelled bytes must not remain cached"
         );
-        assert!(!directory.0.join("download").exists());
     }
 }

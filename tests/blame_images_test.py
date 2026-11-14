@@ -55,13 +55,13 @@ class ImageTests(unittest.TestCase):
                 header.size = len(data)
                 stream.addfile(header, io.BytesIO(data))
         archive = self.directory / "images.tar"
-        manifest = {"format": 1, "commit": self.commit, "images": ids,
+        manifest = {"format": 2, "commit": self.commit, "images": ids,
                     "dockerfile_sha256": images.gate.digest(images.ROOT / "Dockerfile"),
                     "archive_sha256": images.gate.digest(archive), "archive_bytes": archive.stat().st_size}
         (self.directory / "manifest.json").write_text(json.dumps(manifest))
         return manifest
 
-    def test_valid_archive_binds_both_ids_and_only_then_exports_environment(self):
+    def test_valid_archive_binds_all_ids_and_only_then_exports_environment(self):
         manifest = self.bundle()
         env_file = self.directory / "environment"
         calls = []
@@ -76,7 +76,10 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][:3], ["docker", "image", "load"])
         self.assertEqual(env_file.read_text(), "BLAME_GATE_BUILDER_IMAGE=" + manifest["images"]["test-fixture-build"]
-                         + "\nBLAME_GATE_IMAGE=" + manifest["images"]["test"] + "\n")
+                         + "\nBLAME_GATE_IMAGE=" + manifest["images"]["test"]
+                         + "\nGIT_RS_TEST_RUNTIME_IMAGE=" + manifest["images"]["release"]
+                         + "\nGIT_RS_TEST_RUNTIME_FIXTURE_IMAGE=" + manifest["images"]["test-server"]
+                         + "\nGIT_RS_TEST_REVISION=" + self.commit + "\n")
 
     def test_containerd_manifest_ids_are_verified_without_changing_declared_identity(self):
         manifest = self.bundle(oci=True)
@@ -152,12 +155,13 @@ class ImageTests(unittest.TestCase):
             Path(argv[argv.index("--iidfile") + 1]).write_text("sha256:" + "c" * 64)
 
         help_text = "--cgroup-parent --cpu-period --cpu-quota --cpuset-cpus --memory-swap --force-rm --iidfile --network --target"
-        with patch.object(images.gate, "verify_unit"), patch.object(images.gate, "checkout_identity"), \
+        with patch.object(images.gate, "verify_unit"), patch.object(images.gate, "checkout_identity", return_value=self.commit), \
                 patch.object(images, "output", return_value=help_text), patch.object(images, "run", side_effect=run), \
                 patch.object(images, "cleanup"), patch.object(os, "sched_getaffinity", return_value={2, 3}):
             images.build(args)
         argv = argv_seen[0]
         for flag, value in [("--cgroup-parent", self.slice), ("--network", "host"),
+                             ("--build-arg", "VCS_REF=" + self.commit),
                             ("--cpu-quota", "180000"), ("--memory", "3712m"),
                             ("--memory-swap", "3712m"), ("--cpuset-cpus", "2,3")]:
             self.assertEqual(argv[argv.index(flag) + 1], value)

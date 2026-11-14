@@ -34,6 +34,7 @@ pub enum WarningKind {
     MissingTagger,
     BadTagName,
     BadFileMode,
+    GitmodulesParse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub(super) struct Edge {
     pub id: ObjectId,
     pub kind: Kind,
     pub parent: bool,
+    pub gitmodules: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -79,6 +81,7 @@ pub(super) fn inspect(
                 id: tree,
                 kind: Kind::Tree,
                 parent: false,
+                gitmodules: false,
             })?;
             for parent in commit.parents {
                 control.check()?;
@@ -88,6 +91,7 @@ pub(super) fn inspect(
                     id: parent,
                     kind: Kind::Commit,
                     parent: true,
+                    gitmodules: false,
                 })?;
             }
         }
@@ -116,6 +120,7 @@ pub(super) fn inspect(
                 id: target,
                 kind: tag.target_kind,
                 parent: false,
+                gitmodules: false,
             })?;
         }
         Kind::Tree => tree(bytes, id, control, budget, max_entries, edge, warning)?,
@@ -316,6 +321,10 @@ fn tree(
                 check()
             },
         )?;
+        let gitmodules = super::gitmodules::is_name(entry.filename, control)?;
+        if gitmodules && kind != Kind::Blob {
+            return Err(invalid("non-blob at .gitmodules"));
+        }
         let is_tree = kind == Kind::Tree;
         if let Some((prior, prior_tree)) = previous
             && name_order(prior, prior_tree, name, is_tree, control)? != std::cmp::Ordering::Less
@@ -336,6 +345,7 @@ fn tree(
                 id: entry.oid.to_owned(),
                 kind,
                 parent: false,
+                gitmodules,
             })?;
         }
         previous = Some((name, is_tree));

@@ -1019,11 +1019,14 @@ fn owned_source_last_cancelled_waiter_retains_real_barrier_until_worker_stops() 
         1,
         "request cancellation released actual running source ownership"
     );
-    assert_eq!(fs_count(&fixture.engine.scratch_root), 1);
+    assert!(
+        fixture.source_files().is_empty(),
+        "a running source uses no request repository"
+    );
     gate.open();
     until(|| fixture.engine.blame.admitted() == 0);
     assert_eq!(fixture.leases(), 0);
-    assert_eq!(fs_count(&fixture.engine.scratch_root), 0);
+    assert!(fixture.source_files().is_empty());
     drop(fixture.complete());
     assert_eq!(fixture.leases(), 0);
 }
@@ -1081,7 +1084,7 @@ fn owned_source_queued_discard_reuses_two_plus_one_capacity_without_source_acqui
     assert_eq!(fixture.engine.blame.waiters(), 2);
     assert_eq!(sources.preparing.load(Ordering::Acquire), 2);
     assert_eq!(fixture.leases(), 2);
-    assert_eq!(fs_count(&fixture.engine.scratch_root), 2);
+    assert!(fixture.source_files().is_empty());
     let replacement = request("path=replacement", Operation::new(10));
     until(|| fixture.engine.blame.waiters() == 3);
     assert_eq!(fixture.engine.blame.admitted(), 3);
@@ -1111,7 +1114,7 @@ fn owned_source_queued_discard_reuses_two_plus_one_capacity_without_source_acqui
     until(|| fixture.engine.blame.admitted() == 0);
     assert_eq!(fixture.engine.blame.waiters(), 0);
     assert_eq!(fixture.leases(), 0);
-    assert_eq!(fs_count(&fixture.engine.scratch_root), 0);
+    assert!(fixture.source_files().is_empty());
 }
 
 #[test]
@@ -1187,7 +1190,8 @@ fn owned_source_http_disconnect_reuses_queue_while_both_cpu_workers_remain_gated
     let mut second = request("missing");
     acquired.recv_timeout(Duration::from_secs(3)).unwrap();
     acquired.recv_timeout(Duration::from_secs(3)).unwrap();
-    until(|| fixture.leases() == 2 && fs_count(&fixture.engine.scratch_root) == 2);
+    until(|| fixture.leases() == 2);
+    assert!(fixture.source_files().is_empty());
     let cancelled = request("cancelled");
     until(|| fixture.engine.blame.waiters() == 3);
     assert_eq!(fixture.engine.blame.admitted(), 3);
@@ -1208,7 +1212,7 @@ fn owned_source_http_disconnect_reuses_queue_while_both_cpu_workers_remain_gated
         fixture.engine.blame.waiters()
     );
     assert_eq!(fixture.leases(), 2);
-    assert_eq!(fs_count(&fixture.engine.scratch_root), 2);
+    assert!(fixture.source_files().is_empty());
     let mut replacement = request("replacement");
     until(|| fixture.engine.blame.waiters() == 3);
     assert_eq!(fixture.engine.blame.admitted(), 3);
@@ -1238,11 +1242,7 @@ fn owned_source_http_disconnect_reuses_queue_while_both_cpu_workers_remain_gated
     assert_eq!(fixture.engine.blame.waiters(), 0);
     assert_eq!(active.load(Ordering::Acquire), 0);
     assert_eq!(fixture.leases(), 0);
-    assert_eq!(fs_count(&fixture.engine.scratch_root), 0);
-}
-
-fn fs_count(path: &std::path::Path) -> usize {
-    std::fs::read_dir(path).unwrap().count()
+    assert!(fixture.source_files().is_empty());
 }
 
 #[test]
@@ -1347,7 +1347,7 @@ fn owned_source_http_blocked_output_keeps_hold_until_deadline_and_write_ack() {
     assert!(partial.len() < fixture.expected.len());
     until(|| fixture.engine.blame.admitted() == 0);
     assert_eq!(fixture.leases(), 0);
-    assert_eq!(fs_count(&fixture.engine.scratch_root), 0);
+    assert!(fixture.source_files().is_empty());
 }
 
 #[test]
@@ -1375,6 +1375,7 @@ fn owned_source_s3_integrity_failure_has_no_complete_result_and_recovers() {
         bytes[0] ^= 1;
         std::fs::write(&corrupt, bytes).unwrap();
         fixture.put(&key, &corrupt);
+        std::fs::remove_file(corrupt).unwrap();
         let result = Operation::new(10).enter(|| {
             fixture
                 .engine

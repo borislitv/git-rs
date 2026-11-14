@@ -205,10 +205,22 @@ impl<T: Send + Sync + 'static> Jobs<T> {
         if !(1..=3600).contains(&seconds) {
             return Err(invalid("invalid background deadline"));
         }
+        self.try_background_until(Instant::now() + Duration::from_secs(seconds), prepare)
+    }
+
+    pub(crate) fn try_background_until(
+        &self,
+        deadline: Instant,
+        prepare: impl FnOnce(&Control, &CapacityBudget) -> Result<()> + Send + 'static,
+    ) -> Result<bool> {
+        let now = Instant::now();
+        if deadline <= now || deadline.duration_since(now) > Duration::from_secs(3600) {
+            return Err(invalid("invalid background deadline"));
+        }
         let Some(permit) = self.cpu.admission.try_admit() else {
             return Ok(false);
         };
-        let operation = process::Operation::new(seconds);
+        let operation = process::Operation::until(deadline);
         let control = Control::new(operation.deadline());
         let background = Background {
             prepare,

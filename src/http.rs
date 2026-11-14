@@ -288,7 +288,6 @@ fn handle_bounded(
     stream.set_read_timeout(Some(remaining))?;
     stream.set_write_timeout(Some(remaining))?;
     let mut input = BufReader::new(stream.try_clone()?);
-    let interrupt = stream.try_clone()?;
     let request = match Request::parse(&mut input) {
         Ok(request) => request,
         Err(_) => {
@@ -313,21 +312,14 @@ fn handle_bounded(
     if let Action::Blame(query) = &request.action {
         return handle_blame(stream, engine, principal, &request.slug, query, timer);
     }
-    let Action::Git(cgi) = &request.action else {
-        return Err(invalid("invalid Git HTTP action"));
-    };
-    let result = engine.run(
-        &request.slug,
-        principal,
-        request.service,
-        &request.protocol,
-        Some(cgi),
-        &mut request.body(&mut input),
-        stream,
-        &|| {
-            let _ = interrupt.shutdown(std::net::Shutdown::Read);
-        },
-    );
+    if request.service == crate::auth::Service::Receive {
+        let result = engine.receive_http(&request, principal, &mut input, stream);
+        if result.is_ok() {
+            timer.outcome(Outcome::Success);
+        }
+        return result;
+    }
+    let result = crate::upload::http(engine, &request, principal, &mut input, stream);
     if result.is_ok() {
         timer.outcome(Outcome::Success);
     }

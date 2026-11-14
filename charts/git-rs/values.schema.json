@@ -33,12 +33,49 @@
     "tolerations": {"type": "array"},
     "affinity": {"type": "object"},
     "resources": {"type": "object"},
-    "scratch": {"type": "object", "additionalProperties": false, "properties": {"sizeLimit": {"type": "string", "minLength": 1}}},
     "cacheBytes": {"type": "integer", "minimum": 0, "maximum": 1073741824},
     "operationSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
-    "packThreads": {"type": "integer", "minimum": 1, "maximum": 4},
+    "cpu": {"type": "object", "additionalProperties": false, "properties": {
+      "concurrency": {"type": "integer", "minimum": 1, "maximum": 4},
+      "waiters": {"type": "integer", "minimum": 0, "maximum": 3}
+    }},
     "debugTimings": {"type": "boolean"},
     "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+    "maintenance": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "replicaCount": {"type": "integer", "minimum": 1, "maximum": 8},
+        "leaseName": {"type": "string", "maxLength": 253, "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"},
+        "serviceAccount": {"type": "object", "additionalProperties": false, "properties": {
+          "create": {"type": "boolean"}, "name": {"type": "string", "maxLength": 253, "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"}
+        }},
+        "tokenAudience": {"type": "string", "maxLength": 256},
+        "leaseSeconds": {"type": "integer", "minimum": 20, "maximum": 300},
+        "renewGraceSeconds": {"type": "integer", "minimum": 1, "maximum": 299},
+        "expirySafetySeconds": {"type": "integer", "minimum": 1, "maximum": 10},
+        "pgFenceLeaseSeconds": {"type": "integer", "minimum": 10, "maximum": 120},
+        "heartbeatSeconds": {"type": "integer", "minimum": 1, "maximum": 30},
+        "jobLeaseSeconds": {"type": "integer", "minimum": 10, "maximum": 120},
+        "jobSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "sourceConcurrency": {"const": 1},
+        "scanBatch": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "scanSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "scanBudgetMillis": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "deleteBatch": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "cacheBytes": {"type": "integer", "minimum": 0, "maximum": 536870912},
+        "shutdownSeconds": {"type": "integer", "minimum": 60, "maximum": 120},
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 70, "maximum": 180},
+        "scratch": {"type": "object", "additionalProperties": false, "properties": {
+          "medium": {"enum": ["Memory", ""]}, "sizeLimit": {"type": "string", "minLength": 1}
+        }},
+        "resources": {"type": "object"},
+        "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"}
+      }
+    },
     "ssh": {
       "type": "object", "additionalProperties": false,
       "properties": {
@@ -137,7 +174,8 @@
       "type": "object", "additionalProperties": false,
       "properties": {
         "enabled": {"type": "boolean"},
-        "activeDeadlineSeconds": {"type": "integer", "minimum": 1}
+        "activeDeadlineSeconds": {"type": "integer", "minimum": 1},
+        "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}}
       }
     }
   }

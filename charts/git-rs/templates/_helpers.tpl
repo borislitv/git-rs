@@ -22,6 +22,31 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{- define "git-rs.maintenanceSelectorLabels" -}}
+app.kubernetes.io/name: git-rs-maintenance
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: maintenance
+{{- end -}}
+
+{{- define "git-rs.maintenanceLabels" -}}
+{{ include "git-rs.maintenanceSelectorLabels" . }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "git-rs.maintenanceServiceAccount" -}}
+{{- if .Values.maintenance.serviceAccount.create -}}
+{{- default (printf "%s-maintenance" (include "git-rs.fullname" .)) .Values.maintenance.serviceAccount.name -}}
+{{- else -}}
+{{- required "maintenance.serviceAccount.name is required when create=false" .Values.maintenance.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "git-rs.maintenanceLease" -}}
+{{- default (printf "%s-source" (include "git-rs.fullname" .)) .Values.maintenance.leaseName -}}
+{{- end -}}
+
 {{- define "git-rs.serviceAccount" -}}
 {{- if .Values.serviceAccount.create -}}
 {{- default (include "git-rs.fullname" .) .Values.serviceAccount.name -}}

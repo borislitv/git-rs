@@ -10,6 +10,11 @@ spec:
   activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
   backoffLimit: 12
   template:
+    {{- with .Values.migration.podAnnotations }}
+    metadata:
+      annotations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
     spec:
       serviceAccountName: {{ include "git-rs.serviceAccount" . }}
       automountServiceAccountToken: false

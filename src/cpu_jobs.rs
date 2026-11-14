@@ -55,15 +55,16 @@ impl std::error::Error for Failed {
 
 /// Trusted, finite CPU work with owned captures, not a transport callback.
 ///
-/// Implementations must poll `control` in bounded quanta and cannot block on
-/// socket/SQL/source acquisition or create nested workers. Acquire/materialize
-/// bounded input outside the callback, then move source pins, scratch and input
+/// Implementations must poll `control` in bounded quanta and cannot perform
+/// SQL/source authorization acquisition or create nested workers. Acquire
+/// authorized source holds outside the callback, then move source pins and input
 /// into this owner. Return any resources needed by publication in `Output`.
 /// Captured storage must already be admitted/bounded at its input boundary; the
 /// supplied CPU-phase budget does not retrospectively charge opaque captures.
 /// Destructors/cleanup must also be bounded: cancellation cannot preempt opaque
-/// I/O or arbitrary Drop. Interactive jobs use the explicit `CpuIoJob` seam,
-/// never lifetime erasure or an unbounded blocking Read in this callback.
+/// I/O or arbitrary Drop. Physical source reads use the controlled range adapter,
+/// and stream writes use the admission's poll-bounded StreamOutput. Interactive
+/// reads use CpuIoJob, never lifetime erasure or an arbitrary blocking Read.
 pub trait CpuJob: Send + 'static {
     type Output: Send + 'static;
 
@@ -71,9 +72,10 @@ pub trait CpuJob: Send + 'static {
 }
 
 /// Trusted interactive work on the SAME pool. The only transport read is the
-/// supplied owned, poll-bounded ReceiveInput. Do not perform SQL/source/network
-/// acquisition, use arbitrary stdio, or start nested workers here. Stop after
-/// the core command/single-pack boundary, not after client/socket EOF. Neither
+/// supplied owned, poll-bounded ReceiveInput. Do not acquire SQL/source authority,
+/// use arbitrary stdio, or start nested workers here. Immutable range reads and
+/// StreamOutput preserve that same admission and absolute stop context. Stop at
+/// the protocol boundary, not at client/socket EOF. Neither
 /// this trait nor a successful read grants EOF/publication authority.
 pub trait CpuIoJob: Send + 'static {
     type Output: Send + 'static;

@@ -13,6 +13,7 @@ import pwd
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -32,6 +33,9 @@ S3_IMAGE = "versity/versitygw@sha256:89cad13cc981986ee284cbafea4613f9533ce6fd5f3
 
 
 def command(args, *, env=None, cwd=None, data=None, ok=True):
+    if args[0] == "docker":
+        env = dict(env or os.environ, DOCKER_HOST="unix:///var/run/docker.sock")
+        env.pop("DOCKER_CONTEXT", None)
     result = subprocess.run([str(a) for a in args], input=data, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, cwd=cwd, timeout=180)
     if ok and result.returncode:
@@ -63,6 +67,50 @@ def metric_value(body, series):
     values = [float(line[len(prefix):]) for line in body.splitlines() if line.startswith(prefix)]
     assert len(values) == 1, f"expected exactly one metric series: {series}"
     return values[0]
+
+
+def health_framing_test(f, name):
+    """Real TCP framing, not an in-memory request-line parser test."""
+    address = ("127.0.0.1", f.health_ports[name])
+    with socket.create_connection(address, timeout=3) as peer:
+        peer.sendall(b"GET /livez HTTP/1.1\r\n")
+        assert not select.select([peer], [], [], 0.2)[0], "health replied before complete headers"
+        peer.sendall(b"Host: fixture.invalid\r\nX-Probe: fragmented\r\nContent-Length: 0\r\n\r\n")
+        reply = http.client.HTTPResponse(peer)
+        reply.begin()
+        body = reply.read()
+        assert (reply.status, body) == (200, b"live\n")
+        assert int(reply.getheader("Content-Length")) == len(body)
+        assert reply.getheader("Connection") == "close"
+        assert peer.recv(1) == b"", "health must close after its complete response"
+    for label, headers in [
+        ("missing colon", b"invalid-header\r\n\r\n"),
+        ("invalid name", b"Bad Name: value\r\n\r\n"),
+        ("control byte", b"X-Probe: bad\x01value\r\n\r\n"),
+        ("oversized line", b"X-Probe: " + b"a" * 8192 + b"\r\n\r\n"),
+        ("oversized total", (b"X-Probe: " + b"a" * 8000 + b"\r\n") * 3 + b"\r\n"),
+        ("too many headers", b"X-Probe: value\r\n" * 65 + b"\r\n"),
+        ("unexpected body", b"Content-Length: 1\r\n\r\nx"),
+        ("transfer encoding", b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+    ]:
+        with socket.create_connection(address, timeout=3) as peer:
+            try:
+                peer.sendall(b"GET /livez HTTP/1.1\r\n" + headers)
+                peer.shutdown(socket.SHUT_WR)
+                response = peer.recv(4096)
+            except (BrokenPipeError, ConnectionResetError):
+                response = b""
+            assert not response.startswith(b"HTTP/1.1 200"), (label, response)
+    with socket.create_connection(address, timeout=3) as peer:
+        start = time.monotonic()
+        peer.sendall(b"GET /livez HTTP/1.1\r\nHost: incomplete")
+        try:
+            response = peer.recv(4096)
+        except ConnectionResetError:
+            response = b""
+        assert response == b"", "incomplete headers must not receive success"
+        assert time.monotonic() - start < 2.5, "health must retain its one-second absolute interrupt"
+    f.results["health_complete_bounded_headers_and_connection_close"] = True
 
 
 class Balancer(socketserver.ThreadingTCPServer):
@@ -98,26 +146,101 @@ class Relay(socketserver.BaseRequestHandler):
 
 
 class Fixture:
-    def __init__(self, base, binary):
-        self.base, self.binary = base, str(binary)
+    def __init__(self, base, binary, *, runtime_image=None, runtime_fixture_image=None, revision=None):
+        self.base, self.binary = Path(base).resolve(), str(binary)
         self.containers, self.processes, self.logs = [], [], []
         self.daemons, self.health_ports = {}, {}
         self.results = {}
         self.blame_fixture_binary = None
+        self.lease_fixture = None
         self.blame_core_resources = False
         self.identity = uuid.uuid4().hex
-        self.containers_started = False
+        self.containers_started = bool(runtime_image)
         self.env = {k: v for k, v in os.environ.items() if k in ["PATH", "LANG", "TERM"]}
         self.env.update(HOME=str(base), LC_ALL="C", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
                         GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Test Author",
-                        GIT_AUTHOR_EMAIL="author@example.invalid", GIT_COMMITTER_NAME="Test Author",
-                        GIT_COMMITTER_EMAIL="author@example.invalid", GIT_RS_CACHE_BYTES="1048576",
-                         GIT_RS_DEV_HTTP="1", GIT_RS_PACK_THREADS="4", GIT_RS_S3_ACCESS_KEY="test-access",
+                         GIT_AUTHOR_EMAIL="author@example.invalid", GIT_COMMITTER_NAME="Test Author",
+                         GIT_COMMITTER_EMAIL="author@example.invalid", GIT_RS_CACHE_BYTES="1048576",
+                         GIT_RS_DEV_HTTP="1", GIT_RS_BLAME_CONCURRENCY="1", GIT_RS_BLAME_WAITERS="0",
+                         GIT_RS_S3_ACCESS_KEY="test-access",
                         GIT_RS_S3_SECRET_KEY="synthetic-secret-key", GIT_RS_S3_BUCKET="git-test",
                         PGHOST="127.0.0.1", PGUSER="postgres", PGDATABASE="git_rs",
                         PGPASSWORD="development-only", PGSSLMODE="disable", PGCONNECT_TIMEOUT="2",
                         PGGSSENCMODE="disable")
-        (base / "scratch").mkdir(mode=0o700)
+        self.server = self.base / "server"
+        self.server.mkdir(mode=0o700)
+        self.runtime = None
+        if runtime_image:
+            from runtime_process import Runtime
+            self.runtime = Runtime(self.server, self.identity, runtime_image, runtime_fixture_image,
+                                   revision, self.containers.append)
+            self.results["server_images"] = {"runtime": self.runtime.image,
+                                             "fixture": self.runtime.fixture_image,
+                                             "revision": revision}
+
+    def socket(self, name):
+        return self.server / f"{name}.sock"
+
+    def spawn(self, arguments, *, log, env=None, fixture_program=None):
+        if self.runtime:
+            child = self.runtime.start(arguments, env or self.env, log, program=fixture_program)
+        else:
+            child = subprocess.Popen([fixture_program or self.binary, *map(str, arguments)],
+                                     env=env or self.env, stdout=log, stderr=log)
+        self.processes.append(child)
+        return child
+
+    def process_status(self, child):
+        if self.runtime and hasattr(child, "process_status"):
+            return child.process_status()
+        return Path(f"/proc/{child.pid}/status").read_text()
+
+    def bridge_command(self, socket, principal="alice"):
+        # This Rust program is an external transport client, not a backend. In
+        # particular OpenSSH need not delegate Docker privileges to its login
+        # session just to forward the authenticated byte stream to this socket.
+        return [self.binary, "ssh", "--socket", str(socket), "--principal", principal]
+
+    def write_bridge(self, path, socket, principal="alice"):
+        path.write_text("#!/bin/sh\nexec " + shlex.join(self.bridge_command(socket, principal)) + "\n")
+        path.chmod(0o700)
+
+    def assert_no_repository_bridge(self):
+        unexpected = [str(path.relative_to(self.server)) for path in self.server.rglob("*")
+                      if path.name in {"objects", ".git"} or path.suffix in {".pack", ".idx"}
+                      or path.name.startswith(("instance-", "request-"))]
+        assert not unexpected, ("serving created a filesystem repository bridge", unexpected)
+
+    def configure_maintenance(self, cluster):
+        from maintenance_fixture import LeaseFixture
+        assert self.runtime and self.lease_fixture is None
+        directory = self.base / "maintenance-fixture"
+        directory.mkdir(mode=0o700)
+        self.lease_fixture = LeaseFixture(cluster, directory)
+        self.lease_fixture.setup()
+
+    def cleanup(self, slug, principal="alice", *, expected="succeeded"):
+        assert self.runtime and self.lease_fixture, "cleanup execution requires real named-Lease credentials"
+        queued = self.cli("cleanup", slug, principal).stdout.decode().rstrip("\n").split("\t")
+        assert len(queued) == 3 and queued[1:] == ["queued", ""], queued
+        identifier = queued[0]
+        # Other previously queued repositories/retirements remain legitimate work.
+        # Bound dispatch count rather than deleting their durable queue history.
+        deadline = time.monotonic() + 120
+        for attempt in range(16):
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "maintenance dispatch exceeded its absolute fixture deadline"
+            env = {**self.env, **self.lease_fixture.environment,
+                   "GIT_RS_POD_UID": "fixture-" + uuid.uuid4().hex}
+            result = self.runtime.execute(["maintenance", "--scratch", str(self.server / "maintenance"),
+                                           "--health", "127.0.0.1:0", "--once", "--wait", "30"], env,
+                                          timeout=min(90, remaining), service_account=self.lease_fixture.account)
+            (self.base / f"maintenance-{identifier}-{attempt}.log").write_bytes(result.stdout + result.stderr)
+            state = self.sql("SELECT state,coalesce(error_code,'') FROM git_rs.maintenance_jobs WHERE id='" + identifier + "'").split("|")
+            if state[0] in {"succeeded", "retry", "dead"}:
+                assert state[0] == expected, state
+                return identifier, state[1]
+        raise AssertionError("requested maintenance job was not dispatched within the bounded queue window")
 
     def setup(self, provision):
         self.check_native_git()
@@ -166,7 +289,7 @@ class Fixture:
         owned = ["--label", "git-rs.integration-fixture=" + self.identity]
         if os.environ.get("GIT_RS_TEST_OWNER_LABEL"):
             owned += ["--label", os.environ["GIT_RS_TEST_OWNER_LABEL"]]
-        if self.blame_core_resources:
+        if self.blame_core_resources or os.environ.get("GIT_RS_TEST_OWNER_LABEL"):
             pg = PG_IMAGE in args
             memory = "1024m" if pg else "512m"
             owned += ["--pull=never", "--cpuset-cpus", os.environ.get("GIT_RS_TEST_SERVICE_CPUS", ",".join(map(str, sorted(os.sched_getaffinity(0))[:2]))),
@@ -194,8 +317,10 @@ class Fixture:
             args += ["--upload-file", str(data)]
         return command(args, data=config.encode(), ok=ok)
 
-    def cli(self, *args, ok=True):
-        return command([self.binary, *args], env=self.env, ok=ok)
+    def cli(self, *args, ok=True, env=None, data=None):
+        if self.runtime:
+            return self.runtime.execute(list(map(str, args)), env or self.env, data=data, ok=ok)
+        return command([self.binary, *args], env=env or self.env, data=data, ok=ok)
 
     def git(self, path, *args, ok=True, env=None):
         return command(["git", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-C", path, *args], env=env or self.env, ok=ok)
@@ -207,11 +332,8 @@ class Fixture:
         log_path = self.base / f"{name}.log"
         log = log_path.open("wb")
         self.logs.append(log)
-        process = subprocess.Popen([self.binary, "serve", "--scratch", str(self.base / "scratch"),
-                                   "--socket", str(self.base / f"{name}.sock"), "--health", "127.0.0.1:0",
-                                   "--dev-http", "127.0.0.1:0",
-                                   "--dev-principal", principal], env=self.env, stdout=log, stderr=log)
-        self.processes.append(process)
+        process = self.spawn(["serve", "--socket", str(self.socket(name)), "--health", "127.0.0.1:0",
+                              "--dev-http", "127.0.0.1:0", "--dev-principal", principal], log=log)
 
         def ready():
             if process.poll() is not None:
@@ -224,20 +346,21 @@ class Fixture:
         return process, int(ready().group(1))
 
     def start_blame(self, name, *, control=None, phase="source", seconds=30,
-                    concurrency=2, waiters=1, cache=False, principal="alice"):
-        assert self.blame_fixture_binary, "--blame-fixture-binary prebuilt test example is required"
+                    concurrency=2, waiters=1, cache=False, principal="alice", extra=()):
+        assert self.blame_fixture_binary or self.runtime, "a prebuilt blame fixture is required"
         path = self.base / f"{name}.log"
         log = path.open("xb")
         self.logs.append(log)
-        args = [str(self.blame_fixture_binary), "--scratch", str(self.base / "scratch"),
-                "--socket", str(self.base / f"{name}.sock"), "--seconds", str(seconds),
+        args = ["--socket", str(self.socket(name)), "--seconds", str(seconds),
                 "--concurrency", str(concurrency), "--waiters", str(waiters), "--principal", principal]
         if control is not None:
             args += ["--control", str(control), "--phase", phase]
         if cache:
             args.append("--cache")
-        child = subprocess.Popen(args, env=self.env, stdout=log, stderr=log)
-        self.processes.append(child)
+        args.extend(map(str, extra))
+        program = ("/usr/local/bin/examples/blame-http-fixture" if self.runtime
+                   else str(self.blame_fixture_binary))
+        child = self.spawn(args, log=log, fixture_program=program)
         def ready():
             if child.poll() is not None:
                 raise AssertionError(path.read_text())
@@ -268,47 +391,83 @@ class Fixture:
         for name in list(self.daemons):
             self.stop(name)
 
-    def record_memory(self):
+    def record_memory(self, max_bytes=64 * 1024 * 1024):
         peaks = []
         for process in self.daemons.values():
             if process.poll() is None:
-                status = Path(f"/proc/{process.pid}/status").read_text()
+                status = self.process_status(process)
                 peaks.append(int(re.search(r"VmHWM:\s+(\d+)", status).group(1)) * 1024)
         if peaks:
             self.results["maximum_rust_daemon_hwm_bytes"] = max(peaks)
-            assert max(peaks) < 64 * 1024 * 1024, peaks
+            self.results["rust_daemon_hwm_limit_bytes"] = max_bytes
+            assert max(peaks) < max_bytes, peaks
 
     def close(self):
-        for process in reversed(self.processes):
-            if process.poll() is None:
-                process.terminate()
-        for process in reversed(self.processes):
+        if sys.exception() is not None:
+            self.results["status"] = "failed"
+        failures = []
+
+        def attempt(action):
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                return action()
+            except BaseException as error:
+                failures.append(error)
+                return None
+
+        for process in reversed(self.processes):
+            def terminate(process=process):
+                if process.poll() is None:
+                    process.terminate()
+            attempt(terminate)
+        for process in reversed(self.processes):
+            def reap(process=process):
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            attempt(reap)
         for log in self.logs:
-            log.close()
+            attempt(log.close)
         identifiers = set(self.containers)
         if self.containers_started:
-            recovered = command(["docker", "ps", "-aq", "--filter",
-                                 "label=git-rs.integration-fixture=" + self.identity], ok=False)
-            identifiers.update(recovered.stdout.decode().split())
-        if self.blame_core_resources:
-            for identifier in identifiers:
-                resources = command(["docker", "inspect", identifier], ok=False)
-                (self.base / (identifier[:12] + ".resources.json")).write_bytes(resources.stdout)
-                diagnostic = command(["docker", "logs", "--tail", "100", identifier], ok=False)
-                (self.base / (identifier[:12] + ".log")).write_bytes(
-                    diagnostic.stdout[-16384:] + diagnostic.stderr[-16384:])
+            recovered = attempt(lambda: command(["docker", "ps", "-aq", "--no-trunc", "--filter",
+                                                 "label=git-rs.integration-fixture=" + self.identity]))
+            if recovered is not None:
+                identifiers.update(recovered.stdout.decode().split())
         for identifier in identifiers:
-            command(["docker", "rm", "-f", identifier], ok=False)
+            def remove(identifier=identifier):
+                assert re.fullmatch(r"[0-9a-f]{64}", identifier), "invalid integration container identity"
+                inspection = command(["docker", "inspect", identifier])
+                rows = json.loads(inspection.stdout)
+                assert len(rows) == 1 and rows[0]["Id"] == identifier, "integration container identity changed"
+                assert (rows[0]["Config"].get("Labels") or {}).get("git-rs.integration-fixture") == self.identity, \
+                    "foreign integration container must be preserved"
+                if self.blame_core_resources:
+                    (self.base / (identifier[:12] + ".resources.json")).write_bytes(inspection.stdout)
+                    diagnostic = command(["docker", "logs", "--tail", "100", identifier], ok=False)
+                    (self.base / (identifier[:12] + ".log")).write_bytes(
+                        diagnostic.stdout[-16384:] + diagnostic.stderr[-16384:])
+                command(["docker", "rm", "-f", identifier])
+            attempt(remove)
         if self.containers_started:
-            left = command(["docker", "ps", "-aq", "--filter",
-                            "label=git-rs.integration-fixture=" + self.identity]).stdout.strip()
-            assert not left, "owned integration containers remain after cleanup"
-            self.results["owned_containers_removed"] = True
+            def confirm():
+                left = command(["docker", "ps", "-aq", "--filter",
+                                "label=git-rs.integration-fixture=" + self.identity]).stdout.strip()
+                assert not left, "owned integration containers remain after cleanup"
+            attempt(confirm)
+            if not failures:
+                self.results["owned_containers_removed"] = True
+        if self.lease_fixture and not failures:
+            attempt(self.lease_fixture.close)
+        if failures:
+            self.results["status"] = "failed"
+            self.results["cleanup_errors"] = [type(error).__name__ for error in failures]
+            original = sys.exception()
+            if original is not None:
+                original.add_note("Integration cleanup also failed: " + ", ".join(self.results["cleanup_errors"]))
+            else:
+                raise failures[0]
 
 
 def pkt(payload):
@@ -406,6 +565,11 @@ def generate(path, mib, seed):
 
 
 def exercise(f, large_mib, skip_ssh):
+    # Four simultaneous pushes are a success/concurrency gate, not the separate
+    # fail-fast saturation contract. One CPU worker plus three admitted waiters
+    # fits the existing four-request transport bound without adding workers.
+    f.env["GIT_RS_BLAME_WAITERS"] = "3"
+    f.results["shared_cpu_capacity"] = {"workers": 1, "waiters": 3}
     f.cli("migrate")
     print("schema and stateless Smart HTTP", flush=True)
     f.cli("create", "team/project", "alice")
@@ -473,8 +637,8 @@ def exercise(f, large_mib, skip_ssh):
     assert f.git(source, "push", "--force", url, "HEAD~1:refs/heads/main", ok=False).returncode
     assert f.git(source, "ls-remote", url).stdout == before
     bridge_env = dict(f.env, SSH_ORIGINAL_COMMAND="git-upload-pack 'team/missing.git'")
-    assert command([f.binary, "ssh", "--socket", f.base / "a.sock", "--principal", "alice"], env=bridge_env, data=b"", ok=False).returncode != 0
-    assert f.cli("serve", "--scratch", str(f.base / "scratch"), "--socket", str(f.base / "a.sock"), ok=False).returncode != 0
+    assert f.cli("ssh", "--socket", f.socket("a"), "--principal", "alice", env=bridge_env, data=b"", ok=False).returncode != 0
+    assert f.cli("serve", "--socket", f.socket("a"), ok=False).returncode != 0
     start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(lambda i: f.git(source, "push", url, f"HEAD:refs/heads/parallel-{i}"), range(8)))
@@ -507,11 +671,11 @@ def exercise(f, large_mib, skip_ssh):
     if not skip_ssh:
         print("restricted OpenSSH transport", flush=True)
         ssh_test(f, source, before)
-    backup = f.base / "repository.bundle"
-    print("native bundle backup and restore", flush=True)
-    f.cli("backup", "team/project", "alice", "--scratch", str(f.base / "scratch"), "--output", str(backup))
+    backup = f.server / "repository.bundle"
+    print("Rust bundle backup and native restore", flush=True)
+    f.cli("backup", "team/project", "alice", "--output", str(backup))
     backup_digest = hashlib.sha256(backup.read_bytes()).digest()
-    assert f.cli("backup", "team/project", "alice", "--scratch", str(f.base / "scratch"), "--output", str(backup), ok=False).returncode
+    assert f.cli("backup", "team/project", "alice", "--output", str(backup), ok=False).returncode
     assert hashlib.sha256(backup.read_bytes()).digest() == backup_digest
     assert backup.stat().st_mode & 0o777 == 0o600
     restored = f.base / "restored.git"
@@ -531,7 +695,6 @@ def exercise(f, large_mib, skip_ssh):
         'git_rs_dependency_duration_seconds_count{operation="sql"}',
         'git_rs_dependency_duration_seconds_count{operation="s3_get"}',
         'git_rs_dependency_duration_seconds_count{operation="s3_put"}',
-        'git_rs_subprocess_duration_seconds_count{program="git"}',
         'git_rs_cache_lookups_total{result="hit"}',
         'git_rs_s3_transferred_bytes_total{direction="download"}',
         'git_rs_s3_transferred_bytes_total{direction="upload"}',
@@ -539,12 +702,20 @@ def exercise(f, large_mib, skip_ssh):
         assert sum(metric_value(body, series) for body in scrapes) > 0, series
     for stage in [
         "sql_init", "sql_acquire", "sql_query", "sql_reset", "lease_commit", "catalog_read",
-        "lease_release", "cache_fill", "cache_link", "object_hash", "restore_refs", "hook_setup",
-        "git_input", "git_output", "git_wait", "ref_validate", "tip_validate", "fast_forward",
-        "scratch_cleanup", "process_spawn",
+        "lease_release", "cache_fill",
     ]:
         series = f'git_rs_stage_duration_seconds_count{{stage="{stage}"}}'
         assert sum(metric_value(body, series) for body in scrapes) > 0, stage
+    for body in scrapes:
+        for program in ["git", "other"]:
+            assert metric_value(body, f'git_rs_subprocess_duration_seconds_count{{program="{program}"}}') == 0
+    # Retained metric names identify the removed native implementation. Both
+    # receive and upload now run on the bounded Rust runtime.
+    for stage in ["ref_validate", "tip_validate", "fast_forward", "cache_link", "object_hash",
+                  "restore_refs", "hook_setup", "git_input", "git_output", "git_wait",
+                  "scratch_cleanup", "process_spawn"]:
+        series = f'git_rs_stage_duration_seconds_count{{stage="{stage}"}}'
+        assert sum(metric_value(body, series) for body in scrapes) == 0, stage
     assert all(metric_value(body, "git_rs_timing_logs_dropped_total") == 0 for body in scrapes)
     if f.env.get("GIT_RS_DEBUG_TIMINGS") == "1":
         def correlated_requests():
@@ -563,12 +734,11 @@ def exercise(f, large_mib, skip_ssh):
                 assert request["operation"] != "0"
                 stages = {row["name"] for row in records if row["kind"] == "stage"
                           and (row["pid"], row["operation"]) == (request["pid"], request["operation"])}
-                if {"lease_commit", "catalog_read", "restore_refs", "hook_setup", "git_input",
-                    "git_output", "scratch_cleanup", "lease_release"} <= stages:
+                if {"lease_commit", "catalog_read", "lease_release"} <= stages:
                     completed.add(request["name"])
             return {"http"} <= completed and (skip_ssh or "ssh" in completed)
-        wait_for(correlated_requests, "correlated native Git request/worker/cleanup timings")
-        f.results["correlated_native_timing_logs"] = "passed"
+        wait_for(correlated_requests, "correlated Rust request/source/cleanup timings")
+        f.results["correlated_rust_timing_logs"] = "passed"
     if not skip_ssh:
         assert metric_value(scrapes[0], 'git_rs_requests_total{transport="ssh",outcome="success"}') > 0
     for process in [first, second]:
@@ -587,11 +757,18 @@ def exercise(f, large_mib, skip_ssh):
     wait_for(lambda: f.health("a", "/readyz")[0] == 200, "primary readiness")
     assert f.health("a", "/livez") == (200, b"live\n")
     assert b"git_rs_cache_allocated_bytes " in f.health("a", "/metrics")[1]
-    f.record_memory()
+    health_framing_test(f, "a")
+    # The old 64 MiB parent-only bound excluded native receive children. Rust
+    # now owns those buffers in this process. Bound its baseline plus the four
+    # configured 1 GiB CpuJobs reservations; the independent cgroup additionally
+    # bounds the combined parent/children/services under the qualification cap.
+    slots = sum(f.results["shared_cpu_capacity"].values())
+    f.record_memory(max_bytes=64 * 1024 * 1024 + slots * 1024 * 1024 * 1024)
     assert all(balancer.counts), balancer.counts
     f.results["balanced_connections"] = balancer.counts
-    wait_for(lambda: not list((f.base / "scratch").glob("instance-*/request-*")), "request scratch cleanup")
+    f.assert_no_repository_bridge()
     balancer.shutdown()
+    f.stop_daemons()
 
 
 def ssh_test(f, source, expected):
@@ -601,7 +778,9 @@ def ssh_test(f, source, expected):
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
-    forced = f'{f.binary} ssh --socket {f.base}/a.sock --principal alice'
+    bridge = f.base / "authorized-ssh-bridge"
+    f.write_bridge(bridge, f.socket("a"))
+    forced = shlex.quote(str(bridge)).replace("\\", "\\\\").replace('"', '\\"')
     (f.base / "authorized_keys").write_text(f'restrict,command="{forced}" ' + (f.base / "client-key.pub").read_text())
     config = f.base / "sshd_config"
     config.write_text(f"Port {port}\nListenAddress 127.0.0.1\nHostKey {f.base}/host-key\n"
@@ -626,7 +805,22 @@ def ssh_test(f, source, expected):
     env = dict(f.env, GIT_SSH_COMMAND=f"ssh -p {port} -i {f.base}/client-key -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known}")
     remote = f"{user}@127.0.0.1:team/project.git"
     assert f.git(source, "ls-remote", remote, env=env).stdout == expected
+    before_push = metric_value(f.health("a", "/metrics")[1], 'git_rs_subprocess_duration_seconds_count{program="git"}')
     f.git(source, "push", remote, "HEAD:refs/heads/ssh-tested", env=env)
+    clone = f.base / "ssh-clone"
+    f.git(source, "clone", "--depth=1", remote, clone, env=env)
+    assert f.git(clone, "rev-list", "--count", "HEAD").stdout.strip() == b"1"
+    f.git(clone, "fetch", "--unshallow", env=env)
+    f.git(clone, "fsck", "--strict", "--full")
+    assert f.git(clone, "rev-list", "--topo-order", "HEAD").stdout == f.git(source, "rev-list", "--topo-order", "HEAD").stdout
+    after_push = metric_value(f.health("a", "/metrics")[1], 'git_rs_subprocess_duration_seconds_count{program="git"}')
+    assert after_push == before_push, "normal SSH receive must not spawn native Git"
+    tip = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    manifest = b"0" * 40 + b" " + tip + b" refs/heads/ssh-tested\n"
+    operation = f.sql("SELECT id FROM git_rs.operations WHERE commands=decode('" + manifest.hex() + "','hex') AND repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/project')")
+    assert operation and len(operation.splitlines()) == 1
+    f.results["normal_ssh_rust_receive"] = {"operation_id": operation, "native_git_delta": after_push - before_push,
+                                          "clone_deepen_native_fsck": True}
     f.results["ssh_authentication"] = "generated Ed25519 key, restricted forced command, strict host verification"
 
 
@@ -650,8 +844,10 @@ def truncate_test(f, source, port, mib):
     old_keys = f.sql("SELECT pack_key FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history') UNION ALL SELECT idx_key FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')").splitlines()
     assert all(f.s3("HEAD", key).stdout == b"200" for key in old_keys)
     old_size = int(f.sql("SELECT sum(pack_size+idx_size) FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')"))
-    backup = f.base / "before-truncate.bundle"
-    f.cli("truncate", "team/history", "alice", "--keep", "2", "--scratch", str(f.base / "scratch"), "--backup", str(backup))
+    native_history = f.git(history, "rev-list", "--topo-order", "main").stdout
+    assert f.cli("history", "team/history", "alice", "--ref", "refs/heads/main").stdout == native_history
+    backup = f.server / "before-truncate.bundle"
+    f.cli("truncate", "team/history", "alice", "--keep", "2", "--backup", str(backup))
     trimmed = f.base / "trimmed"
     f.git(source, "clone", url, trimmed)
     f.git(trimmed, "fsck", "--full")
@@ -659,10 +855,14 @@ def truncate_test(f, source, port, mib):
     assert f.git(trimmed, "rev-parse", "HEAD^{tree}").stdout == original_tree
     new_size = int(f.sql("SELECT sum(pack_size+idx_size) FROM git_rs.packs WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')"))
     assert new_size < old_size / 2, (old_size, new_size)
+    # Serving/admin truncation retires identities but never deletes source bytes.
+    # Physical deletion is qualified separately through the elected worker.
     for key in old_keys:
-        deleted = f.s3("HEAD", key, ok=False)
-        assert deleted.returncode == 22 and deleted.stdout == b"404", (key, deleted.stdout, deleted.stderr)
-    assert f.sql("SELECT count(*) FROM git_rs.retired_objects") == "0"
+        assert f.s3("HEAD", key).stdout == b"200", key
+        assert f.sql("SELECT count(*) FROM git_rs.retired_objects WHERE object_key='" + key + "'") == "1"
+    cleanup = f.cli("cleanup", "team/history", "alice").stdout.decode().rstrip("\n").split("\t")
+    assert len(cleanup) == 3 and cleanup[1:] == ["queued", ""], cleanup
+    assert f.sql("SELECT state FROM git_rs.maintenance_jobs WHERE id='" + cleanup[0] + "'") == "queued"
     assert f.sql("SELECT count(*) FROM git_rs.operations WHERE repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/history')") == "1"
     recovered = f.base / "history-recovered"
     f.git(source, "clone", backup, recovered)
@@ -671,24 +871,113 @@ def truncate_test(f, source, port, mib):
     f.results["truncate"] = {"old_pack_bytes": old_size, "new_pack_bytes": new_size, "remaining_commits": 2, "native_backup_commits": 5}
 
 
+def upload_core_test(f, skip_ssh):
+    """Native clients cover the direct server's advertised transport inventory."""
+    f.cli("migrate")
+    f.cli("create", "team/project", "alice")
+    source = f.base / "upload-source"
+    f.git(f.base, "init", "--initial-branch=main", source)
+    commits = []
+    for ordinal in range(5):
+        (source / "file.txt").write_text(f"synthetic content {ordinal}\n" + "retained line\n" * 256)
+        f.git(source, "add", ".")
+        clock = 1_600_000_100 - ordinal
+        env = dict(f.env, GIT_AUTHOR_DATE=f"@{clock} +0000", GIT_COMMITTER_DATE=f"@{clock} +0000")
+        f.git(source, "commit", "-qm", f"Synthetic transport {ordinal}", env=env)
+        commits.append(f.git(source, "rev-parse", "HEAD").stdout.strip().decode())
+    f.git(source, "checkout", "-qb", "side", commits[1])
+    (source / "side.txt").write_bytes(b"merge payload\n")
+    f.git(source, "add", ".")
+    f.git(source, "commit", "-qm", "Synthetic side", env=env)
+    f.git(source, "checkout", "-q", "main")
+    f.git(source, "merge", "--no-ff", "-qm", "Synthetic merge", "side", env=env)
+    f.git(source, "tag", "-a", "annotated", "-m", "Synthetic annotated tag", env=env)
+    f.git(source, "tag", "lightweight")
+    f.git(source, "notes", "add", "-m", "Synthetic transport note", env=env)
+    _, port = f.start("a")
+    url = f"http://127.0.0.1:{port}/team/project.git"
+    f.git(source, "push", url, "--all")
+    f.git(source, "push", url, "--tags", "refs/notes/commits")
+    tip = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    tree = f.git(source, "rev-parse", "HEAD^{tree}").stdout.strip()
+    hidden = command(["git", "-C", source, "commit-tree", tree.decode(), "-p", tip.decode()],
+                     env=env, data=b"unadvertised physical commit\n").stdout.strip()
+    pack = command(["git", "-C", source, "pack-objects", "--stdout"], env=f.env, data=hidden + b"\n").stdout
+    assert b"ok refs/heads/carrier" in raw_push(port, tip, [b"refs/heads/carrier"], pack=pack)
+    expected = f.git(source, "rev-list", "--topo-order", "main").stdout
+    for protocol in ("0", "1", "2"):
+        clone = f.base / ("upload-v" + protocol)
+        f.git(source, "-c", "protocol.version=" + protocol, "clone", "--depth=1", url, clone)
+        assert f.git(clone, "rev-list", "--count", "HEAD").stdout.strip() == b"1"
+        f.git(clone, "-c", "protocol.version=" + protocol, "fetch", "--deepen=2")
+        assert int(f.git(clone, "rev-list", "--count", "HEAD").stdout) > 1
+        f.git(clone, "-c", "protocol.version=" + protocol, "fetch", "--unshallow", "--tags")
+        assert f.git(clone, "rev-list", "--topo-order", "HEAD").stdout == expected
+        assert f.git(clone, "rev-parse", "HEAD^{tree}").stdout.strip() == tree
+        assert f.git(clone, "cat-file", "-e", hidden.decode(), ok=False).returncode
+        assert f.git(clone, "-c", "protocol.version=" + protocol, "fetch", url, hidden.decode(), ok=False).returncode
+        assert f.git(clone, "cat-file", "-e", hidden.decode(), ok=False).returncode
+        f.git(clone, "fsck", "--strict", "--full")
+    if not skip_ssh:
+        ssh_test(f, source, f.git(source, "ls-remote", url).stdout)
+    assert metric_value(f.health("a", "/metrics")[1], 'git_rs_subprocess_duration_seconds_count{program="git"}') == 0
+    f.assert_no_repository_bridge()
+    f.results["native_upload_protocols"] = {"versions": [0, 1, 2], "shallow_deepen_unshallow": True,
+        "merge_and_tags": True, "hidden_physical_want_rejected": True, "strict_fsck": True}
+    return source, port
+
+
+def history_core_test(f):
+    source, port = upload_core_test(f, True)
+    slug = "team/project"
+    url = f"http://127.0.0.1:{port}/{slug}.git"
+    native = f.git(source, "rev-list", "--topo-order", "main").stdout
+    assert f.cli("history", slug, "alice").stdout == native
+    assert f.cli("history", slug, "alice", "--ref", "refs/heads/main", "--max-commits", "2").stdout == f.git(
+        source, "rev-list", "--topo-order", "-n", "2", "main").stdout
+    assert f.cli("history", slug, "alice", "--max-commits", "0", ok=False).returncode
+    backup = f.server / "all-refs.bundle"
+    assert f.cli("backup", slug, "unregistered", "--output", backup, ok=False).returncode
+    assert not backup.exists()
+    f.cli("backup", slug, "alice", "--output", backup)
+    f.git(source, "bundle", "verify", backup)
+    digest = hashlib.sha256(backup.read_bytes()).hexdigest()
+    assert backup.stat().st_mode & 0o777 == 0o600
+    assert f.cli("backup", slug, "alice", "--output", backup, ok=False).returncode
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == digest
+    restored = f.base / "all-refs-restored.git"
+    f.git(source, "clone", "--mirror", backup, restored)
+    f.git(restored, "fsck", "--strict", "--full")
+    assert f.git(restored, "for-each-ref", "--format=%(objectname)%09%(refname)").stdout == f.git(source, "ls-remote", "--refs", url).stdout
+    objects = lambda repository: {line.split()[0] for line in f.git(repository, "rev-list", "--objects", "--all").stdout.splitlines()}
+    assert objects(restored) == objects(source)
+    f.cli("grant", slug, "alice", "bob", "writer", "refs/")
+    denied = f.server / "denied.bundle"
+    assert f.cli("truncate", slug, "bob", "--keep", "2", "--backup", denied, "--drop-other-refs", ok=False).returncode
+    assert not denied.exists()
+    assert f.cli("truncate", slug, "alice", "--keep", "2", "--backup", denied, ok=False).returncode
+    assert not denied.exists(), "other-ref policy must reject before publishing a backup"
+    truncate_test(f, source, port, 1)
+    f.results["native_history_administration"] = {"complete_ordered_history": True, "bounded_prefix": True,
+        "all_refs_bundle_native_restore": True, "no_overwrite": True, "owner_and_other_ref_fences": True}
+
+
 def authenticated_http_test(f):
     """Exercise native Basic challenge/retry and per-request repository ACLs."""
     print("authenticated Smart HTTP identities and ACLs", flush=True)
     # Only synthetic credentials; both server and native-client stores stay in
     # the private fixture directory. Tokens never enter argv or child env.
     actors = {"alice": "a" * 43, "bob": "b" * 43, "carol": "c" * 43}
-    server_credentials = f.base / "http-server-credentials"
+    server_credentials = f.server / "http-server-credentials"
     server_credentials.write_text("".join(f"{actor} {token}\n" for actor, token in actors.items()))
     server_credentials.chmod(0o600)
     log_path = f.base / "authenticated-http.log"
     log = log_path.open("wb")
     f.logs.append(log)
-    process = subprocess.Popen([f.binary, "serve", "--scratch", str(f.base / "scratch"),
-                                "--socket", str(f.base / "authenticated-http.sock"),
+    process = f.spawn(["serve", "--socket", str(f.socket("authenticated-http")),
                                 "--http", "127.0.0.1:0", "--health", "127.0.0.1:0",
                                 "--http-credentials", str(server_credentials)],
-                               env=f.env, stdout=log, stderr=log)
-    f.processes.append(process)
+                      log=log)
 
     def ready():
         if process.poll() is not None:
@@ -698,6 +987,8 @@ def authenticated_http_test(f):
     wait_for(ready, "authenticated HTTP listener")
     port = int(ready().group(1))
     f.health_ports["authenticated-http"] = int(re.search(r"health 127.0.0.1:(\d+)", log_path.read_text()).group(1))
+    source = f.base / "authenticated-http-source"
+    f.git(f.base, "init", "-b", "main", source)
     helpers = {}
     for actor, token in actors.items():
         # Git can clear a URL username after an initial 401 and ask its helper
@@ -707,14 +998,12 @@ def authenticated_http_test(f):
         client_credentials.write_text(f"http://{actor}:{token}@127.0.0.1:{port}\n")
         client_credentials.chmod(0o600)
         helpers[actor] = f"credential.helper=store --file={client_credentials}"
-        resolved = command(["git", "-c", helpers[actor], "credential", "fill"], env=f.env,
+        resolved = command(["git", "-c", helpers[actor], "credential", "fill"], env=f.env, cwd=source,
                            data=f"protocol=http\nhost=127.0.0.1:{port}\n\n".encode(), ok=False)
-        assert resolved.returncode == 0, "native fixture credential helper must resolve its actor"
+        assert resolved.returncode == 0, ("native fixture credential helper must resolve its actor", resolved.stderr)
         fields = dict(line.split(b"=", 1) for line in resolved.stdout.splitlines() if b"=" in line)
         assert fields.get(b"username") == actor.encode(), "native fixture must use the intended principal"
         assert fields.get(b"password") == token.encode(), "native fixture must use the intended token"
-    source = f.base / "authenticated-http-source"
-    f.git(f.base, "init", "-b", "main", source)
     (source / "synthetic.txt").write_text("authenticated HTTP fixture\n")
     f.git(source, "add", "synthetic.txt")
     f.git(source, "commit", "-qm", "synthetic HTTP fixture")
@@ -729,11 +1018,15 @@ def authenticated_http_test(f):
         return metric_value(body, 'git_rs_subprocess_duration_seconds_count{program="git"}')
     before_push = native_calls()
     f.git(source, "-c", helpers["alice"], "push", url, "HEAD:refs/heads/main")
-    assert native_calls() > before_push, "receive-pack must retain its native server boundary"
+    assert native_calls() == before_push, "normal authenticated receive must not spawn native Git"
+    manifest = b"0" * 40 + b" " + oid + b" refs/heads/main\n"
+    operation = f.sql("SELECT id FROM git_rs.operations WHERE commands=decode('" + manifest.hex() + "','hex') AND repo_id=(SELECT id FROM git_rs.repositories WHERE slug='team/http-auth')")
+    assert operation and len(operation.splitlines()) == 1
+    f.results["normal_authenticated_rust_receive"] = {"operation_id": operation, "native_git_delta": native_calls() - before_push}
     clone = f.base / "authenticated-http-clone"
     before_clone = native_calls()
     f.git(source, "-c", helpers["bob"], "clone", url.replace("alice@", "bob@"), clone)
-    assert native_calls() > before_clone, "upload-pack must retain its native server boundary"
+    assert native_calls() == before_clone, "upload-pack must use the Rust runtime without a native fallback"
     assert f.git(clone, "rev-parse", "HEAD").stdout.strip() == oid
     assert (clone / "synthetic.txt").read_text() == "authenticated HTTP fixture\n"
     before = f.git(source, "-c", helpers["alice"], "ls-remote", url).stdout
@@ -751,6 +1044,49 @@ def authenticated_http_test(f):
     assert not any(token in log_path.read_text() for token in actors.values())
     f.results["authenticated_http_acl_roundtrip"] = "passed"
     complete_blame_test(f, source, port, actors)
+
+
+def import_historical_blame_fixture(f, source, old_oid, oid):
+    """Trusted synthetic pre-cutover data, never a receive acceptance bypass.
+
+    Incoming receive now rejects >128 MiB objects. Readers must still reject an
+    oversized blob already present in historical authoritative storage, without
+    invoking Git. The external native oracle builds/verifies this fixture pack.
+    """
+    pack = f.base / "historical-blame.pack"
+    index = pack.with_suffix(".idx")
+    pack.write_bytes(command(["git", "-C", source, "pack-objects", "--revs", "--stdout"],
+                             env=f.env, data=oid + b"\n").stdout)
+    native_hash = f.git(source, "index-pack", "--strict", "-o", index, pack).stdout.strip().decode()
+    assert re.fullmatch("[0-9a-f]{40}", native_hash)
+    repo = f.sql("SELECT id FROM git_rs.repositories WHERE slug='team/http-auth'")
+    operation = str(uuid.uuid4())
+    prefix = f"repos/{repo}/operations/{operation}/{native_hash}"
+    for suffix, path in [("pack", pack), ("idx", index)]:
+        f.s3("PUT", f"{prefix}.{suffix}", data=path)
+        assert f.s3("HEAD", f"{prefix}.{suffix}").stdout == b"200"
+    wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id='{repo}'") == "0",
+             "historical fixture import excludes live readers")
+    name = "convert_to('refs/heads/main','UTF8')"
+    manifest = old_oid + b" " + oid + b" refs/heads/main\n"
+    f.sql(f"""BEGIN;
+        SELECT id FROM git_rs.repositories WHERE id='{repo}' FOR UPDATE;
+        DO $$ BEGIN
+          IF (SELECT oid FROM git_rs.refs WHERE repo_id='{repo}' AND name={name}) <> decode('{old_oid.decode()}','hex')
+             OR EXISTS(SELECT 1 FROM git_rs.repository_leases WHERE repo_id='{repo}')
+          THEN RAISE EXCEPTION 'historical fixture changed during import'; END IF;
+        END $$;
+        UPDATE git_rs.repositories SET generation=generation+1 WHERE id='{repo}';
+        INSERT INTO git_rs.operations(id,repo_id,principal,commands,generation)
+          SELECT '{operation}',id,'alice',decode('{manifest.hex()}','hex'),generation FROM git_rs.repositories WHERE id='{repo}';
+        INSERT INTO git_rs.packs(repo_id,operation_id,native_hash,pack_key,idx_key,pack_digest,idx_digest,pack_size,idx_size,generation)
+          SELECT id,'{operation}','{native_hash}','{prefix}.pack','{prefix}.idx',
+            '{hashlib.sha256(pack.read_bytes()).hexdigest()}','{hashlib.sha256(index.read_bytes()).hexdigest()}',
+            {pack.stat().st_size},{index.stat().st_size},generation FROM git_rs.repositories WHERE id='{repo}';
+        UPDATE git_rs.refs SET oid=decode('{oid.decode()}','hex') WHERE repo_id='{repo}' AND name={name};
+        INSERT INTO git_rs.ref_updates VALUES('{operation}',1,{name},decode('{old_oid.decode()}','hex'),decode('{oid.decode()}','hex'));
+        COMMIT;""")
+    f.results["trusted_historical_oversized_blame_fixture"] = {"operation_id": operation, "native_hash": native_hash}
 
 
 def complete_blame_test(f, source, port, actors):
@@ -783,17 +1119,24 @@ def complete_blame_test(f, source, port, actors):
         return {"Authorization": "Basic " + value}
 
     helper = f"credential.helper=store --file={f.base}/http-client-alice-credentials"
-    f.git(source, "-c", helper, "push", f"http://alice@127.0.0.1:{port}/team/http-auth.git", "HEAD:refs/heads/main")
-    tree = f.git(source, "rev-parse", "HEAD^{tree}").stdout.strip()
+    repo = "(SELECT id FROM git_rs.repositories WHERE slug='team/http-auth')"
+    old_oid = f.sql(f"SELECT encode(oid,'hex') FROM git_rs.refs WHERE repo_id={repo} AND name=convert_to('refs/heads/main','UTF8')").encode()
+    before_reject = f.sql(f"SELECT generation,(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}),"
+                         f"(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
+    refused = f.git(source, "-c", helper, "push", f"http://alice@127.0.0.1:{port}/team/http-auth.git", "HEAD:refs/heads/main", ok=False)
+    assert refused.returncode, "incoming >128 MiB blob must not pass strict receive"
+    assert before_reject == f.sql(f"SELECT generation,(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}),"
+                                  f"(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
+    tree = f.git(source, "rev-parse", old_oid.decode() + "^{tree}").stdout.strip()
     identity = b"Fixture <fixture@example.invalid> 1577836800 +0000\n"
     unreachable = command(["git", "-C", source, "hash-object", "-w", "-t", "commit", "--stdin"], env=f.env,
-                          data=b"tree " + tree + b"\nparent " + oid + b"\nauthor " + identity
+                           data=b"tree " + tree + b"\nparent " + old_oid + b"\nauthor " + identity
                           + b"committer " + identity + b"\nvalid unreachable fixture\n").stdout.strip()
     pack = command(["git", "-C", source, "pack-objects", "--stdout"], env=f.env, data=unreachable + b"\n").stdout
-    report = raw_push(port, oid, [b"refs/heads/blame-reachability"], pack=pack,
+    report = raw_push(port, old_oid, [b"refs/heads/blame-reachability"], pack=pack,
                       slug="team/http-auth", headers=authorization("alice"))
     assert b"ok refs/heads/blame-reachability" in report, report
-    repo = "(SELECT id FROM git_rs.repositories WHERE slug='team/http-auth')"
+    import_historical_blame_fixture(f, source, old_oid, oid)
     before = f.sql(f"SELECT generation,(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}),"
                    f"(SELECT count(*) FROM git_rs.packs WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
 
@@ -858,13 +1201,12 @@ def complete_blame_test(f, source, port, actors):
 
 def blame_worker_test(f, source, oid, path):
     """The obsolete worker setting must reject startup and never execute a file."""
-    marker = f.base / "obsolete-worker-ran"
-    worker = f.base / "obsolete-worker"
+    marker = f.server / "obsolete-worker-ran"
+    worker = f.server / "obsolete-worker"
     worker.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(marker)!r}).touch()\n")
     worker.chmod(0o700)
-    rejected = command([f.binary, "serve", "--scratch", str(f.base / "scratch"),
-                        "--socket", str(f.base / "obsolete.sock")],
-                       env=dict(f.env, GIT_RS_BLAME_WORKER=str(worker)), ok=False)
+    rejected = f.cli("serve", "--socket", f.socket("obsolete"),
+                     env=dict(f.env, GIT_RS_BLAME_WORKER=str(worker)), ok=False)
     assert rejected.returncode and b"GIT_RS_BLAME_WORKER" in rejected.stderr, rejected.stderr
     assert not marker.exists(), "production must never activate an external blame worker"
     f.results["obsolete_blame_worker_rejected"] = True
@@ -952,7 +1294,7 @@ def blame_blocked_output_test(f, oid, *, slug="team/http-auth"):
                  "blocked writer source ownership released only after write stop")
         observations.append({"phase": "stopped-cleanup", "monotonic": time.monotonic(),
                              **blame_lease_state(f, repo)})
-        status = Path(f"/proc/{daemon.pid}/status").read_text()
+        status = f.process_status(daemon)
         peak = int(re.search(r"VmHWM:\s+(\d+)", status).group(1)) * 1024
         assert peak < 128 * 1024 * 1024, "complete-response buffering must fit its separate test allowance"
         f.results["blocked_blame_output"] = {
@@ -1070,12 +1412,12 @@ def blame_core_test(f):
     url = f"http://127.0.0.1:{port}/{slug}.git"
     before_push = native_calls()
     f.git(source, "push", "--mirror", url)
-    assert native_calls() > before_push, "receive-pack must retain its native server boundary"
+    assert native_calls() == before_push, "normal mirror receive must not spawn native Git"
     clone = f.base / "core-native-boundary-clone.git"
     before_clone = native_calls()
     f.git(f.base, "clone", "--bare", url, clone)
     assert f.git(clone, "rev-parse", "refs/heads/main").stdout.strip() == octopus
-    assert native_calls() > before_clone, "upload-pack must retain its native server boundary"
+    assert native_calls() == before_clone, "upload-pack must use the Rust runtime without native Git"
     dangling = commit(files, [octopus], timestamp=1577836700)
     pack = command(["git", "-C", source, "pack-objects", "--stdout"], env=f.env,
                    data=dangling + b"\n").stdout
@@ -1126,7 +1468,7 @@ def blame_core_test(f):
         "metadata_codec_and_raw_paths": True, "general_DAG": True, "revocation": True,
         "invalid_target_cases": len(rejected_targets), "reader_acl_checks": 2,
         "functional_target_checks": count + len(rejected_targets) + 2,
-        "native_receive_upload_boundaries_preserved": True, "blame_native_subprocesses": 0}
+        "rust_receive_upload_boundaries": True, "blame_native_subprocesses": 0}
     return source, root, raw, slug
 
 
@@ -1155,7 +1497,7 @@ def blame_shared_cache_test(f, source, oid, path, slug):
                           f"(SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}) FROM git_rs.repositories WHERE id={repo}")
     expected = f.git(source, "--literal-pathspecs", "blame", "--root", "--line-porcelain",
                      "--no-textconv", "--no-progress", oid.decode(), "--", os.fsdecode(path)).stdout
-    gates = Gates(f.base / "cache-blame.sock")
+    gates = Gates(f.server / "cache-blame.sock")
     def fetch(port):
         peer = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
         peer.request("GET", target)
@@ -1293,7 +1635,7 @@ def blame_core_output_test(f, source, slug):
         assert (reply.status, reply.read()) == (413, b""), "oversized real serialization must never emit partial 200"
     finally:
         peer.close()
-    peak = int(re.search(r"VmHWM:\s+(\d+)", Path(f"/proc/{daemon.pid}/status").read_text()).group(1)) * 1024
+    peak = int(re.search(r"VmHWM:\s+(\d+)", f.process_status(daemon)).group(1)) * 1024
     assert peak < 512 * 1024 * 1024, "preserve the separate oversized-output memory gate"
     f.results["oversized_blame_output"] = {"real_serializer_limit_bytes": 256 * 1024 * 1024,
                                            "observed_daemon_hwm_bytes": peak}
@@ -1328,7 +1670,6 @@ def long_operation_test(f, seconds=180):
         else:
             f.env["GIT_RS_OPERATION_SECONDS"] = previous
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=180)
-    previous_requests = set((f.base / "scratch").glob("instance-*/request-*"))
     started = time.monotonic()
     try:
         connection.putrequest("POST", f"/{slug}.git/git-receive-pack")
@@ -1341,16 +1682,9 @@ def long_operation_test(f, seconds=180):
                  "committed long-operation hold")
         assert f.sql(f"SELECT count(*) FROM git_rs.refs WHERE repo_id={repo}") == "0"
 
-        def configured_requests():
-            return [path for path in (f.base / "scratch").glob("instance-*/request-*")
-                    if path not in previous_requests and (path / "config").is_file()
-                    and b"[pack]\n" in (path / "config").read_bytes()]
-
-        wait_for(configured_requests, "native request configuration")
-        requests = configured_requests()
-        assert len(requests) == 1, requests
-        assert f.git(requests[0], "config", "--int", "--get", "pack.threads").stdout == b"4\n", (
-            "native receive-pack must use the configured worker budget")
+        f.assert_no_repository_bridge()
+        metrics = f.health("long-operation", "/metrics")[1]
+        assert metric_value(metrics, 'git_rs_subprocess_duration_seconds_count{program="git"}') == 0
         # This is an intentional wall-clock boundary test, not a sleep used to
         # guess worker ordering: the committed hold above proves request admission.
         threading.Event().wait(max(0, 125 - (time.monotonic() - started)))
@@ -1378,9 +1712,9 @@ def long_operation_test(f, seconds=180):
     assert f.sql(f"SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}") == "1"
     wait_for(lambda: f.sql(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id={repo}") == "0",
              "completed long-operation hold release")
-    f.results["long_native_publication"] = {"budget_seconds": seconds, "elapsed_seconds": round(elapsed, 3),
+    f.results["long_rust_publication"] = {"budget_seconds": seconds, "elapsed_seconds": round(elapsed, 3),
                                              "refs": len(names), "native_clone_fsck": "passed",
-                                             "native_pack_threads": 4}
+                                              "cpu_workers": 1, "native_server_subprocesses": 0}
     f.record_memory()
 
 
@@ -1389,7 +1723,14 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--provision", action="store_true", help="create and remove private local Docker PostgreSQL/S3 fixtures")
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/git-rs")
+    parser.add_argument("--binary", type=Path,
+                         default=os.environ.get("GIT_RS_TEST_BINARY", ROOT / "target/debug/git-rs"))
+    parser.add_argument("--runtime-image", default=os.environ.get("GIT_RS_TEST_RUNTIME_IMAGE"),
+                        help="prebuilt immutable Git-free runtime; full integration never starts a host backend")
+    parser.add_argument("--runtime-fixture-image", default=os.environ.get("GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE"),
+                        help="prebuilt Git-free image containing the explicit observer/receive fixtures")
+    parser.add_argument("--revision", default=os.environ.get("GIT_RS_TEST_REVISION"),
+                        help="full source revision required to bind both server images")
     parser.add_argument("--large-mib", type=int, default=16)
     parser.add_argument("--skip-ssh", action="store_true")
     parser.add_argument("--debug-timings", action="store_true",
@@ -1400,11 +1741,27 @@ def main():
                          help="run only the tiny synthetic blame concurrency contract")
     parser.add_argument("--blame-core-only", action="store_true",
                         help="real PG/S3 Rust blame byte oracles, shared reuse, output and concurrency gates")
+    parser.add_argument("--receive-core-only", action="store_true",
+                         help="explicit Rust receive handler with fresh PG/S3 and native client oracles")
+    parser.add_argument("--upload-core-only", action="store_true",
+                        help="native protocol v0/v1/v2, shallow/deepen, hidden wants and SSH against the actual runtime")
+    parser.add_argument("--history-core-only", action="store_true",
+                        help="complete ordered history and native bundle/truncation contracts against the actual runtime")
+    parser.add_argument("--receive-fixture-binary", type=Path,
+                        help="prebuilt receive_fixture test ELF")
     parser.add_argument("--blame-fixture-binary", type=Path,
                         help="prebuilt test-only blame-http-fixture example (never a production worker)")
-    parser.add_argument("--fixture-dir", type=Path,
+    parser.add_argument("--fixture-dir", type=Path, default=os.environ.get("GIT_RS_TEST_FIXTURE_DIR"),
                         help="fresh private directory to retain fixture logs/results after cleanup")
     args = parser.parse_args()
+    assert sum((args.blame_concurrency_only, args.blame_core_only, args.receive_core_only,
+                args.upload_core_only, args.history_core_only)) <= 1, "focused integration selectors are mutually exclusive"
+    if not (args.blame_core_only or args.blame_concurrency_only or args.receive_core_only):
+        assert args.runtime_image and args.runtime_fixture_image and args.revision, (
+            "full integration requires --runtime-image, --runtime-fixture-image and --revision")
+    if args.receive_core_only:
+        from receive_integration import run
+        return run(args)
     if args.blame_core_only:
         assert args.provision, "--blame-core-only requires fresh owned --provision fixtures"
     # OpenSSH StrictModes checks all parents of authorized_keys. A system /tmp
@@ -1427,10 +1784,11 @@ def main():
     with context as directory:
         fixture = None
         try:
-            fixture = Fixture(Path(directory), args.binary.resolve())
+            fixture = Fixture(Path(directory), args.binary.resolve(), runtime_image=args.runtime_image,
+                              runtime_fixture_image=args.runtime_fixture_image, revision=args.revision)
             fixture.blame_fixture_binary = (args.blame_fixture_binary or
                 args.binary.resolve().parent / "examples/blame-http-fixture").resolve()
-            assert fixture.blame_fixture_binary.is_file(), "build the blame-http-fixture test example first"
+            assert fixture.runtime or fixture.blame_fixture_binary.is_file(), "a prebuilt blame fixture is required"
             fixture.blame_core_resources = args.blame_core_only or args.blame_concurrency_only
             if fixture.blame_core_resources and args.provision:
                 invocation = os.environ.get("INVOCATION_ID")
@@ -1439,7 +1797,11 @@ def main():
             if args.debug_timings:
                 fixture.env["GIT_RS_DEBUG_TIMINGS"] = "1"
             fixture.setup(args.provision)
-            if args.blame_core_only:
+            if args.upload_core_only:
+                upload_core_test(fixture, args.skip_ssh)
+            elif args.history_core_only:
+                history_core_test(fixture)
+            elif args.blame_core_only:
                 fixture.cli("migrate")
                 source, oid, path, slug = blame_core_test(fixture)
                 fixture.stop_daemons()
@@ -1455,7 +1817,8 @@ def main():
                 authenticated_http_test(fixture)
                 if args.long_operations:
                     long_operation_test(fixture)
-            blame_concurrency_test(fixture)
+            if not (args.upload_core_only or args.history_core_only):
+                blame_concurrency_test(fixture)
             print(json.dumps({"status": "passed", **fixture.results}, indent=2))
         except Exception as error:
             if fixture:

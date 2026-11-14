@@ -19,6 +19,7 @@ pub(super) struct Work<'a, P> {
     reads: usize,
     edges: usize,
     complete: Set<ObjectId>,
+    gitmodules_done: Set<ObjectId>,
     warnings_seen: Set<(ObjectId, semantics::WarningKind)>,
     warnings: ChargedVec<Warning>,
 }
@@ -32,6 +33,10 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
             reads: 0,
             edges: 0,
             complete: Set::new(snapshot.capacity.clone(), snapshot.limits.max_graph_objects)?,
+            gitmodules_done: Set::new(
+                snapshot.capacity.clone(),
+                snapshot.limits.max_graph_objects,
+            )?,
             warnings_seen: Set::new(snapshot.capacity.clone(), limits.max_warnings)?,
             warnings: ChargedVec::new(snapshot.capacity.clone(), limits.max_warnings)?,
         })
@@ -123,6 +128,7 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
                 id: root,
                 kind,
                 parent: false,
+                gitmodules: false,
             }),
             &snapshot.control,
         )?;
@@ -139,6 +145,28 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
                     let object = self.read(&edge.id)?;
                     if object.header().kind != edge.kind {
                         return Err(invalid("receive graph edge type mismatch"));
+                    }
+                    // Filename-derived context must be checked before an OID-only
+                    // completion shortcut, including a previously ordinary blob.
+                    if edge.gitmodules
+                        && self.gitmodules_done.insert(edge.id, &snapshot.control)?
+                        && super::gitmodules::validate(
+                            object.as_slice(),
+                            &snapshot.control,
+                            &snapshot.capacity,
+                            snapshot.limits.max_metadata_bytes,
+                        )?
+                    {
+                        let warning = Warning {
+                            object: edge.id,
+                            kind: semantics::WarningKind::GitmodulesParse,
+                        };
+                        if self
+                            .warnings_seen
+                            .insert((edge.id, warning.kind), &snapshot.control)?
+                        {
+                            self.warnings.push(warning, &snapshot.control)?;
+                        }
                     }
                     if active.contains(&edge.id) {
                         return Err(invalid("receive object graph cycle"));

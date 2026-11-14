@@ -19,9 +19,9 @@ use git_rs_core::{
 use gix::odb::pack as vendor;
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{BufReader, Cursor, Read, Seek, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -636,7 +636,13 @@ impl Files {
         Self { root }
     }
     fn file(&self, name: &str, bytes: &[u8]) -> File {
-        let mut file = transport::private_file(&self.root.join(name)).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.root.join(name))
+            .unwrap();
         file.write_all(bytes).unwrap();
         file.rewind().unwrap();
         file
@@ -676,18 +682,24 @@ fn gzip_finalization_checks_crc_truncation_tails_and_concatenated_members() {
         ("members", multiple, Some(&b"abcde"[..])),
     ] {
         let mut input = files.file(&format!("input-{name}"), &bytes);
-        let mut output = files.file(&format!("output-{name}"), b"");
         let capacity = CapacityBudget::new(8 * 1024 * 1024);
-        let result = transport::decode_gzip(&mut input, &mut output, &control(), &capacity);
+        let mut output = capacity.buffer(0).unwrap();
+        let control = control();
+        let result = {
+            let mut writer = transport::MemoryOutput {
+                bytes: &mut output,
+                control: &control,
+                limit: 1024,
+            };
+            transport::decode_gzip(&mut input, &mut writer, &control, &capacity)
+        };
         if let Some(expected) = expected {
             result.unwrap();
-            output.rewind().unwrap();
-            let mut decoded = Vec::new();
-            output.read_to_end(&mut decoded).unwrap();
-            assert_eq!(decoded, expected, "{name}");
+            assert_eq!(output.as_slice(), expected, "{name}");
         } else {
             assert!(result.is_err(), "bad gzip case {name} accepted");
         }
+        drop(output);
         assert_eq!(capacity.used(), 0);
     }
 }

@@ -126,7 +126,17 @@ impl Fixture {
             let directory = native.join("objects/pack");
             let packs = [&selected, &unrelated]
                 .iter()
-                .map(|hash| store.upload(&repo, &operation, &directory, hash).unwrap())
+                .map(|hash| {
+                    store
+                        .upload_bytes(
+                            &repo,
+                            &operation,
+                            hash,
+                            &fs::read(directory.join(format!("pack-{hash}.pack"))).unwrap(),
+                            &fs::read(directory.join(format!("pack-{hash}.idx"))).unwrap(),
+                        )
+                        .unwrap()
+                })
                 .collect::<Vec<_>>();
             metadata::publish(
                 &snapshot,
@@ -143,15 +153,11 @@ impl Fixture {
             )
             .unwrap();
             drop(lease);
-            let scratch = root.join("scratch");
-            fs::create_dir(&scratch).unwrap();
             let engine = Arc::new(Engine {
                 blame,
                 store,
                 cache: Arc::new(Cache::new(1024 * 1024, 1024 * 1024)),
-                scratch_root: scratch,
                 operation_seconds: 10,
-                pack_threads: 1,
             });
             Self {
                 root,
@@ -209,13 +215,14 @@ impl Fixture {
             .unwrap();
     }
     pub fn source_files(&self) -> Vec<String> {
-        fs::read_dir(&self.engine.scratch_root)
+        // Source reads must never materialize a request repository. Native
+        // producer files live only under the separate oracle directory.
+        fs::read_dir(&self.root)
             .unwrap()
-            .flat_map(|entry| {
-                fs::read_dir(entry.unwrap().path().join("objects/pack"))
-                    .unwrap()
-                    .map(|file| file.unwrap().file_name().into_string().unwrap())
-                    .collect::<Vec<_>>()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                (name != "native").then_some(name)
             })
             .collect()
     }

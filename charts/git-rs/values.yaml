@@ -22,19 +22,61 @@ affinity: {}
 resources:
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 512Mi
     ephemeral-storage: 1Gi
   limits:
     cpu: "2"
-    memory: 1Gi
-    ephemeral-storage: 18Gi
-scratch:
-  sizeLimit: 16Gi
+    memory: 4Gi
+    ephemeral-storage: 1Gi
 cacheBytes: 67108864
 operationSeconds: 120 # Absolute Git request budget, configurable from 1 to 3600 seconds.
-packThreads: 1 # Native Git workers per request, configurable from 1 to 4.
+cpu:
+  concurrency: 1
+  waiters: 0
 debugTimings: false # Opt-in bounded, lossy diagnostic records on backend stderr.
 terminationGracePeriodSeconds: 150
+
+# Upgrade the source schema with this disabled, then enable in a second upgrade.
+# These provisional limits require workload qualification; they are not an HA SLA.
+maintenance:
+  enabled: false
+  replicaCount: 2
+  leaseName: "" # Defaults to <fullname>-source; pre-created with empty spec.
+  serviceAccount:
+    create: true
+    name: ""
+  tokenAudience: "" # Empty uses the API server's default service-account audience.
+  leaseSeconds: 30
+  renewGraceSeconds: 15
+  expirySafetySeconds: 2
+  pgFenceLeaseSeconds: 20
+  heartbeatSeconds: 5
+  jobLeaseSeconds: 20
+  jobSeconds: 120
+  sourceConcurrency: 1
+  scanBatch: 100
+  scanSeconds: 60
+  scanBudgetMillis: 1000
+  deleteBatch: 100
+  cacheBytes: 536870912
+  shutdownSeconds: 90
+  terminationGracePeriodSeconds: 110
+  scratch:
+    medium: Memory # Empty string opts into node-backed ephemeral storage, not a PVC.
+    sizeLimit: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+      ephemeral-storage: 128Mi
+    limits:
+      cpu: "1"
+      memory: 4Gi
+      ephemeral-storage: 3Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 ssh:
   enabled: true
@@ -128,3 +170,5 @@ migration:
   # Initializes/verifies the schema and refreshes its publication function. A hook runs
   # once per install/upgrade; serving replicas never race to run migrations.
   activeDeadlineSeconds: 600
+  # Finite migration Jobs can opt out of injected, long-running mesh sidecars.
+  podAnnotations: {}

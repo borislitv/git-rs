@@ -1,5 +1,6 @@
 {
   "format": 1,
+  "fork_provenance_in_source": "FORK_PROVENANCE.md",
   "imara_origin": {
     "git": "https://github.com/pascalkuthe/imara-diff",
     "ledger_in_source": "gix-imara-diff/UPSTREAM-PROVENANCE.tsv",
@@ -12,10 +13,11 @@
   "notices_in_source": [
     "LICENSE-MIT",
     "LICENSE-APACHE",
-    "gix-imara-diff/LICENSE"
+    "gix-imara-diff/LICENSE",
+    "FORK_PROVENANCE.md"
   ],
   "pull_request": "https://github.com/borislitv/gitoxide/pull/2",
-  "qualified_snapshot": "Completed MappingMemo and bounded blame controls (C7), controlled single-pack framing, OFS entry-start validation, controlled borrowed tree iteration, pre-allocation admitted ingest with retained pack/index owners, checked finite OFS/object-size/data-offset arithmetic and maintained controlled path-component validation; fork-qualified APIs, not application receive-cutover qualification",
+  "source_scope": "Controlled mapping/blame, single-pack ingestion, borrowed tree and submodule validation, caller-owned range delta/index primitives, original-budget ownership transfer and admitted physical topological traversal; this source record is not a runtime, native-oracle, resource or performance qualification verdict",
   "resolved_package_count": 49,
   "resolved_packages_sha256": "5de07bc366f57b97c05b0de77092abfc1a6ee3d449de733e2cfdcfbe86ce319d",
   "controlled_source_sha256": {
@@ -23,18 +25,29 @@
     "gix-pack/src/bundle/write/admitted.rs": "d1871f3adc9d8815b0046a6daaeb6aa66134e08396c9f46e589e6225cbf064a6",
     "gix-pack/src/bundle/write/controlled.rs": "9ad179d504b10f6bff1972e2f55fb80d6d54817cd04e3fd9d869578462441286",
     "gix-pack/src/bundle/write/mod.rs": "6570e9b85c5a2f21845b2ae396c2f89e2f006c7528bf0271117070a82c8b86b9",
+    "gix-pack/src/data/delta.rs": "da392cb949b61d3a07483ac416db966dd035bbc8ee7b90c8769841e148224330",
     "gix-pack/src/data/entry/decode.rs": "8297bd2b0327ed84f3efea2f0eb0c24708fbcc85f13c3ed886c1143299eff0df",
     "gix-pack/src/data/file/decode/entry.rs": "bf73318f7fc65e8d5f91db74a35e215c7f83ebccae7523eb1f58187372a9261a",
     "gix-pack/src/index/encode.rs": "29a793ef75d137f6e4dedf4e3d7a248a88e2ca522a90ab55738f63f48b170f4d",
+    "gix-pack/src/index/init.rs": "e96256a0880fbde6e0c3422a38b25e0bcd0136eb6f403ae9f803a5c630af7a05",
+    "gix-pack/src/index/write/mod.rs": "1a6f95d21c622e3c7c453d652c5445915fd0afc70cd24ce16a09a7b2103a9f7b",
     "gix-pack/src/lib.rs": "7f270930ebb278f94513b437302ce5c1587188202723d47e2adee735332fcfac",
-    "gix-pack/src/memory.rs": "e03c87b55187929a258d9f1f58b5abe3e90c3a1422fa6aced6158730fb426e68",
+    "gix-pack/src/memory.rs": "783803b98f4b1daad1661b5e812d699671d6a514f97d52fac3c52f522019b495",
+    "gix-revwalk/src/queue.rs": "ce1fab6d308926f688019f65a79478f9873099515131438b12ec110488bc8e81",
+    "gix-traverse/src/commit/mod.rs": "dc9987a5985b1d75e8b54855152e822eb8c60ca46f1fccdca383bc0ce3cb5172",
+    "gix-traverse/src/commit/topo/admission.rs": "02e0616ec8d1d929c0aaa36b8907178ab99471745e52b6172a6b68bd72fbd857",
+    "gix-traverse/src/commit/topo/init.rs": "d48e76b709f31817646394a6c973c4a8258ae40bf26bde015a21e771002f2c6e",
+    "gix-traverse/src/commit/topo/iter.rs": "d323caec1bab5a602211e6e95dea144664db88cca09a67f9bb5f65fb65989e5b",
+    "gix-traverse/src/commit/topo/mod.rs": "b8726114168249bd4d610812c3cfaaa9c1379cd571957d5f1ef4d999f052a9f8",
     "gix-utils/src/decode.rs": "273ae0c4068c28c931dd5974ab849602e8b8d2d507d81e63c6cb546da81aab5a",
+    "gix-url/src/fsck.rs": "a52058d7a2684c7fd53f63dbf59af83d0f50a9e38c364f7f405aefa13bb65100",
+    "gix-url/src/lib.rs": "cd79965458c41331668ebb30a173a7927b6cc057740d7f2a4f28bdbe021439e7",
     "gix-validate/src/path.rs": "4e309ac9f1eff3722eaf672f7f47b7bb7ead167d16c88bf127f58044c7930948",
     "gix-zlib/src/lib.rs": "bf5534bb7f9336b87ac7cfc5fa0caab1bc7e98ca4592e18da1f4d56c6a3c9407"
   },
   "source": {
     "git": "https://github.com/borislitv/gitoxide",
-    "rev": "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3"
+    "rev": "512750f176546e7064b05616be8805caac92d260"
   },
   "upstream": {
     "base": "dd39fb66e3b1551c9fe849043e39b357a9799ca1",

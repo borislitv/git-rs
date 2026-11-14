@@ -38,9 +38,7 @@ impl Backend {
             .env("GIT_RS_S3_ACCESS_KEY", "synthetic")
             .env("GIT_RS_S3_SECRET_KEY", "synthetic")
             .env("GIT_RS_OPERATION_SECONDS", seconds.to_string())
-            .args(["serve", "--scratch"])
-            .arg(&root)
-            .arg("--socket")
+            .args(["serve", "--socket"])
             .arg(root.join("ssh.sock"))
             .args([
                 "--health",
@@ -105,31 +103,29 @@ impl Backend {
 }
 
 #[test]
-fn git_worker_configuration_rejects_unbounded_or_invalid_parallelism() {
+fn obsolete_git_worker_configuration_is_rejected_before_serving() {
     let root = std::env::temp_dir().join(format!(
         "git-rs-worker-options-{}",
         git_rs::scratch::identifier().unwrap()
     ));
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-    for threads in ["0", "5", "255", "256", "auto", "-1"] {
-        let scratch = root.join("must-not-be-created");
+    for threads in ["0", "1", "2", "4", "5", "255", "256", "auto", "-1", ""] {
+        let socket = root.join("must-not-be-created.sock");
         let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
             .env_clear()
             .env("GIT_RS_PACK_THREADS", threads)
-            .args(["serve", "--scratch"])
-            .arg(&scratch)
-            .arg("--socket")
-            .arg(root.join("absent/ssh.sock"))
+            .args(["serve", "--socket"])
+            .arg(&socket)
             .output()
             .unwrap();
         assert!(!output.status.success());
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("GIT_RS_PACK_THREADS must be in 1..=4"),
-            "invalid worker budget must be rejected before creating serving state: {:?}",
+            String::from_utf8_lossy(&output.stderr).contains("GIT_RS_PACK_THREADS is obsolete"),
+            "obsolete native worker configuration must fail before opening a listener: {:?}",
             output.stderr
         );
-        assert!(!scratch.exists());
+        assert!(!socket.exists());
+        assert!(!socket.with_extension("lock").exists());
     }
     fs::remove_dir_all(root).unwrap();
 }
@@ -154,8 +150,8 @@ fn blame_capacity_rejects_invalid_settings_before_serving() {
             .env_clear()
             .env("GIT_RS_BLAME_CONCURRENCY", concurrency)
             .env("GIT_RS_BLAME_WAITERS", waiters)
-            .args(["serve", "--scratch"])
-            .arg(&root)
+            .args(["serve", "--socket"])
+            .arg(root.join("ssh.sock"))
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -198,14 +194,12 @@ fn obsolete_blame_worker_configuration_is_rejected_before_serving() {
         PathBuf::from("/usr/bin/git"),
         PathBuf::from(""),
     ] {
-        let scratch = root.join("must-not-be-created");
+        let socket = root.join("must-not-be-created.sock");
         let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
             .env_clear()
             .env("GIT_RS_BLAME_WORKER", path)
-            .args(["serve", "--scratch"])
-            .arg(&scratch)
-            .arg("--socket")
-            .arg(root.join("absent/ssh.sock"))
+            .args(["serve", "--socket"])
+            .arg(&socket)
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -214,7 +208,8 @@ fn obsolete_blame_worker_configuration_is_rejected_before_serving() {
             "obsolete worker configuration must fail before serving state is created: {:?}",
             output.stderr
         );
-        assert!(!scratch.exists());
+        assert!(!socket.exists());
+        assert!(!socket.with_extension("lock").exists());
     }
     fs::remove_dir_all(root).unwrap();
 }
@@ -237,9 +232,7 @@ fn operation_configuration_rejects_budgets_outside_the_hard_bound() {
             .env("GIT_RS_S3_ACCESS_KEY", "synthetic")
             .env("GIT_RS_S3_SECRET_KEY", "synthetic")
             .env("GIT_RS_OPERATION_SECONDS", seconds)
-            .args(["backup", "team/project", "alice", "--scratch"])
-            .arg(&root)
-            .arg("--output")
+            .args(["backup", "team/project", "alice", "--output"])
             .arg(root.join("backup.bundle"))
             .output()
             .unwrap();
@@ -283,40 +276,33 @@ fn long_operation_budgets_preserve_independent_health_deadlines() {
 }
 
 #[test]
-fn private_hook_broker_stops_for_expired_or_cancelled_operation_budgets() {
-    use git_rs::{hooks, process::Operation};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
+fn stopped_operations_cannot_fill_or_reuse_source_cache_bytes() {
+    use git_rs::{cache::Cache, process::Operation};
+    let cache = Cache::new(4096, 8);
+    let pinned = cache
+        .get_or_load("present", 8, |output| {
+            output.copy_from_slice(b"complete");
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    let allocated = cache.allocated();
     let cancelled = Operation::new(3600);
     cancelled.cancel();
     for operation in [Operation::new(0), cancelled] {
-        let socket = hooks::PrivateSocket::new().unwrap();
-        let stop = AtomicBool::new(false);
-        let (finished, received) = mpsc::channel();
-        let started = Instant::now();
-        let result = std::thread::scope(|scope| {
-            // Bound the regression even if the broker ignores its operation.
-            let stop = &stop;
-            scope.spawn(move || {
-                let _ = received.recv_timeout(Duration::from_secs(2));
-                stop.store(true, Ordering::Release);
-            });
-            let result = operation.enter(|| {
-                hooks::broker(
-                    socket.listener.try_clone().unwrap(),
-                    "synthetic-nonce",
-                    stop,
-                    |_, _| panic!("an expired operation cannot publish"),
-                )
-            });
-            let _ = finished.send(());
-            result
+        operation.enter(|| {
+            for key in ["present", "absent"] {
+                assert!(
+                    cache
+                        .get_or_load(key, 8, |_| panic!(
+                            "a stopped operation cannot load source bytes"
+                        ))
+                        .is_err()
+                );
+            }
         });
-        result.unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the broker must stop with its operation"
-        );
+        assert_eq!(cache.allocated(), allocated);
+        assert_eq!(&pinned[..], b"complete");
     }
 }
 
@@ -353,9 +339,7 @@ fn blocked_stderr_backend(timings: bool) -> (Backend, UnixStream) {
         .env("GIT_RS_S3_SECRET_KEY", "synthetic")
         .env("GIT_RS_OPERATION_SECONDS", "1")
         .env("GIT_RS_DEBUG_TIMINGS", if timings { "1" } else { "0" })
-        .args(["serve", "--scratch"])
-        .arg(&root)
-        .arg("--socket")
+        .args(["serve", "--socket"])
         .arg(root.join("ssh.sock"))
         .args([
             "--health",
@@ -531,7 +515,7 @@ fn cli_and_startup_errors_remain_visible_with_or_without_timing_logs() {
                 vec!["create", "team/synthetic", "alice"],
                 "PostgreSQL configuration invalid",
             ),
-            (vec!["serve"], "missing --scratch"),
+            (vec!["serve"], "missing --socket"),
         ] {
             let output = Command::new(env!("CARGO_BIN_EXE_git-rs"))
                 .env_clear()
@@ -722,70 +706,44 @@ fn trickled_http_headers_release_request_admission_at_absolute_deadline() {
 }
 
 #[test]
-fn unread_output_deadline_reaps_child_and_restores_admission() {
-    use git_rs::process::{Admission, Guard, Operation};
+fn unread_output_deadline_stops_rust_producer_and_restores_admission() {
+    use git_rs::{
+        process::{Admission, Operation},
+        receive_io::{IoControl, StreamOutput},
+    };
 
     let admission = Admission::new(1);
     let permit = admission.try_admit().unwrap();
     assert!(admission.try_admit().is_none());
-    let (mut output, _unread_peer) = UnixStream::pair().unwrap();
+    let (output, unread_peer) = UnixStream::pair().unwrap();
     // A fallback bounds even the deliberately broken implementation in the red
     // check. The absolute operation budget, not this idle timeout, must win.
     output
         .set_write_timeout(Some(Duration::from_secs(3)))
         .unwrap();
-    let interrupt = output.try_clone().unwrap();
     let operation = Operation::new(1);
+    let mut output = StreamOutput::new(output.into(), IoControl::new(operation).unwrap()).unwrap();
     let (sent, received) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         let _permit = permit;
-        operation.with_interrupt(
-            || {
-                let _ = interrupt.shutdown(std::net::Shutdown::Both);
-            },
-            || {
-                let mut child = Guard::new(
-                    git_rs::process::command("/usr/bin/dd")
-                        .args(["if=/dev/zero", "bs=8192", "count=64", "status=none"])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .unwrap(),
-                );
-                let pid = child.0.id();
-                let mut stdout = child.0.stdout.take().unwrap();
-                let mut framed = git_rs::protocol::Framed(&mut output);
-                let copied = std::io::copy(&mut stdout, &mut framed);
-                child.terminate();
-                let status = child.wait().unwrap();
-                let terminal = framed.finish(copied.is_ok());
-                (copied, pid, status, terminal)
-            },
-        )
-    });
-    // Observe completion without blocking the test forever on a failed watchdog.
-    let collector = std::thread::spawn(move || {
-        let _ = sent.send(worker.join().unwrap());
+        let mut framed = git_rs::protocol::Framed(&mut output);
+        let copied = (0..1024).try_for_each(|_| framed.write_all(&[0; 8192]));
+        let terminal = framed.finish(copied.is_ok());
+        let _ = sent.send((copied, terminal));
     });
     let outcome = received.recv_timeout(Duration::from_secs(2));
-    collector.join().unwrap();
-    let (copied, pid, status, terminal) =
+    // Release a broken producer before joining, retaining the original timeout.
+    drop(unread_peer);
+    worker.join().unwrap();
+    let (copied, terminal) =
         outcome.expect("blocked output must end around the one-second deadline");
     assert!(
         copied.is_err(),
         "a truncated SSH payload must never be reported as success"
     );
     assert!(
-        !status.success(),
-        "deadline must not leave a successful live producer"
-    );
-    assert!(
         terminal.is_err(),
         "expired transport cannot send terminal success"
-    );
-    assert!(
-        !PathBuf::from(format!("/proc/{pid}")).exists(),
-        "child must be reaped"
     );
     assert_eq!(admission.active(), 0);
     assert!(

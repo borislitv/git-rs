@@ -1,20 +1,15 @@
 use crate::{Result, http, invalid};
-use git_rs_core::{CapacityBudget, Control};
-use std::{
-    fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::Path,
-};
+use git_rs_core::{CapacityBudget, CapacityBuffer, Control};
+use std::io::{BufRead, BufReader, Read, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Encoding {
+pub(crate) enum Encoding {
     Identity,
     Gzip,
 }
 
 impl Encoding {
-    pub(super) fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "" | "identity" => Ok(Self::Identity),
             "gzip" => Ok(Self::Gzip),
@@ -23,16 +18,27 @@ impl Encoding {
     }
 }
 
-pub(super) fn private_file(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?)
+/// A controlled, growable Rust buffer with admission for old/new backing overlap.
+/// This writer cannot spill into a file or silently exceed the job's live budget.
+pub(crate) struct MemoryOutput<'a> {
+    pub(crate) bytes: &'a mut CapacityBuffer,
+    pub(crate) control: &'a Control,
+    pub(crate) limit: usize,
 }
 
-pub(super) fn copy_bounded(
+impl Write for MemoryOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes
+            .extend_controlled(bytes, self.limit, self.control)
+            .map_err(std::io::Error::other)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.control.check().map_err(std::io::Error::other)
+    }
+}
+
+pub(crate) fn copy_bounded(
     input: &mut impl Read,
     output: &mut impl Write,
     max: u64,
@@ -59,9 +65,9 @@ pub(super) fn copy_bounded(
 
 /// All gzip framing/CRC/ISIZE/header parsing belongs to the maintained decoder,
 /// not to an application reconstruction of gzip or a raw inflate wrapper.
-pub(super) fn decode_gzip(
-    input: &mut File,
-    output: &mut File,
+pub(crate) fn decode_gzip(
+    input: &mut impl Read,
+    output: &mut impl Write,
     control: &Control,
     budget: &CapacityBudget,
 ) -> Result<()> {

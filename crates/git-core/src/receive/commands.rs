@@ -51,6 +51,10 @@ impl Capabilities {
         if bytes.len() > limits.max_capability_bytes {
             return Err(invalid("receive capability byte limit exceeded"));
         }
+        // send-pack prefixes the first capability with SP after the command NUL.
+        // Preserve raw byte accounting; do not trim controls, repeated/trailing
+        // separators, or silently normalize arbitrary malformed token lists.
+        let bytes = bytes.strip_prefix(b" ").unwrap_or(bytes);
         let mut value = Self::default();
         if bytes.is_empty() {
             return Ok(value);
@@ -110,11 +114,51 @@ pub struct CommandBatch {
     pub(super) budget: CapacityBudget,
 }
 
+/// The protocol's command flush without commands. This token is not semantic,
+/// HTTP EOF or publication authority and cannot be constructed by a caller.
+pub struct Noop {
+    _private: (),
+}
+
+/// A successful empty exchange is distinct from cancellation and a change batch.
+pub enum CommandSection {
+    Noop(Noop),
+    Commands(CommandBatch),
+}
+
+impl CommandSection {
+    pub fn read(
+        input: &mut impl Read,
+        control: &Control,
+        budget: CapacityBudget,
+        limits: CommandLimits,
+    ) -> Result<Self> {
+        let batch = CommandBatch::read_allow_empty(input, control, budget, limits)?;
+        Ok(if batch.commands().is_empty() {
+            Self::Noop(Noop { _private: () })
+        } else {
+            Self::Commands(batch)
+        })
+    }
+}
+
 impl CommandBatch {
     /// Read through the required command flush only; raw pack bytes are left in
     /// `input`. The caller owns blocking-I/O deadlines/shutdown. Neither flush nor
     /// returning this batch proves completion of the rest of the request body.
     pub fn read(
+        input: &mut impl Read,
+        control: &Control,
+        budget: CapacityBudget,
+        limits: CommandLimits,
+    ) -> Result<Self> {
+        match CommandSection::read(input, control, budget, limits)? {
+            CommandSection::Commands(batch) => Ok(batch),
+            CommandSection::Noop(_) => Err(invalid("change batch must not be empty")),
+        }
+    }
+
+    fn read_allow_empty(
         input: &mut impl Read,
         control: &Control,
         budget: CapacityBudget,
@@ -195,7 +239,7 @@ impl CommandBatch {
                 control,
             )?;
         }
-        if packets.stopped_at() != Some(PacketLineRef::Flush) || commands.as_slice().is_empty() {
+        if packets.stopped_at() != Some(PacketLineRef::Flush) {
             return Err(invalid("missing receive command list or flush"));
         }
         control.check()?;

@@ -385,6 +385,17 @@ pub trait VerifiedObjectProvider {
     ) -> Result<Option<crate::pack::PackLocation>> {
         Ok(None)
     }
+
+    /// Optional authenticated physical encoding for output pack reuse. Only the
+    /// maintained range provider can construct its immutable witness. This never
+    /// substitutes for independent source and advertised-want authorization.
+    fn packed_object(
+        &self,
+        _id: &oid,
+        _control: &Control,
+    ) -> Result<Option<crate::pack::ranges::PackedObject>> {
+        Ok(None)
+    }
 }
 
 /// A session owns its provider (which may itself borrow a pinned workspace).

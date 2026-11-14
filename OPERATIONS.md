@@ -5,10 +5,11 @@ behaviors, not a guarantee of production HA or a coordinated storage recovery pr
 
 ## Configuration and trust boundary
 
-`git-rs serve --scratch DIR --socket PATH [--health ADDRESS]` runs the backend. Scratch and the
-socket's parent directory must be private (`0700`). The socket has one serving owner; a new owner
-refuses a live socket and replaces only a stale socket, then sweeps the prior recorded instance
-scratch. A pod's `emptyDir` contains no authoritative Git data.
+`git-rs serve --socket PATH [--health ADDRESS]` runs the backend. The socket's parent must
+be private (`0700`); the socket and owner lock are `0600`. One serving owner holds the lock
+through cleanup, refuses a live socket and replaces only a stale socket. Removal checks its
+recorded file identity. Serving needs no request repository, pack-file scratch or persistent
+repository volume. A pod's `emptyDir` contains no authoritative Git data.
 
 The runtime uses Tini as PID 1 to forward termination signals and reap descendants. The backend
 does not implement application-level graceful signal draining: termination is a crash-safe stop,
@@ -26,17 +27,17 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `GIT_RS_CACHE_BYTES` | reusable RAM cache capacity, default 67108864 bytes; `0` disables |
 | `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..3600`, default 120 |
-| `GIT_RS_PACK_THREADS` | native Git `pack.threads` per request, integer `1..4`, default 1 |
-| `GIT_RS_BLAME_CONCURRENCY`, `GIT_RS_BLAME_WAITERS` | 1 / 0; concurrency 1–4, waiters 0–3, total at most 4 |
+| `GIT_RS_BLAME_CONCURRENCY`, `GIT_RS_BLAME_WAITERS` | shared receive/upload/blame/history CPU runtime: 1 / 0; concurrency 1–4, waiters 0–3, total at most 4 |
 | `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` | optional protected absolute 32-byte signing-key file; requires explicit cache configuration |
 | `GIT_RS_BLAME_WARM_PATH` | optional single literal percent-encoded path; requires authenticated checkpoint cache; disabled by default |
 | `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |
 
 The Helm chart obtains credentials from existing Secrets or bucket-claim outputs. Do not put
 credentials, private keys or real identity maps in values files, command-line flags or source
-control. S3 requests use the in-process signed HTTP transport; child environments
-do not inherit arbitrary Git configuration or proxies. Subprocess errors
-intentionally suppress raw external diagnostics.
+control. S3 requests use the in-process signed HTTP transport without proxies,
+redirects or automatic retries. Server paths do not execute native Git, client
+hooks/configuration or external worker programs. Dependency diagnostics suppress
+URLs, credentials and raw external responses.
 
 SQL uses an eight-connection process-local deadpool-postgres pool and a two-worker Tokio runtime.
 Pool waits, connection establishment, query streaming and session reset share the operation's
@@ -47,11 +48,12 @@ The listed PG variables are supported explicitly, not the full libpq environment
 Connection setup is capped at five seconds; statement/lock timeouts are 30/5 seconds. Configuration,
 credentials and CA roots are loaded once per process; restart pods after rotating them.
 
-Snapshots charge encoded row bytes plus 512 bytes per retained ref/pack and a 4096-byte fixed
-reserve before decoding/insertion. Four admitted Git requests can retain up to four such snapshots
-at once. This is conservative accounting for current collection layouts, not an allocator
-or total-RSS guarantee; driver/TLS buffers, transient allocations, cache, Git children and scratch
-need separate resource allowances. Exceeding the budget fails the request without partial data.
+Metadata decoding charges encoded row bytes, retained row overhead and a fixed reserve.
+Data-plane source admission reserves its metadata budget before SQL and bounds retained
+refs, pack/index entries and ref-name bytes. Four admitted transports may retain snapshots
+while one shared CPU worker executes by default. These are collection/backing estimates,
+not an allocator or total-RSS guarantee; driver/TLS/runtime overhead still needs headroom.
+Capacity exhaustion fails the operation without partial source publication.
 
 Only trusted operators holding database/service credentials may run administrative CLI commands.
 The supplied actor argument is not an authentication mechanism for an administrative shell.
@@ -66,21 +68,20 @@ Complete immutable blame uses the authenticated HTTP identity and a leased, publ
 snapshot. It admits one computation per process, accepts at most 256 MiB of complete output, rejects
 blobs over 128 MiB and shares the operation deadline. Path resolution, ancestry,
 attribution and complete porcelain use the pinned Rust core, without a native
-blame subprocess or fallback. Native receive/upload and backup/maintenance remain
-migration debt. See the [endpoint and completed-work contract](docs/blame.md).
+blame subprocess or fallback. Receive/upload, history, bundles and maintenance use
+the same Rust core and bounded source provider. See the
+[endpoint and completed-work contract](docs/blame.md).
 
-Remove `GIT_RS_BLAME_WORKER` from inherited environments before starting this
-binary: even an empty setting is obsolete and causes serving startup to fail.
-Old worker executable/CLI instructions and chart environment overrides are not
-supported migration paths. Check rendered manifests and remove legacy settings;
-chart cleanup belongs to the separate Stage 11 work, not a promise that an older
-published chart configures the new cache/key/warming features.
+Remove `GIT_RS_BLAME_WORKER` and `GIT_RS_PACK_THREADS` from inherited environments:
+even an empty setting is obsolete and causes serving startup to fail. Old worker,
+`packThreads` and serving `scratch` chart settings are rejected. Use the matching
+local chart/binary and inspect rendered manifests during an upgrade.
 
 Production uses the qualified NativeRootV1 core profile with all five performance
 tuning switches on. The vendor default and explicit conservative core profile
 remain all-off. There is no production tuning/producer override.
 The default is one executing job and no queue. Waiters have individual deadlines;
-actual jobs have a finite independent lifetime and retain source holds, scratch,
+actual jobs have a finite independent lifetime and retain source holds,
 buffers and admission through cleanup. Disconnecting a running waiter cannot
 release another waiter's source. Abandoned queued work is cancelled cooperatively.
 Increasing admission does not increase CPU, RAM, SQL or container allowances.
@@ -262,12 +263,14 @@ requires rereading the schema version and retrying the idempotent upgrade path.
 
 ### Verification and publication limits
 
-Current CI includes bounded `tests/cache_gate.py` qualification, ordinary workspace
-checks and full native integration. Separate `blame-images` and dependent `blame`
-jobs build and transfer exact image identities, then explicitly run the ignored
+CI defines bounded `tests/cache_gate.py` qualification, ordinary workspace checks
+and prebuilt actual-image integration. Separate `blame-images` and dependent `blame`
+jobs transfer four exact image roles, then explicitly run the ignored
 blame contracts, `tests/blame_artifacts.py` contracts/faults/legacy-migration harness
-and focused `--blame-core-only` integration. Each job retains its 20-minute bound;
-preparation and execution each retain 900-second bounds. Wiring does not establish
+and focused `--blame-core-only` integration. Preparation and each measured phase
+retain 900-second bounds. The separate runtime gate discovers and serially executes
+source/maintenance SQL contracts and uses fresh owned Kubernetes 1.37 fixtures.
+See [runtime verification](docs/runtime-contracts.md). Wiring does not establish
 successful execution: inspect the exact revision, selected inventory, results and
 cleanup artifacts. See the [current coverage inventory](docs/rust-data-plane.md#current-ci-coverage-and-publication-gaps).
 Legacy migration evidence requires actual old binaries with verified hashes.
@@ -317,11 +320,11 @@ git-rs grant team/project alice maintainer-agent maintainer refs/
 git-rs grant team/project alice bob none refs/
 ```
 
-`migrate` serializes initialization with a transaction advisory lock; repeated/concurrent execution
-checks schema version 1 and refreshes its publication function without resetting stored data.
-It does not migrate arbitrary older/unreleased database layouts. Metadata snapshots consume a
-native query stream rather than retaining a second complete SQL wire image; the decoded catalog
-has a separate allocation-accounting budget and request materialization still consumes resources.
+`migrate` serializes initialization with a transaction advisory lock. It accepts source
+schema v1/v2, transactionally creates/upgrades v2 and refreshes publication/maintenance
+functions without resetting durable state. It does not migrate arbitrary unreleased layouts.
+Metadata consumes a bounded driver stream rather than a second complete SQL wire image.
+Cache migrations remain separate. Follow the two-phase worker upgrade below.
 
 | Role | Read | Ref writes |
 | --- | --- | --- |
@@ -338,9 +341,10 @@ mid-stream; every publication rechecks current write authorization under the rep
 ## Publication, crashes and retries
 
 1. A request authorizes, acquires a committed shared repository lease and takes a fresh metadata
-   snapshot. Git reads/validates a private native repository reconstructed from catalogued packs.
-2. Complete pre-receive/proc-receive command lists must match. Git normalizes packs, validates
-   graph connectivity and computes fast-forward facts; new pack/idx objects are immutable uploads.
+   snapshot. Rust reads catalogued physical objects through bounded authenticated ranges.
+2. One complete immutable command batch is sealed before SQL/status. Controlled Rust ingestion
+   validates all physical entries, typed graph closure and fast-forward facts; new pack/idx
+   identities have durable staged intents before immutable uploads.
 3. One SQL transaction locks the repository, validates the live lease/storage epoch, current
    permissions, old OIDs and complete ref namespace post-image, and publishes refs/catalog/audit.
 4. If the COMMIT transport is lost, the same operation/manifest is confirmed with a fresh
@@ -352,40 +356,49 @@ connection or blindly repeat a destructive maintenance command. Ordinary push re
 Git old-OID checks. SQL commit durability still depends on PostgreSQL/CNPG and storage configuration.
 
 Committed leases cover the remaining absolute operation budget, rounded up to a second, plus
-a 30-second subprocess-termination/cleanup margin. Both shared requests and exclusive maintenance
+a 30-second actual-work cleanup margin. Both shared requests and exclusive maintenance
 use that rule; no heartbeat or live database connection is required to retain a hold. Operations
 default to 120 seconds and may be explicitly configured up to 3600 seconds. A crashed holder can
 therefore delay maintenance for up to its remaining budget plus the margin. Maintenance waits at
 most five seconds for admission, then reports busy; retry after active operations/crashed leases
 finish. Expired leases cannot authorize publication, even if their process is still alive.
 
-SSH, private hooks and HTTP share the request's absolute lifetime; periodic client traffic cannot
+SSH and HTTP share the request's absolute lifetime; periodic client traffic cannot
 extend it. Health retains its independent one-second budget. PostgreSQL connection/statement/lock
 limits and the 110-second per-object S3 transfer limit still apply within a longer request budget.
 Configure gateway timeouts consistently when opting into longer operations. Pod termination is
 still a crash-safe stop, not application-level request draining.
 
 Serving never deletes objects. Interrupted or rejected uploads are tracked as staged objects;
-explicit owner cleanup reclaims uncatalogued objects. A PUT with an unknown outcome leaves a
+explicit owner cleanup enqueues elected work to retire/reclaim uncatalogued objects.
+A PUT with an unknown outcome leaves a
 planned tombstone even after deletion, because its remote write may finish late. Subsequent
 cleanup retries the deletion; tombstone retention is currently unbounded.
 
-## Native Git backups
+## Native-compatible backups and ordered history
 
 Any principal with read permission can export the entire visible repository as a native bundle:
 
 ```sh
 umask 077
-mkdir -p /secure/git-backups /private/request-scratch
-git-rs backup team/project alice --scratch /private/request-scratch \
+mkdir -p /secure/git-backups
+git-rs backup team/project alice \
   --output /secure/git-backups/project-before-maintenance.bundle
 git bundle verify /secure/git-backups/project-before-maintenance.bundle
 ```
 
-The destination must be absolute with a private (`0700`) parent. The bundle is built and verified
+The Rust bundle writer uses a leased snapshot, admitted object selection and streaming
+pack output. The destination must be absolute with a private (`0700`) parent. The bundle is verified
 privately, fsynced and published with create-if-absent semantics and mode `0600`. Existing backup
 files are never overwritten. Store the verified artifact on durable storage outside the serving
 pod before treating it as a backup; a pod-local bundle disappears with ephemeral storage.
+The external `git bundle verify` command is an independent client/oracle check, not a
+server subprocess.
+
+`git-rs history team/project alice --ref refs/heads/main --max-commits 1000000`
+prints ordered commit OIDs using maintained topological traversal. The limit accepts
+`1..1000000`; an omitted ref selects the snapshot's actual default branch. The
+completed result retains source holds and CPU admission through output consumption.
 
 Bundles preserve native Git refs/objects, not PostgreSQL permissions/audit/operations. To restore
 Git contents into a new repository, verify the bundle, mirror-clone it, create a fresh logical
@@ -404,13 +417,13 @@ not first-parent depth. Boundary commits become roots; each branch tip tree is p
 
 Ordered maintenance procedure:
 
-1. Verify the owner identity, repository, intended N, destination durability and free scratch space.
+1. Verify the owner identity, repository, intended N, destination durability and admitted resource headroom.
    Confirm that the bucket has never enabled versioning and no independent lifecycle deletes data.
 2. Save any required old history and check clients/automation are prepared for rewritten OIDs.
 3. Run the owner command with a new backup destination:
 
    ```sh
-   git-rs truncate team/project alice --keep 100 --scratch /private/request-scratch \
+    git-rs truncate team/project alice --keep 100 \
      --backup /secure/git-backups/project-before-truncate.bundle
    ```
 
@@ -419,41 +432,101 @@ Ordered maintenance procedure:
    verified backup.
 4. After success, fetch/clone anew, inspect retained history and verify the backup. If the command
    reports an unknown publication outcome, inspect current refs/catalog before any retry.
-5. If metadata publication succeeded but DELETE failed, keep the backup and rerun only cleanup:
+5. Keep the backup. Physical deletion is separate queued work; enqueue or inspect cleanup:
 
    ```sh
-   git-rs cleanup team/project alice --scratch /private/request-scratch
+    git-rs cleanup team/project alice --wait 120
    ```
 
-Cleanup uses an exclusive lease, durable retirement rows and a storage epoch. Failed DELETEs remain
-retryable. Bucket versioning enabled, suspended or unknown is rejected; version-aware permanent
+Cleanup returns `job-id<TAB>state<TAB>error-code`; without `--wait` it only enqueues.
+Waiting accepts `1..300` seconds and does not run a worker. A separate elected worker
+uses PostgreSQL authority, job tokens, reader fencing, durable retirement rows and
+a storage epoch. Failed DELETEs remain retryable. Bucket versioning enabled,
+suspended or unknown is rejected; version-aware permanent
 deletion is not implemented. Physical live-object deletion is not secure erasure: backup bundles,
 client clones, WAL and retained metadata backups can still contain old data.
 
+## Elected source maintenance and schema upgrade
+
+Serving and ordinary enqueue commands need no Kubernetes credentials. Deploy
+`git-rs maintenance --scratch /scratch/private --health 0.0.0.0:8081` separately,
+with two replicas and a distinct maintenance-only ServiceAccount. Scratch is an
+explicit private ephemeral workspace, not a repository/cache source of truth.
+`--once --wait SECONDS` is an elected fixture/operator mode, never an unfenced
+one-shot deletion fallback.
+
+The chart precreates one kept named Lease with `spec: {}`. The worker role grants
+only GET/PATCH of that exact name; it cannot list/watch/create/delete Leases or
+access Secrets/pods. The projected token, verified CA and namespace are mounted
+read-only. Production uses in-cluster credentials, not inferred kubeconfig or
+external credential plugins. Identity combines Pod UID/process nonce with a fresh
+PostgreSQL campaign UUID.
+
+Kubernetes candidacy is advisory. Only a confirmed, monotonic PostgreSQL fence
+with a live DB-clock lease authorizes work. Logged job/result/publication journals
+bind leader fence, fresh job token and claim generation. Expired campaigns cannot
+revive. Loss/uncertainty stops claims, cancels actual CPU/I/O and forbids publication;
+normal shutdown drains work before PostgreSQL release and Kubernetes vacate.
+The two systems are not atomic and this is not an instantaneous zero-overlap claim.
+
+| Maintenance setting | Default / contract |
+| --- | --- |
+| `GIT_RS_LEADER_LEASE_NAME`, `GIT_RS_LEADER_LEASE_NAMESPACE`, `GIT_RS_POD_UID` | Required exact named Lease and Pod UID |
+| `GIT_RS_LEADER_LEASE_SECONDS`, `GIT_RS_LEADER_RENEW_GRACE_SECONDS`, `GIT_RS_LEADER_EXPIRY_SAFETY_SECONDS` | 30 / 15 / 2; validated API/deadline margins |
+| `GIT_RS_LEADER_PG_FENCE_LEASE_SECONDS`, `GIT_RS_LEADER_PG_FENCE_HEARTBEAT_SECONDS` | 20 / 5; live DB-clock renewal and independent local expiry |
+| `GIT_RS_MAINTENANCE_JOB_LEASE_SECONDS`, `GIT_RS_MAINTENANCE_JOB_SECONDS` | 20 / 120; separate job lease and hard operation lifetime |
+| `GIT_RS_MAINTENANCE_CONCURRENCY` | Exactly 1 source job |
+| `GIT_RS_MAINTENANCE_SCAN_BATCH`, `GIT_RS_MAINTENANCE_SCAN_SECONDS`, `GIT_RS_MAINTENANCE_SCAN_BUDGET_MILLIS` | 100 / 60 / 1000; durable cursor, maximum batch 1000 |
+| `GIT_RS_MAINTENANCE_DELETE_BATCH` | 100; maximum 1000 |
+| `GIT_RS_CACHE_BYTES` | Maintenance range cache 512 MiB, maximum 512 MiB |
+| `GIT_RS_MAINTENANCE_SHUTDOWN_SECONDS` | 90; range 60–120, shorter than pod termination grace |
+
+Compaction preserves every catalog object, including unreachable objects. Automatic
+reachability `full_gc` terminates with `reachability_retention_policy_required`:
+there is no implicit retention/backup-root policy. Unsupported bucket versioning
+and capacity exhaustion are explicit dead-letter errors; other transient failures
+retry with bounded attempts/backoff. Permanent retired identities, staged intents
+and multipart cursors survive restart and successful physical deletion.
+
+Upgrade in two operations:
+
+1. Keep `maintenance.enabled=false`, deploy the new source binary/chart, run the
+   serialized migration and verify committed source schema v2. Stop incompatible
+   old maintenance processes; a schema-version check alone is not quiescence.
+2. Enable `maintenance.enabled=true` using the same image digest, separate account
+   and named Lease. Both eligible standbys must become ready; exactly one locally
+   confirmed authority should answer `/leaderz` with 200. Validate a queued job and
+   exact immutable result before accepting maintenance.
+
+The post-upgrade migration hook runs after ordinary resources are applied; enabling
+workers before the first schema upgrade can make rollout wait on an absent schema.
+There is no v2-to-v1 downgrade/reset procedure. Preserve leadership fences and
+journals; rollback requires a schema-v2-compatible binary and drained ownership.
+
 ## Resource and service checks
 
-- Default 64 MiB cache is shared by requests in one process, not replicas. Entries larger than
-  8 MiB bypass it. Reservations and evicted-but-pinned files remain accounted against capacity,
-  rounded to 4 KiB; at most 256 backing files may be live. Files are size-sealed before download,
-  checked for actual written length and SHA-256, then write-sealed before publication. Native Git
-  reopens request-local symlinks through `/proc/<serving-pid>/fd`; request pins outlive its children.
-  The supplied Linux container/security profile supports this path. Memfd pages can be swapped;
-  this accounting does not bound kernel metadata, total file descriptors or pod RSS.
-- Four admitted operations per process; native Git/curl children consume additional memory,
-  CPU and process slots. A cache metric is not total pod RSS.
-- Native pack workers default to one per request. Explicitly set `GIT_RS_PACK_THREADS=2`, `3`
-  or `4` only within the backend's CPU and memory allowance. Native Git's delta-base cache limit
-  applies per worker, with object buffers in addition; up to four requests can run concurrently.
-  This setting does not raise admission, container quotas, pack sizes or validation limits.
+- Default 64 MiB RAM range cache is shared by a process, not replicas. Entries over 8 MiB
+  bypass it. Reservations, metadata, in-flight fills and evicted reader pins retain actual
+  capacity charges, rounded to 4 KiB. There are at most 256 lookup slots; invalidation drops
+  lookups without refunding pinned readers or allowing a crossed fill to reinstall itself.
+  Accounting excludes allocator/kernel/TLS/runtime overhead and is not total pod RSS.
+- Four admitted transports share one CPU runtime, default one worker/no queue. Raising
+  `GIT_RS_BLAME_CONCURRENCY`/`GIT_RS_BLAME_WAITERS` does not raise resource quotas.
+- Physical packs use bounded ranges, admitted indexes and controlled delta resolution;
+  graph/selection/output buffers and replacement overlap retain separate capacity charges.
 - Absolute transport deadlines cover headers, SSH handshake and blocked response writes; the
   operation budget is not reset after parsing. Health has a separate eight-request admission cap
   and one-second absolute connection budget, so a single trickling client cannot starve probes.
-- A snapshot's pack+idx catalog is admitted up to 12 GiB, incoming pack/HTTP body up to 4 GiB;
-  request materialization and concurrent requests need additional scratch headroom. Chart defaults
-  are an evaluation starting point, not a guarantee that four worst-case requests fit.
-- At most 10,000 refs/commands, truncation N `1..10000`, retained commit metadata up to 64 MiB.
+- Data-plane bounds include 4096 refs/packs, 1 MiB ref names, 128 MiB aggregate indexes,
+  an individual source pack up to 12 GiB and incoming pack/body up to 4 GiB. An incoming
+  wire bound is not a promise that its expanded objects fit the shared 1 GiB CPU-job budget.
+  Chart defaults are provisional, not a guarantee that worst-case concurrent work fits.
+- Receive accepts at most 10,000 commands; truncation N is `1..10000` with retained
+  commit metadata up to 64 MiB per branch. History traverses at most one million commits.
 - `/livez` checks process responsiveness; `/readyz` checks a reachable writable PostgreSQL primary.
-  Readiness does not certify the current schema, S3 availability or replication health. Gate initial
+  Serving readiness does not certify the schema, S3 or replication health. Maintenance readiness
+  additionally requires an eligible Lease observation and recent schema-v2 writable-primary check;
+  `/leaderz` separately requires live local authority. Gate initial
   client exposure on successful migration and a native Git smoke test.
 - `/metrics` on the health listener exposes request/phase/stage/dependency/subprocess histograms,
   failures, cache outcomes, S3 object bytes and admission rejections, alongside the active/cache

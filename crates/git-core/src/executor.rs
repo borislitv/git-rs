@@ -499,6 +499,49 @@ impl CapacityBuffer {
         Ok(())
     }
 
+    /// Append with old/new overlap admitted before growth. Initialization and
+    /// copying poll the original control; backing and its reservation always move
+    /// together. A failed append never exposes a partial logical result.
+    pub fn extend_controlled(
+        &mut self,
+        bytes: &[u8],
+        limit: usize,
+        control: &Control,
+    ) -> Result<(), CapacityError> {
+        control.check()?;
+        let original = self.data.len();
+        let required = original
+            .checked_add(bytes.len())
+            .filter(|length| *length <= limit)
+            .ok_or(CapacityError::Exhausted)?;
+        if required > self.capacity() {
+            let capacity = required.max(self.capacity().saturating_mul(2).min(limit));
+            let mut replacement = self.reservation.budget.buffer(capacity)?;
+            replacement.resize_controlled(original, 0, control)?;
+            for (source, destination) in self
+                .data
+                .chunks(32 * 1024)
+                .zip(replacement.data.chunks_mut(32 * 1024))
+            {
+                control.check()?;
+                destination.copy_from_slice(source);
+            }
+            *self = replacement;
+        }
+        for chunk in bytes.chunks(32 * 1024) {
+            if let Err(reason) = control.check() {
+                self.data.truncate(original);
+                return Err(reason.into());
+            }
+            self.data.extend_from_slice(chunk);
+        }
+        if let Err(reason) = control.check() {
+            self.data.truncate(original);
+            return Err(reason.into());
+        }
+        Ok(())
+    }
+
     /// Initialize at most 32 KiB between request-local checks, including a final
     /// check. On interruption, retain the original visible length and capacity
     /// charge. This bounds fill chunks, not allocator or scheduler latency.
@@ -534,5 +577,11 @@ impl Drop for CapacityBuffer {
         // Free backing memory before returning capacity to other jobs.
         drop(std::mem::take(&mut self.data));
         // The reservation field drops after this destructor returns.
+    }
+}
+
+impl AsRef<[u8]> for CapacityBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
     }
 }

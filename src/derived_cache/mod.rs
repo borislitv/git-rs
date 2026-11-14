@@ -283,7 +283,7 @@ impl DerivedCache {
                 "large cache payload requires separate cache S3 configuration",
             ));
         }
-        // PG binary parameter encoding and the S3 sealed memfd are not zero-copy.
+        // PG binary parameter encoding and bounded S3 transport chunks are not zero-copy.
         // The physical candidate and native context have separate owned charges.
         let _working = self.inner.budget.reserve(
             stored

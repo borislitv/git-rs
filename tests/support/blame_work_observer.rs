@@ -4,7 +4,10 @@ use git_rs::{
     blame::{Observer, Phase, WorkStatistics},
 };
 use git_rs_core::Control;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 #[derive(Clone, Copy, Default)]
 struct Record {
@@ -14,12 +17,16 @@ struct Record {
 pub struct WorkObserver {
     gate: Option<Arc<dyn Observer>>,
     records: Mutex<[Record; 2]>,
+    body_hits: AtomicU64,
+    body_claims: [AtomicU64; 3],
 }
 impl WorkObserver {
     pub fn new(gate: Option<Arc<dyn Observer>>) -> Self {
         Self {
             gate,
             records: Mutex::new([Record::default(); 2]),
+            body_hits: AtomicU64::new(0),
+            body_claims: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
     pub fn render(&self) -> String {
@@ -27,7 +34,19 @@ impl WorkObserver {
             .records
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let mut out = String::new();
+        let mut out = format!(
+            "git_rs_fixture_body_hits_total {}\n",
+            self.body_hits.load(Ordering::Relaxed)
+        );
+        for (outcome, count) in ["owned", "pending", "unavailable"]
+            .into_iter()
+            .zip(&self.body_claims)
+        {
+            out.push_str(&format!(
+                "git_rs_fixture_body_build_claims_total{{outcome=\"{outcome}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
         for (kind, record) in ["foreground", "warm"].into_iter().zip(records) {
             out.push_str(&format!(
                 "git_rs_fixture_work_completions{{kind=\"{kind}\"}} {}\n",
@@ -60,6 +79,18 @@ impl WorkObserver {
 }
 impl Observer for WorkObserver {
     fn observe(&self, phase: Phase, control: &Control) -> Result<()> {
+        if phase == Phase::CacheHit {
+            self.body_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        let claim = match phase {
+            Phase::BodyBuildClaimed => Some(0),
+            Phase::BodyBuildPending => Some(1),
+            Phase::BodyBuildUnavailable => Some(2),
+            _ => None,
+        };
+        if let Some(index) = claim {
+            self.body_claims[index].fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(gate) = &self.gate {
             gate.observe(phase, control)?;
         }

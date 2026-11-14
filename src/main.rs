@@ -6,15 +6,14 @@ use git_rs::{
     blob::Store,
     cache::Cache,
     engine::Engine,
-    history, hooks, http, invalid, metadata,
+    history, http, invalid, metadata,
     metrics::{self, Listener, Outcome, RequestTimer, ServiceEvent, Transport},
     process::Admission,
-    protocol,
+    protocol, serving_socket,
 };
-use std::fs::{self, DirBuilder};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::Ordering};
@@ -35,16 +34,6 @@ fn operation_seconds() -> Result<u64> {
         return Err(invalid("GIT_RS_OPERATION_SECONDS must be in 1..=3600"));
     }
     Ok(seconds)
-}
-
-fn pack_threads() -> Result<u8> {
-    std::env::var_os("GIT_RS_PACK_THREADS").map_or(Ok(1), |value| {
-        value
-            .to_str()
-            .and_then(|value| value.parse::<u8>().ok())
-            .filter(|threads| (1..=4).contains(threads))
-            .ok_or_else(|| invalid("GIT_RS_PACK_THREADS must be in 1..=4"))
-    })
 }
 
 fn blame_capacity(name: &str, default: usize) -> Result<usize> {
@@ -77,14 +66,108 @@ fn bridge(args: &[String]) -> Result<()> {
         protocol::write_packet(&mut socket, field.as_bytes())?;
     }
     socket.flush()?;
-    let mut writer = socket.try_clone()?;
-    // The server closes its half once Git exits; the client-side input pipe then
-    // closes as ordinary Git terminates. Do not join a blocked terminal reader.
-    std::thread::spawn(move || {
-        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut writer);
-        let _ = writer.shutdown(std::net::Shutdown::Write);
-    });
-    protocol::receive_framed(&mut socket, &mut std::io::stdout().lock())
+    let operation = git_rs::process::Operation::new(git_rs::process::MAX_OPERATION_SECONDS);
+    let control = git_rs::receive_io::IoControl::new(operation.clone())?;
+    let input = git_rs::receive_io::ReceiveInput::stdin(control.clone())?;
+    let writer = socket.try_clone()?;
+    let interrupt = socket.try_clone()?;
+    let mut output = BridgeOutput::new(operation.clone())?;
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(move || {
+            let result = input.forward_to(&writer);
+            if result.is_ok() {
+                let _ = writer.shutdown(std::net::Shutdown::Write);
+            }
+            result
+        });
+        let result = operation.with_interrupt(
+            || {
+                let _ = interrupt.shutdown(std::net::Shutdown::Both);
+            },
+            || protocol::receive_framed(&mut socket, &mut output),
+        );
+        // A framed terminal outcome, not client stdin EOF, ends the input pump.
+        // Cancel before joining, including failures and full backend send buffers.
+        control.cancel();
+        let joined = sender
+            .join()
+            .map_err(|_| invalid("SSH input pump panicked"));
+        let _ = joined?;
+        result
+    })
+}
+
+/// Exclusive bridge stdout. No global stdio lock survives a blocked client.
+/// Pipe writes are <= PIPE_BUF after writable readiness; sockets use per-call
+/// nonblocking sends. Arbitrary devices/files lack this stop contract.
+struct BridgeOutput {
+    fd: std::os::fd::OwnedFd,
+    socket: bool,
+    operation: Arc<git_rs::process::Operation>,
+}
+
+impl BridgeOutput {
+    fn new(operation: Arc<git_rs::process::Operation>) -> Result<Self> {
+        use std::os::fd::AsFd;
+        let fd = std::io::stdout().as_fd().try_clone_to_owned()?;
+        let kind = rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode);
+        let socket = match kind {
+            rustix::fs::FileType::Fifo => false,
+            rustix::fs::FileType::Socket
+                if rustix::net::sockopt::socket_type(&fd)? == rustix::net::SocketType::STREAM =>
+            {
+                true
+            }
+            _ => {
+                return Err(invalid(
+                    "SSH bridge stdout must be an exclusive pipe or stream socket",
+                ));
+            }
+        };
+        Ok(Self {
+            fd,
+            socket,
+            operation,
+        })
+    }
+}
+
+impl Write for BridgeOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.operation.check().map_err(std::io::Error::other)?;
+            let mut poll = [rustix::event::PollFd::new(
+                &self.fd,
+                rustix::event::PollFlags::OUT,
+            )];
+            let timeout = rustix::event::Timespec::try_from(Duration::from_millis(10))
+                .map_err(std::io::Error::other)?;
+            rustix::event::poll(&mut poll, Some(&timeout))?;
+            if poll[0].revents().is_empty() {
+                continue;
+            }
+            let bytes = &bytes[..bytes.len().min(4096)];
+            let result = if self.socket {
+                rustix::net::send(
+                    &self.fd,
+                    bytes,
+                    rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
+                )
+            } else {
+                rustix::io::write(&self.fd, bytes)
+            };
+            match result {
+                Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+                result => return result.map_err(Into::into),
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn authorized_keys(args: &[String]) -> Result<()> {
@@ -143,23 +226,26 @@ fn session_bounded(socket: &mut UnixStream, engine: &Engine) -> Result<()> {
     let slug = field(socket)?;
     let service = Service::parse(&field(socket)?)?;
     let protocol = field(socket)?;
-    let mut input = socket.try_clone()?;
-    let interrupt = socket.try_clone()?;
-    let mut output = protocol::Framed(socket);
-    let result = engine.run(
+    let input = socket.try_clone()?;
+    if service == Service::Receive {
+        // The typed receive entrypoint owns its private terminal frame. It must
+        // keep the source/admission receipt through that output and cleanup.
+        return engine.receive_ssh(
+            &slug,
+            &principal,
+            &protocol,
+            input.into(),
+            &mut protocol::Framed(socket),
+        );
+    }
+    git_rs::upload::ssh(
+        engine,
         &slug,
         &principal,
-        service,
         &protocol,
-        None,
-        &mut input,
-        &mut output,
-        &|| {
-            let _ = interrupt.shutdown(std::net::Shutdown::Read);
-        },
-    );
-    output.finish(result.is_ok())?;
-    result
+        input.into(),
+        socket.try_clone()?.into(),
+    )
 }
 
 enum HttpIdentity {
@@ -170,8 +256,12 @@ enum HttpIdentity {
 fn serve(args: &[String]) -> Result<()> {
     // Rust retains the initial GNU C/ASCII thread locale. Blame::new verifies
     // that producer-bound codeset before workers/listeners; never setlocale or
-    // uselocale while serving. Native subprocesses likewise use LC_ALL=C.
-    let pack_threads = pack_threads()?;
+    // uselocale while serving.
+    if std::env::var_os("GIT_RS_PACK_THREADS").is_some() {
+        return Err(invalid(
+            "GIT_RS_PACK_THREADS is obsolete; use the shared CPU admission configuration",
+        ));
+    }
     if std::env::var_os("GIT_RS_BLAME_WORKER").is_some() {
         return Err(invalid(
             "GIT_RS_BLAME_WORKER is obsolete; remove it: blame now runs directly in the bounded Rust core executor",
@@ -235,18 +325,8 @@ fn serve(args: &[String]) -> Result<()> {
     } else {
         None
     };
-    let root = PathBuf::from(option(args, "--scratch")?);
-    if !root.exists() {
-        DirBuilder::new().mode(0o700).create(&root)?;
-    }
-    if !fs::metadata(&root)?.is_dir() || fs::metadata(&root)?.permissions().mode() & 0o077 != 0 {
-        return Err(invalid("scratch root must be a private directory (0700)"));
-    }
     let socket = PathBuf::from(option(args, "--socket")?);
-    let listener = hooks::ServingSocket::bind(&socket)?;
-    // The socket lock proves the previous owner has exited; only its recorded
-    // scratch root is swept. Other serving processes can share the parent.
-    let own_root = listener.scratch_root(&root)?;
+    let listener = serving_socket::ServingSocket::bind(&socket)?;
     let cache_bytes = std::env::var("GIT_RS_CACHE_BYTES")
         .unwrap_or_else(|_| "67108864".into())
         .parse()?;
@@ -254,9 +334,7 @@ fn serve(args: &[String]) -> Result<()> {
         blame,
         store: Store::from_env()?,
         cache: Arc::new(Cache::new(cache_bytes, 8 * 1024 * 1024)),
-        scratch_root: own_root,
         operation_seconds: operation_seconds()?,
-        pack_threads,
     });
     let active = Admission::new(4);
     if let Ok(address) = option(args, "--health") {
@@ -377,59 +455,58 @@ fn health_request(
         || {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-            let mut line = String::new();
-            if BufReader::new(&mut stream)
-                .take(4096)
-                .read_line(&mut line)
-                .is_err()
-            {
-                return Ok(());
-            }
-            let (status, body) = match line
-                .split_whitespace()
-                .take(2)
-                .collect::<Vec<_>>()
-                .as_slice()
-            {
-                ["GET", "/livez"] => ("200 OK", "live\n".to_string()),
-                ["GET", "/readyz"] if ready.load(Ordering::Acquire) => {
+            let path = health_path(&mut BufReader::new(&mut stream))?;
+            let (status, body) = match path.as_str() {
+                "/livez" => ("200 OK", "live\n".to_string()),
+                "/readyz" if ready.load(Ordering::Acquire) => {
                     ("200 OK", "primary metadata available\n".to_string())
                 }
-                ["GET", "/readyz"] => (
+                "/readyz" => (
                     "503 Service Unavailable",
                     "primary metadata unavailable\n".to_string(),
                 ),
-                ["GET", "/metrics"] => (
+                "/metrics" => (
                     "200 OK",
                     metrics::global().render(active.active(), engine.cache.allocated()),
                 ),
                 _ => ("404 Not Found", String::new()),
             };
-            let _ = write!(
+            write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            );
+            )?;
+            stream.shutdown(std::net::Shutdown::Write)?;
             Ok(())
         },
     )
 }
 
+// Probes share the transport's original one-second absolute interrupt. Consume
+// the entire bounded header section before replying; closing with unread TCP
+// headers can reset an otherwise successful response. Health never acquires SQL.
+fn health_path(input: &mut impl BufRead) -> Result<String> {
+    git_rs::health::path(input)
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let basename = Path::new(&args[0])
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    if ["pre-receive", "proc-receive"].contains(&basename) {
-        return hooks::helper(basename);
-    }
     match args.get(1).map(String::as_str) {
         Some("--version") => {
             println!("git-rs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("serve") => serve(&args),
+        Some("maintenance") => git_rs::maintenance::run(git_rs::maintenance::Options {
+            scratch: PathBuf::from(option(&args, "--scratch")?),
+            health: option(&args, "--health")?.parse()?,
+            once: args.iter().any(|arg| arg == "--once"),
+            wait_seconds: if args.iter().any(|arg| arg == "--wait") {
+                option(&args, "--wait")?.parse()?
+            } else {
+                120
+            },
+        }),
         Some("ssh") => bridge(&args),
         Some("authorized-keys") => authorized_keys(&args),
         Some("migrate") => metadata::migrate(),
@@ -439,17 +516,56 @@ fn run() -> Result<()> {
         Some("grant") if args.len() == 7 => {
             metadata::grant(&args[2], &args[3], &args[4], &args[5], args[6].as_bytes())
         }
-        Some(action @ ("backup" | "truncate" | "cleanup")) if args.len() >= 4 => {
-            let root = PathBuf::from(option(&args, "--scratch")?);
+        Some("cleanup") if args.len() >= 4 => git_rs::process::Operation::new(operation_seconds()?)
+            .enter(|| {
+                let queued = history::cleanup(&args[2], &args[3])?;
+                let state = if args.iter().any(|arg| arg == "--wait") {
+                    git_rs::maintenance::queue::wait(&queued.id, option(&args, "--wait")?.parse()?)?
+                } else {
+                    queued
+                };
+                println!(
+                    "{}\t{}\t{}",
+                    state.id,
+                    state.state,
+                    state.error_code.as_deref().unwrap_or("")
+                );
+                Ok(())
+            }),
+        Some(action @ ("history" | "backup" | "truncate")) if args.len() >= 4 => {
             let engine = Engine {
                 blame: git_rs::blame::Blame::new(1, 0)?,
                 store: Store::from_env()?,
                 cache: Arc::new(Cache::new(0, 0)),
-                scratch_root: root,
                 operation_seconds: operation_seconds()?,
-                pack_threads: pack_threads()?,
             };
             git_rs::process::Operation::new(engine.operation_seconds).enter(|| match action {
+                "history" => {
+                    let branch = if args.iter().any(|arg| arg == "--ref") {
+                        Some(option(&args, "--ref")?)
+                    } else {
+                        None
+                    };
+                    let max = if args.iter().any(|arg| arg == "--max-commits") {
+                        option(&args, "--max-commits")?.parse()?
+                    } else {
+                        1_000_000
+                    };
+                    let history = history::list(
+                        &engine,
+                        &args[2],
+                        &args[3],
+                        branch.as_deref().map(str::as_bytes),
+                        max,
+                    )?;
+                    let mut output = std::io::stdout().lock();
+                    for id in history.iter() {
+                        git_rs::process::check_operation()?;
+                        writeln!(output, "{id}")?;
+                    }
+                    output.flush()?;
+                    history.check()
+                }
                 "backup" => history::backup(
                     &engine,
                     &args[2],
@@ -464,11 +580,11 @@ fn run() -> Result<()> {
                     Path::new(&option(&args, "--backup")?),
                     args.iter().any(|a| a == "--drop-other-refs"),
                 ),
-                _ => history::cleanup(&engine, &args[2], &args[3]),
+                _ => Err(invalid("unsupported administration action")),
             })
         }
         _ => Err(invalid(
-            "usage: git-rs serve --scratch DIR --socket PATH [--http ADDRESS --http-credentials FILE | --dev-http 127.0.0.1:PORT --dev-principal NAME] | ssh --socket PATH --principal NAME | migrate | cache-migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX",
+            "usage: git-rs serve --socket PATH [--http ADDRESS --http-credentials FILE | --dev-http 127.0.0.1:PORT --dev-principal NAME] | maintenance --scratch PATH --health ADDRESS [--once --wait SECONDS] | ssh --socket PATH --principal NAME | migrate | cache-migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX | history REPO PRINCIPAL [--ref refs/heads/NAME --max-commits COUNT] | backup REPO PRINCIPAL --output PATH | truncate REPO PRINCIPAL --keep COUNT --backup PATH [--drop-other-refs] | cleanup REPO PRINCIPAL [--wait SECONDS]",
         )),
     }
 }

@@ -13,6 +13,7 @@ spec:
     metadata:
       labels:
         {{- include "git-rs.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: serving
       annotations:
         {{- if .Values.ssh.enabled }}
         checksum/ssh-config: {{ include (print $.Template.BasePath "/ssh-config.yaml") . | sha256sum }}
@@ -37,7 +38,7 @@ spec:
           image: {{ include "git-rs.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [/bin/sh, -ec]
-          args: ["mkdir -p /scratch/private /run/git-rs/private; chmod 0700 /scratch/private /run/git-rs/private"]
+          args: ["mkdir -p /run/git-rs/private; chmod 0700 /run/git-rs/private"]
           securityContext:
             runAsUser: 10001
             runAsGroup: 10001
@@ -47,7 +48,6 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
-            - {name: scratch, mountPath: /scratch}
             - {name: bridge, mountPath: /run/git-rs}
         {{- if .Values.ssh.enabled }}
         # fsGroup makes Secret files group-readable. OpenSSH requires a private
@@ -79,8 +79,6 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - serve
-            - --scratch
-            - /scratch/private
             - --socket
             - /run/git-rs/private/ssh.sock
             - --health
@@ -106,8 +104,10 @@ spec:
               value: {{ .Values.cacheBytes | int64 | quote }}
             - name: GIT_RS_OPERATION_SECONDS
               value: {{ .Values.operationSeconds | quote }}
-            - name: GIT_RS_PACK_THREADS
-              value: {{ .Values.packThreads | quote }}
+            - name: GIT_RS_BLAME_CONCURRENCY
+              value: {{ .Values.cpu.concurrency | quote }}
+            - name: GIT_RS_BLAME_WAITERS
+              value: {{ .Values.cpu.waiters | quote }}
             {{- if .Values.debugTimings }}
             - name: GIT_RS_DEBUG_TIMINGS
               value: "1"
@@ -129,7 +129,6 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
-            - {name: scratch, mountPath: /scratch}
             - {name: bridge, mountPath: /run/git-rs}
             - {name: temporary, mountPath: /tmp}
             - {name: pg-ca, mountPath: /etc/git-rs/pg-ca, readOnly: true}
@@ -174,9 +173,6 @@ spec:
             items:
               - {key: {{ .Values.http.credentialsKey }}, path: credentials}
         {{- end }}
-        - name: scratch
-          emptyDir:
-            sizeLimit: {{ .Values.scratch.sizeLimit }}
         - name: bridge
           emptyDir: {medium: Memory, sizeLimit: 8Mi}
         - name: temporary

@@ -23,7 +23,7 @@ class Gates:
         peer.settimeout(8)
         reader = peer.makefile("rb")
         event = json.loads(reader.readline())
-        assert event["phase"] in ("SourceAcquired", "Complete", "Preparing"), event
+        assert event["phase"] in ("SourceAcquired", "Complete", "Preparing", "BodyBuildClaimed"), event
         self.peers.append((peer, reader))
         return peer, reader
 
@@ -71,7 +71,7 @@ def exercise(f):
             return result.status, result.read()
         finally:
             connection.close()
-    gates = Gates(f.base / "core-gates.sock")
+    gates = Gates(f.server / "core-gates.sock")
     try:
         _, port = f.start_blame("concurrent-blame", control=gates.path)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -84,7 +84,7 @@ def exercise(f):
             wait_for(lambda: admitted("concurrent-blame") == 3, "distinct queued waiter")
             assert response(request(port, "delta")) == (503, b"")
             assert not gates.pending() and leases() == 2
-            assert len(list((f.base / "scratch").glob("instance-*/request-*"))) == 2
+            f.assert_no_repository_bridge()
             alpha.sendall(b"G")
             gamma, _ = gates.entered()
             assert a.result(timeout=8) == (200, expected["alpha"])
@@ -181,7 +181,8 @@ def exercise(f):
         wait_for(lambda: waiters("stop-ack-blame") == 0, "last waiter disconnected from real job")
         assert leases() == 1
         assert reader.readline() == b"stop-requested\n"
-        assert leases() == 1 and list((f.base / "scratch").glob("instance-*/request-*"))
+        assert leases() == 1 and admitted("stop-ack-blame") == 1
+        f.assert_no_repository_bridge()
         alpha.sendall(b"A")
         wait_for(lambda: leases() == 0, "actual stopped job released source")
         healthy = request(stop_port, "delta")

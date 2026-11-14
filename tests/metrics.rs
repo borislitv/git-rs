@@ -107,15 +107,14 @@ fn sample(name: &str) -> u64 {
 
 #[test]
 fn real_cache_hits_misses_and_bypass_are_observable() {
-    use std::io::Write;
     let hit = sample("git_rs_cache_lookups_total{result=\"hit\"}");
     let miss = sample("git_rs_cache_lookups_total{result=\"miss\"}");
     let bypass = sample("git_rs_cache_lookups_total{result=\"bypass\"}");
     let fills = sample("git_rs_stage_duration_seconds_count{stage=\"cache_fill\"}");
     let cache = git_rs::cache::Cache::new(4096, 4);
     let first = cache
-        .get_or_load("private-repository:private-object", 4, |mut file| {
-            file.write_all(b"data")?;
+        .get_or_load("private-repository:private-object", 4, |output| {
+            output.copy_from_slice(b"data");
             Ok(())
         })
         .unwrap()
@@ -126,8 +125,9 @@ fn real_cache_hits_misses_and_bypass_are_observable() {
         })
         .unwrap()
         .unwrap();
-    assert_eq!(std::fs::read(first.path()).unwrap(), b"data");
-    assert_eq!(std::fs::read(second.path()).unwrap(), b"data");
+    assert_eq!(&first[..], b"data");
+    assert_eq!(&second[..], b"data");
+    assert!(Arc::ptr_eq(&first, &second));
     assert!(
         cache
             .get_or_load("too-large", 5, |_| panic!("oversized entry must bypass"))
@@ -156,25 +156,7 @@ fn real_cache_hits_misses_and_bypass_are_observable() {
 }
 
 #[test]
-fn failed_subprocess_spawn_and_unwinding_phase_are_observable() {
-    let errors = sample("git_rs_subprocess_errors_total{program=\"other\"}");
-    let spawns = sample("git_rs_stage_errors_total{stage=\"process_spawn\"}");
-    assert!(
-        git_rs::process::capture(
-            &mut std::process::Command::new("/nonexistent/git-rs-metrics-test"),
-            b"",
-            4096
-        )
-        .is_err()
-    );
-    assert_eq!(
-        sample("git_rs_subprocess_errors_total{program=\"other\"}"),
-        errors + 1
-    );
-    assert_eq!(
-        sample("git_rs_stage_errors_total{stage=\"process_spawn\"}"),
-        spawns + 1
-    );
+fn unwinding_phase_is_observable_without_subprocess_events() {
     let count = sample("git_rs_phase_duration_seconds_count{phase=\"upload\"}");
     let errors = sample("git_rs_phase_errors_total{phase=\"upload\"}");
     let panicked = std::panic::catch_unwind(|| {
@@ -188,6 +170,15 @@ fn failed_subprocess_spawn_and_unwinding_phase_are_observable() {
     assert_eq!(
         sample("git_rs_phase_errors_total{phase=\"upload\"}"),
         errors + 1
+    );
+    assert_eq!(sample("git_rs_subprocess_errors_total{program=\"git\"}"), 0);
+    assert_eq!(
+        sample("git_rs_subprocess_errors_total{program=\"other\"}"),
+        0
+    );
+    assert_eq!(
+        sample("git_rs_stage_duration_seconds_count{stage=\"process_spawn\"}"),
+        0
     );
 }
 
@@ -215,15 +206,22 @@ fn timing_log_fixture() {
                 .spawn(|| {
                     operation.enter(|| {
                         let cache = git_rs::cache::Cache::new(4096, 4);
-                        let file = cache
-                            .get_or_load("private-repository:private-object", 4, |mut file| {
-                                file.write_all(b"data")?;
+                        let bytes = cache
+                            .get_or_load("private-repository:private-object", 4, |output| {
+                                output.copy_from_slice(b"data");
                                 Ok(())
                             })
                             .unwrap()
                             .unwrap();
+                        let digest = metrics::measure(Metric::Stage(Stage::ObjectHash), || {
+                            Ok(openssl::sha::sha256(&bytes))
+                        })
+                        .unwrap();
                         assert_eq!(
-                            git_rs::blob::digest(file.path()).unwrap(),
+                            digest
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>(),
                             "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
                         );
                     })
@@ -237,16 +235,7 @@ fn timing_log_fixture() {
             })
             .is_err()
         );
-        assert!(
-            git_rs::process::capture(
-                std::process::Command::new("/nonexistent/private-command")
-                    .arg("private-credential"),
-                b"",
-                4096,
-            )
-            .is_err()
-        );
-        drop(Timer::start(Metric::Stage(Stage::GitWait)));
+        drop(Timer::start(Metric::Stage(Stage::GitOutput)));
         operation.cancel();
         Operation::new(1).enter(|| {
             metrics::measure(
@@ -272,35 +261,31 @@ fn timing_log_fixture() {
     if std::env::var("GIT_RS_TIMING_BACKPRESSURE").as_deref() == Ok("1") {
         use std::fs;
         use std::os::unix::fs::DirBuilderExt;
-        // External deletion is a reachable cleanup failure. Exercise the real
+        // External replacement is a reachable cleanup failure. Exercise the real
         // public RAII owners, not a mocked log call, with the sink already full.
         let root = std::env::temp_dir().join(format!(
             "git-rs-cleanup-{}",
             git_rs::scratch::identifier().unwrap()
         ));
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-        let scratch = git_rs::scratch::Scratch::new(&root, 1).unwrap();
-        fs::remove_dir_all(&scratch.path).unwrap();
-        let hook = git_rs::hooks::PrivateSocket::new().unwrap();
-        fs::remove_dir_all(hook.path.parent().unwrap()).unwrap();
         let socket_path = root.join("serve.sock");
-        let serving = git_rs::hooks::ServingSocket::bind(&socket_path).unwrap();
-        fs::remove_file(&socket_path).unwrap();
+        let serving = git_rs::serving_socket::ServingSocket::bind(&socket_path).unwrap();
+        let moved = root.with_extension("moved");
+        fs::rename(&root, &moved).unwrap();
+        fs::write(&root, b"replacement prevents traversal to the old socket").unwrap();
         let admission = git_rs::process::Admission::new(1);
         let permit = admission.try_admit().unwrap();
         Operation::new(1).with_interrupt(
             || {},
             || {
                 let _permit = permit;
-                drop(scratch);
-                drop(hook);
                 drop(serving);
                 for _ in 0..8192 {
                     assert!(metrics::service_event(
                         metrics::ServiceEvent::LeaseReleaseFailed
                     ));
                     metrics::measure(
-                        Metric::Stage(Stage::GitWait),
+                        Metric::Stage(Stage::GitOutput),
                         git_rs::process::check_operation,
                     )
                     .unwrap();
@@ -309,7 +294,8 @@ fn timing_log_fixture() {
         );
         assert_eq!(admission.active(), 0);
         assert!(admission.try_admit().is_some());
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(root).unwrap();
+        fs::remove_dir_all(moved).unwrap();
         assert!(sample("git_rs_service_logs_dropped_total") > 0);
         assert!(
             sample("git_rs_timing_logs_dropped_total") > 0,
@@ -483,7 +469,7 @@ fn timing_logs_are_opt_in_correlated_and_exclude_private_values() {
             );
             continue;
         }
-        assert_eq!(records.len(), 11, "{stderr}");
+        assert_eq!(records.len(), 9, "{stderr}");
         let find = |kind, name| {
             records
                 .iter()
@@ -502,9 +488,7 @@ fn timing_logs_are_opt_in_correlated_and_exclude_private_values() {
             ("stage", "cache_fill", "success"),
             ("stage", "object_hash", "success"),
             ("stage", "ref_validate", "error"),
-            ("stage", "process_spawn", "error"),
-            ("subprocess", "other", "error"),
-            ("stage", "git_wait", "error"),
+            ("stage", "git_output", "error"),
             ("stage", "lease_release", "success"),
             ("request", "ssh", "success"),
         ] {

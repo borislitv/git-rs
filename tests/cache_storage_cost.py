@@ -49,12 +49,19 @@ class WireProxy:
         self.lock = threading.Lock()
         self.counts = [0, 0]
         self.sockets = set()
+        self.workers = set()
+        self.stopping = threading.Event()
         self.errors = []
         proxy = self
 
         class Handler(socketserver.BaseRequestHandler):
             def handle(self):
+                current = threading.current_thread()
+                with proxy.lock:
+                    proxy.workers.add(current)
                 try:
+                    if proxy.stopping.is_set():
+                        return
                     with socket.create_connection(proxy.target, timeout=3) as upstream:
                         upstream.settimeout(1)
                         self.request.settimeout(1)
@@ -63,11 +70,13 @@ class WireProxy:
                         upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                         self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                         with proxy.lock:
+                            if proxy.stopping.is_set():
+                                return
                             proxy.sockets.update((upstream, self.request))
 
                         def pump(source, destination, direction):
                             try:
-                                while True:
+                                while not proxy.stopping.is_set():
                                     try:
                                         data = source.recv(65536)
                                     except socket.timeout:
@@ -96,6 +105,9 @@ class WireProxy:
                 except Exception as error:
                     with proxy.lock:
                         proxy.errors.append(str(error))
+                finally:
+                    with proxy.lock:
+                        proxy.workers.discard(current)
 
         class Server(socketserver.ThreadingTCPServer):
             daemon_threads = True
@@ -111,6 +123,7 @@ class WireProxy:
             return list(self.counts)
 
     def close(self):
+        self.stopping.set()
         self.server.shutdown()
         with self.lock:
             for stream in self.sockets:
@@ -121,6 +134,15 @@ class WireProxy:
         self.server.server_close()
         self.thread.join(timeout=5)
         require(not self.thread.is_alive(), "wire listener did not stop")
+        deadline = time.monotonic() + 5
+        while True:
+            with self.lock:
+                workers = list(self.workers)
+            if not workers:
+                break
+            for worker in workers:
+                worker.join(timeout=max(0, deadline - time.monotonic()))
+            require(time.monotonic() < deadline, "wire forwarding owners did not stop")
         require(not self.errors, f"wire proxy failed: {self.errors}")
 
 

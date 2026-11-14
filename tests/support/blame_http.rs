@@ -6,9 +6,9 @@ use git_rs::{
     blob::Store,
     cache::Cache,
     engine::Engine,
-    hooks::ServingSocket,
     http, invalid, metrics,
-    process::Admission,
+    process::{Admission, Operation},
+    serving_socket::ServingSocket,
 };
 use git_rs_core::Control;
 use std::{
@@ -139,6 +139,7 @@ fn run() -> Result<()> {
             "checkpoint-decoded" => Phase::CheckpointDecoded,
             "checkpoint-installed" => Phase::CheckpointInstalled,
             "checkpoint-published" => Phase::CheckpointPublished,
+            "body-claimed" => Phase::BodyBuildClaimed,
             _ => return Err(invalid("invalid fixture phase")),
         };
         gate_observer = Some(Arc::new(Gate {
@@ -149,15 +150,21 @@ fn run() -> Result<()> {
     }
     let work = Arc::new(work_observer::WorkObserver::new(gate_observer));
     blame = blame.with_observer(work.clone());
-    let root = PathBuf::from(option(&args, "--scratch")?);
-    let serving = ServingSocket::bind(&PathBuf::from(option(&args, "--socket")?))?;
+    let _serving = ServingSocket::bind(&PathBuf::from(option(&args, "--socket")?))?;
+    let object_cache_bytes = match option(&args, "--object-cache-bytes") {
+        Ok(value) => value.parse::<usize>()?,
+        Err(_) => 1024 * 1024,
+    };
+    if object_cache_bytes > 64 * 1024 * 1024 {
+        return Err(invalid("fixture object cache exceeds 64 MiB"));
+    }
+    let source_probe = option(&args, "--source-probe").ok();
+    let probe_principal = option(&args, "--principal")?;
     let engine = Arc::new(Engine {
         blame,
         store: Store::from_env()?,
-        cache: Arc::new(Cache::new(1024 * 1024, 8 * 1024 * 1024)),
-        scratch_root: serving.scratch_root(&root)?,
+        cache: Arc::new(Cache::new(object_cache_bytes, 8 * 1024 * 1024)),
         operation_seconds: seconds,
-        pack_threads: 1,
     });
     let active = Admission::new(16);
     let health = TcpListener::bind("127.0.0.1:0")?;
@@ -172,7 +179,7 @@ fn run() -> Result<()> {
             if reader.read_line(&mut line).is_err() || line.len() > 8192 {
                 continue;
             }
-            let body = if line.starts_with("GET /metrics ") {
+            let (status, body) = if line.starts_with("GET /metrics ") {
                 let mut body =
                     metrics::global().render(requests.active(), monitor.cache.allocated());
                 body.push_str(&format!(
@@ -187,13 +194,37 @@ fn run() -> Result<()> {
                 if let Some(stats) = monitor.blame.warming_statistics() {
                     body.push_str(&format!("git_rs_fixture_warm_admitted {}\ngit_rs_fixture_warm_completed {}\ngit_rs_fixture_warm_failed {}\n", stats.admitted, stats.completed, stats.failed));
                 }
-                body
+                (200, body)
+            } else if line.starts_with("GET /source-probe ") {
+                match source_probe.as_deref() {
+                    Some(slug) => {
+                        let started = Instant::now();
+                        match Operation::new(3)
+                            .enter(|| git_rs::metadata::snapshot(slug, &probe_principal, false))
+                        {
+                            Ok(snapshot) => (
+                                200,
+                                format!(
+                                    "snapshot {} {} {} {} {}\n",
+                                    started.elapsed().as_nanos(),
+                                    snapshot.generation,
+                                    snapshot.storage_epoch,
+                                    snapshot.refs.len(),
+                                    snapshot.packs.len()
+                                ),
+                            ),
+                            Err(_) => (503, "source probe failed\n".into()),
+                        }
+                    }
+                    None => (404, "source probe disabled\n".into()),
+                }
             } else {
-                "live\n".into()
+                (200, "live\n".into())
             };
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
                 body.len(),
                 body
             );
@@ -248,18 +279,6 @@ fn fixture_options(args: &[String]) -> Result<git_rs_core::blame::BlameOptions> 
     Ok(selected)
 }
 fn main() {
-    let invocation = std::env::args().next().unwrap_or_default();
-    let basename = std::path::Path::new(&invocation)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    if matches!(basename, "pre-receive" | "proc-receive") {
-        if let Err(error) = git_rs::hooks::helper(basename) {
-            eprintln!("fixture hook: {error}");
-            std::process::exit(1);
-        }
-        return;
-    }
     if let Err(error) = run() {
         eprintln!("blame fixture: {error}");
         std::process::exit(1);

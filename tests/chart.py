@@ -23,7 +23,7 @@ def render(helm, values=None, *, file=None, error=None):
         base = Path(directory) / "base.json"
         base.write_text(json.dumps(ENDPOINT))
         command = [helm, "template", "contract", str(CHART), "--namespace", "git-test",
-                   "--kube-version", "1.30.0", "--values", str(base)]
+                   "--kube-version", "1.37.0", "--values", str(base)]
         if file:
             command += ["--values", str(file)]
         result = subprocess.run(command + ["--values", str(path)], capture_output=True,
@@ -38,10 +38,75 @@ def render(helm, values=None, *, file=None, error=None):
     return documents
 
 
-def resource(documents, kind):
-    found = [doc for doc in documents if doc["kind"] == kind]
+def resource(documents, kind, name=None):
+    found = [doc for doc in documents if doc["kind"] == kind
+             and (name is None or doc["metadata"]["name"] == name)]
     assert len(found) == 1, (kind, len(found))
     return found[0]
+
+
+def maintenance_contracts(helm):
+    documents = render(helm, {"maintenance": {"enabled": True}})
+    serving = resource(documents, "Deployment", "contract-git-rs")
+    worker = resource(documents, "Deployment", "contract-git-rs-maintenance")
+    service = resource(documents, "Service")["spec"]["selector"]
+    serving_pod = serving["spec"]["template"]
+    worker_pod = worker["spec"]["template"]
+    assert all(serving_pod["metadata"]["labels"].get(key) == value for key, value in service.items())
+    assert not all(worker_pod["metadata"]["labels"].get(key) == value for key, value in service.items())
+    assert not all(worker_pod["metadata"]["labels"].get(key) == value
+                   for key, value in serving["spec"]["selector"]["matchLabels"].items())
+    assert worker["spec"]["replicas"] == 2
+    pod = worker_pod["spec"]
+    assert pod["serviceAccountName"] != serving_pod["spec"]["serviceAccountName"]
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["terminationGracePeriodSeconds"] == 110
+    assert pod["securityContext"]["runAsUser"] == 10001
+    backend = pod["containers"][0]
+    assert len(pod["containers"]) == 1
+    assert backend["image"] == serving_pod["spec"]["containers"][0]["image"]
+    assert backend["args"] == ["maintenance", "--scratch", "/scratch/private", "--health", "0.0.0.0:8081"]
+    assert backend["securityContext"]["readOnlyRootFilesystem"]
+    assert backend["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    assert backend["readinessProbe"]["httpGet"]["path"] == "/readyz"
+    env = {item["name"]: item for item in backend["env"]}
+    assert env["GIT_RS_POD_UID"]["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.uid"
+    assert env["GIT_RS_LEADER_LEASE_NAMESPACE"]["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.namespace"
+    assert env["GIT_RS_LEADER_LEASE_NAME"]["value"] == "contract-git-rs-source"
+    assert env["GIT_RS_MAINTENANCE_CONCURRENCY"]["value"] == "1"
+    assert env["GIT_RS_MAINTENANCE_SHUTDOWN_SECONDS"]["value"] == "90"
+    assert env["PGTARGETSESSIONATTRS"]["value"] == "read-write"
+    volumes = {volume["name"]: volume for volume in pod["volumes"]}
+    assert volumes["scratch"]["emptyDir"] == {"medium": "Memory", "sizeLimit": "2Gi"}
+    assert not any("persistentVolumeClaim" in volume for volume in pod["volumes"])
+    projection = volumes["identity"]["projected"]
+    assert projection["defaultMode"] == 0o440
+    assert projection["sources"] == [
+        {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}},
+        {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+        {"downwardAPI": {"items": [{"path": "namespace", "fieldRef": {"fieldPath": "metadata.namespace"}}]}},
+    ]
+    lease = resource(documents, "Lease")
+    assert lease["metadata"]["name"] == "contract-git-rs-source"
+    assert lease["metadata"]["annotations"]["helm.sh/resource-policy"] == "keep"
+    assert lease["spec"] == {}, "chart upgrades must never declare controller-owned live Lease fields"
+    role = resource(documents, "Role")
+    assert role["rules"] == [{"apiGroups": ["coordination.k8s.io"], "resources": ["leases"],
+                              "resourceNames": [lease["metadata"]["name"]], "verbs": ["get", "patch"]}]
+    binding = resource(documents, "RoleBinding")
+    assert binding["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": role["metadata"]["name"]}
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": pod["serviceAccountName"], "namespace": "git-test"}]
+    assert not any(doc["kind"] in {"ClusterRole", "ClusterRoleBinding", "Secret"} for doc in documents)
+    configured = render(helm, {"maintenance": {"enabled": True, "leaseName": "existing.source",
+        "tokenAudience": "api.example.invalid", "serviceAccount": {"create": False, "name": "source-worker"},
+        "scratch": {"medium": "", "sizeLimit": "3Gi"}}})
+    configured_pod = resource(configured, "Deployment", "contract-git-rs-maintenance")["spec"]["template"]["spec"]
+    assert configured_pod["serviceAccountName"] == "source-worker"
+    assert not any(doc["kind"] == "ServiceAccount" and doc["metadata"]["name"] == "source-worker" for doc in configured)
+    volumes = {volume["name"]: volume for volume in configured_pod["volumes"]}
+    assert volumes["scratch"]["emptyDir"] == {"sizeLimit": "3Gi"}
+    assert volumes["identity"]["projected"]["sources"][0]["serviceAccountToken"]["audience"] == "api.example.invalid"
+    assert resource(configured, "Role")["rules"][0]["resourceNames"] == ["existing.source"]
 
 
 def validate_operator_schemas(profiles):
@@ -97,7 +162,9 @@ def main():
     backend = next(c for c in pod["containers"] if c["name"] == "backend")
     env = {item["name"]: item for item in backend["env"]}
     assert env["GIT_RS_CACHE_BYTES"]["value"] == "67108864", env["GIT_RS_CACHE_BYTES"]
-    assert env["GIT_RS_PACK_THREADS"]["value"] == "1"
+    assert "GIT_RS_PACK_THREADS" not in env
+    assert env["GIT_RS_BLAME_CONCURRENCY"]["value"] == "1"
+    assert env["GIT_RS_BLAME_WAITERS"]["value"] == "0"
     assert env["PGSSLMODE"]["value"] == "verify-full"
     assert "GIT_RS_DEBUG_TIMINGS" not in env
     assert env["PGTARGETSESSIONATTRS"]["value"] == "read-write"
@@ -116,7 +183,12 @@ def main():
     assert backend["securityContext"]["runAsNonRoot"]
     assert backend["securityContext"]["readOnlyRootFilesystem"]
     assert not any("persistentVolumeClaim" in volume for volume in pod["volumes"])
-    assert resource(defaults, "Service")["spec"]["selector"] == deployment["spec"]["selector"]["matchLabels"]
+    assert resource(defaults, "Service")["spec"]["selector"] == {
+        **deployment["spec"]["selector"]["matchLabels"], "app.kubernetes.io/component": "serving"}
+    assert "--scratch" not in backend["args"]
+    assert not any(volume["name"] == "scratch" for volume in pod["volumes"])
+    assert not any(doc["kind"] in {"Lease", "Role", "RoleBinding"} for doc in defaults)
+    assert not any(item["name"].startswith("GIT_RS_LEADER_") for item in backend["env"])
     pg = resource(defaults, "Cluster")
     assert pg["spec"]["bootstrap"]["initdb"] == {"database": "git_rs", "owner": "git_rs"}
     assert pg["spec"]["postgresql"]["synchronous"] == {"method": "any", "number": 1, "dataDurability": "required"}
@@ -127,6 +199,9 @@ def main():
     assert "AuthorizedKeysFile none" in resource(defaults, "ConfigMap")["data"]["sshd_config"]
     assert "AuthorizedKeysCommandUser git-rs" in resource(defaults, "ConfigMap")["data"]["sshd_config"]
     assert resource(defaults, "Job")["metadata"]["annotations"]["helm.sh/hook"] == "post-install,post-upgrade"
+    migration = resource(render(args.helm, {"migration": {"podAnnotations": {"sidecar.istio.io/inject": "false"}}}), "Job")
+    assert migration["spec"]["template"]["metadata"]["annotations"] == {"sidecar.istio.io/inject": "false"}
+    assert migration["spec"]["template"]["spec"]["containers"][0]["args"] == ["migrate"]
     assert backend["image"] == f"ghcr.io/borislitv/git-rs:{manifest['package']['version']}"
     assert pg["spec"]["imageName"].endswith("@sha256:605c6e45e733ce0e908505e9ac3c441637d6794d330ec0e9d8d6f631b6918b1e")
 
@@ -171,7 +246,7 @@ def main():
         {"name": "http", "port": 2222, "targetPort": "http"}]
 
     customized = render(args.helm, {
-        "fullnameOverride": "isolated", "cacheBytes": 0, "debugTimings": True, "packThreads": 4,
+        "fullnameOverride": "isolated", "cacheBytes": 0, "debugTimings": True, "cpu": {"concurrency": 4, "waiters": 0},
         "image": {"repository": "example.invalid/git-rs", "digest": "sha256:" + "a" * 64},
         "cnpg": {"name": "metadata-db"},
         "objectBucket": {"name": "packs-claim", "bucketName": "unique-packs", "storageClassName": "retained-buckets", "additionalConfig": {"maxObjects": "1000"}},
@@ -189,7 +264,8 @@ def main():
     assert resource(customized, "ObjectBucketClaim")["spec"]["storageClassName"] == "retained-buckets"
     env = {item["name"]: item for item in pod["containers"][0]["env"]}
     assert env["GIT_RS_CACHE_BYTES"]["value"] == "0"
-    assert env["GIT_RS_PACK_THREADS"]["value"] == "4"
+    assert "GIT_RS_PACK_THREADS" not in env
+    assert env["GIT_RS_BLAME_CONCURRENCY"]["value"] == "4"
     assert env["GIT_RS_DEBUG_TIMINGS"]["value"] == "1"
     assert env["PGHOST"]["value"] == "metadata-db-rw"
     assert env["GIT_RS_S3_BUCKET"]["valueFrom"]["configMapKeyRef"]["name"] == "packs-claim"
@@ -213,6 +289,8 @@ def main():
     scheduled = resource(backed_up, "ScheduledBackup")["spec"]
     assert scheduled["method"] == "plugin" and scheduled["cluster"]["name"] == pg["metadata"]["name"]
 
+    maintenance_contracts(args.helm)
+
     invalid = [
         ({"cacheByte": 1}, "cacheByte"),
         ({"replicaCount": 0}, "replicaCount"),
@@ -221,7 +299,24 @@ def main():
         ({"packThreads": 0}, "packThreads"),
         ({"packThreads": 5}, "packThreads"),
         ({"packThreads": "auto"}, "packThreads"),
+        ({"cpu": {"concurrency": 0}}, "concurrency"),
+        ({"cpu": {"concurrency": 5}}, "concurrency"),
+        ({"cpu": {"concurrency": 2, "waiters": 3}}, "at most four"),
+        ({"maintenance": {"enabled": True, "renewGraceSeconds": 12}}, "lease margins"),
+        ({"maintenance": {"enabled": True, "leaseSeconds": 27}}, "lease margins"),
+        ({"maintenance": {"enabled": True, "pgFenceLeaseSeconds": 17}}, "PG/job leases"),
+        ({"maintenance": {"enabled": True, "jobLeaseSeconds": 17}}, "PG/job leases"),
+        ({"maintenance": {"enabled": True, "terminationGracePeriodSeconds": 95}}, "terminationGracePeriodSeconds"),
+        ({"maintenance": {"enabled": True, "serviceAccount": {"create": False}}}, "maintenance.serviceAccount.name"),
+        ({"maintenance": {"enabled": True, "serviceAccount": {"name": "contract-git-rs"}}}, "distinct from serving"),
+        ({"maintenance": {"sourceConcurrency": 2}}, "sourceConcurrency"),
+        ({"maintenance": {"leaseName": "bad..name"}}, "leaseName"),
+        ({"maintenance": {"leaseName": "a" * 64}}, "leaseName"),
+        ({"maintenance": {"serviceAccount": {"name": "bad/name"}}}, "name"),
+        ({"maintenance": {"scratch": {"medium": "PersistentVolume"}}}, "medium"),
+        ({"maintenance": {"scanBudgetMillis": 1001}}, "scanBudgetMillis"),
         ({"debugTimings": "true"}, "debugTimings"),
+        ({"migration": {"podAnnotations": {"sidecar.istio.io/inject": False}}}, "sidecar.istio.io/inject"),
         ({"image": {"digest": "sha256:bad"}}, "digest"),
         ({"s3": {"endpoint": "http://s3.example.invalid"}}, "endpoint"),
         ({"cnpg": {"enabled": False}}, "postgresql.host is required"),
@@ -251,7 +346,7 @@ def main():
     ]
     for values, message in invalid:
         render(args.helm, values, error=message)
-    print(f"Helm contracts passed: configured defaults, external, OBC, HTTP, Gateway, overrides, Barman; {len(invalid)} invalid profiles rejected")
+    print(f"Helm contracts passed: configured defaults, external, OBC, HTTP, Gateway, overrides, Barman, isolated maintenance; {len(invalid)} invalid profiles rejected")
     if args.operator_schemas:
         validate_operator_schemas([defaults, routed, backed_up])
 

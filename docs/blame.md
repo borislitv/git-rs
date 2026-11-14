@@ -40,7 +40,7 @@ tuning switches: line-token reuse, retained current-input tokens, unchanged-run 
 bounded resource reuse and change indexing. Its immutable canonical tuning byte is 31.
 This does not enable persisted mapping/body reuse or add a production tuning override.
 The vendor tuning default and explicit conservative core profile remain all-off.
-The synthetic 2000-commit/20000-line C7 profile passed the prepared 5 s and hosted
+The historical synthetic 2000-commit/20000-line C7 profile passed the prepared 5 s and hosted
 8 s median gates under a 20 s deadline, 1 GiB job budget and 256 MiB prepared/32 MiB
 hosted decoder budgets (aggregate ceiling 4 GiB/2 CPUs/256 tasks). This is not a
 general latency guarantee; full joined authentication/runtime and real-image CI
@@ -49,8 +49,8 @@ qualification remain pending. See [qualification scope](rust-data-plane.md).
 The complete body is buffered before success headers are sent. A failed, cancelled or oversized
 worker cannot publish a partial successful annotation. A single query may annotate a blob up to
 128 MiB and produce up to 256 MiB of output. These are payload limits, not total-RSS bounds:
-allocation capacity, source mappings, caches and snapshot metadata need additional
-memory and scratch allowances.
+allocation capacity, source ranges, caches and snapshot metadata need additional
+memory allowances. Serving does not create a bare repository or scratch pack bridge.
 
 Each physical tree participating in blame may contain up to 128 MiB of tree
 records, subject to a smaller session object bound and shared capacity admission.
@@ -66,12 +66,14 @@ delta-compressed objects in verified, source-pinned packs acquired on demand.
 These checks do not grant reachability or authorization: the leased published
 snapshot, Rust reachability and literal path checks still precede annotation.
 
-By default only one blame computation executes per serving process and another returns 503.
+By default one shared CPU worker admits work per serving process, with no queued
+capacity. Receive, upload, history and blame use that same pool; occupied shared
+capacity can therefore reject another blame request with 503.
 Operators may set `GIT_RS_BLAME_CONCURRENCY` (1..=4, default 1) and
 `GIT_RS_BLAME_WAITERS` (0..=3, default 0); their sum must not exceed 4. For example,
 concurrency 2 and waiters 1 permits two independent queries to execute and one to wait.
-Excess queries return 503, without materialization or a SQL reader lease. Waiting occupies
-an ordinary request admission but acquires no scratch, cache pins, reader lease or worker;
+Excess queries return 503 before source acquisition. Waiting occupies
+an ordinary request admission but acquires no cache pins, reader lease or worker;
 it honors cancellation and the original absolute deadline, without a fresh execution budget.
 There is no FIFO guarantee. All queries still share the four ordinary request admissions;
 health has independent admission. The absolute `GIT_RS_OPERATION_SECONDS` deadline covers the request,
@@ -79,15 +81,17 @@ source acquisition, computation and response writes. A queued job abandoned by i
 last waiter is cancelled; its actual admission remains held through capture
 destruction. An already-running job has an independent finite lifetime: one
 departed waiter cannot cancel another waiter or release the job's source early.
-Successful and failed jobs release their read hold and private scratch;
-a crashed server's committed hold instead remains until its bounded expiry.
+Completed outputs and resource-owning errors retain actual admission and source
+owners through consumption and cleanup. A crashed server's committed hold instead
+remains until its bounded expiry.
 
 Increasing concurrency does not increase the process-private RAM cache budget, SQL pool,
-Tokio threads or per-worker thread settings. It is not a memory/CPU isolation mechanism.
-Choose it against the pod's aggregate CPU/memory/scratch limits and the selected worker's
-own bounded CPU/memory settings, not the host core count. Each executing query can still
-select up to the existing 12 GiB source-pack admission limit and buffer up to
-256 MiB of output, in addition to worker memory. Completed response buffers can coexist
+Tokio threads or create nested pack workers. It is not a memory/CPU isolation mechanism.
+Choose it against the pod's aggregate CPU/memory limits and shared capacity
+accounting, not the host core count. An individual source pack may be at most
+12 GiB, accessed in bounded immutable ranges rather than one allocation. Each
+query may buffer up to 256 MiB of output, in addition to its working set.
+Completed response buffers can coexist
 until their ordinary request admissions finish. Defaults deliberately preserve the old
 resource envelope; do not multiply large-worker budgets without aggregate headroom.
 
@@ -205,6 +209,12 @@ synthetic signing-key fixtures are not production HTTP/configuration surfaces.
 
 ## Verification
 
+The range-backed/shared-CPU implementation and prebuilt image lifecycle gates need
+fresh joined qualification. See [runtime contracts](runtime-contracts.md) for the
+current actual-image supervisor, compiled-input handoff and independent cleanup.
+Earlier blame/cache observations remain bound to their recorded revisions; they do
+not qualify subsequent source, dependency or image changes.
+
 Synthetic native integration covers reader credentials, rename history, non-UTF-8 paths and
 content, rejection of a valid unreachable commit in a stored pack, the uncompressed-blob bound
 and unchanged publication state. Root/core cases cover native output equivalence,
@@ -216,67 +226,24 @@ tests cover the new boundary. Real HTTP-push cases exercise warming and independ
 cache-network outage. These do not establish a full-repository performance score
 or production HA behavior.
 
-The existing `make integration` and native integration CI job run the concurrency contract
-using their already-provisioned disposable SQL/S3 fixtures. CI also explicitly compiles
-the Rust HTTP fixture with `make blame-core-build`; this does not execute ignored
-PostgreSQL/checkpoint contracts or the artifact/legacy-migration harness.
+`make integration` consumes prebuilt production, fixture and external-oracle image
+identities. It runs under the actual-image observer, with exact-owned disposable
+SQL/S3 fixtures and independent cleanup. `make runtime-contracts-build` prepares
+the separate compiled SQL/candidate handoff outside measurement. Neither a compile
+step nor ordinary discovery executes ignored PostgreSQL/checkpoint contracts.
 
-For the focused core/shared-cache/output/concurrency run, use the public Make targets
-below. Prebuild outside measurement, then run `blame-core-check` in a separate bounded
-systemd unit. Do not invoke focused provisioning directly or fabricate INVOCATION_ID:
-systemd supplies it to both the runner and independent `ExecStopPost` cleanup.
+The split `blame-images` / `blame` workflow separately prepares the current and
+immutable legacy cache contracts. Its four-role image transfer binds the archive,
+Dockerfile, source revision and immutable image identities before preparation;
+registry credentials and Docker user configuration are not exported. The cache
+contract gate and actual-image lifecycle gate have distinct evidence scopes.
 
-Run from the checkout, with Docker access and the fixture images pinned by
-`tests/integration.py` already available locally (focused provisioning uses
-`--pull=never`). Set the shell inputs `cpu_quota`, `memory_max` and `tasks_max` to
-explicit finite cgroup limits selected for the test host. They are inputs to this
-operator wrapper, not git-rs configuration settings or qualified performance budgets.
-The wrapper preserves the existing 900-second runtime bound and 40-second stop bound:
-
-```sh
-(
-  set -eu
-  : "${cpu_quota:?select a finite systemd CPUQuota}"
-  : "${memory_max:?select a finite systemd MemoryMax}"
-  : "${tasks_max:?select a finite systemd TasksMax}"
-  checkout="$(pwd -P)"
-  target_dir="$(python3 -c 'import os; from pathlib import Path; print(Path(os.environ.get("CARGO_TARGET_DIR", "target")).resolve())')"
-  CARGO_TARGET_DIR="$target_dir" make blame-core-build
-  cpus="$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')"
-  unit="git-rs-blame-core-$(date +%s)-$$"
-  cleanup() {
-    if [ "$(systemctl show "$unit.service" --property=LoadState --value)" != not-found ]; then
-      sudo systemctl stop "$unit.service"
-    fi
-  }
-  trap cleanup EXIT
-  sudo systemd-run --wait --pipe --unit="$unit" \
-    --working-directory="$checkout" \
-    --property="User=$(id -un)" --property="Group=$(id -gn)" \
-    --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
-    --property=KillMode=control-group --property=MemorySwapMax=0 \
-    --property="CPUQuota=$cpu_quota" --property="MemoryMax=$memory_max" \
-    --property="TasksMax=$tasks_max" --property="AllowedCPUs=$cpus" \
-    --property="ExecStopPost=/usr/bin/make blame-core-cleanup" \
-    --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
-    --setenv="CARGO_TARGET_DIR=$target_dir" \
-    /usr/bin/make blame-core-check
-)
-```
-
-The Make runner uses prebuilt binaries and retains invocation-specific synthetic
-reports/logs. Cleanup removes only containers carrying that invocation's ownership
-label. Docker fixtures have their own harness resource caps; the systemd cgroup
-does not contain Docker-daemon-owned containers. The wrapper requires measured
-runtime, failure/timeout cleanup and resource qualification before becoming a CI gate.
-The full public gate has local qualification: 58 selected contracts, 11 migration/
-artifact groups, four isolated runtime scenarios and 31 focused serving checks.
-The split `blame-images` / `blame` workflow keeps both jobs at 20 minutes and
-preparation/measurement units at 900 seconds. Image transfer verifies one
-uncompressed archive's checksum, both immutable IDs and the current commit before
-preparation; no registry credentials or Docker user configuration are exported.
-The first exact-HEAD hosted split execution and cold image-job fit remain pending.
-Do not infer those results from this standalone compile step or raise its budgets.
+Measured units retain the 900-second bound, bounded aggregate resources and a
+40-second systemd stop bound. Do not fabricate `INVOCATION_ID` or invoke focused
+provisioning without its independent exact-owner cleanup. Preparation, filesystem
+absence, zero Git counters and a successful timeout cleanup are not interchangeable
+with successful complete server behavior. Keep failed outcomes and unchanged
+latency/memory acceptance budgets in the joined report.
 
 A socket-controlled test observer checks real query overlap/queuing, overflow and
 cleanup without replacing attribution. Native Git independently supplies expected

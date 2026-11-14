@@ -17,20 +17,27 @@ deadpool-postgres = "0.14.2"
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 git-rs-core = { version = "0.1.0", path = "crates/git-core" }
-gix = { git = "https://github.com/borislitv/gitoxide", rev = "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3", version = "0.90.0", default-features = false, features = ["sha1"] }
-gix-packetline = { git = "https://github.com/borislitv/gitoxide", rev = "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3", version = "=0.24.1", default-features = false, features = ["blocking-io"] }
-memfd = "0.6.6"
+gix = { git = "https://github.com/borislitv/gitoxide", rev = "512750f176546e7064b05616be8805caac92d260", version = "0.90.0", default-features = false, features = ["sha1"] }
+gix-packetline = { git = "https://github.com/borislitv/gitoxide", rev = "512750f176546e7064b05616be8805caac92d260", version = "=0.24.1", default-features = false, features = ["blocking-io"] }
+k8s-openapi = { version = "=0.25.0", default-features = false, features = ["v1_33"] }
+kube-client = { version = "=1.1.0", default-features = false, features = ["client", "config", "openssl-tls"] }
+kubert = { git = "https://github.com/borislitv/kubert", rev = "5ebc70e236e14852c82ace1dc772e3c48c1839f7", version = "=0.25.0", default-features = false, features = ["lease", "openssl-tls"] }
 native-tls = "0.2"
 openssl = "0.10"
 percent-encoding = "2.3.2"
 postgres-native-tls = "0.5.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "stream"] }
+quick-xml = { version = "=0.42.0", default-features = false, features = ["serialize"] }
 rustix = { version = "=1.1.6", default-features = false, features = ["std", "event", "fs", "net", "pipe"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "signal", "net"] }
 tokio-postgres = "0.7.18"
-tokio-util = { version = "0.7", features = ["io"] }
 tracing-appender = { version = "0.2.5", default-features = false }
 zstd = { git = "https://github.com/borislitv/zstd-rs", rev = "a6adf4a49ab3b43e2b0279a4257f79dcc164478f", default-features = false, features = ["experimental", "vendored"] }
+
+[dev-dependencies]
+memfd = "0.6.6"
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

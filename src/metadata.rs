@@ -71,7 +71,7 @@ fn lease_seconds(remaining: Duration) -> Result<u64> {
         return Err(invalid("operation exceeds repository lease budget"));
     }
     // Round up the remaining request budget and retain the existing 30-second
-    // subprocess-termination/cleanup margin, including after connection loss.
+    // stop/cleanup margin, including after connection loss.
     Ok(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0) + 30)
 }
 
@@ -143,8 +143,10 @@ impl Drop for Barrier {
 
 pub fn migrate() -> Result<()> {
     sql(&format!(
-        "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('git-rs-schema',0)); {} COMMIT;",
-        include_str!("../migrations/001.sql")
+        "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('git-rs-schema',0)); {} {} {} COMMIT;",
+        include_str!("../migrations/001.sql"),
+        include_str!("../migrations/002_maintenance.sql"),
+        include_str!("../migrations/current_functions.sql")
     ))?;
     Ok(())
 }
@@ -350,6 +352,21 @@ pub fn leased_snapshot(slug: &str, principal: &str, write: bool) -> Result<(Snap
     }
 }
 
+/// A maintenance caller already owns the fenced job and this committed source
+/// hold. Do not manufacture an ACL principal or a new, unfenced serving route.
+pub(crate) fn held_snapshot(repo_id: &str, lease: &Barrier) -> Result<Snapshot> {
+    let repo = format!(
+        "(SELECT r.id FROM repositories r WHERE r.id={}::uuid AND EXISTS(SELECT 1 FROM repository_leases l WHERE l.id={}::uuid AND l.repo_id=r.id AND NOT l.exclusive AND l.expires_at>clock_timestamp()))",
+        text(repo_id),
+        text(&lease.id)
+    );
+    let query = format!(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT 'repo',r.id,r.generation,encode(r.default_ref,'hex'),r.storage_epoch FROM repositories r WHERE r.id={repo}; SELECT 'ref',encode(name,'hex'),encode(oid,'hex') FROM refs WHERE repo_id={repo} ORDER BY name; SELECT 'pack',native_hash,pack_key,idx_key,pack_digest,idx_digest,pack_size,idx_size FROM packs WHERE repo_id={repo} ORDER BY native_hash COLLATE \"C\"; COMMIT;"
+    );
+    read_snapshot(&[(&query, Some(Stage::CatalogRead))], None, &mut None)?
+        .ok_or_else(|| invalid("held maintenance source unavailable"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn publish(
     snapshot: &Snapshot,
@@ -388,10 +405,13 @@ pub fn publish(
     let mut transaction = format!("BEGIN; SET LOCAL synchronous_commit=on; {call}");
     for pack in packs {
         transaction.push_str(&format!(
-            "INSERT INTO packs VALUES({}::uuid,{}::uuid,{},{},{},{},{},{},{},(SELECT generation FROM repositories WHERE id={}::uuid)) ON CONFLICT(repo_id,native_hash) DO NOTHING;",
+            "INSERT INTO packs(repo_id,operation_id,native_hash,pack_key,idx_key,pack_digest,idx_digest,pack_size,idx_size,generation) VALUES({}::uuid,{}::uuid,{},{},{},{},{},{},{},(SELECT generation FROM repositories WHERE id={}::uuid)) ON CONFLICT(repo_id,native_hash) DO NOTHING;",
             text(&snapshot.id), text(operation), text(&pack.hash), text(&pack.pack_key), text(&pack.idx_key), text(&pack.pack_digest), text(&pack.idx_digest), pack.pack_size, pack.idx_size, text(&snapshot.id)));
     }
-    transaction.push_str(&format!("DELETE FROM staged_objects s USING packs p WHERE s.repo_id=p.repo_id AND s.repo_id={}::uuid AND (s.object_key=p.pack_key OR s.object_key=p.idx_key); COMMIT;",text(&snapshot.id)));
+    transaction.push_str(&format!(
+        "DELETE FROM staged_objects s USING packs p WHERE s.repo_id=p.repo_id AND s.repo_id={}::uuid AND (s.object_key=p.pack_key OR s.object_key=p.idx_key); \
+         DO $lease$ BEGIN IF NOT EXISTS(SELECT 1 FROM repositories r JOIN repository_leases l ON l.repo_id=r.id WHERE r.id={}::uuid AND r.storage_epoch={} AND l.id={}::uuid AND NOT l.exclusive AND l.expires_at>clock_timestamp()) THEN RAISE EXCEPTION 'publication source lease unavailable'; END IF; END $lease$; COMMIT;",
+        text(&snapshot.id), text(&snapshot.id), snapshot.storage_epoch, text(&lease.id)));
     match sql(&transaction) {
         Ok(result) => Ok(result.trim().parse()?),
         Err(_) => {
