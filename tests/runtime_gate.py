@@ -156,7 +156,7 @@ def cleanup(*, containers_only=False, deadline=None):
     local = directory(token)
     now = time.monotonic()
     deadline = now + CLEANUP_SECONDS if deadline is None else deadline
-    gate.require(math.isfinite(deadline) and 0 < deadline - now <= CLEANUP_SECONDS,
+    gate.require(math.isfinite(deadline) and now < deadline <= now + CLEANUP_SECONDS,
                  "invalid runtime cleanup deadline")
 
     def remaining(limit):

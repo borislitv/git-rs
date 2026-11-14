@@ -475,7 +475,7 @@ class Fixture:
             for versioning in ("Enabled", "Suspended"):
                 proxy.arm("GET", "/derived-test?versioning", versioning)
                 reply = process.ask("delete")
-                assert "unversioned bucket" in reply, f"{versioning} policy must reject non-version-aware GC: {reply}"
+                assert "never-versioned bucket" in reply, f"{versioning} policy must reject non-version-aware GC: {reply}"
                 assert proxy.hit.wait(timeout=5), "bucket versioning policy boundary was not exercised"
                 self.assert_stored_object(ns, f"cache/{ns}/{payload}", bytes([87]) * 524288)
                 assert self.sql(f"SELECT last_delete_at IS NULL FROM git_rs_cache.payloads WHERE namespace='{ns}'") == "t"

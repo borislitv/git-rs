@@ -96,6 +96,15 @@ class SupervisorContracts(unittest.TestCase):
             runtime.cleanup()
         self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
 
+    def test_default_cleanup_budget_accepts_a_fractional_monotonic_origin(self):
+        # Subtracting the sampled origin from its rounded sum can exceed 35s.
+        with patch.object(runtime.time, "monotonic", return_value=29.019), \
+                patch.object(runtime, "confirm_drain"), \
+                patch.object(runtime, "cleanup_namespace", side_effect=lambda path, **_: path.unlink()):
+            runtime.cleanup()
+        self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
+        self.assertFalse(self.journal.exists())
+
     def test_changed_owner_is_not_removed_after_label_discovery(self):
         before = copy.deepcopy(self.daemon.containers)
         self.daemon.replaced = True

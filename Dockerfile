@@ -14,9 +14,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
         > /usr/share/git-rs/abi-packages.tsv
 
 FROM codec-base AS runtime-base
-RUN DEBIAN_FRONTEND=noninteractive apt-get --no-download purge -y --auto-remove \
-        build-essential curl xz-utils libssl-dev pkg-config libcurl4-openssl-dev \
-        libexpat1-dev zlib1g-dev gettext gnu-coreutils perl python3 python3-venv postgresql-client \
+RUN apt-mark showmanual > /tmp/manual-packages \
+    && xargs -r apt-mark auto < /tmp/manual-packages \
+    && apt-mark manual ca-certificates coreutils gnu-coreutils libcurl4t64 libexpat1 \
+        libssl3t64 zlib1g openssh-server tini libgcc-s1 passwd \
+    && DEBIAN_FRONTEND=noninteractive apt-get --no-download autoremove --purge -y \
+    && rm /tmp/manual-packages \
     && dpkg-query -W -f='${Package}\t${Version}\n' libc6 libc-bin libssl3t64 > /tmp/abi-packages.tsv \
     && cmp /usr/share/git-rs/abi-packages.tsv /tmp/abi-packages.tsv \
     && rm /tmp/abi-packages.tsv \
