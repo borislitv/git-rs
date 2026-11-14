@@ -69,6 +69,9 @@ credential values are not. The kernel basename identifies descriptor-based reexe
 without racing a later `/proc/<pid>/exe` lookup. Both requested and installed names
 are checked for native Git; backend coverage and the program inventory use the
 installed name. Missing or malformed installed identities fail the gate.
+Descriptor-based `runc` bootstrap executions in bound backend cgroups are counted
+separately; they cannot supply backend program coverage. An ordinary requested
+`runc` path is not accepted as this observed container-runtime bootstrap.
 
 Exact-owner Docker create events bind container IDs to the revision-matched image
 roles. A resource-version Kubernetes pod watch starts before Helm hooks and records

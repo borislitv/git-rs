@@ -224,7 +224,7 @@ def inspect_trace(local, group, images, phase):
             ended += 1
     runtime.gate.require(0 < len(groups) <= MAX_CGROUPS and len(executions) <= MAX_EXECS and ended == 1,
                          "incomplete or oversized process lifecycle trace")
-    observed, native_clients, backend_programs = False, 0, set()
+    observed, native_clients, runtime_execs, backend_programs = False, 0, 0, set()
     for identity, executable, name in executions:
         runtime.gate.require(identity in groups, "exec has no recorded cgroup")
         path = groups[identity]
@@ -235,9 +235,8 @@ def inspect_trace(local, group, images, phase):
         # A checkout directory such as git-rs-fixture is not an executable. Git
         # helpers are recognized by basename or their actual git-core directory.
         requested = PurePosixPath(executable).name
-        # OpenSSH reexecutes its session/auth binary through an open descriptor.
-        # The syscall path may be /proc/self/fd/6; the kernel's installed exe
-        # dentry still identifies the actual program, without a /proc PID race.
+        # Descriptor reexecs may use /proc/self/fd/6. The kernel's installed exe
+        # dentry identifies the actual program without a later /proc PID race.
         native = (any(value in {"git", "gitk", "scalar", "gitweb.cgi"}
                       or (value.startswith("git-") and value != "git-rs")
                       for value in (name, requested))
@@ -247,14 +246,19 @@ def inspect_trace(local, group, images, phase):
                                  "native Git executed outside a bound external client/oracle")
             native_clients += 1
         if containers & backends:
-            runtime.gate.require(name in BACKEND_PROGRAMS, "unexpected backend executable: " + name)
-            backend_programs.add(name)
+            bootstrap = name == "runc" and re.fullmatch(r"/proc/self/fd/[0-9]+", executable) is not None
+            runtime.gate.require(name in BACKEND_PROGRAMS or bootstrap, "unexpected backend executable: " + name)
+            if bootstrap:
+                runtime_execs += 1
+            else:
+                backend_programs.add(name)
     runtime.gate.require(observed, "successful-exec probe was not captured before work")
     if phase in {"integration", "receive", "upload", "history", "failures", "maintenance", "cache-matrix", "kubernetes", "istio"}:
         runtime.gate.require(native_clients > 0 and "git-rs" in backend_programs,
                               "runtime/native-client execution coverage missing")
     return {"status": "passed", "successful_execs": len(executions), "cgroups": len(groups),
             "external_native_execs": native_clients, "bound_backend_programs": sorted(backend_programs),
+            "container_runtime_execs": runtime_execs,
             "probe_seen": observed, "native_git_outside_external_oracle": 0}
 
 

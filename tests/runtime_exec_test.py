@@ -64,6 +64,20 @@ class ExecEvidenceContracts(unittest.TestCase):
         self.rows.insert(-1, "E\t2\t14\t/proc/self/fd/6\tsshd-session")
         self.assertEqual(self.inspect()["bound_backend_programs"], ["git-rs", "sshd-session"])
 
+    def test_container_runtime_descriptor_bootstrap_is_separate_from_backend_work(self):
+        self.rows.insert(-1, "E\t2\t14\t/proc/self/fd/6\trunc")
+        result = self.inspect()
+        self.assertEqual(result["container_runtime_execs"], 1)
+        self.assertEqual(result["bound_backend_programs"], ["git-rs"])
+        self.rows[4] = "E\t2\t12\t/proc/self/fd/6\trunc"
+        with self.assertRaisesRegex(ValueError, "coverage missing"):
+            self.inspect()
+
+    def test_runtime_name_without_the_observed_descriptor_path_is_not_a_bootstrap(self):
+        self.rows.insert(-1, "E\t2\t14\t/usr/local/bin/runc\trunc")
+        with self.assertRaisesRegex(ValueError, "unexpected backend executable"):
+            self.inspect()
+
     def test_descriptor_native_git_is_rejected_even_behind_an_allowed_requested_name(self):
         original = list(self.rows)
         for executable in ("/proc/self/fd/6", "/dev/fd/7", "/usr/local/bin/git-rs"):
