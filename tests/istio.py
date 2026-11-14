@@ -220,7 +220,9 @@ def exercise(args, base, distribution, watchers):
         ["--quiet", "--cert", "/fixture-tls/tls.crt", "--key", "/fixture-tls/tls.key", "posix", "/data"],
         [volume, {"name": "data", "emptyDir": {}}], [mount, {"name": "data", "mountPath": "/data"}])
     for doc in fixtures:
-        if doc["kind"] == "Deployment":
+        if doc["kind"] == "Service" and doc["metadata"]["name"] == "s3":
+            doc["spec"]["type"] = "NodePort"
+        elif doc["kind"] == "Deployment":
             doc["spec"]["template"]["metadata"]["annotations"] = {"sidecar.istio.io/inject": "false"}
             doc["spec"]["template"]["spec"]["containers"][0]["resources"] = {
                 "requests": {"cpu": "25m", "memory": "32Mi"}, "limits": {"cpu": "250m", "memory": "256Mi"}}
@@ -229,6 +231,7 @@ def exercise(args, base, distribution, watchers):
         app.kubectl("rollout", "status", "deployment/" + name, "--timeout=120s")
     repository, digest = runtime["reference"].rsplit("@", 1)
     values = {"fullnameOverride": "backend", "replicaCount": 2,
+              "service": {"type": "NodePort"},
               "cacheBytes": 8 * 1024 * 1024,
               "migration": {"podAnnotations": {"sidecar.istio.io/inject": "false"}},
               "image": {"repository": repository, "digest": digest, "pullPolicy": "Never"},
@@ -273,27 +276,18 @@ def exercise(args, base, distribution, watchers):
     for pod in backends:
         containers = pod["spec"]["containers"] + pod["spec"].get("initContainers", [])
         assert any(c["name"] == "istio-proxy" for c in containers), "sidecar injection missing"
-    app.apply([{"apiVersion": "v1", "kind": "Pod", "metadata": {
-        "name": "plaintext-probe", "annotations": {"sidecar.istio.io/inject": "false"}},
-        "spec": {"automountServiceAccountToken": False, "restartPolicy": "Never", "activeDeadlineSeconds": 900,
-            "securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001},
-            "containers": [{"name": "probe", "image": oracle["reference"], "imagePullPolicy": "Never",
-                "command": ["/usr/bin/tini", "--", "/usr/bin/sleep", "900"],
-                "securityContext": {"readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False,
-                                    "capabilities": {"drop": ["ALL"]}},
-                "resources": {"requests": {"cpu": "25m", "memory": "32Mi"},
-                              "limits": {"cpu": "250m", "memory": "128Mi"}},
-                "volumeMounts": [{"name": "ca", "mountPath": "/fixture-ca", "readOnly": True}]}],
-            "volumes": [{"name": "ca", "secret": {"secretName": "fixture-ca", "defaultMode": 0o440}}]}}])
-    app.kubectl("wait", "--for=condition=Ready", "pod/plaintext-probe", "--timeout=60s")
-    app.kubectl("exec", "-i", "plaintext-probe", "--", "curl", "--disable", "--silent",
-                "--fail", "--cacert", "/fixture-ca/ca.crt", "--request", "PUT", "--config", "-",
-                data=(f'url = "https://s3.{APP}.svc:7070/packs"\naws-sigv4 = "aws:amz:us-east-1:s3"\n'
-                      'user = "test-access:synthetic-secret-key"\n').encode())
+    # The existing external controller is already a non-mesh client. Reach the
+    # fixture NodePorts rather than starting a second idle oracle pod and shim.
+    address = next(iter(inspection["NetworkSettings"]["Networks"].values()))["IPAddress"]
+    s3_port = read(app, "service/s3")["spec"]["ports"][0]["nodePort"]
+    command(["curl", "--disable", "--noproxy", "*", "--silent", "--fail", "--max-time", "10",
+             "--resolve", f"s3.{APP}.svc:{s3_port}:{address}", "--cacert", base / "ca.crt",
+             "--request", "PUT", "--config", "-"],
+            data=(f'url = "https://s3.{APP}.svc:{s3_port}/packs"\naws-sigv4 = "aws:amz:us-east-1:s3"\n'
+                  'user = "test-access:synthetic-secret-key"\n').encode())
     app.kubectl("exec", "deployment/backend", "-c", "backend", "--", "git-rs", "create", "team/project", "alice")
     service = read(ingress, "service/public-gateway-istio")
     port = next(p["nodePort"] for p in service["spec"]["ports"] if p["port"] == 443)
-    address = next(iter(inspection["NetworkSettings"]["Networks"].values()))["IPAddress"]
     url = f"https://{HOST}:{port}/team/project.git"
     resolve = f"{HOST}:{port}:{address}"
     auth = "Authorization: Basic " + base64.b64encode(f"alice:{TOKEN}".encode()).decode()
@@ -349,8 +343,10 @@ def exercise(args, base, distribution, watchers):
                and b'istio_requests_total{' in line and b'reporter="destination"' in line
                for line in metrics.splitlines()), "missing gateway-to-backend mutual TLS telemetry"
     # A non-mesh client with otherwise valid app credentials cannot bypass STRICT.
-    plaintext = app.kubectl("exec", "plaintext-probe", "--", "curl", "--disable", "--silent", "--show-error", "--max-time", "5",
-                            "-H", auth, f"http://backend:8080/team/project.git/info/refs?service=git-upload-pack", ok=False)
+    backend_service = read(app, "service/backend")
+    backend_port = next(port["nodePort"] for port in backend_service["spec"]["ports"] if port["name"] == "http")
+    plaintext = command(["curl", "--disable", "--noproxy", "*", "--silent", "--show-error", "--max-time", "5",
+                         "-H", auth, f"http://{address}:{backend_port}/team/project.git/info/refs?service=git-upload-pack"], ok=False)
     assert plaintext.returncode in {52, 56}, ("expected STRICT connection rejection, not DNS/setup failure",
                                             plaintext.returncode, plaintext.stderr)
     old_names = {p["metadata"]["name"] for p in backends}

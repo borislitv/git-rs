@@ -145,6 +145,13 @@ old replicas before starting two fresh ones; they do not claim rolling-upgrade
 availability. Authentication, image identity, mesh and lifecycle checks still
 exercise both serving replicas within the unchanged aggregate bounds.
 
+The existing non-mesh external controller also performs the plaintext rejection
+probe through the fixture backend NodePort. It creates the fixture S3 bucket through
+a separate NodePort with verified CA/hostname and signed requests. No additional
+idle probe pod or container-runtime shim is needed. These NodePorts belong only
+to the disposable fixture; the positive application path still uses HTTPS Gateway
+and destination-verified mutual TLS.
+
 `make istio-prepare` downloads the checksum-pinned public distribution and CRDs
 before measurement. `tests/runtime_gate.py images --phase istio` lists the public
 dependency images to pull beforehand. The measured controller receives those
