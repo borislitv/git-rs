@@ -55,8 +55,11 @@ class Cluster:
 def import_image(cluster, image):
     save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
     try:
+        # Register immutable references explicitly after joining the imported
+        # named image. Generated digest names can point at an archive wrapper
+        # index instead of the image identity exposed by kubelet.
         result = subprocess.run(["docker", "exec", "-i", cluster, "ctr", "images",
-                                 "import", "--digests", "-"], stdin=save.stdout, capture_output=True, timeout=120)
+                                 "import", "-"], stdin=save.stdout, capture_output=True, timeout=120)
         assert result.returncode == 0, result.stderr.decode()
         assert save.wait(timeout=10) == 0, "Docker image export failed"
     finally:
