@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-type Session = UploadSession<RangePackSet<Source>>;
+type Session = UploadSession<'static, RangePackSet<Source>>;
 
 fn packet(bytes: &[u8], output: &mut Vec<u8>) {
     output.extend_from_slice(format!("{:04x}", bytes.len() + 4).as_bytes());
@@ -98,6 +98,52 @@ fn upload_advertises_all_ten_thousand_supported_catalog_refs() -> Result<()> {
         advertised.last().unwrap(),
         format!("{tip} refs/heads/b09999\n").as_bytes()
     );
+    assert!(wire.is_empty());
+    drop(session);
+    assert_eq!(budget.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn upload_borrows_full_length_catalog_names_under_its_own_working_set_budget() -> Result<()> {
+    let mut graph = Graph::default();
+    let blob = graph.object(gix::objs::Kind::Blob, b"contents\n")?;
+    let tree = graph.tree(b"file", blob)?;
+    let tip = graph.commit(tree, &[], 1)?;
+    let refs: Vec<_> = (0..10_000)
+        .map(|number| {
+            let mut name = format!("refs/heads/b{number:05}/").into_bytes();
+            name.resize(1024, b'x');
+            name
+        })
+        .collect();
+    // The caller owns this immutable 10 MiB catalog. The upload view must not
+    // allocate another full set of names in its independently admitted budget.
+    let budget = CapacityBudget::new(2 * 1024 * 1024);
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let snapshot = graph
+        .source()?
+        .open(control, budget.clone(), ReadLimits::default())?;
+    let session = UploadSession::new(
+        snapshot,
+        refs.iter().map(|name| (name.as_slice(), tip)),
+        &refs[0],
+        Version::V0,
+    )?;
+    let mut output = Vec::new();
+    session.advertise(false, &mut output)?;
+    let mut wire = output.as_slice();
+    let mut count = 0;
+    let mut last = None;
+    while let Some(packet) = git_rs::protocol::read_packet(&mut wire)? {
+        count += 1;
+        last = Some(packet);
+    }
+    assert_eq!(count, 10_001);
+    let mut expected = format!("{tip} ").into_bytes();
+    expected.extend_from_slice(&refs[9_999]);
+    expected.push(b'\n');
+    assert_eq!(last.as_deref(), Some(expected.as_slice()));
     assert!(wire.is_empty());
     drop(session);
     assert_eq!(budget.used(), 0);

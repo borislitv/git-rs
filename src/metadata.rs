@@ -5,6 +5,7 @@ use crate::{
     process, scratch,
 };
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -377,32 +378,51 @@ pub fn publish(
     fast_forward: &[bool],
     packs: &[Pack],
 ) -> Result<u64> {
-    let manifest: Vec<u8> = commands
-        .iter()
-        .flat_map(|c| {
-            let mut l = c.line();
-            l.push(b'\n');
-            l
-        })
-        .collect();
-    let array = |values: Vec<String>, kind: &str| format!("ARRAY[{}]::{kind}[]", values.join(","));
-    let call = format!(
-        "SELECT publish({}::uuid,{}::uuid,{},{},{},{}::uuid,{},{},{},{});",
+    let mut manifest = Vec::with_capacity(commands.iter().map(|c| c.name.len() + 83).sum());
+    for command in commands {
+        manifest.extend_from_slice(&command.line());
+        manifest.push(b'\n');
+    }
+    // Build one query buffer, without retaining a second complete publish call
+    // or independently encoded/joined arrays of long ref names. The immutable
+    // call range below is also the exact retry witness after an unknown COMMIT.
+    let mut transaction = String::with_capacity(manifest.len() * 4 + 4096);
+    transaction.push_str("BEGIN; SET LOCAL synchronous_commit=on; ");
+    let call_start = transaction.len();
+    write!(
+        transaction,
+        "SELECT publish({}::uuid,{}::uuid,{},",
         text(&snapshot.id),
         text(operation),
-        text(principal),
-        bytes(&manifest),
+        text(principal)
+    )?;
+    append_bytes(&mut transaction, &manifest)?;
+    write!(
+        transaction,
+        ",{},{}::uuid,",
         snapshot.storage_epoch,
-        text(&lease.id),
-        array(commands.iter().map(|c| bytes(&c.name)).collect(), "bytea"),
-        array(commands.iter().map(|c| bytes(&c.old.0)).collect(), "bytea"),
-        array(commands.iter().map(|c| bytes(&c.new.0)).collect(), "bytea"),
-        array(
-            fast_forward.iter().map(|b| b.to_string()).collect(),
-            "boolean"
-        )
-    );
-    let mut transaction = format!("BEGIN; SET LOCAL synchronous_commit=on; {call}");
+        text(&lease.id)
+    )?;
+    append_bytea_array(&mut transaction, commands.iter().map(|c| c.name.as_slice()))?;
+    transaction.push(',');
+    append_bytea_array(
+        &mut transaction,
+        commands.iter().map(|c| c.old.0.as_slice()),
+    )?;
+    transaction.push(',');
+    append_bytea_array(
+        &mut transaction,
+        commands.iter().map(|c| c.new.0.as_slice()),
+    )?;
+    transaction.push_str(",ARRAY[");
+    for (index, value) in fast_forward.iter().enumerate() {
+        if index != 0 {
+            transaction.push(',');
+        }
+        transaction.push_str(if *value { "true" } else { "false" });
+    }
+    transaction.push_str("]::boolean[]);");
+    let call_end = transaction.len();
     for pack in packs {
         transaction.push_str(&format!(
             "INSERT INTO packs(repo_id,operation_id,native_hash,pack_key,idx_key,pack_digest,idx_digest,pack_size,idx_size,generation) VALUES({}::uuid,{}::uuid,{},{},{},{},{},{},{},(SELECT generation FROM repositories WHERE id={}::uuid)) ON CONFLICT(repo_id,native_hash) DO NOTHING;",
@@ -412,6 +432,7 @@ pub fn publish(
         "DELETE FROM staged_objects s USING packs p WHERE s.repo_id=p.repo_id AND s.repo_id={}::uuid AND (s.object_key=p.pack_key OR s.object_key=p.idx_key); \
          DO $lease$ BEGIN IF NOT EXISTS(SELECT 1 FROM repositories r JOIN repository_leases l ON l.repo_id=r.id WHERE r.id={}::uuid AND r.storage_epoch={} AND l.id={}::uuid AND NOT l.exclusive AND l.expires_at>clock_timestamp()) THEN RAISE EXCEPTION 'publication source lease unavailable'; END IF; END $lease$; COMMIT;",
         text(&snapshot.id), text(&snapshot.id), snapshot.storage_epoch, text(&lease.id)));
+    let call = &transaction[call_start..call_end];
     match sql(&transaction) {
         Ok(result) => Ok(result.trim().parse()?),
         Err(_) => {
@@ -433,4 +454,23 @@ pub fn publish(
             Ok(confirmed.trim().parse()?)
         }
     }
+}
+
+fn append_bytes(output: &mut String, value: &[u8]) -> std::fmt::Result {
+    write!(output, "decode('{}','hex')", hex(value))
+}
+
+fn append_bytea_array<'a>(
+    output: &mut String,
+    values: impl Iterator<Item = &'a [u8]>,
+) -> std::fmt::Result {
+    output.push_str("ARRAY[");
+    for (index, value) in values.enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        append_bytes(output, value)?;
+    }
+    output.push_str("]::bytea[]");
+    Ok(())
 }

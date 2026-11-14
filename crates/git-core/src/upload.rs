@@ -36,25 +36,27 @@ impl Version {
     }
 }
 
-struct VisibleRef {
-    name: CapacityBuffer,
+struct VisibleRef<'a> {
+    name: &'a [u8],
     id: ObjectId,
     peeled: Option<ObjectId>,
 }
 
 /// A pinned authorized ref view. Arbitrary physical catalog objects do not become
 /// legal wants. Have acknowledgments are restricted to its reachable commits.
-pub struct UploadSession<P> {
+/// Names borrow the caller's immutable authorized catalog; its owner must outlive
+/// this session instead of allocating a second complete set of long ref names.
+pub struct UploadSession<'a, P> {
     snapshot: SnapshotSession<P>,
-    refs: ChargedVec<VisibleRef>,
+    refs: ChargedVec<VisibleRef<'a>>,
     advertised: Set<ObjectId>,
     default_ref: CapacityBuffer,
     version: Version,
     visible_commits: Option<Set<ObjectId>>,
 }
 
-impl<P: VerifiedObjectProvider> UploadSession<P> {
-    pub fn new<'a>(
+impl<'a, P: VerifiedObjectProvider> UploadSession<'a, P> {
+    pub fn new(
         snapshot: SnapshotSession<P>,
         refs: impl IntoIterator<Item = (&'a [u8], ObjectId)>,
         default_ref: &[u8],
@@ -67,14 +69,11 @@ impl<P: VerifiedObjectProvider> UploadSession<P> {
         let mut visible = ChargedVec::new(snapshot.capacity.clone(), MAX_REFS)?;
         let mut advertised =
             Set::new(snapshot.capacity.clone(), snapshot.limits.max_graph_objects)?;
-        let mut previous: Option<CapacityBuffer> = None;
+        let mut previous: Option<&[u8]> = None;
         for (name, id) in refs {
             snapshot.control.check()?;
             validate_ref(name)?;
-            if previous
-                .as_ref()
-                .is_some_and(|previous| previous.as_slice() >= name)
-            {
+            if previous.is_some_and(|previous| previous >= name) {
                 return Err(invalid("upload refs must have unique byte-sorted names"));
             }
             if name.starts_with(b"refs/heads/")
@@ -89,15 +88,8 @@ impl<P: VerifiedObjectProvider> UploadSession<P> {
             if let Some(peeled) = peeled {
                 advertised.insert(peeled, &snapshot.control)?;
             }
-            previous = Some(copy(&snapshot, name)?);
-            visible.push(
-                VisibleRef {
-                    name: copy(&snapshot, name)?,
-                    id,
-                    peeled,
-                },
-                &snapshot.control,
-            )?;
+            previous = Some(name);
+            visible.push(VisibleRef { name, id, peeled }, &snapshot.control)?;
         }
         let default_ref = copy(&snapshot, default_ref)?;
         Ok(Self {
@@ -136,11 +128,11 @@ impl<P: VerifiedObjectProvider> UploadSession<P> {
             }
             for reference in self.refs.as_slice() {
                 self.snapshot.control.check()?;
-                self.advertise_ref(reference.name.as_slice(), reference.id, &mut first, output)?;
+                self.advertise_ref(reference.name, reference.id, &mut first, output)?;
                 if let Some(peeled) = reference.peeled {
                     let mut name = [0u8; MAX_REF_BYTES + 3];
-                    let len = reference.name.as_slice().len();
-                    name[..len].copy_from_slice(reference.name.as_slice());
+                    let len = reference.name.len();
+                    name[..len].copy_from_slice(reference.name);
                     name[len..len + 3].copy_from_slice(b"^{}");
                     self.advertise_ref(&name[..len + 3], peeled, &mut first, output)?;
                 }
@@ -352,9 +344,9 @@ impl<P: VerifiedObjectProvider> UploadSession<P> {
         }
         for reference in self.refs.as_slice() {
             self.snapshot.control.check()?;
-            if matches(reference.name.as_slice()) {
+            if matches(reference.name) {
                 self.ls_ref(
-                    reference.name.as_slice(),
+                    reference.name,
                     Some(reference.id),
                     false,
                     if peel_tags { reference.peeled } else { None },
@@ -521,7 +513,7 @@ impl<P: VerifiedObjectProvider> UploadSession<P> {
                 self.refs
                     .as_slice()
                     .iter()
-                    .map(|reference| (reference.name.as_slice(), reference.id)),
+                    .map(|reference| (reference.name, reference.id)),
             )?;
             let mut visible = Set::new(
                 self.snapshot.capacity.clone(),
@@ -618,11 +610,11 @@ impl<P: VerifiedObjectProvider> UploadSession<P> {
         Ok(())
     }
 
-    fn head(&self) -> Option<&VisibleRef> {
+    fn head(&self) -> Option<&VisibleRef<'a>> {
         self.refs
             .as_slice()
             .iter()
-            .find(|reference| reference.name.as_slice() == self.default_ref.as_slice())
+            .find(|reference| reference.name == self.default_ref.as_slice())
     }
 }
 
@@ -668,7 +660,7 @@ impl Request {
 
     fn argument<P: VerifiedObjectProvider>(
         &mut self,
-        session: &UploadSession<P>,
+        session: &UploadSession<'_, P>,
         line: &[u8],
         v2: bool,
     ) -> Result<()> {
@@ -698,7 +690,7 @@ impl Request {
             }
             let mut found = None;
             for reference in session.refs.as_slice() {
-                let full = reference.name.as_slice();
+                let full = reference.name;
                 if full == name
                     || full.strip_prefix(b"refs/heads/") == Some(name)
                     || full.strip_prefix(b"refs/tags/") == Some(name)
