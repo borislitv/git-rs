@@ -247,7 +247,11 @@ def inspect_trace(local, group, images, phase):
             native_clients += 1
         if containers & backends:
             bootstrap = name == "runc" and re.fullmatch(r"/proc/self/fd/[0-9]+", executable) is not None
-            runtime.gate.require(name in BACKEND_PROGRAMS or bootstrap, "unexpected backend executable: " + name)
+            # Ubuntu's packaged cp resolves to a gnucp ELF. Keep the installed
+            # identity and allow only this observed canonical path/name pair.
+            packaged_copy = executable == "/usr/bin/cp" and name == "gnucp"
+            runtime.gate.require(name in BACKEND_PROGRAMS or bootstrap or packaged_copy,
+                                 "unexpected backend executable: " + name)
             if bootstrap:
                 runtime_execs += 1
             else:

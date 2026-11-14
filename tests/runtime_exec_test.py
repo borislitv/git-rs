@@ -64,6 +64,19 @@ class ExecEvidenceContracts(unittest.TestCase):
         self.rows.insert(-1, "E\t2\t14\t/proc/self/fd/6\tsshd-session")
         self.assertEqual(self.inspect()["bound_backend_programs"], ["git-rs", "sshd-session"])
 
+    def test_the_packaged_gnu_copy_alias_retains_its_installed_executable_identity(self):
+        self.rows.insert(-1, "E\t2\t14\t/usr/bin/cp\tgnucp")
+        self.assertEqual(self.inspect()["bound_backend_programs"], ["git-rs", "gnucp"])
+
+    def test_gnu_copy_name_with_an_unrelated_or_descriptor_path_is_not_a_packaged_alias(self):
+        original = list(self.rows)
+        for path in ("/proc/self/fd/6", "/tmp/cp", "/usr/local/bin/cp"):
+            with self.subTest(path=path):
+                self.rows = list(original)
+                self.rows.insert(-1, f"E\t2\t14\t{path}\tgnucp")
+                with self.assertRaisesRegex(ValueError, "unexpected backend executable"):
+                    self.inspect()
+
     def test_container_runtime_descriptor_bootstrap_is_separate_from_backend_work(self):
         self.rows.insert(-1, "E\t2\t14\t/proc/self/fd/6\trunc")
         result = self.inspect()
@@ -80,7 +93,7 @@ class ExecEvidenceContracts(unittest.TestCase):
 
     def test_descriptor_native_git_is_rejected_even_behind_an_allowed_requested_name(self):
         original = list(self.rows)
-        for executable in ("/proc/self/fd/6", "/dev/fd/7", "/usr/local/bin/git-rs"):
+        for executable in ("/proc/self/fd/6", "/dev/fd/7", "/usr/local/bin/git-rs", "/usr/bin/cp"):
             with self.subTest(executable=executable):
                 self.rows = list(original)
                 self.rows.insert(-1, f"E\t2\t14\t{executable}\tgit")
