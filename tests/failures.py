@@ -697,10 +697,19 @@ def thread_spawn_pressure_test(f):
             except (OSError, http.client.HTTPException) as error:
                 raise AssertionError(f"{listener} health listener did not recover") from error
             assert live == (200, b"live\n"), (listener, "health listener did not recover")
-            status, body = f.health(name, "/metrics")
-            assert status == 200
-            assert metric_value(body, f'git_rs_admission_rejections_total{{listener="{listener}"}}') == 1
-            assert metric_value(body, "git_rs_active_requests") == 0, "failed worker leaked admission"
+            def rejected():
+                # Socket/closure destruction precedes counter publication. The
+                # independent health loop may observe that short interval.
+                status, body = f.health(name, "/metrics")
+                assert status == 200
+                count = metric_value(body, f'git_rs_admission_rejections_total{{listener="{listener}"}}')
+                assert count <= 1, "one failed worker must produce exactly one rejection"
+                if count == 1:
+                    assert metric_value(body, "git_rs_active_requests") == 0, "failed worker leaked admission"
+                    return True
+                return False
+
+            wait_for(rejected, "OS worker rejection metric publication")
             environment = f.env
             url = f"http://127.0.0.1:{port}/team/project.git"
             if listener == "ssh":
