@@ -221,6 +221,25 @@ class SupervisorContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "successful-exec observer"):
             runtime.run(SimpleNamespace(traced=False))
 
+    def test_kubernetes_controller_runs_in_the_pinned_oracle_with_the_prebuilt_helm(self):
+        commands = []
+        with self.phase() as (args, local, _):
+            args.phase = "kubernetes"
+            helm = local / "helm"
+            helm.write_bytes(b"\x7fELFsynthetic-prebuilt-helm")
+            helm.chmod(0o555)
+            args.helm = str(helm)
+            with patch.object(runtime, "start_cluster", return_value="owned-cluster"), \
+                    patch.object(runtime, "cluster_cgroups", return_value=["owned-pod"]), \
+                    patch.object(runtime.gate, "command", side_effect=lambda argv, **_: commands.append(argv)):
+                runtime.run(args)
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertEqual(command[:2], ["docker", "run"])
+        self.assertIn("sha256:" + "7" * 64, command)
+        self.assertIn(f"type=bind,src={helm},dst=/usr/local/bin/helm,readonly", command)
+        self.assertEqual(command[-4:], ["--phase", "kubernetes", "--cluster-container", "owned-cluster"])
+
     def test_istio_dispatch_keeps_native_clients_in_the_oracle_and_consumes_prepared_inputs(self):
         environment = {"INVOCATION_ID": self.daemon.token, "GIT_RS_TEST_RUNTIME_IMAGE": "sha256:" + "1" * 64,
                        "GIT_RS_TEST_ORACLE_IMAGE": "sha256:" + "2" * 64, "GIT_RS_TEST_REVISION": "a" * 40}
@@ -450,6 +469,18 @@ class ControllerProxyContracts(unittest.TestCase):
                 patch.object(cache_matrix, "load_config", side_effect=RuntimeError("parsed matrix configuration")):
             with self.assertRaisesRegex(RuntimeError, "parsed matrix configuration"):
                 cache_matrix.main()
+
+    def test_kubernetes_dispatch_preserves_immutable_image_inputs(self):
+        environment = {"GIT_RS_TEST_RUNTIME_IMAGE": "runtime", "GIT_RS_TEST_ORACLE_IMAGE": "oracle",
+                       "GIT_RS_TEST_REVISION": "a" * 40}
+        with patch.dict(os.environ, environment), \
+                patch.object(runtime.gate, "output", return_value="Docker version fixture"), \
+                patch.object(runtime.os, "execv") as work:
+            runtime.inside(SimpleNamespace(phase="kubernetes", cluster_container="owned-cluster"))
+        self.assertEqual(work.call_args.args[1], [runtime.sys.executable, "-B", "/opt/git-rs/tests/kubernetes.py",
+            "--cluster-container", "owned-cluster", "--fixture-dir", "/opt/git-rs/.local/fixture",
+            "--runtime-image", "runtime", "--oracle-image", "oracle", "--revision", "a" * 40,
+            "--helm", "/usr/local/bin/helm"])
 
     def test_selected_but_unexecutable_proxy_stops_before_work(self):
         with patch.object(runtime.gate, "output", side_effect=PermissionError("noexec")), \

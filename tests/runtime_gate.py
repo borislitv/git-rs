@@ -436,10 +436,8 @@ def run(args):
         pod_root = group + "/pods"
         cluster = None
         controller_inputs = []
-        if args.phase == "istio":
-            from istio_artifacts import MAX_BYTES, verify_artifacts
-            inputs = args.istio_artifacts
-            prepared = verify_artifacts(inputs)
+        if args.phase in {"kubernetes", "istio"}:
+            from istio_artifacts import MAX_BYTES
             executable = shutil.which(args.helm)
             gate.require(executable is not None, "prepare the Helm executable before measurement")
             helm = Path(executable).resolve(strict=True)
@@ -447,10 +445,15 @@ def run(args):
                          "bounded prebuilt Helm executable required")
             with helm.open("rb") as source:
                 gate.require(source.read(4) == b"\x7fELF", "the prebuilt Helm input must be a Linux ELF")
-            report["istio_inputs"] = {"artifacts_sha256": prepared, "helm_sha256": gate.digest(helm)}
-            controller_inputs = ["--mount", f"type=bind,src={inputs.resolve(strict=True)},dst=/opt/git-rs/istio-inputs,readonly",
-                                 "--mount", f"type=bind,src={helm},dst=/usr/local/bin/helm,readonly",
-                                 "--env", "GIT_RS_TEST_HELM_SHA256=" + report["istio_inputs"]["helm_sha256"]]
+            report["helm_sha256"] = gate.digest(helm)
+            controller_inputs = ["--mount", f"type=bind,src={helm},dst=/usr/local/bin/helm,readonly",
+                                 "--env", "GIT_RS_TEST_HELM_SHA256=" + report["helm_sha256"]]
+        if args.phase == "istio":
+            from istio_artifacts import verify_artifacts
+            inputs = args.istio_artifacts
+            prepared = verify_artifacts(inputs)
+            report["istio_inputs"] = {"artifacts_sha256": prepared, "helm_sha256": report["helm_sha256"]}
+            controller_inputs += ["--mount", f"type=bind,src={inputs.resolve(strict=True)},dst=/opt/git-rs/istio-inputs,readonly"]
         if args.phase in {"failures", "maintenance", "cache-matrix", "leader", "kubernetes", "istio"}:
             cluster = start_cluster(token, args.slice, cpus, pod_root, deadline, local)
             report["cluster_id"] = cluster
@@ -469,12 +472,6 @@ def run(args):
                 gate.command([sys.executable, "-B", ROOT / "tests/leader_dependency.py", "--cluster-container", cluster,
                     "--test-binary", binary, "--directory", local / "candidate"],
                     timeout=remaining, stdout=log, stderr=subprocess.STDOUT)
-            elif args.phase == "kubernetes":
-                env = dict(os.environ, GIT_RS_TEST_POD_CGROUP_ROOT=pod_root)
-                gate.command([sys.executable, "-B", ROOT / "tests/kubernetes.py", "--cluster-container", cluster,
-                    "--runtime-image", runtime, "--oracle-image", oracle, "--revision", args.revision,
-                    "--fixture-dir", local / "fixture", "--helm", args.helm],
-                    timeout=remaining, stdout=log, stderr=subprocess.STDOUT, env=env)
             else:
                 gate.command(["docker", "run", "--rm", "--pull=never", "--init", "--read-only", "--network", "host",
                     "--name", "git-rs-runtime-controller-" + token, "--label", gate.LABEL + token,
@@ -533,6 +530,13 @@ def inside(args):
             "--image", os.environ["GIT_RS_TEST_RUNTIME_IMAGE"], "--oracle-image", os.environ["GIT_RS_TEST_ORACLE_IMAGE"],
             "--revision", os.environ["GIT_RS_TEST_REVISION"], "--helm", "/usr/local/bin/helm",
             "--artifacts", "/opt/git-rs/istio-inputs"]
+    elif args.phase == "kubernetes":
+        gate.require(args.cluster_container, "supervisor-owned Kubernetes cluster required")
+        arguments = [sys.executable, "-B", "/opt/git-rs/tests/kubernetes.py",
+            "--cluster-container", args.cluster_container, "--fixture-dir", "/opt/git-rs/.local/fixture",
+            "--runtime-image", os.environ["GIT_RS_TEST_RUNTIME_IMAGE"],
+            "--oracle-image", os.environ["GIT_RS_TEST_ORACLE_IMAGE"],
+            "--revision", os.environ["GIT_RS_TEST_REVISION"], "--helm", "/usr/local/bin/helm"]
     elif args.phase == "integration":
         arguments += ["--large-mib", "64", "--debug-timings", "--long-operations"]
     elif args.phase == "receive":
