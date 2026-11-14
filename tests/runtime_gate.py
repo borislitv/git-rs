@@ -330,7 +330,11 @@ def serial_sql(args, local, oracle, token, cpus, deadline):
             with log.open("xb") as stream:
                 for ordinal, name in enumerate(names):
                     database = f"contract_{suite}_{ordinal}"
-                    sql = [*runner, "--entrypoint", "psql", oracle, "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c"]
+                    # Administration stays in the already-owned PG fixture. A
+                    # fresh oracle container per poll can consume the entire
+                    # five-second session-drain budget before SQL even starts.
+                    sql = ["docker", "exec", identity, "psql", "-X", "-qAt",
+                           "--username=postgres", "--dbname=git_rs", "-v", "ON_ERROR_STOP=1", "-c"]
                     gate.command([*sql, "CREATE DATABASE " + database],
                                  timeout=max(0.1, deadline - time.monotonic()), stdout=stream, stderr=subprocess.STDOUT)
                     stream.write(f"\ncontract: {name}\n".encode())

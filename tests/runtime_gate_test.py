@@ -353,6 +353,10 @@ class CompiledInputContracts(unittest.TestCase):
         local = self.root / "sql"
         local.mkdir(mode=0o700)
 
+        def administrative_session(argv):
+            self.assertEqual(argv[:4], ["docker", "exec", "1" * 64, "psql"])
+            self.assertIn("--dbname=git_rs", argv)
+
         def output(argv, **_):
             if argv[:2] == ["docker", "create"]:
                 return "1" * 64
@@ -363,6 +367,7 @@ class CompiledInputContracts(unittest.TestCase):
                 suite = Path(binary).name.split("-", 1)[0]
                 return "\n".join(name + ": test" for name in inventories[suite])
             self.assertIn("FROM pg_stat_activity", argv[-1])
+            administrative_session(argv)
             return "0"
 
         def command(argv, **kwargs):
@@ -377,11 +382,13 @@ class CompiledInputContracts(unittest.TestCase):
                 kwargs["stdout"].write((f"test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n").encode())
                 kwargs["stdout"].flush()
             elif argv[-1].startswith("CREATE DATABASE "):
+                administrative_session(argv)
                 database = argv[-1].split()[-1]
                 self.assertNotIn(database, created)
                 created.add(database)
             else:
                 self.assertTrue(argv[-1].startswith("DROP DATABASE "))
+                administrative_session(argv)
                 dropped.add(argv[-1].split()[-1])
 
         with patch.object(runtime.gate, "output", side_effect=output), \
