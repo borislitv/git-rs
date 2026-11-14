@@ -54,5 +54,41 @@ class DependencyImageContracts(unittest.TestCase):
         self.assertEqual(images, before)
 
 
+class ColdRestartContracts(unittest.TestCase):
+    def test_both_old_pods_are_gone_before_either_new_replica_is_started(self):
+        state = {"replicas": 2, "pods": ["old-a", "old-b"]}
+
+        def endpoint(*arguments):
+            if arguments[0] == "scale":
+                replicas = int(arguments[-1].removeprefix("--replicas="))
+                if replicas:
+                    self.assertEqual(state["pods"], [], "cold start must not overlap old pods")
+                state["replicas"] = replicas
+            elif arguments[0] == "get":
+                self.assertEqual(state["replicas"], 0)
+                state["pods"] = []
+            else:
+                self.assertEqual(arguments[:2], ("rollout", "status"))
+                self.assertEqual(state["replicas"], 2)
+            return SimpleNamespace(stdout=json.dumps({"items": [{"metadata": {"name": name}}
+                for name in state["pods"]]}).encode())
+
+        kubernetes.cold_restart(SimpleNamespace(kubectl=endpoint), {"old-a", "old-b"})
+        self.assertEqual(state["replicas"], 2)
+
+    def test_failed_old_pod_inventory_never_scales_new_replicas_up(self):
+        calls = []
+
+        def endpoint(*arguments):
+            calls.append(arguments)
+            if arguments[0] == "get":
+                raise RuntimeError("API unavailable")
+            return SimpleNamespace(stdout=b"")
+
+        with self.assertRaisesRegex(RuntimeError, "API unavailable"):
+            kubernetes.cold_restart(SimpleNamespace(kubectl=endpoint), {"old-a", "old-b"})
+        self.assertNotIn(("scale", "deployment/backend", "--replicas=2"), calls)
+
+
 if __name__ == "__main__":
     unittest.main()

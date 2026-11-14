@@ -138,6 +138,13 @@ endpoint. The controller and node keep their existing task limits; client thread
 no longer consume the node's container-runtime allowance. The kubeconfig is removed
 after its controller stops, including independent failure cleanup.
 
+The Istio bootstrap executes the actual migration hook with one serving replica,
+verifies schema v2 and waits for the hook pod to disappear, then enables both mesh
+replicas without a redundant migration. Cold-restart checks explicitly stop both
+old replicas before starting two fresh ones; they do not claim rolling-upgrade
+availability. Authentication, image identity, mesh and lifecycle checks still
+exercise both serving replicas within the unchanged aggregate bounds.
+
 `make istio-prepare` downloads the checksum-pinned public distribution and CRDs
 before measurement. `tests/runtime_gate.py images --phase istio` lists the public
 dependency images to pull beforehand. The measured controller receives those

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 import istio
 
 
@@ -64,6 +66,45 @@ class LifecycleContracts(unittest.TestCase):
         self.assertEqual(self.stopped, ["watch"])
         self.assertTrue(any("OSError" in note for note in original.__notes__))
         self.assertFalse((self.base / "report.json").exists())
+
+
+class BootstrapContracts(unittest.TestCase):
+    def install(self, directory, version):
+        values = {"replicaCount": 2, "migration": {"podAnnotations": {"sidecar.istio.io/inject": "false"}}}
+        path, observed = Path(directory) / "values.yaml", []
+
+        def helm(arguments):
+            observed.append((arguments[1], yaml.safe_load(path.read_text())))
+            return SimpleNamespace(stdout=b"")
+
+        def kubectl(*arguments):
+            if arguments[0] == "exec":
+                return SimpleNamespace(stdout=version)
+            self.assertEqual(arguments, ("wait", "--for=delete", "pod", "-l", "job-name=backend-migrate", "--timeout=60s"))
+            return SimpleNamespace(stdout=b"")
+
+        with patch.object(istio, "command", side_effect=helm):
+            try:
+                istio.install_application(SimpleNamespace(kubectl=kubectl), ["helm"], values, path)
+            except AssertionError:
+                self.assertEqual(observed[0][0], "install")
+                self.assertEqual(len(observed), 1, "failed schema validation must not enable both replicas")
+                raise
+        return observed
+
+    def test_real_migration_bootstraps_before_two_mesh_replicas_are_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            observed = self.install(directory, b"2\n")
+        self.assertEqual([kind for kind, _ in observed], ["install", "upgrade"])
+        self.assertEqual(observed[0][1]["replicaCount"], 1)
+        self.assertTrue(observed[0][1]["migration"].get("enabled", True))
+        self.assertEqual(observed[1][1]["replicaCount"], 2)
+        self.assertFalse(observed[1][1]["migration"]["enabled"])
+        self.assertEqual(observed[1][1]["migration"]["podAnnotations"], {"sidecar.istio.io/inject": "false"})
+
+    def test_wrong_schema_does_not_start_the_second_mesh_replica(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(AssertionError, "bootstrap schema"):
+            self.install(directory, b"1\n")
 
 
 class PlatformImageContracts(unittest.TestCase):

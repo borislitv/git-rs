@@ -198,6 +198,17 @@ def wait_ssh(address, port):
     wait_for(listening, "SSH service dataplane readiness")
 
 
+def cold_restart(cluster, old_names):
+    assert len(old_names) == 2, "cold restart requires both serving replicas"
+    cluster.kubectl("scale", "deployment/backend", "--replicas=0")
+    wait_for(lambda: not old_names.intersection(
+        pod["metadata"]["name"] for pod in json.loads(
+            cluster.kubectl("get", "pods", "-o", "json").stdout)["items"]),
+        "old serving pods to disappear before cold startup")
+    cluster.kubectl("scale", "deployment/backend", "--replicas=2")
+    cluster.kubectl("rollout", "status", "deployment/backend", "--timeout=120s")
+
+
 def maintenance_contract(cluster, runtime, values, values_path, install, client):
     def sql(query):
         return cluster.kubectl("exec", "deployment/postgres", "--", "psql", "-X", "-qAt", "-U", "git_rs",
@@ -430,16 +441,7 @@ def exercise(args, base, cluster):
         "/usr/local/bin/git-rs", "history", "team/project", "alice", "--ref", "refs/heads/main").stdout.decode().splitlines()
     assert history == state["history"], "Rust history differs from the independent native traversal"
     old_names = assert_runtime_pods(cluster, runtime)
-    selector = "app.kubernetes.io/instance=smoke,app.kubernetes.io/component=serving"
-    cluster.kubectl("rollout", "restart", "deployment/backend")
-    cluster.kubectl("rollout", "status", "deployment/backend", "--timeout=120s")
-    # Deployment readiness does not wait for terminating pods or for kube-proxy
-    # to observe EndpointSlices. Establish the cold-start/transport preconditions
-    # explicitly; never retry the Git operation whose result is under test.
-    wait_for(lambda: not old_names.intersection(
-        pod["metadata"]["name"] for pod in json.loads(
-            cluster.kubectl("get", "pods", "-l", selector, "-o", "json").stdout)["items"]),
-        "old serving pods to disappear before cold clone")
+    cold_restart(cluster, old_names)
     wait_ssh(address, ssh_port)
     assert_runtime_pods(cluster, runtime)
     client("cold")

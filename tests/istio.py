@@ -20,7 +20,7 @@ import yaml
 
 from integration import PG_IMAGE, ROOT, S3_IMAGE, command
 from istio_artifacts import ARTIFACTS, GATEWAY_API, IMAGES, ISTIO, artifacts, digest, prepare_artifacts, read_artifact
-from kubernetes import Cluster, bound_dependency, bound_image, dependency, import_image
+from kubernetes import Cluster, bound_dependency, bound_image, cold_restart, dependency, import_image
 from kubernetes_processes import PodProcessWatch
 
 APP = "git-app"
@@ -125,8 +125,28 @@ def certificate(base):
         f"subjectAltName=DNS:{HOST},DNS:postgres.{APP}.svc,DNS:s3.{APP}.svc\n"
         "extendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n")
     command(["openssl", "x509", "-req", "-in", base / "tls.csr", "-CA", base / "ca.crt",
-             "-CAkey", base / "ca.key", "-CAcreateserial", "-days", "1", "-extfile",
-             base / "extensions", "-out", base / "tls.crt"])
+              "-CAkey", base / "ca.key", "-CAcreateserial", "-days", "1", "-extfile",
+              base / "extensions", "-out", base / "tls.crt"])
+
+
+def install_application(app, helm, values, values_path):
+    # Exercise the real bootstrap hook before admitting the second mesh replica.
+    # The final two-replica dataplane and all negative controls are unchanged.
+    assert values["replicaCount"] == 2
+    values["replicaCount"] = 1
+    values_path.write_text(yaml.safe_dump(values))
+    command([*helm, "install", "smoke", ROOT / "charts/git-rs", "-n", APP,
+             "-f", values_path, "--wait", "--timeout", "120s"])
+    version = app.kubectl("exec", "deployment/postgres", "--", "psql", "-X", "-qAt", "-U", "git_rs",
+                         "-d", "git_rs", "-v", "ON_ERROR_STOP=1", "-c",
+                         "SELECT version FROM git_rs.schema_version").stdout.strip()
+    assert version == b"2", "bootstrap schema before enabling both mesh replicas"
+    app.kubectl("wait", "--for=delete", "pod", "-l", "job-name=backend-migrate", "--timeout=60s")
+    values["replicaCount"] = 2
+    values["migration"]["enabled"] = False
+    values_path.write_text(yaml.safe_dump(values))
+    command([*helm, "upgrade", "smoke", ROOT / "charts/git-rs", "-n", APP,
+             "-f", values_path, "--wait", "--timeout", "120s"])
 
 
 def exercise(args, base, distribution, watchers):
@@ -221,9 +241,7 @@ def exercise(args, base, distribution, watchers):
               "resources": {"requests": {"cpu": "50m", "memory": "64Mi", "ephemeral-storage": "256Mi"},
                             "limits": {"cpu": "1", "memory": "512Mi", "ephemeral-storage": "2Gi"}}}
     values_path = base / "values.yaml"
-    values_path.write_text(yaml.safe_dump(values))
-    command([*helm, "install", "smoke", ROOT / "charts/git-rs", "-n", APP,
-             "-f", values_path, "--wait", "--timeout", "120s"])
+    install_application(app, helm, values, values_path)
 
     def gateway_ready():
         doc = read(ingress, "gateway/public-gateway")
@@ -336,10 +354,7 @@ def exercise(args, base, distribution, watchers):
     assert plaintext.returncode in {52, 56}, ("expected STRICT connection rejection, not DNS/setup failure",
                                             plaintext.returncode, plaintext.stderr)
     old_names = {p["metadata"]["name"] for p in backends}
-    app.kubectl("rollout", "restart", "deployment/backend")
-    app.kubectl("rollout", "status", "deployment/backend", "--timeout=120s")
-    wait(lambda: not old_names.intersection(p["metadata"]["name"] for p in read(app, "pods")["items"]),
-         "old backend pods removed")
+    cold_restart(app, old_names)
     wait(lambda: command([*curl, "-H", auth, "-o", "/dev/null", "-w", "%{http_code}", discovery], ok=False).stdout == b"200",
          "restarted mesh endpoints")
     command(["git", "clone", url, base / "cold-clone"], env=env)
