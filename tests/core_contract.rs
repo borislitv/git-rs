@@ -10,6 +10,7 @@ use git_rs_core::{
 };
 use ranges::{Pack, Source, compressed, full, oid};
 use std::{
+    io::Write,
     sync::{Arc, atomic::Ordering, mpsc},
     time::{Duration, Instant},
 };
@@ -179,6 +180,91 @@ fn root_ranges_reject_corrupt_physical_identity_and_unadmitted_find_growth() -> 
     assert!(raw.is_empty());
     drop(odb);
     assert_eq!(budget.used(), 0);
+    Ok(())
+}
+
+#[test]
+fn range_blame_rejects_oversized_full_and_delta_blobs_before_decode() -> Result<()> {
+    use git_rs_core::blame::{BlameError, BlameOptions, BlameRequest, MAX_BLOB_BYTES};
+
+    let size = MAX_BLOB_BYTES + 1;
+    let mut blob_hash = openssl::sha::Sha1::new();
+    blob_hash.update(format!("blob {size}\0").as_bytes());
+    let mut delta_hash = openssl::sha::Sha1::new();
+    delta_hash.update(format!("blob {}\0", size + 1).as_bytes());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let block = vec![0; 1024 * 1024];
+    for _ in 0..128 {
+        encoder.write_all(&block)?;
+        blob_hash.update(&block);
+        delta_hash.update(&block);
+    }
+    encoder.write_all(&[0])?;
+    blob_hash.update(&[0]);
+    delta_hash.update(&[0, b'x']);
+    let blob = gix::ObjectId::from(blob_hash.finish());
+    let delta = gix::ObjectId::from(delta_hash.finish());
+    // Git pack entry: full blob, declared size 128 MiB + 1.
+    let mut blob_entry = vec![0xb1, 0x80, 0x80, 0x80, 0x04];
+    blob_entry.extend_from_slice(&encoder.finish()?);
+    // Delta size integers are LEB128. Repeated default 64-KiB copies read
+    // zeros from the base, followed by the final zero and distinct suffix.
+    let mut instructions = Vec::new();
+    for length in [size, size + 1] {
+        let mut remaining = length;
+        while remaining >= 128 {
+            instructions.push((remaining as u8 & 127) | 128);
+            remaining >>= 7;
+        }
+        instructions.push(remaining as u8);
+    }
+    instructions.extend(std::iter::repeat_n(0x80, 2048));
+    instructions.extend_from_slice(&[2, 0, b'x']);
+    assert_eq!(instructions.len(), 2059);
+    // Git pack entry: reference delta with 2059 instruction bytes.
+    let mut delta_entry = vec![0xfb, 0x80, 0x01];
+    delta_entry.extend_from_slice(blob.as_slice());
+    delta_entry.extend_from_slice(&compressed(&instructions));
+    let mut entries = vec![(blob, blob_entry), (delta, delta_entry)];
+    let mut commits = Vec::new();
+    for selected in [blob, delta] {
+        let mut tree = b"100644 file\0".to_vec();
+        tree.extend_from_slice(selected.as_slice());
+        let tree_id = oid(gix::objs::Kind::Tree, &tree)?;
+        let commit = format!(
+            "tree {tree_id}\nauthor A <a@example.invalid> 1 +0000\ncommitter A <a@example.invalid> 1 +0000\n\nsynthetic\n"
+        );
+        let commit_id = oid(gix::objs::Kind::Commit, commit.as_bytes())?;
+        entries.push((tree_id, full(gix::objs::Kind::Tree, &tree)));
+        entries.push((commit_id, full(gix::objs::Kind::Commit, commit.as_bytes())));
+        commits.push(commit_id);
+    }
+    let source = Source::new(vec![Pack::new(&entries)?]);
+    let options = BlameOptions::default();
+    for commit in commits {
+        // This budget cannot hold either blob: rejection must precede decode.
+        let budget = CapacityBudget::new(32 * 1024 * 1024);
+        let session = source
+            .clone()
+            .open(control(), budget.clone(), options.read_limits())?;
+        let error = session
+            .blame_complete(
+                BlameRequest {
+                    commit: &commit,
+                    path: b"file",
+                },
+                &options,
+            )
+            .err()
+            .expect("oversized historical blobs must not reach attribution");
+        assert_eq!(error, BlameError::BlobTooLarge, "selected commit {commit}");
+        drop(session);
+        assert_eq!(
+            budget.used(),
+            0,
+            "failed preflight must release every admitted buffer"
+        );
+    }
     Ok(())
 }
 

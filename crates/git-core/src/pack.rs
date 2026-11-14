@@ -25,6 +25,21 @@ pub struct PackLocation {
     pub offset: u64,
 }
 
+/// Preserve size-limit failures across provider error boundaries without
+/// classifying corruption, cancellation or capacity failures by message text.
+#[derive(Debug)]
+pub(crate) struct ObjectSizeLimit {
+    pub size: u64,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for ObjectSizeLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("delta object byte limit exceeded")
+    }
+}
+impl std::error::Error for ObjectSizeLimit {}
+
 #[derive(Clone, Copy)]
 pub(crate) struct DecodePlan {
     header: gix_object::Header,
@@ -38,7 +53,10 @@ pub(crate) struct DecodePlan {
 impl DecodePlan {
     pub(crate) fn validate(self, limits: ReadLimits) -> Result<()> {
         if self.max_object > limits.max_object_bytes {
-            return Err(invalid("delta object byte limit exceeded"));
+            return Err(Box::new(ObjectSizeLimit {
+                size: self.max_object as u64,
+                limit: limits.max_object_bytes,
+            }));
         }
         if self.expanded > limits.max_decode_bytes {
             return Err(invalid("delta decoded-byte budget exceeded"));
@@ -369,10 +387,16 @@ impl<G> PackSet<G> {
             return Err(invalid("delta depth limit exceeded"));
         }
         prepared.active.push(location);
-        let result = (|| {
+        let result = (|| -> Result<DecodePlan> {
             let bundle = &self.bundles[location.pack];
             let entry = bundle.pack.entry(location.offset)?;
             let size = usize::try_from(entry.decompressed_size)?;
+            if entry.header.is_base() && size > limits.max_object_bytes {
+                return Err(Box::new(ObjectSizeLimit {
+                    size: entry.decompressed_size,
+                    limit: limits.max_object_bytes,
+                }));
+            }
             if size > limits.max_decode_bytes {
                 return Err(invalid("delta decoded-byte budget exceeded"));
             }
@@ -416,7 +440,10 @@ impl<G> PackSet<G> {
                 if base_size > limits.max_object_bytes as u64
                     || result_size > limits.max_object_bytes
                 {
-                    return Err(invalid("delta object byte limit exceeded"));
+                    return Err(Box::new(ObjectSizeLimit {
+                        size: base_size.max(result_size as u64),
+                        limit: limits.max_object_bytes,
+                    }));
                 }
                 // No instruction storage survives recursive preflight.
                 drop(instructions);

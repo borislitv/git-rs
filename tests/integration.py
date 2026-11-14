@@ -1178,7 +1178,8 @@ def complete_blame_test(f, source, port, actors):
         assert status == 404 and payload == b"", (
             "blame must reject invalid or unreachable targets", commit, filename, status, payload)
     before_calls = native_calls()
-    assert request(oid, b"oversized.bin")[0:2] == (413, b""), "oversized blobs must be rejected before annotation"
+    oversized = request(oid, b"oversized.bin")[0:2]
+    assert oversized == (413, b""), ("oversized blobs must be rejected before annotation", oversized)
     oversized_calls = native_calls() - before_calls
     assert oversized_calls == 0, ("oversized blob checks must not invoke native Git", oversized_calls)
     assert request(oid, path, actor=None)[0:2] == (401, b"")

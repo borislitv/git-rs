@@ -813,7 +813,21 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 }
                 let header = self
                     .header(&id)
-                    .map_err(|e| source_error(e.as_ref()))?
+                    .map_err(|error| {
+                        // The selected tree entry is a blob. A provider may
+                        // reject its size during preflight before returning a
+                        // header; retain that outcome without decoding it.
+                        if error
+                            .downcast_ref::<crate::pack::ObjectSizeLimit>()
+                            .is_some_and(|size| {
+                                size.limit == MAX_BLOB_BYTES && size.size > MAX_BLOB_BYTES as u64
+                            })
+                        {
+                            BlameError::BlobTooLarge
+                        } else {
+                            source_error(error.as_ref())
+                        }
+                    })?
                     .ok_or(BlameError::Corrupt("missing physical blob"))?;
                 if header.kind != Kind::Blob {
                     return Err(BlameError::Corrupt("blob type mismatch"));

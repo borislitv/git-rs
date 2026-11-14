@@ -641,6 +641,12 @@ impl<S: PackSource> RangePackSet<S> {
         let frame = self.frame(location, control)?;
         let entry = self.entry(frame, control)?;
         let size = usize::try_from(entry.decompressed_size)?;
+        if entry.header.is_base() && size > limits.max_object_bytes {
+            return Err(Box::new(super::ObjectSizeLimit {
+                size: entry.decompressed_size,
+                limit: limits.max_object_bytes,
+            }));
+        }
         if size > limits.max_decode_bytes {
             return Err(invalid("range-backed instruction byte budget exceeded"));
         }
@@ -660,7 +666,10 @@ impl<S: PackSource> RangePackSet<S> {
             let (base_size, result_size) = self.delta_sizes(frame, &entry, control)?;
             let result_size = usize::try_from(result_size)?;
             if base_size > limits.max_object_bytes as u64 || result_size > limits.max_object_bytes {
-                return Err(invalid("range-backed delta object limit exceeded"));
+                return Err(Box::new(super::ObjectSizeLimit {
+                    size: base_size.max(result_size as u64),
+                    limit: limits.max_object_bytes,
+                }));
             }
             let base = self.base(location, &entry, control)?;
             let base = self.prepare(base, control, limits, active, depth + 1, authenticate)?;
@@ -862,7 +871,10 @@ impl<S: PackSource> RangePackSet<S> {
                 gix_pack::data::delta::decode_header_size(&bytes.as_slice()[prefix..])?;
             let size = usize::try_from(result_size)?;
             if size > limits.max_object_bytes || base_size > limits.max_object_bytes as u64 {
-                return Err(invalid("range-backed delta object limit exceeded"));
+                return Err(Box::new(super::ObjectSizeLimit {
+                    size: base_size.max(size as u64),
+                    limit: limits.max_object_bytes,
+                }));
             }
             let base = self.base(location, &entry, control)?;
             let (base, base_plan) = self.decode_at(base, control, limits, active, depth + 1)?;
