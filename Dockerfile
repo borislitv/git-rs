@@ -88,6 +88,9 @@ RUN curl --fail --show-error --location --max-time 180 --retry 3 \
 
 FROM runtime-base AS runtime
 ARG VCS_REF
+# Bound allocator retention in the two-CPU serving profile. Large freed buffers
+# stay independently returnable instead of raising glibc's adaptive mmap limit.
+ENV MALLOC_ARENA_MAX=2 MALLOC_MMAP_THRESHOLD_=131072
 COPY --from=build /build/target/release/git-rs /usr/local/bin/git-rs
 COPY --from=build /build/release-notices/ /usr/share/git-rs/dependencies/
 COPY docs/*-source.json /usr/share/git-rs/sources/
