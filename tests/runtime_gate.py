@@ -523,7 +523,7 @@ def inside(args):
     executable.chmod(0o700)
     os.environ["PATH"] = str(proxy) + ":" + os.environ["PATH"]
     gate.require(shutil.which("docker") == str(executable), "Docker proxy is not the selected executable")
-    gate.output([str(executable), "--version"])
+    gate.output([str(executable), "version", "--format", "{{.Client.Version}}"])
     arguments = [sys.executable, "-B", "/opt/git-rs/tests/integration.py", "--provision",
                  "--binary", "/usr/local/bin/git-rs", "--fixture-dir", "/opt/git-rs/.local/fixture"]
     if args.phase == "istio":

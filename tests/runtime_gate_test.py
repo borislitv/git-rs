@@ -425,7 +425,7 @@ class ControllerProxyContracts(unittest.TestCase):
         executable = self.root / ".local/runtime-gate-bin/docker"
         self.assertTrue(executable.is_file())
         self.assertEqual(Path(os.environ["PATH"].split(":")[0]), executable.parent)
-        probe.assert_called_once_with([str(executable), "--version"])
+        probe.assert_called_once_with([str(executable), "version", "--format", "{{.Client.Version}}"])
         self.assertEqual(work.call_count, 1)
 
     def test_skipped_proxy_cannot_fall_through_to_the_host_cli(self):
