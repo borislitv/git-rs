@@ -224,7 +224,9 @@ class SupervisorContracts(unittest.TestCase):
     def test_istio_dispatch_keeps_native_clients_in_the_oracle_and_consumes_prepared_inputs(self):
         environment = {"INVOCATION_ID": self.daemon.token, "GIT_RS_TEST_RUNTIME_IMAGE": "sha256:" + "1" * 64,
                        "GIT_RS_TEST_ORACLE_IMAGE": "sha256:" + "2" * 64, "GIT_RS_TEST_REVISION": "a" * 40}
-        with patch.dict(os.environ, environment), patch.object(runtime, "Path", return_value=self.root / "bin"), \
+        (self.root / ".local").mkdir(mode=0o700)
+        with patch.dict(os.environ, environment), patch.object(runtime, "ROOT", self.root), \
+                patch.object(runtime.gate, "output", return_value="Docker version fixture"), \
                 patch.object(runtime.os, "execv", side_effect=RuntimeError("dispatch captured")) as dispatch:
             with self.assertRaisesRegex(RuntimeError, "dispatch captured"):
                 runtime.inside(SimpleNamespace(phase="istio", cluster_container=self.daemon.cluster))
@@ -402,6 +404,45 @@ class CompiledInputContracts(unittest.TestCase):
         self.assertFalse((local / ".metadata-env").exists())
         self.assertEqual({name: row["executed"] for name, row in results.items()},
                          {"metadata": 2, "maintenance": 1, "maintenance_leader": 1})
+
+
+class ControllerProxyContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / ".local").mkdir(mode=0o700)
+        for boundary in (patch.object(runtime, "ROOT", self.root),
+                         patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}),
+                         patch.object(runtime.gate, "invocation", return_value="a" * 32)):
+            boundary.start()
+            self.addCleanup(boundary.stop)
+
+    def test_controller_uses_the_bound_directory_and_executes_its_selected_proxy(self):
+        with patch.object(runtime.gate, "output", return_value="Docker version fixture") as probe, \
+                patch.object(runtime.os, "execv") as work:
+            runtime.inside(SimpleNamespace(phase="integration", cluster_container=None))
+        executable = self.root / ".local/runtime-gate-bin/docker"
+        self.assertTrue(executable.is_file())
+        self.assertEqual(Path(os.environ["PATH"].split(":")[0]), executable.parent)
+        probe.assert_called_once_with([str(executable), "--version"])
+        self.assertEqual(work.call_count, 1)
+
+    def test_skipped_proxy_cannot_fall_through_to_the_host_cli(self):
+        with patch.object(runtime.shutil, "which", return_value="/usr/bin/docker"), \
+                patch.object(runtime.gate, "output") as probe, \
+                patch.object(runtime.os, "execv") as work:
+            with self.assertRaisesRegex(ValueError, "proxy is not the selected executable"):
+                runtime.inside(SimpleNamespace(phase="integration", cluster_container=None))
+        probe.assert_not_called()
+        work.assert_not_called()
+
+    def test_selected_but_unexecutable_proxy_stops_before_work(self):
+        with patch.object(runtime.gate, "output", side_effect=PermissionError("noexec")), \
+                patch.object(runtime.os, "execv") as work:
+            with self.assertRaises(PermissionError):
+                runtime.inside(SimpleNamespace(phase="integration", cluster_container=None))
+        work.assert_not_called()
 
 
 if __name__ == "__main__":

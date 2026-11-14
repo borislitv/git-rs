@@ -514,12 +514,16 @@ def run(args):
 
 def inside(args):
     gate.invocation()
-    proxy = Path("/tmp/runtime-gate-bin")
+    # Docker tmpfs mounts are noexec by default. PATH lookup may silently skip
+    # such a shim and invoke the unrestricted CLI later in PATH instead.
+    proxy = ROOT / ".local/runtime-gate-bin"
     proxy.mkdir(mode=0o700)
     executable = proxy / "docker"
     executable.write_text('#!/bin/sh\nexec /usr/bin/python3 -B /opt/git-rs/tests/blame_gate.py docker "$@"\n')
     executable.chmod(0o700)
     os.environ["PATH"] = str(proxy) + ":" + os.environ["PATH"]
+    gate.require(shutil.which("docker") == str(executable), "Docker proxy is not the selected executable")
+    gate.output([str(executable), "--version"])
     arguments = [sys.executable, "-B", "/opt/git-rs/tests/integration.py", "--provision",
                  "--binary", "/usr/local/bin/git-rs", "--fixture-dir", "/opt/git-rs/.local/fixture"]
     if args.phase == "istio":
