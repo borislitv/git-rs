@@ -92,6 +92,7 @@ def bound_image(cluster, image, revision, role):
     matches = [row.split() for row in rows if row.split() and row.split()[0] == alias]
     assert len(matches) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0][2]), "imported manifest not found"
     reference = repository + "@" + matches[0][2]
+    command(["docker", "exec", cluster, "ctr", "images", "tag", alias, reference])
     imported = json.loads(command(["docker", "exec", cluster, "crictl", "inspecti", reference]).stdout)
     labels = imported["info"]["imageSpec"]["config"]["Labels"]
     assert labels["io.git-rs.role"] == role and labels["org.opencontainers.image.revision"] == revision

@@ -48,6 +48,7 @@ def platform_image(cluster, reference):
     matches = [row.split() for row in rows if row.split() and row.split()[0] == reference]
     assert len(matches) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0][2]), "imported Istio manifest missing"
     bound = reference.rsplit(":", 1)[0] + "@" + matches[0][2]
+    command(["docker", "exec", cluster, "ctr", "images", "tag", reference, bound])
     imported = json.loads(command(["docker", "exec", cluster, "crictl", "inspecti", bound]).stdout)
     # Classic Docker identifies a config; its containerd image store identifies
     # the OCI manifest. Both must join this exact imported image, not a tag alone.
