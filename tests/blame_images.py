@@ -8,11 +8,13 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
+import time
 
 import blame_gate as gate
 
 ROOT = gate.ROOT
 TARGETS = ("test-fixture-build", "test", "release", "test-server")
+BUILD_TARGETS = ("build-inputs", *TARGETS)
 ENV = dict(os.environ, DOCKER_BUILDKIT="0", DOCKER_HOST="unix:///var/run/docker.sock")
 ENV.pop("DOCKER_CONTEXT", None)
 
@@ -31,12 +33,17 @@ def slice_name(value):
     return value
 
 
-def workers(slice_value):
-    ids = output(["docker", "ps", "-aq", "--no-trunc"]).split()
+def workers(slice_value, *, deadline):
+    def remaining():
+        seconds = deadline - time.monotonic()
+        gate.require(seconds > 0, "image worker cleanup absolute deadline expired")
+        return min(5, seconds)
+
+    ids = output(["docker", "ps", "-aq", "--no-trunc"], timeout=remaining()).split()
     gate.require(all(re.fullmatch(r"[0-9a-f]{64}", item) for item in ids), "invalid container IDs")
     if not ids:
         return []
-    result = run(["docker", "inspect", *ids], capture_output=True, text=True)
+    result = run(["docker", "inspect", *ids], timeout=remaining(), capture_output=True, text=True)
     if result.returncode:
         # A build's --force-rm may race inspection, but daemon/access failures
         # must not be mistaken for an empty owned set.
@@ -50,11 +57,23 @@ def workers(slice_value):
 
 def cleanup(value):
     value = slice_name(value)
-    ids = workers(value)
-    gate.require(all(re.fullmatch(r"[0-9a-f]{64}", item) for item in ids), "invalid worker IDs")
-    if ids:
-        run(["docker", "rm", "-f", "-v", *ids], timeout=20, check=True)
-    gate.require(not workers(value), "owned image workers remain")
+    deadline = time.monotonic() + 20
+    while ids := workers(value, deadline=deadline):
+        gate.require(all(re.fullmatch(r"[0-9a-f]{64}", item) for item in ids), "invalid worker IDs")
+        remaining = deadline - time.monotonic()
+        gate.require(remaining > 0, "image worker cleanup absolute deadline expired")
+        result = run(["docker", "rm", "-f", "-v", *ids], timeout=min(5, remaining),
+                     capture_output=True, text=True)
+        if result.returncode:
+            allowed = {message for identity in ids for message in (
+                "Error response from daemon: removal of container " + identity + " is already in progress",
+                "Error response from daemon: No such container: " + identity,
+            )}
+            lines = result.stderr.splitlines()
+            gate.require(lines and all(line in allowed for line in lines), "owned image worker removal failed")
+        # --force-rm can race us. A successful removal response alone is not drain.
+        # Reinspect the exact slice until empty, within the original cleanup budget.
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
 
 
 def commit(value):
@@ -168,7 +187,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     builder = sub.add_parser("build")
-    builder.add_argument("--target", choices=TARGETS, required=True)
+    builder.add_argument("--target", choices=BUILD_TARGETS, required=True)
     builder.add_argument("--tag", required=True)
     builder.add_argument("--unit", required=True)
     builder.add_argument("--slice", required=True)

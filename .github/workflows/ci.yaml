@@ -85,7 +85,7 @@ jobs:
           TasksMax=256
           EOF
           sudo systemctl daemon-reload
-          for target in test-fixture-build test release test-server; do
+          for target in build-inputs test-fixture-build test release test-server; do
             unit="git-rs-blame-images-$target-$tag.service"
             printf 'BLAME_IMAGE_UNIT=%s\n' "$unit" >> "$GITHUB_ENV"
             sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \

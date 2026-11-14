@@ -19,6 +19,13 @@ descriptors/config identities before exporting the
 IDs. A mutable tag is never the identity recorded by a measured phase. Runtime,
 fixture and oracle roles must be distinct and revision-matched.
 
+The preparatory `build-inputs` target audits and fetches the locked sources before
+the offline release/fixture builds. It is not a fifth runtime role and is not part
+of the exported four-image inventory. Each preparation/build invocation retains
+its independent deadline and worker limits; splitting preparation does not attest
+that a cold hosted job fits its overall timeout. Cleanup tolerates only exact
+owned-worker removal races and confirms an empty slice within its original budget.
+
 ## Independent bounds and ownership
 
 `tests/runtime_exec.py run` requires a real systemd invocation and verifies its

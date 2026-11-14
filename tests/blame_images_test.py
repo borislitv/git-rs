@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -127,6 +128,7 @@ class ImageTests(unittest.TestCase):
                     for key, value in containers.items()]), stderr="")
             self.assertEqual(argv, ["docker", "rm", "-f", "-v", owned])
             del containers[owned]
+            return subprocess.CompletedProcess(argv, 0, owned, "")
 
         with patch.object(images, "output", side_effect=output), patch.object(images, "run", side_effect=run):
             images.cleanup(self.slice)
@@ -144,6 +146,60 @@ class ImageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "inspection failed"):
                 images.cleanup(self.slice)
             self.assertEqual(run.call_count, 1)
+
+    def test_cleanup_confirms_a_worker_removed_concurrently_by_force_rm(self):
+        owned = "a" * 64
+        containers = {owned: self.slice}
+
+        def output(argv, **kwargs):
+            return "\n".join(containers)
+
+        def run(argv, **kwargs):
+            if argv[1] == "inspect":
+                return subprocess.CompletedProcess(argv, 0, json.dumps([
+                    {"Id": key, "HostConfig": {"CgroupParent": value}}
+                    for key, value in containers.items()]), "")
+            del containers[owned]
+            error = "Error response from daemon: removal of container " + owned + " is already in progress\n"
+            result = subprocess.CompletedProcess(argv, 1, "", error)
+            if kwargs.get("check"):
+                raise subprocess.CalledProcessError(1, argv, stderr=error)
+            return result
+
+        with patch.object(images, "output", side_effect=output), patch.object(images, "run", side_effect=run):
+            images.cleanup(self.slice)
+        self.assertEqual(containers, {})
+
+    def test_cleanup_does_not_accept_a_removal_permission_failure(self):
+        owned = "a" * 64
+
+        def run(argv, **kwargs):
+            if argv[1] == "inspect":
+                return subprocess.CompletedProcess(argv, 0, json.dumps([
+                    {"Id": owned, "HostConfig": {"CgroupParent": self.slice}}]), "")
+            result = subprocess.CompletedProcess(argv, 1, "", "permission denied")
+            if kwargs.get("check"):
+                raise subprocess.CalledProcessError(1, argv, stderr=result.stderr)
+            return result
+
+        with patch.object(images, "output", return_value=owned), patch.object(images, "run", side_effect=run):
+            with self.assertRaisesRegex(ValueError, "worker removal failed"):
+                images.cleanup(self.slice)
+
+    def test_successful_remove_without_actual_drain_expires_the_original_budget(self):
+        owned = "a" * 64
+
+        def run(argv, **kwargs):
+            if argv[1] == "inspect":
+                return subprocess.CompletedProcess(argv, 0, json.dumps([
+                    {"Id": owned, "HostConfig": {"CgroupParent": self.slice}}]), "")
+            return subprocess.CompletedProcess(argv, 0, owned, "")
+
+        with patch.object(images, "output", return_value=owned), patch.object(images, "run", side_effect=run), \
+                patch.object(images.time, "monotonic", side_effect=[0, 1, 2, 3, 4, 21]), \
+                patch.object(images.time, "sleep"):
+            with self.assertRaisesRegex(ValueError, "cleanup absolute deadline expired"):
+                images.cleanup(self.slice)
 
     def test_build_uses_supported_legacy_limits_and_refuses_missing_backend_flags(self):
         args = SimpleNamespace(unit="unit", slice=self.slice, directory=self.directory,

@@ -49,7 +49,7 @@ RUN set -eu; \
 
 FROM toolchain AS rust-toolchain
 
-FROM rust-toolchain AS build
+FROM rust-toolchain AS build-inputs
 WORKDIR /build
 COPY Cargo.toml Cargo.lock Dockerfile ./
 COPY src ./src
@@ -61,8 +61,10 @@ COPY crates/git-core ./crates/git-core
 COPY docs/*-source.json ./docs/
 COPY tools/check-core-source.py tools/dependency-notices.py ./tools/
 RUN python3 tools/check-core-source.py \
-    && cargo fetch --locked \
-    && cargo build --release --offline --locked \
+    && cargo fetch --locked
+
+FROM build-inputs AS build
+RUN cargo build --release --offline --locked \
     && cargo metadata --format-version 1 --offline --locked > /tmp/cargo-metadata.json \
     && python3 tools/dependency-notices.py --metadata /tmp/cargo-metadata.json --output /build/release-notices \
     && rm /tmp/cargo-metadata.json
