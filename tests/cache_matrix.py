@@ -9,7 +9,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import hashlib
-import http.client
+from http.client import HTTPConnection
 import json
 import math
 import os
@@ -133,7 +133,7 @@ def sql(f, query, environment=None):
 
 
 def http(port, path, seconds, maximum):
-    peer = http.client.HTTPConnection("127.0.0.1", port, timeout=seconds)
+    peer = HTTPConnection("127.0.0.1", port, timeout=seconds)
     try:
         peer.request("GET", path)
         response = peer.getresponse()
@@ -152,7 +152,7 @@ def metrics(f, name):
 
 
 def resource(identifier):
-    connection = http.client.HTTPConnection("localhost", timeout=3)
+    connection = HTTPConnection("localhost", timeout=3)
     stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stream.settimeout(3)
     try:

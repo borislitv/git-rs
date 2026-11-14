@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Matrix input, evidence completeness and failure-preserving cleanup contracts."""
 import copy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import socket
@@ -12,6 +13,33 @@ from unittest.mock import Mock, patch
 
 import cache_matrix
 from cache_matrix import Matrix, ROOT, WireProxy, cleanup_all, load_config, require_compaction
+
+
+class HttpContracts(unittest.TestCase):
+    def test_actual_http_client_preserves_response_status_and_byte_bound(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                body = b"complete" if self.path == "/body" else b"x" * 17
+                self.send_response(503)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+        thread.start()
+        try:
+            self.assertEqual(cache_matrix.http(server.server_port, "/body", 2, 16), (503, b"complete"))
+            with self.assertRaisesRegex(AssertionError, "response exceeded"):
+                cache_matrix.http(server.server_port, "/oversize", 2, 16)
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+            self.assertFalse(thread.is_alive())
 
 
 class ConfigurationContracts(unittest.TestCase):
