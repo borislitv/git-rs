@@ -350,27 +350,35 @@ fn serve(args: &[String]) -> Result<()> {
         let identity = Arc::new(identity);
         let engine = engine.clone();
         let active = active.clone();
-        std::thread::spawn(move || {
+        std::thread::Builder::new().spawn(move || {
             for stream in http.incoming() {
                 match stream {
                     Ok(stream) => {
                         if let Some(slot) = active.try_admit() {
                             let engine = engine.clone();
                             let identity = identity.clone();
-                            std::thread::spawn(move || {
-                                let _slot = slot;
-                                let result = match identity.as_ref() {
-                                    HttpIdentity::Development(principal) => {
-                                        http::handle(stream, &engine, principal)
+                            // An OS thread rejection drops the closure's socket
+                            // and admission slot, without killing the listener.
+                            if std::thread::Builder::new()
+                                .spawn(move || {
+                                    let _slot = slot;
+                                    let result = match identity.as_ref() {
+                                        HttpIdentity::Development(principal) => {
+                                            http::handle(stream, &engine, principal)
+                                        }
+                                        HttpIdentity::Basic(credentials) => {
+                                            http::handle_authenticated(stream, &engine, credentials)
+                                        }
+                                    };
+                                    if result.is_err() {
+                                        metrics::service_event(ServiceEvent::HttpOperationFailed);
                                     }
-                                    HttpIdentity::Basic(credentials) => {
-                                        http::handle_authenticated(stream, &engine, credentials)
-                                    }
-                                };
-                                if result.is_err() {
-                                    metrics::service_event(ServiceEvent::HttpOperationFailed);
-                                }
-                            });
+                                })
+                                .is_err()
+                            {
+                                metrics::global().reject(Listener::Http);
+                                metrics::service_event(ServiceEvent::RequestThreadStartFailed);
+                            }
                         } else {
                             metrics::global().reject(Listener::Http);
                         }
@@ -381,19 +389,25 @@ fn serve(args: &[String]) -> Result<()> {
                     }
                 }
             }
-        });
+        })?;
     }
     eprintln!("SSH bridge ready");
     for socket in listener.listener.incoming() {
         let socket = socket?;
         if let Some(slot) = active.try_admit() {
             let engine = engine.clone();
-            std::thread::spawn(move || {
-                let _slot = slot;
-                if session(socket, &engine).is_err() {
-                    metrics::service_event(ServiceEvent::SshOperationFailed);
-                }
-            });
+            if std::thread::Builder::new()
+                .spawn(move || {
+                    let _slot = slot;
+                    if session(socket, &engine).is_err() {
+                        metrics::service_event(ServiceEvent::SshOperationFailed);
+                    }
+                })
+                .is_err()
+            {
+                metrics::global().reject(Listener::Ssh);
+                metrics::service_event(ServiceEvent::RequestThreadStartFailed);
+            }
         } else {
             metrics::global().reject(Listener::Ssh);
         }
@@ -406,7 +420,7 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<Admission>) -> Result<
     eprintln!("health {}", listener.local_addr()?);
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let updated = ready.clone();
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         loop {
             let check = git_rs::process::Operation::new(5)
                 .enter(|| metadata::sql("SELECT NOT pg_is_in_recovery();"));
@@ -416,8 +430,8 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<Admission>) -> Result<
             );
             std::thread::sleep(Duration::from_secs(5));
         }
-    });
-    std::thread::spawn(move || {
+    })?;
+    std::thread::Builder::new().spawn(move || {
         let health_active = Admission::new(8);
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
@@ -432,12 +446,18 @@ fn health(address: &str, engine: Arc<Engine>, active: Arc<Admission>) -> Result<
             let engine = engine.clone();
             let active = active.clone();
             let ready = ready.clone();
-            std::thread::spawn(move || {
-                let _slot = slot;
-                let _ = health_request(stream, &engine, &active, &ready);
-            });
+            if std::thread::Builder::new()
+                .spawn(move || {
+                    let _slot = slot;
+                    let _ = health_request(stream, &engine, &active, &ready);
+                })
+                .is_err()
+            {
+                metrics::global().reject(Listener::Health);
+                metrics::service_event(ServiceEvent::RequestThreadStartFailed);
+            }
         }
-    });
+    })?;
     Ok(())
 }
 

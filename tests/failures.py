@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
 import socket
 import socketserver
 import sys
@@ -660,12 +661,67 @@ def standalone_orphan_race_test(f, gateway, source, normal_url, faulty_url):
         "advanced_epoch": True, "compaction_required": False, "late_put_redeleted": True}
 
 
+def thread_spawn_pressure_test(f):
+    """A temporary real task cap must not permanently kill an accept loop."""
+    assert f.runtime, "OS task-pressure contracts require the actual server image"
+    recovered = []
+    for listener in ("health", "http", "ssh"):
+        name = "thread-pressure-" + listener
+        process, port = f.start(name)
+        try:
+            wait_for(lambda: f.health(name, "/readyz")[0] == 200, "primed metadata readiness")
+            record = json.loads(command(["docker", "inspect", process.identifier]).stdout)[0]
+            assert record["Id"] == process.identifier
+            assert record["Config"]["Labels"]["git-rs.integration-fixture"] == f.identity
+            original = record["HostConfig"]["PidsLimit"]
+            assert 0 < original <= 64, "finite original runtime task cap required"
+            try:
+                # Lower only this exact owned container. Existing threads keep
+                # running, but Linux rejects the next real pthread creation.
+                command(["docker", "update", "--pids-limit", "1", process.identifier])
+                with socket.socket(socket.AF_UNIX if listener == "ssh" else socket.AF_INET) as peer:
+                    peer.settimeout(3)
+                    peer.connect(str(f.socket(name)) if listener == "ssh" else
+                                 ("127.0.0.1", f.health_ports[name] if listener == "health" else port))
+                    if listener != "ssh":
+                        peer.sendall(b"GET /livez HTTP/1.1\r\nHost: fixture.invalid\r\nConnection: close\r\n\r\n")
+                    try:
+                        assert peer.recv(1) == b"", "exhausted worker capacity must close the connection"
+                    except ConnectionResetError:
+                        pass
+            finally:
+                command(["docker", "update", "--pids-limit", str(original), process.identifier])
+            assert process.poll() is None, (listener, "thread creation failure terminated the server")
+            try:
+                live = f.health(name, "/livez")
+            except (OSError, http.client.HTTPException) as error:
+                raise AssertionError(f"{listener} health listener did not recover") from error
+            assert live == (200, b"live\n"), (listener, "health listener did not recover")
+            status, body = f.health(name, "/metrics")
+            assert status == 200
+            assert metric_value(body, f'git_rs_admission_rejections_total{{listener="{listener}"}}') == 1
+            assert metric_value(body, "git_rs_active_requests") == 0, "failed worker leaked admission"
+            environment = f.env
+            url = f"http://127.0.0.1:{port}/team/project.git"
+            if listener == "ssh":
+                environment = dict(f.env, GIT_SSH_VARIANT="simple",
+                    GIT_SSH_COMMAND=shlex.join(f.bridge_command(f.socket(name))),
+                    SSH_ORIGINAL_COMMAND="git-upload-pack 'team/project.git'")
+                url = "fixture.invalid:team/project.git"
+            assert f.git(f.base, "ls-remote", url, env=environment).stdout == b""
+            recovered.append(listener)
+        finally:
+            f.stop(name)
+    f.results["thread_spawn_pressure_recovery"] = recovered
+
+
 def exercise(f):
     f.cli("migrate")
     print("repeatable, concurrent schema initialization", flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda _: f.cli("migrate"), range(2)))
     f.cli("create", "team/project", "alice")
+    thread_spawn_pressure_test(f)
     _, port = f.start("normal")
     url = f"http://127.0.0.1:{port}/team/project.git"
     source = f.base / "source"

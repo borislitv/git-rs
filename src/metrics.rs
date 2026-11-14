@@ -23,6 +23,7 @@ pub enum ServiceEvent {
     HttpOperationFailed,
     SshOperationFailed,
     HttpAcceptFailed,
+    RequestThreadStartFailed,
     HookRejected,
     HookSocketCleanupFailed,
     ServingSocketCleanupFailed,
@@ -36,6 +37,7 @@ impl ServiceEvent {
             Self::HttpOperationFailed => b"git_rs_error event=http_operation_failed\n",
             Self::SshOperationFailed => b"git_rs_error event=ssh_operation_failed\n",
             Self::HttpAcceptFailed => b"git_rs_error event=http_accept_failed\n",
+            Self::RequestThreadStartFailed => b"git_rs_error event=request_thread_start_failed\n",
             Self::HookRejected => b"git_rs_error event=hook_rejected\n",
             Self::HookSocketCleanupFailed => b"git_rs_error event=hook_socket_cleanup_failed\n",
             Self::ServingSocketCleanupFailed => {
@@ -568,7 +570,7 @@ impl Registry {
         header(
             &mut output,
             "git_rs_admission_rejections_total",
-            "Connections closed because listener admission was full.",
+            "Connections closed because listener admission or request thread creation failed.",
             "counter",
         );
         for (i, name) in LISTENERS.iter().enumerate() {

@@ -165,6 +165,14 @@ shutdown, actual pod-task drain and credential cleanup remain outer-owned.
 
 ## Crash cleanup and diagnostics
 
+HTTP, SSH and health accept loops use fallible request-thread creation. If the OS
+rejects a new worker, its socket and admission owner are dropped, a closed-label
+rejection is recorded, and the accept loop remains available after capacity
+returns. Startup thread failures propagate as startup errors. The real-image
+failure contract temporarily lowers one exact-owned backend's task cap, observes
+connection rejection, restores its original cap, and verifies listener recovery,
+released admission and native-client interoperability.
+
 The supervisor writes/fsyncs a private non-secret cluster ownership journal before
 starting its API. Namespace fixtures likewise persist owner/name before ambiguous
 creation, then record the returned UID. Normal deletion checks owner label/UID
