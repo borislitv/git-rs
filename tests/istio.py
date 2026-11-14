@@ -401,6 +401,11 @@ def main():
             cluster_cgroups(args.cluster_container, root)
         except BaseException as error:
             report.update(status="failed", failure=type(error).__name__)
+            if isinstance(error, Exception):
+                try:
+                    Cluster(args.cluster_container, APP).logs()
+                except Exception as diagnostic_error:
+                    error.add_note("Istio application diagnostics unavailable: " + type(diagnostic_error).__name__)
             raise
         finally:
             finish(base, report, watchers)
