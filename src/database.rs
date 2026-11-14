@@ -15,6 +15,9 @@ use tokio_postgres::SimpleQueryMessage;
 pub(crate) mod config;
 
 const CONNECTIONS: usize = 8;
+// The protocol codecs retain reusable write buffers. Large accepted publication
+// queries must not leave a multi-MiB buffer in each otherwise idle pooled client.
+const MAX_RETAINED_QUERY_BYTES: usize = 64 * 1024;
 
 struct Database {
     runtime: Runtime,
@@ -31,6 +34,13 @@ impl Checkout {
     }
     pub(crate) fn recycle(mut self) {
         drop(self.0.take());
+    }
+    fn close(mut self) {
+        if let Some(client) = self.0.take() {
+            // This path consumed and reset the complete response already. Remove
+            // it from the pool without sending cancellation to an idle session.
+            drop(Client::take(client));
+        }
     }
 }
 impl Drop for Checkout {
@@ -141,7 +151,14 @@ impl Database {
                     .await
                     .map_err(sql_error)?;
                 reset.finish(true);
-                connection.recycle();
+                if queries
+                    .iter()
+                    .any(|(query, _)| query.len() > MAX_RETAINED_QUERY_BYTES)
+                {
+                    connection.close();
+                } else {
+                    connection.recycle();
+                }
                 Ok(())
             };
             let cancelled = async {

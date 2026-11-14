@@ -203,6 +203,35 @@ fn sql_reuses_sessions_and_does_not_recycle_failed_transactions() {
 
 #[test]
 #[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
+fn large_sql_queries_release_their_oversized_connection_buffers() {
+    process::Operation::new(30).enter(|| {
+        let mut query = String::from("SELECT pg_backend_pid(); -- synthetic large-query buffer ");
+        query.extend(std::iter::repeat_n('x', 4 * 1024 * 1024));
+        let pid = metadata::sql(&query)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while metadata::sql(&format!(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid={pid};"
+        ))
+        .unwrap()
+        .trim()
+            != "0"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "oversized PostgreSQL session was retained in the pool"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(metadata::sql("SELECT 42;").unwrap().trim(), "42");
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL database configured with PG* variables; run serially"]
 fn cancelled_sql_rolls_back_and_returns_pool_capacity() {
     let _timing_guard = git_rs::metrics::init_timing_logs();
     metadata::migrate().unwrap();
