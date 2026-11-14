@@ -86,7 +86,7 @@ class ClusterStartupContracts(unittest.TestCase):
 
 
 class ControllerClientContracts(unittest.TestCase):
-    def prepare(self, directory, *, copied=b"\x7fELFsynthetic pinned client", digest=None):
+    def prepare(self, directory, *, copied=b"\x7fELFsynthetic pinned client", digest=None, size=None):
         identity = "1" * 64
         config = {"clusters": [{"cluster": {"server": "https://127.0.0.1:6443",
                    "certificate-authority-data": "synthetic-ca"}}], "users": [{"name": "synthetic-client"}]}
@@ -94,11 +94,20 @@ class ControllerClientContracts(unittest.TestCase):
         def command(argv, **_):
             self.assertEqual(argv[:4], ["docker", "cp", "--follow-link", identity + ":/bin/kubectl"])
             Path(argv[4]).write_bytes(copied)
+            if size is not None:
+                with Path(argv[4]).open("r+b") as output:
+                    output.truncate(size)
 
         def output(argv, **_):
             if argv[:3] == ["docker", "exec", identity]:
                 if argv[3] == "sha256sum":
-                    return (digest or hashlib.sha256(copied).hexdigest()) + "  /bin/kubectl\n"
+                    expected = hashlib.sha256(copied)
+                    remaining = (size or len(copied)) - len(copied)
+                    while remaining:
+                        chunk = min(remaining, 65536)
+                        expected.update(b"\0" * chunk)
+                        remaining -= chunk
+                    return (digest or expected.hexdigest()) + "  /bin/kubectl\n"
                 self.assertEqual(argv[3:], ["kubectl", "config", "view", "--raw", "--flatten", "-o", "json"])
                 return json.dumps(config)
             self.assertEqual(argv, ["docker", "inspect", identity])
@@ -119,11 +128,17 @@ class ControllerClientContracts(unittest.TestCase):
             self.assertEqual((Path(directory) / "kubectl").stat().st_mode & 0o777, 0o500)
 
     def test_a_different_copy_or_non_executable_payload_cannot_receive_credentials(self):
-        for options in ({"digest": "f" * 64}, {"copied": b"not a client"}):
+        for options in ({"digest": "f" * 64}, {"copied": b"not a client"}, {"size": 256 * 1024 * 1024 + 1}):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
-                with self.assertRaisesRegex(ValueError, "copy differs|Linux ELF"):
+                with self.assertRaisesRegex(ValueError, "copy differs|Linux ELF|invalid pinned"):
                     self.prepare(directory, **options)
                 self.assertFalse((Path(directory) / "controller-kubeconfig.json").exists())
+
+    def test_the_pinned_multicall_client_size_is_accepted_within_the_file_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.prepare(directory, size=242520984)
+            self.assertEqual((Path(directory) / "kubectl").stat().st_size, 242520984)
+            self.assertTrue((Path(directory) / "controller-kubeconfig.json").is_file())
 
 
 class SupervisorContracts(unittest.TestCase):
@@ -151,6 +166,8 @@ class SupervisorContracts(unittest.TestCase):
     def test_cleanup_reaps_servers_and_cluster_before_credentials_preserving_unrelated_state(self):
         config = self.local / "controller-kubeconfig.json"
         config.write_text("synthetic client credentials")
+        client = self.local / "kubectl"
+        client.write_bytes(b"\x7fELFsynthetic client")
         def namespace(path, *, destroyed_cluster):
             self.assertEqual(path, self.journal)
             self.assertEqual(destroyed_cluster, self.daemon.cluster)
@@ -162,6 +179,7 @@ class SupervisorContracts(unittest.TestCase):
         self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
         self.assertFalse(self.journal.exists())
         self.assertFalse(config.exists())
+        self.assertFalse(client.exists())
 
     def test_interrupted_credential_cleanup_retries_from_the_durable_removed_cluster_identity(self):
         with patch.object(runtime, "confirm_drain"), \

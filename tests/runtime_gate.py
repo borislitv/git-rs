@@ -237,6 +237,7 @@ def cleanup(*, containers_only=False, deadline=None):
                          "cluster removal is unconfirmed or the cluster owner changed")
         (local / ".metadata-env").unlink(missing_ok=True)
         (local / "controller-kubeconfig.json").unlink(missing_ok=True)
+        (local / "kubectl").unlink(missing_ok=True)
         for inventory in (local / "inventory/ownership.json", local / "fixture-inventory/ownership.json"):
             if inventory.exists():
                 gate.command([sys.executable, "-B", ROOT / "tools/check-runtime-boundaries.py", "--cleanup", inventory],
@@ -306,7 +307,7 @@ def prepare_controller_client(cluster, local, deadline):
                  timeout=max(0.1, min(20, deadline - time.monotonic())))
     metadata = executable.lstat()
     gate.require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
-                 and 4 <= metadata.st_size <= 128 * 1024 * 1024, "invalid pinned kubectl executable")
+                 and 4 <= metadata.st_size <= 256 * 1024 * 1024, "invalid pinned kubectl executable")
     with executable.open("rb") as source:
         gate.require(source.read(4) == b"\x7fELF", "pinned kubectl must be a Linux ELF")
     executable.chmod(0o500)
