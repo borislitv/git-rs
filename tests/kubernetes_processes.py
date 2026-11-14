@@ -16,6 +16,8 @@ import threading
 import time
 from urllib.parse import urlencode
 
+from maintenance_fixture import kubectl_command
+
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_EVENT = 1024 * 1024
@@ -107,8 +109,8 @@ class PodProcessWatch:
         path = "/api/v1/namespaces/" + self.cluster.namespace + "/pods?" + query
         environment = dict(os.environ, DOCKER_HOST="unix:///var/run/docker.sock")
         environment.pop("DOCKER_CONTEXT", None)
-        process = subprocess.Popen(["docker", "exec", self.cluster.container, "kubectl", "get", "--raw", path,
-                                    "--request-timeout=8s"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+        process = subprocess.Popen(kubectl_command(self.cluster.container, "get", "--raw", path,
+                                    "--request-timeout=8s"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
         self.process = process
         pending, errors = bytearray(), bytearray()
         deadline = time.monotonic() + 10

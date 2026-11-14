@@ -3,6 +3,7 @@
 import base64
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -169,6 +170,30 @@ class NamespaceContracts(unittest.TestCase):
         self.assertFalse(owner.journal.exists())
         self.assertFalse(owner.account.exists())
         self.assertEqual(len(self.api.calls), before)
+
+
+class ControllerClientContracts(unittest.TestCase):
+    def test_namespace_requests_use_the_bound_external_client_and_private_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = fixture.NamespaceFixture("a" * 64, directory)
+            environment = {"GIT_RS_TEST_KUBECTL": "/usr/local/bin/kubectl",
+                           "GIT_RS_TEST_KUBECONFIG": "/private/controller-kubeconfig.json",
+                           "GIT_RS_TEST_CLUSTER_CONTAINER": "a" * 64}
+            with patch.dict(os.environ, environment), patch.object(fixture, "command") as endpoint:
+                owner.kubectl("get", "namespace", owner.namespace)
+            self.assertEqual(endpoint.call_args.args[0], ["/usr/local/bin/kubectl", "--kubeconfig",
+                "/private/controller-kubeconfig.json", "--request-timeout=10s", "get", "namespace", owner.namespace])
+
+    def test_a_client_bound_to_another_cluster_fails_before_any_api_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = fixture.NamespaceFixture("a" * 64, directory)
+            environment = {"GIT_RS_TEST_KUBECTL": "/usr/local/bin/kubectl",
+                           "GIT_RS_TEST_KUBECONFIG": "/private/controller-kubeconfig.json",
+                           "GIT_RS_TEST_CLUSTER_CONTAINER": "b" * 64}
+            with patch.dict(os.environ, environment), patch.object(fixture, "command") as endpoint:
+                with self.assertRaisesRegex(AssertionError, "client cluster"):
+                    owner.kubectl("get", "namespace", owner.namespace)
+            endpoint.assert_not_called()
 
 
 if __name__ == "__main__":

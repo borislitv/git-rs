@@ -2,6 +2,7 @@
 """Supervisor cleanup and completion contracts without Docker or systemd."""
 import copy
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -84,6 +85,47 @@ class ClusterStartupContracts(unittest.TestCase):
         self.assertEqual(self.start('[plugins."io.containerd.shim.v1.manager"]\nenv = ["GOMAXPROCS=1"]'), "1" * 64)
 
 
+class ControllerClientContracts(unittest.TestCase):
+    def prepare(self, directory, *, copied=b"\x7fELFsynthetic pinned client", digest=None):
+        identity = "1" * 64
+        config = {"clusters": [{"cluster": {"server": "https://127.0.0.1:6443",
+                   "certificate-authority-data": "synthetic-ca"}}], "users": [{"name": "synthetic-client"}]}
+
+        def command(argv, **_):
+            self.assertEqual(argv[:4], ["docker", "cp", "--follow-link", identity + ":/bin/kubectl"])
+            Path(argv[4]).write_bytes(copied)
+
+        def output(argv, **_):
+            if argv[:3] == ["docker", "exec", identity]:
+                if argv[3] == "sha256sum":
+                    return (digest or hashlib.sha256(copied).hexdigest()) + "  /bin/kubectl\n"
+                self.assertEqual(argv[3:], ["kubectl", "config", "view", "--raw", "--flatten", "-o", "json"])
+                return json.dumps(config)
+            self.assertEqual(argv, ["docker", "inspect", identity])
+            return '[{"NetworkSettings":{"Ports":{"6443/tcp":[{"HostPort":"12345"}]}}}]'
+
+        with patch.object(runtime.gate, "command", side_effect=command), \
+                patch.object(runtime.gate, "output", side_effect=output):
+            return runtime.prepare_controller_client(identity, Path(directory), time.monotonic() + 30)
+
+    def test_pinned_client_uses_the_published_tls_endpoint_and_private_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.prepare(directory), hashlib.sha256(b"\x7fELFsynthetic pinned client").hexdigest())
+            config = Path(directory) / "controller-kubeconfig.json"
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            content = json.loads(config.read_text())
+            self.assertEqual(content["clusters"][0]["cluster"], {
+                "server": "https://127.0.0.1:12345", "certificate-authority-data": "synthetic-ca"})
+            self.assertEqual((Path(directory) / "kubectl").stat().st_mode & 0o777, 0o500)
+
+    def test_a_different_copy_or_non_executable_payload_cannot_receive_credentials(self):
+        for options in ({"digest": "f" * 64}, {"copied": b"not a client"}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "copy differs|Linux ELF"):
+                    self.prepare(directory, **options)
+                self.assertFalse((Path(directory) / "controller-kubeconfig.json").exists())
+
+
 class SupervisorContracts(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -107,6 +149,8 @@ class SupervisorContracts(unittest.TestCase):
         self.journal.write_text("synthetic exact-owned journal")
 
     def test_cleanup_reaps_servers_and_cluster_before_credentials_preserving_unrelated_state(self):
+        config = self.local / "controller-kubeconfig.json"
+        config.write_text("synthetic client credentials")
         def namespace(path, *, destroyed_cluster):
             self.assertEqual(path, self.journal)
             self.assertEqual(destroyed_cluster, self.daemon.cluster)
@@ -117,6 +161,7 @@ class SupervisorContracts(unittest.TestCase):
             runtime.cleanup()
         self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
         self.assertFalse(self.journal.exists())
+        self.assertFalse(config.exists())
 
     def test_interrupted_credential_cleanup_retries_from_the_durable_removed_cluster_identity(self):
         with patch.object(runtime, "confirm_drain"), \
@@ -264,6 +309,7 @@ class SupervisorContracts(unittest.TestCase):
             helm.chmod(0o555)
             args.helm = str(helm)
             with patch.object(runtime, "start_cluster", return_value="owned-cluster"), \
+                    patch.object(runtime, "prepare_controller_client", return_value="c" * 64), \
                     patch.object(runtime, "cluster_cgroups", return_value=["owned-pod"]), \
                     patch.object(runtime.gate, "command", side_effect=lambda argv, **_: commands.append(argv)):
                 runtime.run(args)
@@ -272,6 +318,10 @@ class SupervisorContracts(unittest.TestCase):
         self.assertEqual(command[:2], ["docker", "run"])
         self.assertIn("sha256:" + "7" * 64, command)
         self.assertIn(f"type=bind,src={helm},dst=/usr/local/bin/helm,readonly", command)
+        self.assertIn(f"type=bind,src={local / 'kubectl'},dst=/usr/local/bin/kubectl,readonly", command)
+        self.assertIn("GIT_RS_TEST_KUBECTL=/usr/local/bin/kubectl", command)
+        self.assertIn("GIT_RS_TEST_KUBECONFIG=/opt/git-rs/.local/controller-kubeconfig.json", command)
+        self.assertIn("GIT_RS_TEST_CLUSTER_CONTAINER=owned-cluster", command)
         self.assertEqual(command[-4:], ["--phase", "kubernetes", "--cluster-container", "owned-cluster"])
 
     def test_istio_dispatch_keeps_native_clients_in_the_oracle_and_consumes_prepared_inputs(self):

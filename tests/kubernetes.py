@@ -19,7 +19,7 @@ import tomllib
 import yaml
 
 from integration import PG_IMAGE, ROOT, S3_IMAGE, command, wait_for
-from maintenance_fixture import NamespaceFixture
+from maintenance_fixture import NamespaceFixture, kubectl_command
 from kubernetes_processes import PodProcessWatch
 from runtime_process import cluster_cgroups, inspect_image
 
@@ -30,8 +30,7 @@ class Cluster:
         self.process_watch = None
 
     def kubectl(self, *args, data=None, ok=True):
-        return command(["docker", "exec", "-i", self.container, "kubectl", "-n",
-                        self.namespace, *args], data=data, ok=ok)
+        return command(kubectl_command(self.container, "-n", self.namespace, *args), data=data, ok=ok)
 
     def apply(self, documents):
         self.kubectl("apply", "-f", "-", data=yaml.safe_dump_all(documents).encode())

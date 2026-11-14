@@ -142,6 +142,19 @@ class PodIdentityContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "truncated"):
             watch.close()
 
+    def test_external_watch_keeps_the_same_resume_and_expiry_contract(self):
+        environment = {"GIT_RS_TEST_KUBECTL": "/usr/local/bin/kubectl",
+                       "GIT_RS_TEST_KUBECONFIG": "/private/controller-kubeconfig.json",
+                       "GIT_RS_TEST_CLUSTER_CONTAINER": "owned-k3s"}
+        expired = b'{"type":"ERROR","object":{"code":410,"reason":"Expired"}}\n'
+        with patch.dict(os.environ, environment):
+            watch, requests = self.watch([expired])
+            with self.assertRaisesRegex(AssertionError, "failed or expired"):
+                watch.close()
+        self.assertEqual(requests[0][:3], ["/usr/local/bin/kubectl", "--kubeconfig",
+                                         "/private/controller-kubeconfig.json"])
+        self.assertIn("resourceVersion=10", requests[0][-2])
+
 
 if __name__ == "__main__":
     unittest.main()

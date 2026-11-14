@@ -32,6 +32,16 @@ def command(arguments, *, data=None, ok=True):
     return result
 
 
+def kubectl_command(cluster, *arguments):
+    executable = os.environ.get("GIT_RS_TEST_KUBECTL")
+    if executable:
+        assert cluster == os.environ["GIT_RS_TEST_CLUSTER_CONTAINER"], "external client cluster differs"
+        config = os.environ["GIT_RS_TEST_KUBECONFIG"]
+        assert Path(executable).is_absolute() and Path(config).is_absolute()
+        return [executable, "--kubeconfig", config, *arguments]
+    return ["docker", "exec", "-i", cluster, "kubectl", *arguments]
+
+
 class NamespaceFixture:
     kind = "smoke"
 
@@ -48,7 +58,7 @@ class NamespaceFixture:
         self.journal = self.directory / (self.kind + "-fixture.json")
 
     def kubectl(self, *arguments, **options):
-        return command(["docker", "exec", "-i", self.cluster, "kubectl", "--request-timeout=10s", *arguments], **options)
+        return command(kubectl_command(self.cluster, "--request-timeout=10s", *arguments), **options)
 
     def save(self):
         value = {"format": 1, "kind": self.kind, "cluster": self.cluster, "namespace": self.namespace,

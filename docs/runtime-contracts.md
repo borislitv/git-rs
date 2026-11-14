@@ -130,6 +130,14 @@ credentials and TLS PG/S3; direct disposable-bridge HTTP does not prove a produc
 Gateway/mTLS route. The separate `istio` phase supplies that synthetic routing scope
 through the same aggregate supervisor and successful-exec observer.
 
+For Kubernetes and Istio, the supervisor copies the pinned node image's `kubectl`,
+checks its ELF and content digest, and mounts it read-only into the existing
+external controller. API commands and the resource-version watch use that client
+with a private kubeconfig bound to the exact owned cluster and published TLS
+endpoint. The controller and node keep their existing task limits; client threads
+no longer consume the node's container-runtime allowance. The kubeconfig is removed
+after its controller stops, including independent failure cleanup.
+
 `make istio-prepare` downloads the checksum-pinned public distribution and CRDs
 before measurement. `tests/runtime_gate.py images --phase istio` lists the public
 dependency images to pull beforehand. The measured controller receives those

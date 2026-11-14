@@ -236,6 +236,7 @@ def cleanup(*, containers_only=False, deadline=None):
             gate.require(not output(["docker", "ps", "-aq", "--no-trunc", "--filter", "id=" + removed]),
                          "cluster removal is unconfirmed or the cluster owner changed")
         (local / ".metadata-env").unlink(missing_ok=True)
+        (local / "controller-kubeconfig.json").unlink(missing_ok=True)
         for inventory in (local / "inventory/ownership.json", local / "fixture-inventory/ownership.json"):
             if inventory.exists():
                 gate.command([sys.executable, "-B", ROOT / "tools/check-runtime-boundaries.py", "--cleanup", inventory],
@@ -296,6 +297,32 @@ def start_cluster(token, slice_name, cpus, pod_root, deadline, local):
     gate.require(env == ["GOMAXPROCS=1"], "containerd shim launcher setting is not configured")
     cluster_cgroups(identity, pod_root)
     return identity
+
+
+def prepare_controller_client(cluster, local, deadline):
+    """Run the pinned node's client in the controller, not its runtime task cap."""
+    executable = local / "kubectl"
+    gate.command(["docker", "cp", "--follow-link", cluster + ":/bin/kubectl", executable],
+                 timeout=max(0.1, min(20, deadline - time.monotonic())))
+    metadata = executable.lstat()
+    gate.require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
+                 and 4 <= metadata.st_size <= 128 * 1024 * 1024, "invalid pinned kubectl executable")
+    with executable.open("rb") as source:
+        gate.require(source.read(4) == b"\x7fELF", "pinned kubectl must be a Linux ELF")
+    executable.chmod(0o500)
+    expected = gate.output(["docker", "exec", cluster, "sha256sum", "/bin/kubectl"], timeout=5).split()[0]
+    gate.require(gate.digest(executable) == expected, "pinned kubectl copy differs")
+    config = json.loads(gate.output(["docker", "exec", cluster, "kubectl", "config", "view", "--raw",
+                                    "--flatten", "-o", "json"], timeout=5))
+    inspection = json.loads(gate.output(["docker", "inspect", cluster], timeout=5))[0]
+    port = int(inspection["NetworkSettings"]["Ports"]["6443/tcp"][0]["HostPort"])
+    gate.require(len(config["clusters"]) == 1 and 0 < port < 65536, "invalid owned client endpoint")
+    config["clusters"][0]["cluster"]["server"] = "https://127.0.0.1:" + str(port)
+    with (local / "controller-kubeconfig.json").open("x") as output:
+        os.fchmod(output.fileno(), 0o600)
+        json.dump(config, output)
+        output.write("\n")
+    return expected
 
 
 def serial_sql(args, local, oracle, token, cpus, deadline):
@@ -466,6 +493,12 @@ def run(args):
         if args.phase in {"failures", "maintenance", "cache-matrix", "leader", "kubernetes", "istio"}:
             cluster = start_cluster(token, args.slice, cpus, pod_root, deadline, local)
             report["cluster_id"] = cluster
+        if args.phase in {"kubernetes", "istio"}:
+            report["kubectl_sha256"] = prepare_controller_client(cluster, local, deadline)
+            controller_inputs += ["--mount", f"type=bind,src={local / 'kubectl'},dst=/usr/local/bin/kubectl,readonly",
+                "--env", "GIT_RS_TEST_KUBECTL=/usr/local/bin/kubectl",
+                "--env", "GIT_RS_TEST_KUBECONFIG=/opt/git-rs/.local/controller-kubeconfig.json",
+                "--env", "GIT_RS_TEST_CLUSTER_CONTAINER=" + cluster]
         with (local / "controller.log").open("xb") as log:
             remaining = max(0.1, deadline - time.monotonic())
             if args.phase == "runtime":
