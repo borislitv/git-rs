@@ -539,6 +539,10 @@ def inside(args):
         arguments += ["--receive-core-only"]
     elif args.phase in {"upload", "history"}:
         arguments += ["--" + args.phase + "-core-only"]
+    elif args.phase == "cache-matrix":
+        gate.require(args.cluster_container, "maintenance cluster required")
+        arguments = [sys.executable, "-B", "/opt/git-rs/tests/cache_matrix.py", "--provision",
+                     "--fixture-dir", "/opt/git-rs/.local/fixture", "--cluster-container", args.cluster_container]
     else:
         gate.require(args.phase in {"failures", "maintenance", "cache-matrix"} and args.cluster_container, "maintenance cluster required")
         arguments[2] = "/opt/git-rs/tests/" + args.phase.replace("-", "_") + ".py"

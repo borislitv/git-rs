@@ -437,6 +437,20 @@ class ControllerProxyContracts(unittest.TestCase):
         probe.assert_not_called()
         work.assert_not_called()
 
+    def test_cache_matrix_dispatch_reaches_its_actual_argument_parser(self):
+        import cache_matrix
+        with patch.object(runtime.gate, "output", return_value="Docker version fixture"), \
+                patch.object(runtime.os, "execv") as work:
+            runtime.inside(SimpleNamespace(phase="cache-matrix", cluster_container="owned-cluster"))
+        arguments = work.call_args.args[1]
+        self.assertEqual(arguments[:2], [runtime.sys.executable, "-B"])
+        with patch("sys.argv", arguments[2:]), \
+                patch.dict(os.environ, {"GIT_RS_TEST_RUNTIME_IMAGE": "runtime",
+                    "GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE": "fixture", "GIT_RS_TEST_REVISION": "revision"}), \
+                patch.object(cache_matrix, "load_config", side_effect=RuntimeError("parsed matrix configuration")):
+            with self.assertRaisesRegex(RuntimeError, "parsed matrix configuration"):
+                cache_matrix.main()
+
     def test_selected_but_unexecutable_proxy_stops_before_work(self):
         with patch.object(runtime.gate, "output", side_effect=PermissionError("noexec")), \
                 patch.object(runtime.os, "execv") as work:
