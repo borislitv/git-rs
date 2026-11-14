@@ -152,11 +152,12 @@ def exercise(args, base, distribution, watchers):
     platform_values = base / "istiod.yaml"
     platform_values.write_text(yaml.safe_dump({
         "image": platform["pilot"]["reference"], "autoscaleEnabled": False, "replicaCount": 1,
+        "env": {"GOMAXPROCS": "1"},
         "resources": {"requests": {"cpu": "50m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}},
         "global": {"imagePullPolicy": "Never", "proxy": {"image": platform["proxy"]["reference"],
             "resources": {"requests": {"cpu": "25m", "memory": "32Mi"}, "limits": {"cpu": "250m", "memory": "256Mi"}}},
             "proxy_init": {"image": platform["proxy"]["reference"]}},
-        "meshConfig": {"defaultConfig": {"concurrency": 1}},
+        "meshConfig": {"defaultConfig": {"concurrency": 1, "proxyMetadata": {"GOMAXPROCS": "1"}}},
         "gatewayClasses": {"istio": {"service": {"spec": {"type": "NodePort"}}}}}))
     print(f"Installing official Istio {ISTIO}, Gateway API {GATEWAY_API}", flush=True)
     for release, chart, extra in [

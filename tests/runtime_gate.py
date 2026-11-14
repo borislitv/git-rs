@@ -262,7 +262,7 @@ def start_cluster(token, slice_name, cpus, pod_root, deadline, local):
     # CRI task observations bind pods as well as k3s to the attested slice.
     identity = gate.output(["docker", "create", "--name", name, "--pull=never", "--privileged",
         "--cgroupns=host", "--cgroup-parent", slice_name, "--cpuset-cpus", cpus, "--cpus", ".5",
-        "--memory", "1024m", "--memory-swap", "1024m", "--pids-limit", "128",
+        "--memory", "1024m", "--memory-swap", "1024m", "--pids-limit", "128", "--env", "GOMAXPROCS=1",
         "--label", gate.LABEL + token, "--publish", "127.0.0.1::6443",
         "--tmpfs", "/run", "--tmpfs", "/var/run", "--entrypoint", "/bin/sh", K3S,
         "-ec", 'mkdir -p "$1"; shift; exec /bin/k3s "$@"', "fixture-entrypoint",
