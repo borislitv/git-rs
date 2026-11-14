@@ -44,7 +44,12 @@ class ProcessInventory:
                 actual = row["imageID"].removeprefix("containerd://")
                 assert re.fullmatch(r"[0-9a-f]{64}", identity), "invalid CRI process identity"
                 assert actual in {bound["reference"], bound["cri_id"]}, "CRI image identity changed"
-                assert row.get("restartCount", 0) == 0, "an unrecorded container restart invalidates lifecycle evidence"
+                if row.get("restartCount", 0) != 0:
+                    previous = row.get("lastState", {}).get("terminated", {})
+                    termination = {key: previous[key] for key in ("reason", "exitCode", "signal") if key in previous}
+                    raise AssertionError("an unrecorded container restart invalidates lifecycle evidence: "
+                        f"pod={pod.get('metadata', {}).get('name', '')!r} container={row['name']!r} "
+                        f"count={row['restartCount']!r} previous={termination!r}")
                 value = {"id": identity, "role": role, "image_id": actual, "image": bound}
                 if identity in self.containers:
                     assert self.containers[identity] == value, "CRI process image binding changed"

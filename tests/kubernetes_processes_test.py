@@ -63,6 +63,21 @@ class PodIdentityContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "binding changed"):
             self.inventory.record(pod)
 
+    def test_a_restart_failure_retains_only_bounded_identity_and_termination_diagnostics(self):
+        pod = self.pod()
+        pod["metadata"] = {"name": "synthetic-backend"}
+        status = pod["status"]["containerStatuses"][0]
+        status.update(restartCount=1, lastState={"terminated": {
+            "reason": "OOMKilled", "exitCode": 137, "message": "sensitive application stderr"}})
+        with self.assertRaisesRegex(AssertionError, "unrecorded container restart") as failure:
+            self.inventory.record(pod)
+        message = str(failure.exception)
+        self.assertIn("synthetic-backend", message)
+        self.assertIn("OOMKilled", message)
+        self.assertIn("137", message)
+        self.assertNotIn("sensitive application stderr", message)
+        self.assertEqual(self.inventory.containers, {})
+
     def watch(self, responses):
         # Real pipes preserve byte-stream/EOF semantics; only the external
         # Docker/Kubernetes endpoint is replaced. No native process is spawned.
