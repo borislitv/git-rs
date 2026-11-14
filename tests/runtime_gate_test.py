@@ -166,7 +166,7 @@ class SupervisorContracts(unittest.TestCase):
                 return SimpleNamespace(st_mode=0o100644, st_uid=0)
             return real_lstat(path, *a, **kw)
 
-        with patch.object(runtime.gate, "verify_unit", return_value=token), \
+        with patch.object(runtime, "observed_scope", return_value={"owner": token, "group": "/owned.slice"}), \
                 patch.object(runtime, "inspect_image", side_effect=["sha256:" + digit * 64 for digit in "567"]), \
                 patch.object(runtime.gate, "output", return_value="/owned.slice"), \
                 patch.object(runtime.gate, "command", side_effect=work_error), patch.object(Path, "stat", stat), patch.object(Path, "lstat", lstat), \
@@ -238,6 +238,78 @@ class SupervisorContracts(unittest.TestCase):
             self.assertEqual(argv[argv.index(option) + 1], value)
         self.assertNotIn("--prepare", argv)
         self.assertNotIn("--provision", argv)
+
+
+class ObservedScopeContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.token = "f" * 32
+        self.unit = "git-rs-blame-observer-fixture123.service"
+        self.slice = "git-rs-blame-observer-fixture123.slice"
+        self.group = "/" + self.slice
+        self.controller = self.group + "/" + self.unit
+        local = self.root / self.token
+        local.mkdir()
+        self.path = local / "unit-proof.json"
+        self.proof = {"owner": self.token, "unit": self.unit, "slice": self.slice,
+                      "group": self.group, "controller": self.controller}
+        self.path.write_text(json.dumps(self.proof))
+        self.path.chmod(0o644)
+        self.owner = 0
+        cgroup = self.root / "cgroups" / self.slice
+        cgroup.mkdir(parents=True)
+        for name, value in {"memory.max": str(4 * 1024**3), "pids.max": "256",
+                            "cpu.max": "200000 100000", "memory.swap.max": "0",
+                            "cpuset.cpus.effective": "24-25"}.items():
+            (cgroup / name).write_text(value)
+        self.cgroup = cgroup
+        real_read_text, real_fstat = Path.read_text, os.fstat
+
+        def read_text(path, *args, **kwargs):
+            return "0::" + self.controller if str(path) == "/proc/self/cgroup" else real_read_text(path, *args, **kwargs)
+
+        def metadata(descriptor):
+            value = real_fstat(descriptor)
+            return SimpleNamespace(st_uid=self.owner, st_mode=value.st_mode, st_size=value.st_size)
+
+        # Simulate the root file-owner boundary on unprivileged CI accounts too.
+        for boundary in (patch.object(runtime, "DIRECTORIES", self.root),
+                         patch.object(runtime, "CGROUPS", self.root / "cgroups"),
+                         patch.object(runtime.gate, "invocation", return_value=self.token),
+                         patch.object(Path, "read_text", read_text),
+                         patch.object(runtime.os, "fstat", side_effect=metadata),
+                         patch.object(runtime.gate, "output", side_effect=AssertionError("system bus access"))):
+            boundary.start()
+            self.addCleanup(boundary.stop)
+
+    def test_exact_root_proof_and_live_limits_work_without_system_bus_access(self):
+        self.assertEqual(runtime.observed_scope(self.unit, self.slice), self.proof)
+
+    def test_image_owned_or_replayed_proof_and_changed_limits_are_rejected(self):
+        for fault in ("owner", "token", "controller", "unit", "mode", "limits"):
+            with self.subTest(fault=fault):
+                proof = dict(self.proof)
+                self.owner = 10001 if fault == "owner" else 0
+                self.path.chmod(0o600 if fault == "mode" else 0o644)
+                (self.cgroup / "memory.swap.max").write_text("1" if fault == "limits" else "0")
+                if fault == "token":
+                    proof["owner"] = "e" * 32
+                elif fault == "controller":
+                    proof["controller"] += ".different"
+                elif fault == "unit":
+                    proof["unit"] += ".different"
+                self.path.write_text(json.dumps(proof))
+                with self.assertRaises(ValueError):
+                    runtime.observed_scope(self.unit, self.slice)
+
+    def test_linked_attestation_is_not_followed(self):
+        target = self.path.with_name("replacement")
+        self.path.rename(target)
+        self.path.symlink_to(target)
+        with self.assertRaises(OSError):
+            runtime.observed_scope(self.unit, self.slice)
 
 
 class CompiledInputContracts(unittest.TestCase):

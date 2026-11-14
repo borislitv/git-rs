@@ -76,6 +76,11 @@ explicit program inventory, and client-side `git-rs ssh` does not count as backe
 coverage. Names in a checkout directory are not executable identities.
 
 Raw observer inputs are root-owned/private, separate from the work child's files.
+After verifying the actual unit, the root observer publishes a bounded root-owned
+read-only attestation bound to its invocation, unit, slice and current cgroup.
+The image UID validates that attestation and live aggregate limits without needing
+a host passwd entry or system-bus access. Image-owned replacements and proofs from
+a different invocation are rejected.
 The observer remains active through work, container shutdown, actual CRI drain and
 credential cleanup. Only then may the outer observer mark the phase complete. This
 combines the filesystem inventory with process evidence; neither check alone is

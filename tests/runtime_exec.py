@@ -149,7 +149,7 @@ tracepoint:cgroup:cgroup_mkdir {
     printf("C\\t%llu\\t%s\\n", args.id, $path);
   }
 }
-tracepoint:sched:sched_process_exec /@owned[cgroup]/ {
+tracepoint:sched:sched_process_exec /has_key(@owned, cgroup)/ {
   printf("E\\t%llu\\t%d\\t%s\\n", cgroup, pid, str(args.filename));
 }
 END { printf("Z\\n"); }
@@ -272,6 +272,7 @@ def trace(args, arguments):
                          "the runtime aggregate must start with only its controller")
     runtime.gate.require(not (root / "cgroup.procs").read_text().strip(), "unexpected direct aggregate tasks")
     write_json(observer_files / "scope.json", owned)
+    write_json(local / "unit-proof.json", {**owned, "unit": args.unit, "slice": args.slice}, mode=0o644)
     (local / "exec-probe").symlink_to("/usr/bin/true")
     script = observer_files / "exec.bt"
     script.write_text(program(group, controller))
@@ -329,7 +330,9 @@ def trace(args, arguments):
                                 os.close(descriptor)
                     runtime.gate.require(len(pending) <= 4096, "unterminated process trace record")
         runtime.gate.require(observer.wait(timeout=2) == 0, "process tracer failed")
-        runtime.gate.require(ending and events.wait(timeout=2) in {0, -signal.SIGTERM},
+        # Docker may handle our SIGTERM and return its conventional 128+signal
+        # status. It must still have been alive before our requested stop.
+        runtime.gate.require(ending and events.wait(timeout=2) in {0, -signal.SIGTERM, 128 + signal.SIGTERM},
                              "Docker lifecycle observer ended before its requested stop")
         for stream in streams:
             stream.flush()

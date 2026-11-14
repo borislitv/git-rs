@@ -151,6 +151,30 @@ def confirm_drain(local, token):
                  "actual aggregate owners have not stopped")
 
 
+def observed_scope(unit, slice_name):
+    """Consume the root observer's unit attestation without a host passwd entry."""
+    token = gate.invocation()
+    path = directory(token) / "unit-proof.json"
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor) as source:
+        metadata = os.fstat(source.fileno())
+        gate.require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0
+                     and stat.S_IMODE(metadata.st_mode) == 0o644 and metadata.st_size <= 4096,
+                     "root-owned unit attestation required")
+        encoded = source.read(4097)
+    gate.require(len(encoded) <= 4096, "oversized unit attestation")
+    owned = json.loads(encoded)
+    controller = Path("/proc/self/cgroup").read_text().strip().removeprefix("0::")
+    group = str(Path(controller).parent)
+    gate.require(re.fullmatch(gate.SLICE_PATTERN, slice_name)
+                 and Path(group).name == slice_name and Path(controller).name == unit
+                 and owned == {"owner": token, "group": group, "controller": controller,
+                               "unit": unit, "slice": slice_name},
+                 "unit attestation identity differs")
+    gate.verify_limits(CGROUPS / group.lstrip("/"))
+    return owned
+
+
 def cleanup(*, containers_only=False, deadline=None):
     token = gate.invocation()
     local = directory(token)
@@ -380,7 +404,8 @@ def finish(local, report, started):
 
 def run(args):
     gate.require(getattr(args, "traced", False), "run runtime contracts through the successful-exec observer")
-    token = gate.verify_unit(args.unit, args.slice, cleanup_command=CLEANUP_COMMAND)
+    owned = observed_scope(args.unit, args.slice)
+    token = owned["owner"]
     private(DIRECTORIES)
     local = directory(token)
     private(local)
@@ -403,7 +428,7 @@ def run(args):
                  "invalid runtime work deadline")
     try:
         cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
-        group = gate.output(["systemctl", "show", args.slice, "--property=ControlGroup", "--value"])
+        group = owned["group"]
         pod_root = group + "/pods"
         cluster = None
         controller_inputs = []
