@@ -105,6 +105,86 @@ fn upload_advertises_all_ten_thousand_supported_catalog_refs() -> Result<()> {
 }
 
 #[test]
+fn full_catalog_fetch_accepts_the_native_head_want_but_retains_a_wire_bound() -> Result<()> {
+    for version in [Version::V0, Version::V1, Version::V2] {
+        for count in [10_001, 10_002] {
+            let mut graph = Graph::default();
+            let blob = graph.object(gix::objs::Kind::Blob, b"contents\n")?;
+            let tree = graph.tree(b"file", blob)?;
+            let tip = graph.commit(tree, &[], 1)?;
+            let refs: Vec<_> = (0..10_000)
+                .map(|number| format!("refs/heads/b{number:05}").into_bytes())
+                .collect();
+            let budget = CapacityBudget::new(64 * 1024 * 1024);
+            let control = Control::new(Instant::now() + Duration::from_secs(10));
+            let snapshot = graph
+                .source()?
+                .open(control, budget.clone(), ReadLimits::default())?;
+            let mut session = UploadSession::new(
+                snapshot,
+                refs.iter().map(|name| (name.as_slice(), tip)),
+                &refs[0],
+                version,
+            )?;
+            let mut request = Vec::new();
+            if version == Version::V2 {
+                packet(b"command=fetch\n", &mut request);
+                request.extend_from_slice(b"0001");
+            }
+            // Git 2.56 sends a want per advertised ref plus HEAD, even when
+            // every ref names the same object. These are wire entries, not
+            // independently reachable objects or additional catalog refs.
+            for _ in 0..count {
+                packet(format!("want {tip}\n").as_bytes(), &mut request);
+            }
+            if version != Version::V2 {
+                request.extend_from_slice(b"0000");
+            }
+            packet(b"done\n", &mut request);
+            if version == Version::V2 {
+                request.extend_from_slice(b"0000");
+            }
+            let mut output = Vec::new();
+            let result = session.run(&mut request.as_slice(), &mut output, true);
+            if count == 10_002 {
+                assert!(
+                    result.is_err(),
+                    "{version:?} accepted an excessive want list"
+                );
+                assert!(output.is_empty(), "rejected wants published success bytes");
+            } else {
+                result?;
+                let pack = if version == Version::V2 {
+                    let mut wire = output.as_slice();
+                    assert_eq!(
+                        git_rs::protocol::read_packet(&mut wire)?.unwrap(),
+                        b"packfile\n"
+                    );
+                    let mut pack = Vec::new();
+                    while let Some(packet) = git_rs::protocol::read_packet(&mut wire)? {
+                        assert_eq!(packet[0], 1);
+                        pack.extend_from_slice(&packet[1..]);
+                    }
+                    assert!(wire.is_empty());
+                    pack
+                } else {
+                    assert!(output.starts_with(b"0008NAK\n"));
+                    output[b"0008NAK\n".len()..].to_vec()
+                };
+                assert!(pack.starts_with(b"PACK\0\0\0\x02\0\0\0\x03"));
+                assert_eq!(
+                    ranges::hash(&pack[..pack.len() - 20])?.as_slice(),
+                    &pack[pack.len() - 20..]
+                );
+            }
+            drop(session);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn physical_but_unadvertised_wants_fail_before_any_success_or_pack_bytes() -> Result<()> {
     for version in [Version::V0, Version::V1, Version::V2] {
         let (mut session, _, hidden, budget) = fixture(version)?;

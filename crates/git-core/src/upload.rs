@@ -650,7 +650,9 @@ struct Request {
 impl Request {
     fn new<P: VerifiedObjectProvider>(snapshot: &SnapshotSession<P>) -> Result<Self> {
         Ok(Self {
-            wants: ChargedVec::new(snapshot.capacity.clone(), MAX_REFS)?,
+            // Native clients can request every catalog ref and the separately
+            // advertised HEAD without deduplicating identical object IDs.
+            wants: ChargedVec::new(snapshot.capacity.clone(), MAX_REFS + 1)?,
             haves: ChargedVec::new(snapshot.capacity.clone(), snapshot.limits.max_graph_objects)?,
             shallow: ChargedVec::new(snapshot.capacity.clone(), snapshot.limits.max_graph_objects)?,
             deepen_not: ChargedVec::new(snapshot.capacity.clone(), MAX_REFS)?,
