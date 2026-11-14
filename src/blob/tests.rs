@@ -1,0 +1,547 @@
+use super::*;
+use crate::cache::Cache;
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+enum Reply {
+    Complete(Vec<u8>),
+    Redirect(SocketAddr),
+    Paused {
+        headers: bool,
+        reached: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
+}
+
+struct Server {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    requested: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Vec<SocketAddr>>>,
+}
+
+impl Server {
+    fn new(replies: Vec<Reply>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let requested = Arc::new(AtomicBool::new(false));
+        let observed = requested.clone();
+        let worker = thread::spawn(move || {
+            let mut connection: Option<(BufReader<TcpStream>, SocketAddr)> = None;
+            let mut peers = Vec::new();
+            for reply in replies {
+                loop {
+                    if connection.is_none() {
+                        let (stream, peer) = listener.accept().unwrap();
+                        if stopping.load(Ordering::Acquire) {
+                            return peers;
+                        }
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        connection = Some((BufReader::new(stream), peer));
+                    }
+                    let (stream, peer) = connection.as_mut().unwrap();
+                    let mut header = String::new();
+                    if stream.read_line(&mut header).unwrap_or(0) == 0 {
+                        connection = None;
+                        continue;
+                    }
+                    assert!(header.starts_with("GET /test-bucket"), "{header:?}");
+                    observed.store(true, Ordering::Release);
+                    let mut headers = 0;
+                    loop {
+                        header.clear();
+                        assert!(stream.read_line(&mut header).unwrap() > 0);
+                        if header == "\r\n" {
+                            break;
+                        }
+                        headers += 1;
+                        assert!(headers <= 100);
+                    }
+                    peers.push(*peer);
+                    let socket = stream.get_mut();
+                    match reply {
+                        Reply::Complete(body) => {
+                            write!(
+                                socket,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            )
+                            .unwrap();
+                            socket.write_all(&body).unwrap();
+                        }
+                        Reply::Redirect(address) => {
+                            write!(socket, "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/test-bucket/?versioning\r\nContent-Length: 0\r\n\r\n").unwrap();
+                        }
+                        Reply::Paused {
+                            headers,
+                            reached,
+                            release,
+                        } => {
+                            if headers {
+                                socket
+                                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ncomp")
+                                    .unwrap();
+                            }
+                            reached.send(()).unwrap();
+                            release.recv_timeout(Duration::from_secs(5)).unwrap();
+                            let rest = if headers {
+                                b"lete".as_slice()
+                            } else {
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ncomplete"
+                            };
+                            // Cancellation is expected to close the peer first.
+                            let _ = socket.write_all(rest);
+                        }
+                    }
+                    break;
+                }
+            }
+            peers
+        });
+        Self {
+            address,
+            stop,
+            requested,
+            worker: Some(worker),
+        }
+    }
+
+    fn store(&self) -> Store {
+        Store {
+            endpoint: format!("http://{}", self.address),
+            bucket: "test-bucket".into(),
+            region: "us-east-1".into(),
+            access: "synthetic-access".into(),
+            secret: "synthetic-secret".into(),
+        }
+    }
+
+    fn finish(mut self) -> Vec<SocketAddr> {
+        self.worker.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.stop.store(true, Ordering::Release);
+            let _ = TcpStream::connect(self.address);
+            worker.join().unwrap();
+        }
+    }
+}
+
+struct Directory(PathBuf);
+
+impl Directory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "git-rs-s3-{}",
+            crate::scratch::identifier().unwrap()
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Directory {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+#[test]
+fn consecutive_s3_requests_reuse_a_connection() {
+    let (identity, certificate) = tls_identity();
+    let directory = Directory::new();
+    let ca = directory.0.join("ca.pem");
+    fs::write(&ca, certificate).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (socket, peer) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
+        let mut stream = BufReader::new(acceptor.accept(socket).unwrap());
+        let mut peers = Vec::new();
+        // Keep the listener alive, but complete only one TLS handshake. A
+        // speculative second connection cannot beat the original connection's
+        // asynchronous return to the HTTP pool. A per-call Client cannot reuse
+        // that pool and fails within the bounded request budget instead.
+        for _ in 0..3 {
+            let mut header = String::new();
+            assert!(stream.read_line(&mut header).unwrap() > 0);
+            assert!(header.starts_with("GET /test-bucket?versioning "));
+            let mut headers = 0;
+            loop {
+                header.clear();
+                assert!(stream.read_line(&mut header).unwrap() > 0);
+                if header == "\r\n" {
+                    break;
+                }
+                headers += 1;
+                assert!(headers <= 100);
+            }
+            peers.push(peer);
+            stream
+                .get_mut()
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\n<VersioningConfiguration/>",
+                )
+                .unwrap();
+        }
+        drop(listener);
+        peers
+    });
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "blob::tests::isolated_tls_client"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/nonexistent")
+        .env(
+            "GIT_RS_S3_ENDPOINT",
+            format!("https://localhost:{}", address.port()),
+        )
+        .env("GIT_RS_S3_BUCKET", "test-bucket")
+        .env("GIT_RS_S3_ACCESS_KEY", "synthetic-access")
+        .env("GIT_RS_S3_SECRET_KEY", "synthetic-secret")
+        .env("GIT_RS_TEST_TLS_SUCCESS", "1")
+        .env("GIT_RS_TEST_TLS_REQUESTS", "3")
+        .env("SSL_CERT_FILE", ca)
+        .output()
+        .unwrap();
+    // Also release accept if initialization failed before connecting.
+    let _ = TcpStream::connect(address);
+    let peers = server.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(peers.len(), 3);
+    assert_eq!(
+        peers.into_iter().collect::<BTreeSet<_>>().len(),
+        1,
+        "sequential S3 calls must reuse their authenticated HTTP connection"
+    );
+}
+
+#[test]
+fn redirects_are_rejected_instead_of_forwarding_a_signed_request() {
+    let target = Server::new(vec![Reply::Complete(
+        b"<VersioningConfiguration/>".to_vec(),
+    )]);
+    let source = Server::new(vec![Reply::Redirect(target.address)]);
+    let operation = process::Operation::new(2);
+    assert!(
+        operation
+            .enter(|| source.store().require_unversioned())
+            .is_err()
+    );
+    assert_eq!(source.finish().len(), 1);
+    assert!(
+        !target.requested.load(Ordering::Acquire),
+        "redirect target must never receive a request"
+    );
+    // Drop wakes a target that was correctly never contacted.
+    drop(target);
+}
+
+#[test]
+fn failed_response_integrity_does_not_poison_a_later_complete_fill() {
+    let server = Server::new(vec![
+        Reply::Complete(b"too-large".to_vec()),
+        Reply::Complete(b"comp".to_vec()),
+        Reply::Complete(b"corrupt!".to_vec()),
+        Reply::Complete(b"complete".to_vec()),
+    ]);
+    let store = server.store();
+    let hash = crate::protocol::hex(&openssl::sha::sha256(b"complete"));
+    let budget = git_rs_core::CapacityBudget::new(1024 * 1024);
+    let control = git_rs_core::Control::new(std::time::Instant::now() + Duration::from_secs(5));
+    for _ in 0..3 {
+        assert!(
+            store
+                .source_bytes("object.pack", 8, &hash, &control, &budget)
+                .is_err()
+        );
+        assert_eq!(budget.used(), 0);
+    }
+    let entry = store
+        .source_bytes("object.pack", 8, &hash, &control, &budget)
+        .unwrap();
+    assert_eq!(entry.as_slice(), b"complete");
+    drop(entry);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(server.finish().len(), 4);
+}
+
+#[test]
+fn bucket_policy_response_cannot_grow_past_its_budget() {
+    let mut policy = b"<VersioningConfiguration/>".to_vec();
+    policy.resize(16385, b' ');
+    let server = Server::new(vec![Reply::Complete(policy)]);
+    assert!(server.store().require_unversioned().is_err());
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn only_an_empty_versioning_policy_authorizes_physical_cleanup() {
+    for policy in [
+        b"<VersioningConfiguration/>".as_slice(),
+        b"<?xml version=\"1.0\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"> \n<!-- never enabled -->\n</VersioningConfiguration>",
+    ] {
+        let server = Server::new(vec![Reply::Complete(policy.to_vec())]);
+        server.store().require_unversioned().unwrap();
+        assert_eq!(server.finish().len(), 1);
+    }
+    for policy in [
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".as_slice(),
+        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+        b"<VersioningConfiguration><Status/></VersioningConfiguration>",
+        b"<VersioningConfiguration>unknown</VersioningConfiguration>",
+    ] {
+        let server = Server::new(vec![Reply::Complete(policy.to_vec())]);
+        let error = server.store().require_unversioned().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::xml::VersioningBlocked>()
+                .is_some(),
+            "{error}"
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[test]
+fn malformed_or_recursive_policy_responses_fail_closed() {
+    let mut events = b"<VersioningConfiguration>".to_vec();
+    for _ in 0..512 {
+        events.extend_from_slice(b"<!-- event -->");
+    }
+    events.extend_from_slice(b"</VersioningConfiguration>");
+    for policy in [
+        b"<!DOCTYPE VersioningConfiguration [<!ENTITY policy 'enabled'>]><VersioningConfiguration/>".to_vec(),
+        b"<?policy unknown?><VersioningConfiguration/>".to_vec(),
+        b"<VersioningConfiguration/><VersioningConfiguration/>".to_vec(),
+        b"<VersioningConfiguration></Other>".to_vec(),
+        b"<VersioningConfiguration>".to_vec(),
+        b"<Error><Code>AccessDenied</Code></Error>".to_vec(),
+        [b"<VersioningConfiguration/>".as_slice(), &[0xff]].concat(),
+        events,
+    ] {
+        let server = Server::new(vec![Reply::Complete(policy)]);
+        assert!(server.store().require_unversioned().is_err());
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[test]
+#[ignore = "entry point for the isolated TLS fixture"]
+fn isolated_tls_client() {
+    let expected = std::env::var("GIT_RS_TEST_TLS_SUCCESS").unwrap() == "1";
+    let requests = std::env::var("GIT_RS_TEST_TLS_REQUESTS")
+        .map_or(1, |value| value.parse::<usize>().unwrap());
+    for _ in 0..requests {
+        let result = process::Operation::new(2).enter(|| Store::from_env()?.require_unversioned());
+        assert_eq!(
+            result.is_ok(),
+            expected,
+            "unexpected TLS verification outcome: {result:?}"
+        );
+    }
+}
+
+fn tls_identity() -> (native_tls::Identity, Vec<u8>) {
+    use openssl::{
+        asn1::Asn1Time,
+        hash::MessageDigest,
+        pkey::PKey,
+        rsa::Rsa,
+        x509::{
+            X509, X509NameBuilder,
+            extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+        },
+    };
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_text("CN", "localhost").unwrap();
+    let name = name.build();
+    let mut certificate = X509::builder().unwrap();
+    certificate.set_version(2).unwrap();
+    let serial = openssl::bn::BigNum::from_u32(1)
+        .unwrap()
+        .to_asn1_integer()
+        .unwrap();
+    certificate.set_serial_number(&serial).unwrap();
+    certificate.set_subject_name(&name).unwrap();
+    certificate.set_issuer_name(&name).unwrap();
+    certificate.set_pubkey(&key).unwrap();
+    certificate
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    certificate
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    certificate
+        .append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+        .unwrap();
+    certificate
+        .append_extension(
+            KeyUsage::new()
+                .digital_signature()
+                .key_encipherment()
+                .key_cert_sign()
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    certificate
+        .append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap())
+        .unwrap();
+    let subject = SubjectAlternativeName::new()
+        .dns("localhost")
+        .build(&certificate.x509v3_context(None, None))
+        .unwrap();
+    certificate.append_extension(subject).unwrap();
+    certificate.sign(&key, MessageDigest::sha256()).unwrap();
+    let certificate = certificate.build().to_pem().unwrap();
+    let identity =
+        native_tls::Identity::from_pkcs8(&certificate, &key.private_key_to_pem_pkcs8().unwrap())
+            .unwrap();
+    (identity, certificate)
+}
+
+#[test]
+fn tls_requires_a_trusted_certificate_and_matching_hostname() {
+    let (identity, certificate) = tls_identity();
+    let directory = Directory::new();
+    let ca = directory.0.join("ca.pem");
+    fs::write(&ca, &certificate).unwrap();
+
+    for (trust, host, success) in [
+        (true, "localhost", true),
+        (false, "localhost", false),
+        (true, "127.0.0.1", false),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = native_tls::TlsAcceptor::new(identity.clone()).unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            if let Ok(socket) = acceptor.accept(socket) {
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                while socket.read_line(&mut line).unwrap_or(0) != 0 {
+                    if line == "\r\n" {
+                        socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\n<VersioningConfiguration/>").unwrap();
+                        break;
+                    }
+                    line.clear();
+                }
+            }
+        });
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--ignored", "--exact", "blob::tests::isolated_tls_client"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/nonexistent")
+            .env(
+                "GIT_RS_S3_ENDPOINT",
+                format!("https://{host}:{}", address.port()),
+            )
+            .env("GIT_RS_S3_BUCKET", "test-bucket")
+            .env("GIT_RS_S3_ACCESS_KEY", "synthetic-access")
+            .env("GIT_RS_S3_SECRET_KEY", "synthetic-secret")
+            .env("GIT_RS_TEST_TLS_SUCCESS", if success { "1" } else { "0" });
+        if trust {
+            child.env("SSL_CERT_FILE", &ca);
+        }
+        let result = child.output().unwrap();
+        // Wake accept even if client configuration failed before connecting.
+        let _ = TcpStream::connect(address);
+        server.join().unwrap();
+        assert!(
+            result.status.success(),
+            "trust={trust} host={host}: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[test]
+fn cancelling_s3_headers_or_body_releases_the_cache_fill_before_the_server_replies() {
+    for headers in [false, true] {
+        let (reached, requested) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (completed, result) = mpsc::channel();
+        let server = Server::new(vec![Reply::Paused {
+            headers,
+            reached,
+            release: released,
+        }]);
+        let store = server.store();
+        let cache = Cache::new(4096, 8);
+        let operation = process::Operation::new(30);
+        thread::scope(|scope| {
+            let cache = &cache;
+            let operation = &operation;
+            scope.spawn(move || {
+                let failed = operation.enter(|| {
+                    let control = git_rs_core::Control::new(operation.deadline());
+                    cache
+                        .get_or_load_controlled("object.pack", 8, &control, |bytes| {
+                            store.source_into(
+                                "object.pack",
+                                &crate::protocol::hex(&openssl::sha::sha256(b"complete")),
+                                bytes,
+                                &control,
+                            )
+                        })
+                        .is_err()
+                });
+                completed.send(failed).unwrap();
+            });
+            requested.recv_timeout(Duration::from_secs(5)).unwrap();
+            operation.cancel();
+            let stopped = result.recv_timeout(Duration::from_secs(2));
+            release.send(()).unwrap();
+            assert!(stopped.expect("cancelled S3 must stop without waiting for the peer"));
+        });
+        server.finish();
+        assert_eq!(
+            cache.allocated(),
+            0,
+            "cancelled bytes must not remain cached"
+        );
+    }
+}

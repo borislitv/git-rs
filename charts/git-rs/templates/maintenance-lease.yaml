@@ -1,0 +1,13 @@
+{{- if .Values.maintenance.enabled }}
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ include "git-rs.maintenanceLease" . }}
+  labels:
+    {{- include "git-rs.maintenanceLabels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+# The chart never declares holder/renewTime/acquireTime/duration/transitions.
+# Upgrades must leave the controller's live fields and SSA ownership intact.
+spec: {}
+{{- end }}

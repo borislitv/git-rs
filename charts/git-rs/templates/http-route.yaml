@@ -1,0 +1,30 @@
+{{- if .Values.httpRoute.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "git-rs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.httpRoute.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- toYaml .Values.httpRoute.parentRefs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.httpRoute.hostnames | nindent 4 }}
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /}
+      # Omitting retry inherits Istio's default automatic retries, including POST.
+      # Requires Gateway API standard CRDs v1.7+ and controller retry support.
+      retry:
+        attempts: 0
+      backendRefs:
+        - name: {{ include "git-rs.fullname" . }}
+          port: {{ .Values.http.port }}
+      {{- with .Values.httpRoute.timeouts }}
+      timeouts:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

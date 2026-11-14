@@ -1,0 +1,32 @@
+{
+  "source": {
+    "git": "https://github.com/borislitv/zstd-rs",
+    "rev": "a6adf4a49ab3b43e2b0279a4257f79dcc164478f"
+  },
+  "upstream": {
+    "git": "https://github.com/gyscos/zstd-rs",
+    "rev": "fa82b4c286e9a95e6681e59df5d0892ed89e75b9"
+  },
+  "packages": {"zstd": "0.14.3", "zstd-safe": "8.2.0", "zstd-sys": "2.1.2+zstd.1.5.7"},
+  "licenses": {"zstd": "BSD-3-Clause", "zstd-safe": "BSD-3-Clause", "zstd-sys": "BSD-3-Clause AND BSD-2-Clause"},
+  "notices_in_source": ["LICENSE", "zstd-safe/LICENSE", "zstd-safe/zstd-sys/LICENSE", "zstd-safe/zstd-sys/LICENSE.BSD-2-Clause", "zstd-safe/zstd-sys/LICENSE.BSD-3-Clause"],
+  "native": {
+    "git": "https://github.com/facebook/zstd",
+    "rev": "f8745da6ff1ad1e7bab384bd1f9d742439278e99",
+    "version": "1.5.7",
+    "path": "zstd-safe/zstd-sys/zstd",
+    "license": "BSD-3-Clause OR GPL-2.0-only",
+    "selected_license": "BSD-3-Clause",
+    "notices_in_source": ["LICENSE", "COPYING"]
+  },
+  "default_features": false,
+  "features": ["experimental", "vendored"],
+  "resolved_features": {
+    "zstd": ["experimental", "vendored"],
+    "zstd-safe": ["alloc", "experimental", "std", "vendored"],
+    "zstd-sys": ["experimental", "std", "vendored"]
+  },
+  "forbidden_environment": ["ZSTD_SYS_USE_PKG_CONFIG"],
+  "fork_provenance_in_source": "zstd-safe/FORK_PROVENANCE.md",
+  "owned_pull_request": "https://github.com/borislitv/zstd-rs/pull/1"
+}

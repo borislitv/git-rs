@@ -1,0 +1,49 @@
+{{- if .Values.migration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "git-rs.fullname" . }}-migrate
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  backoffLimit: 12
+  template:
+    {{- with .Values.migration.podAnnotations }}
+    metadata:
+      annotations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    spec:
+      serviceAccountName: {{ include "git-rs.serviceAccount" . }}
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "git-rs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [migrate]
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          env:
+            {{- include "git-rs.pgEnv" . | nindent 12 }}
+          volumeMounts:
+            - {name: pg-ca, mountPath: /etc/git-rs/pg-ca, readOnly: true}
+      volumes:
+        - name: pg-ca
+          secret:
+            secretName: {{ include "git-rs.pgCASecret" . }}
+            items:
+              - {key: {{ .Values.postgresql.serverCAKey }}, path: ca.crt}
+{{- end }}

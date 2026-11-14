@@ -1,0 +1,28 @@
+{{- if .Values.maintenance.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "git-rs.fullname" . }}-maintenance
+  labels:
+    {{- include "git-rs.maintenanceLabels" . | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [{{ include "git-rs.maintenanceLease" . | quote }}]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "git-rs.fullname" . }}-maintenance
+  labels:
+    {{- include "git-rs.maintenanceLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "git-rs.maintenanceServiceAccount" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "git-rs.fullname" . }}-maintenance
+{{- end }}

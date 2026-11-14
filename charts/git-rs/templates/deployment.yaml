@@ -1,0 +1,220 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "git-rs.fullname" . }}
+  labels:
+    {{- include "git-rs.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "git-rs.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "git-rs.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: serving
+      annotations:
+        {{- if .Values.ssh.enabled }}
+        checksum/ssh-config: {{ include (print $.Template.BasePath "/ssh-config.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "git-rs.serviceAccount" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: private-directories
+          image: {{ include "git-rs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/bin/sh, -ec]
+          args: ["mkdir -p /run/git-rs/private; chmod 0700 /run/git-rs/private"]
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: bridge, mountPath: /run/git-rs}
+        {{- if .Values.ssh.enabled }}
+        # fsGroup makes Secret files group-readable. OpenSSH requires a private
+        # root-owned copy; keep that copy in RAM, inaccessible to the backend.
+        - name: private-host-key
+          image: {{ include "git-rs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              mkdir -p /host-keys/private;
+              chmod 0700 /host-keys/private;
+              cp /source/ssh_host_ed25519_key /host-keys/private/ssh_host_ed25519_key;
+              chmod 0600 /host-keys/private/ssh_host_ed25519_key
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: host-keys-source, mountPath: /source, readOnly: true}
+            - {name: host-keys, mountPath: /host-keys}
+        {{- end }}
+      containers:
+        - name: backend
+          image: {{ include "git-rs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --socket
+            - /run/git-rs/private/ssh.sock
+            - --health
+            - "0.0.0.0:8081"
+            {{- if .Values.http.enabled }}
+            - --http
+            - {{ printf "0.0.0.0:%v" .Values.http.port | quote }}
+            - --http-credentials
+            - /etc/git-rs/http/credentials
+            {{- end }}
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          env:
+            {{- include "git-rs.pgEnv" . | nindent 12 }}
+            {{- include "git-rs.s3Env" . | nindent 12 }}
+            - name: GIT_RS_CACHE_BYTES
+              value: {{ .Values.cacheBytes | int64 | quote }}
+            - name: GIT_RS_OPERATION_SECONDS
+              value: {{ .Values.operationSeconds | quote }}
+            - name: GIT_RS_BLAME_CONCURRENCY
+              value: {{ .Values.cpu.concurrency | quote }}
+            - name: GIT_RS_BLAME_WAITERS
+              value: {{ .Values.cpu.waiters | quote }}
+            {{- if .Values.debugTimings }}
+            - name: GIT_RS_DEBUG_TIMINGS
+              value: "1"
+            {{- end }}
+          ports:
+            - {name: health, containerPort: 8081}
+            {{- if .Values.http.enabled }}
+            - {name: http, containerPort: {{ .Values.http.port }}}
+            {{- end }}
+          startupProbe:
+            httpGet: {path: /livez, port: health}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /livez, port: health}
+          readinessProbe:
+            httpGet: {path: /readyz, port: health}
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: bridge, mountPath: /run/git-rs}
+            - {name: temporary, mountPath: /tmp}
+            - {name: pg-ca, mountPath: /etc/git-rs/pg-ca, readOnly: true}
+            {{- if .Values.http.enabled }}
+            - {name: http-credentials, mountPath: /etc/git-rs/http, readOnly: true}
+            {{- end }}
+            {{- if .Values.s3.caSecret }}
+            - {name: s3-ca, mountPath: /etc/git-rs/s3-ca, readOnly: true}
+            {{- end }}
+        {{- if .Values.ssh.enabled }}
+        - name: ssh
+          image: {{ include "git-rs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/usr/sbin/sshd, -D, -e, -f, /etc/git-rs/ssh/sshd_config]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [SETUID, SETGID, SYS_CHROOT]
+          ports:
+            - {name: ssh, containerPort: 2222}
+          readinessProbe:
+            tcpSocket: {port: ssh}
+          resources:
+            {{- toYaml .Values.ssh.resources | nindent 12 }}
+          volumeMounts:
+            - {name: bridge, mountPath: /run/git-rs}
+            - {name: temporary, mountPath: /tmp}
+            - {name: ssh-config, mountPath: /etc/git-rs/ssh, readOnly: true}
+            - {name: host-keys, mountPath: /etc/git-rs/host-keys, readOnly: true}
+            - {name: authorized-keys, mountPath: /etc/git-rs/authorized, readOnly: true}
+        {{- end }}
+      volumes:
+        {{- if .Values.http.enabled }}
+        - name: http-credentials
+          secret:
+            secretName: {{ .Values.http.credentialsSecret }}
+            defaultMode: 0440
+            items:
+              - {key: {{ .Values.http.credentialsKey }}, path: credentials}
+        {{- end }}
+        - name: bridge
+          emptyDir: {medium: Memory, sizeLimit: 8Mi}
+        - name: temporary
+          emptyDir: {medium: Memory, sizeLimit: 128Mi}
+        - name: pg-ca
+          secret:
+            secretName: {{ include "git-rs.pgCASecret" . }}
+            items:
+              - {key: {{ .Values.postgresql.serverCAKey }}, path: ca.crt}
+        {{- if .Values.s3.caSecret }}
+        - name: s3-ca
+          secret:
+            secretName: {{ .Values.s3.caSecret }}
+            items:
+              - {key: {{ .Values.s3.caKey }}, path: ca.crt}
+        {{- end }}
+        {{- if .Values.ssh.enabled }}
+        - name: ssh-config
+          configMap:
+            name: {{ include "git-rs.fullname" . }}-ssh
+        - name: host-keys
+          emptyDir: {medium: Memory, sizeLimit: 8Mi}
+        - name: host-keys-source
+          secret:
+            secretName: {{ .Values.ssh.hostKeysSecret }}
+            defaultMode: 0400
+        - name: authorized-keys
+          secret:
+            secretName: {{ .Values.ssh.authorizedKeysSecret }}
+            defaultMode: 0444
+            items:
+              - {key: {{ .Values.ssh.authorizedKeysKey }}, path: principals}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

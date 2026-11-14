@@ -1,0 +1,470 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  cache:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.99.1
+      - name: Build cache gate executables
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config postgresql-client curl
+          python3 -B tests/cache_gate_test.py
+          make cache-build
+      - name: Independent PostgreSQL cache, failure and storage-cost gates
+        run: |
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo systemd-run --wait --pipe --unit="git-rs-cache-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --property="User=$(id -un)" --property="Group=$(id -gn)" \
+            --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+            --property=KillMode=control-group --property=MemorySwapMax=0 \
+            --property=CPUQuota=100% --property=MemoryMax=768M --property=TasksMax=64 \
+            --property="AllowedCPUs=$cpus" \
+            --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/cache_gate.py cleanup" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/cache_gate.py" run --target-dir "$GITHUB_WORKSPACE/target"
+      - name: Remove owned cache fixtures
+        if: always()
+        run: |
+          unit="git-rs-cache-${{ github.run_id }}-${{ github.run_attempt }}.service"
+          if [ "$(systemctl show "$unit" --property=LoadState --value)" != not-found ]; then
+            sudo systemctl stop "$unit"
+          fi
+      - name: Preserve synthetic cache gate diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cache-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            .local/cache-gate-*/report.json
+            .local/cache-gate-*/*.log
+            .local/derived-cache-*/report.json
+            .local/derived-cache-*/*.log
+            .local/derived-cache-*/*.stderr
+  # Images have their own 20-minute job; preparation and measurement keep their
+  # independent 900-second bounds. Cold hosted-image timing remains observable.
+  blame-images:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check bounded image handoff and ownership guards
+        run: python3 -B tests/blame_images_test.py
+      - name: Build exact builder, oracle and Git-free server targets with bounded workers
+        run: |
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          slice="git-rs-blame-images-$tag.slice"
+          printf 'BLAME_IMAGE_SLICE=%s\n' "$slice" >> "$GITHUB_ENV"
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
+          [Unit]
+          Description=Owned prebuilt image workers
+          [Slice]
+          CPUQuota=200%
+          AllowedCPUs=$cpus
+          MemoryMax=4G
+          MemorySwapMax=0
+          TasksMax=256
+          EOF
+          sudo systemctl daemon-reload
+          for target in build-inputs test-fixture-build test release test-server; do
+            unit="git-rs-blame-images-$target-$tag.service"
+            printf 'BLAME_IMAGE_UNIT=%s\n' "$unit" >> "$GITHUB_ENV"
+            sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
+              --working-directory="$GITHUB_WORKSPACE" \
+              --property="User=$(id -un)" --property="Group=$(id -gn)" \
+              --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+              --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
+              --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_images.py cleanup --slice $slice" \
+              /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/blame_images.py" build \
+                --target "$target" --tag "git-rs:blame-$target" --unit "$unit" --slice "$slice" \
+                --directory "$GITHUB_WORKSPACE/.local/blame-images"
+          done
+      - name: Export four immutable images once with commit and archive identity
+        run: python3 -B tests/blame_images.py export --directory .local/blame-images --commit "$GITHUB_SHA"
+      - name: Stop only owned legacy image workers
+        if: always()
+        run: |
+          if [ -n "${BLAME_IMAGE_SLICE:-}" ]; then
+            if [ -n "${BLAME_IMAGE_UNIT:-}" ] && [ "$(systemctl show "$BLAME_IMAGE_UNIT" --property=LoadState --value)" != not-found ]; then
+              sudo systemctl stop "$BLAME_IMAGE_UNIT" || [ "$(systemctl show "$BLAME_IMAGE_UNIT" --property=LoadState --value)" = not-found ]
+            fi
+            python3 -B tests/blame_images.py cleanup --slice "$BLAME_IMAGE_SLICE"
+            sudo systemctl stop "$BLAME_IMAGE_SLICE"
+            sudo rm -f -- "/run/systemd/system/$BLAME_IMAGE_SLICE"
+            sudo systemctl daemon-reload
+          fi
+      - name: Upload this run and attempt's exact image archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blame-images-${{ github.run_id }}-${{ github.run_attempt }}
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            .local/blame-images/images.tar
+            .local/blame-images/manifest.json
+  blame:
+    needs: blame-images
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the immutable v1 migration source separately
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/git-rs
+          ref: 43d79301993c88cdde044c5dead260a4b0424079
+          path: .local/cache-v1
+          persist-credentials: false
+      - name: Light controller guards and fault tests
+        run: python3 -B tests/blame_gate_test.py
+      - name: Download only this run and attempt's image handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: blame-images-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/blame-images
+      - name: Verify and load all image roles before preparation
+        run: |
+          python3 -B tests/blame_images.py load --directory .local/blame-images --commit "$GITHUB_SHA" --env-file "$GITHUB_ENV"
+          python3 -B tests/blame_gate.py images > "$RUNNER_TEMP/blame-images"
+          while IFS= read -r image; do docker pull "$image"; done < "$RUNNER_TEMP/blame-images"
+      - name: Prebuild current contracts and exact legacy binaries; seal provenance
+        run: |
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          unit="git-rs-blame-prep-$tag.service"
+          slice="git-rs-blame-prep-$tag.slice"
+          token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+          # Record ownership before the first daemon-side container creation.
+          printf 'BLAME_GATE_PREP_UNIT=%s\nBLAME_GATE_PREP_SLICE=%s\nBLAME_GATE_PREP_TOKEN=%s\n' "$unit" "$slice" "$token" >> "$GITHUB_ENV"
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
+          [Unit]
+          Description=Owned blame input preparation aggregate
+          [Slice]
+          CPUQuota=200%
+          AllowedCPUs=$cpus
+          MemoryMax=4G
+          MemorySwapMax=0
+          TasksMax=256
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --property="User=$(id -un)" --property="Group=$(id -gn)" \
+            --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+            --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
+            --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_gate.py cleanup --prep-token $token" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="BLAME_GATE_PREP_UNIT=$unit" --setenv="BLAME_GATE_PREP_SLICE=$slice" \
+            --setenv="BLAME_GATE_PREP_TOKEN=$token" \
+             --setenv="BLAME_GATE_BUILDER_IMAGE=$BLAME_GATE_BUILDER_IMAGE" \
+             --setenv="BLAME_GATE_IMAGE=$BLAME_GATE_IMAGE" \
+             --setenv="GIT_RS_TEST_RUNTIME_IMAGE=$GIT_RS_TEST_RUNTIME_IMAGE" \
+             --setenv="GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE=$GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE" \
+             --setenv="GIT_RS_TEST_REVISION=$GIT_RS_TEST_REVISION" \
+            /usr/bin/make blame-gate-prepare
+          manifest="$GITHUB_WORKSPACE/.local/blame-prebuilt/manifest.json"
+          hash=$(sha256sum "$manifest")
+          printf 'BLAME_GATE_MANIFEST_SHA256=%s\n' "${hash%% *}" >> "$GITHUB_ENV"
+      - name: Owned aggregate-slice blame, artifact and migration qualification
+        run: |
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          unit="git-rs-blame-$tag.service"
+          slice="git-rs-blame-$tag.slice"
+          printf 'BLAME_GATE_UNIT=%s\nBLAME_GATE_SLICE=%s\n' "$unit" "$slice" >> "$GITHUB_ENV"
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
+          [Unit]
+          Description=Owned synthetic blame qualification aggregate
+          [Slice]
+          CPUQuota=200%
+          AllowedCPUs=$cpus
+          MemoryMax=4G
+          MemorySwapMax=0
+          TasksMax=256
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
+            --working-directory="$GITHUB_WORKSPACE" \
+            --property="User=$(id -un)" --property="Group=$(id -gn)" \
+            --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+            --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
+            --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_gate.py cleanup" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="BLAME_GATE_UNIT=$unit" --setenv="BLAME_GATE_SLICE=$slice" \
+            --setenv="BLAME_GATE_MANIFEST_SHA256=$BLAME_GATE_MANIFEST_SHA256" \
+            /usr/bin/make blame-gate-check
+      - name: Stop only the owned blame unit and aggregate slice
+        if: always()
+        run: |
+          failed=0
+          if [ -n "${BLAME_GATE_PREP_UNIT:-}" ]; then
+            if [ "$(systemctl show "$BLAME_GATE_PREP_UNIT" --property=LoadState --value)" != not-found ]; then
+              sudo systemctl stop "$BLAME_GATE_PREP_UNIT" || failed=1
+            fi
+            python3 -B tests/blame_gate.py cleanup --prep-token "$BLAME_GATE_PREP_TOKEN" || failed=1
+            sudo systemctl stop "$BLAME_GATE_PREP_SLICE" || failed=1
+            sudo rm -f -- "/run/systemd/system/$BLAME_GATE_PREP_SLICE" || failed=1
+            sudo systemctl daemon-reload || failed=1
+          fi
+          if [ -n "${BLAME_GATE_UNIT:-}" ]; then
+            if [ "$(systemctl show "$BLAME_GATE_UNIT" --property=LoadState --value)" != not-found ]; then
+              sudo systemctl stop "$BLAME_GATE_UNIT" || failed=1
+            fi
+            sudo systemctl stop "$BLAME_GATE_SLICE" || failed=1
+            sudo rm -f -- "/run/systemd/system/$BLAME_GATE_SLICE" || failed=1
+            sudo systemctl daemon-reload || failed=1
+          fi
+          exit "$failed"
+      - name: Preserve synthetic inventories, provenance and bounded-gate logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blame-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            .local/blame-prebuilt/manifest.json
+            .local/blame-gate-*/report.json
+            .local/blame-gate-*/controller.log
+            .local/blame-gate-*/artifacts.json
+            .local/blame-gate-*/artifacts.stderr
+            .local/blame-gate-*/inventory.json
+            .local/blame-gate-*/blame_*.log
+            .local/blame-gate-*/derived-cache-*/*.log
+            .local/blame-gate-*/derived-cache-*/*.stderr
+            .local/blame-gate-*/focused/report.json
+            .local/blame-gate-*/focused/*.log
+  vendor:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Audit pristine core source and license inventory
+        run: make core-source-check
+      - name: Check out the pinned owned Gitoxide source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/gitoxide
+          ref: 512750f176546e7064b05616be8805caac92d260
+          path: .local/gitoxide
+          persist-credentials: false
+      - name: Check out the pinned owned codec source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/iconv-native-rs
+          ref: f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f
+          path: .local/iconv-native
+          persist-credentials: false
+      - name: Check out the pinned owned zstd source and native gitlink
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/zstd-rs
+          ref: a6adf4a49ab3b43e2b0279a4257f79dcc164478f
+          path: .local/zstd-rs
+          submodules: recursive
+          persist-credentials: false
+      - name: Check out the pinned owned named-Lease implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borislitv/kubert
+          ref: 5ebc70e236e14852c82ace1dc772e3c48c1839f7
+          path: .local/kubert
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - name: Pinned dependency tests, strict Clippy and explicit doctests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config git coreutils
+          make vendor-check
+      - name: Verify zstd sources, unified features and minimal safe streaming API
+        run: |
+          test "${ZSTD_SYS_USE_PKG_CONFIG+x}" != x
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/zstd-app-metadata.json"
+          python3 -B tools/check-core-source.py --zstd-root .local/zstd-rs --cargo-metadata "$RUNNER_TEMP/zstd-app-metadata.json"
+          cargo test --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --test streaming_admission -- --test-threads=1
+          cargo test --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --doc
+          cargo clippy --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --all-targets -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo doc --manifest-path .local/zstd-rs/zstd-safe/Cargo.toml --no-default-features --features std,experimental,vendored --no-deps
+  verify:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Audit pristine core source and license inventory
+        run: make core-source-check
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - name: Rust checks and cache benchmark
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config gnu-coreutils
+          make check
+          make bench
+      - name: Compile the Rust blame HTTP fixture (no ignored-contract execution)
+        run: make blame-core-build
+      - name: Chart and pinned operator-schema contracts
+        run: |
+          python3 -m venv "$RUNNER_TEMP/python"
+          "$RUNNER_TEMP/python/bin/pip" install PyYAML==6.0.3 jsonschema==4.26.0
+          printf '%s\n' "$RUNNER_TEMP/python/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/python/bin/python" tests/chart.py --operator-schemas
+          "$RUNNER_TEMP/python/bin/python" -B tests/istio_test.py
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.1
+      - name: Helm 3 compatibility
+        run: python3 tests/chart.py --operator-schemas
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - name: Seal the compiled SQL and candidate contract inputs
+        run: python3 -B tests/runtime_gate.py export-contracts --destination .local/runtime-contracts
+      - name: Transfer exact compiled contract identities
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/runtime-contracts
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+  runtime:
+    needs: [verify, blame-images]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        phase: [runtime, metadata, integration, receive, upload, history, failures, maintenance, cache-matrix, leader, kubernetes, istio]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - name: Prepare external process observer and chart controller
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bpftrace acl
+          python3 -m venv "$RUNNER_TEMP/python"
+          "$RUNNER_TEMP/python/bin/pip" install PyYAML==6.0.3 jsonschema==4.26.0
+          printf '%s\n' "$RUNNER_TEMP/python/bin" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: runtime-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/runtime-contracts
+      - name: Restore executable bits for hash-verified ELF inputs
+        run: chmod 0555 .local/runtime-contracts/debug/deps/*
+      - name: Prepare checksum-pinned public Istio charts and Gateway API CRDs
+        if: matrix.phase == 'istio'
+        run: make istio-prepare
+      - name: Download this run's immutable runtime and external oracle handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: blame-images-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/blame-images
+      - name: Verify image identities and fetch pinned disposable dependencies
+        run: |
+          python3 -B tests/blame_images.py load --directory .local/blame-images --commit "$GITHUB_SHA" --env-file "$GITHUB_ENV"
+          python3 -B tests/runtime_gate.py images --phase "${{ matrix.phase }}" > "$RUNNER_TEMP/runtime-images"
+          while IFS= read -r image; do docker pull "$image"; done < "$RUNNER_TEMP/runtime-images"
+          sudo install -d -o 10001 -g 10001 -m 0700 "$GITHUB_WORKSPACE/.local/runtime-gates"
+          # Grant traversal to the image account without publishing private input
+          # directory contents or changing the runner's ownership/modes.
+          python3 -c 'import os,pathlib; roots=[pathlib.Path(os.environ[key]).resolve() for key in ("GITHUB_WORKSPACE","RUNNER_TEMP")]; print("\n".join(sorted({str(p) for root in roots for p in (root,*root.parents) if str(p)!="/"})))' > "$RUNNER_TEMP/runtime-parents"
+          while IFS= read -r path; do sudo setfacl -m u:10001:--x "$path"; done < "$RUNNER_TEMP/runtime-parents"
+      - name: Serial SQL, Rust data plane, Git-free runtime and Kubernetes routing contracts
+        env:
+          PHASE: ${{ matrix.phase }}
+        run: |
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          for phase in "$PHASE"; do
+            unit="git-rs-blame-runtime-$phase-$tag.service"
+            slice="git-rs-blame-runtime-$phase-$tag.slice"
+            sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
+          [Unit]
+          Description=Owned prebuilt runtime contract aggregate
+          [Slice]
+          CPUQuota=200%
+          AllowedCPUs=$cpus
+          MemoryMax=4G
+          MemorySwapMax=0
+          TasksMax=256
+          EOF
+            sudo systemctl daemon-reload
+            # Only the BPF observer and exact cgroup drain retain root. Work
+            # drops all groups before using the images' UID/GID 10001.
+            sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
+              --working-directory="$GITHUB_WORKSPACE" \
+              --property=User=root --property=Group=root \
+              --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
+              --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
+              --property="ExecStopPost=$RUNNER_TEMP/python/bin/python3 -B $GITHUB_WORKSPACE/tests/runtime_exec.py cleanup --unit $unit --slice $slice" \
+              --setenv="PATH=$PATH" --setenv=HOME=/tmp \
+              "$RUNNER_TEMP/python/bin/python3" -B "$GITHUB_WORKSPACE/tests/runtime_exec.py" run \
+                --phase "$phase" --unit "$unit" --slice "$slice" --revision "$GITHUB_SHA" \
+                --runtime-image "$GIT_RS_TEST_RUNTIME_IMAGE" \
+                --fixture-image "$GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE" --oracle-image "$BLAME_GATE_IMAGE" \
+                --helm "$(command -v helm)" --target-dir "$GITHUB_WORKSPACE/.local/runtime-contracts" \
+                --istio-artifacts "$GITHUB_WORKSPACE/.local/istio-artifacts"
+          done
+      - name: Stop only owned runtime units and aggregate slices
+        if: always()
+        env:
+          PHASE: ${{ matrix.phase }}
+        run: |
+          failed=0
+          tag="${{ github.run_id }}-${{ github.run_attempt }}"
+          for phase in "$PHASE"; do
+            unit="git-rs-blame-runtime-$phase-$tag.service"
+            slice="git-rs-blame-runtime-$phase-$tag.slice"
+            if [ "$(systemctl show "$unit" --property=LoadState --value)" != not-found ]; then
+              sudo systemctl stop "$unit" || failed=1
+              sudo systemctl stop "$slice" || failed=1
+              sudo rm -f -- "/run/systemd/system/$slice" || failed=1
+            fi
+          done
+          sudo systemctl daemon-reload
+          exit "$failed"
+      - name: Collect only synthetic runtime reports and logs
+        if: always()
+        run: sudo python3 -B tests/runtime_gate.py collect --destination "$RUNNER_TEMP/runtime-reports"
+      - name: Preserve runtime contract diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-gate-${{ matrix.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: ${{ runner.temp }}/runtime-reports

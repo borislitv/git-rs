@@ -1,0 +1,8 @@
+# Apply only after a successful schema-v2 migration with maintenance disabled.
+# Combine with one of the existing TLS PG/S3 profiles and an immutable image.
+maintenance:
+  enabled: true
+  replicaCount: 2
+  resources:
+    requests: {cpu: 100m, memory: 512Mi, ephemeral-storage: 128Mi}
+    limits: {cpu: "1", memory: 4Gi, ephemeral-storage: 3Gi}
