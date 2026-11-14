@@ -485,6 +485,7 @@ def run(args):
                     *controller_inputs,
                     "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m,mode=1777",
                     "--env", "INVOCATION_ID=" + token, "--env", "GIT_RS_GATE_SLICE=" + args.slice,
+                    "--env", "GOMAXPROCS=1",
                     "--env", "GIT_RS_TEST_OWNER_LABEL=" + gate.LABEL + token,
                     "--env", "GIT_RS_TEST_HOST_ROOT=" + str(local),
                     "--env", "GIT_RS_TEST_CONTROLLER_ROOT=/opt/git-rs/.local",

@@ -273,6 +273,9 @@ def stop(process):
 
 
 def trace(args, arguments):
+    # Docker event/client helpers are Go programs too. Avoid spending the
+    # fixed task inventory on unnecessary parallelism in the observer itself.
+    os.environ.setdefault("GOMAXPROCS", "1")
     started = time.monotonic()
     deadline = started + runtime.gate.RUNTIME_SECONDS
     owned = scope(args, deadline)
