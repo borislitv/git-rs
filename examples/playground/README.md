@@ -201,3 +201,111 @@ python3 examples/playground/smoke.py --verify-existing
 The first command intentionally refuses nonempty history. The restart check uses
 the exact saved commit and repository URL, makes a fresh clone and checks full
 blame byte parity again. Use Git 2.56.0 for the qualified native comparison.
+
+## Read-only Prometheus freshness probe
+
+`metrics_freshness.py` checks an **existing, explicitly selected serving target**.
+It requires Python 3.10 or newer and only standard-library modules.
+It does not discover clusters, configure scraping, start containers, restart the
+application or modify Git data. The Prometheus URL and the target's exact scrape
+URL must both be reachable from the probe. In particular, a different loopback
+forwarding URL does not match an advertised remote scrape URL.
+
+Supply the target's exact `job` and `instance`, and the package version from the
+caller-held release receipt. For example, after a separate operator has configured
+an owned playground target and Prometheus:
+
+```sh
+umask 077
+mkdir -p examples/playground/.state/metrics-receipts
+python3 examples/playground/metrics_freshness.py \
+  --prometheus-url http://127.0.0.1:19090 \
+  --metrics-url http://127.0.0.1:18081/metrics \
+  --job git-rs-playground \
+  --instance 127.0.0.1:18081 \
+  --expected-version 0.1.0-rc.3 \
+  --max-wait 60 --scrape-interval 5 --http-timeout 5 --clock-skew 1 \
+  --output-receipt examples/playground/.state/metrics-receipts/first.json
+```
+
+Set `--scrape-interval` to the actual target interval; keep the clocks synchronized.
+The freshness allowance is **two scrape intervals + HTTP timeout + clock skew**.
+Future timestamps beyond the explicit skew allowance fail. A successful run must
+observe a later `lastScrape` and later actual sample timestamps, not merely values
+still inside the freshness allowance. Total polling has a finite budget (at most
+600 seconds), individual GETs have a whole-operation timeout (at most 30 seconds),
+and responses are bounded to 2 MiB for Prometheus JSON and 128 KiB for exposition
+and optional discovery. HTTP failures abort rather than trigger request retries.
+
+The probe requires:
+
+- Exactly one active target for the selected `job`/`instance`, with the exact
+  `--metrics-url`, `health="up"`, empty `lastError`, and recent, advancing
+  `lastScrape`. Its scrape-pool/URL/target-label identity must remain unchanged.
+- A unique `up == 1` and unique build, instrumentation-start, HTTP-success and
+  HTTP-duration-count samples. It queries `timestamp(metric)` and checks the
+  **returned numeric value**, rather than trusting the query envelope's evaluation
+  time. All four sample timestamps must be recent and advance.
+- Raw serving exposition with the current fixed family names, HELP/TYPE records,
+  closed label sets, finite nonnegative values, valid cumulative histogram counts,
+  and the caller's expected version. Schema extensions require an explicit probe
+  schema update; unexpected families or labels fail closed.
+- The same positive instrumentation initialization time in raw and scraped data,
+  stable across observations, and no observed decrease in cumulative raw samples.
+  Counters at or above `2^53` fail rather than permit imprecise exact-delta claims.
+
+### Optional controlled read-only request
+
+With other HTTP transport traffic quiescent, add:
+
+```sh
+  --discovery-url 'http://127.0.0.1:18080/demo/repo.git/info/refs?service=git-upload-pack'
+```
+
+Append that option to the command above, selecting a fresh receipt filename. The
+probe sends **one GET**, only to an `/info/refs?service=git-upload-pack` URL. After a
+new successful scrape, it requires exactly **+1 HTTP success** and **+1 HTTP request
+duration count** relative to the preceding verified observation. Missing deltas
+time out; excess/negative deltas fail. The discovery GET is never retried, including
+after a timeout with unknown request outcome. It does not push or publish refs.
+Discovery success is not clone correctness or proof of S3/pack/blame performance.
+
+### Credentials, receipt and verification limits
+
+Use anonymous internal endpoints reachable in the fixture's network context.
+There are no credential flags. URL userinfo, fragments, arbitrary query parameters,
+redirects and ambient HTTP proxies are rejected/disabled. Do not place tokens,
+passwords or other secrets in arguments. Target errors and response bodies are
+never printed. Argument errors use fixed messages without echoing rejected values.
+
+The receipt parent must already be owned by the caller and private (no group/other
+permissions). The receipt is created exclusively with mode `0600`; existing files
+and symlinks are not overwritten. The receipt contains timestamps, observed
+version/start, scope/limitations and a target-identity hash, not target URLs,
+target-label values, credentials or remote error text. Only successful verification
+writes a receipt; a failed run exits nonzero with a fixed diagnostic code.
+
+`git_rs_build_info` currently exposes **package version only**. The process-start
+metric is **instrumentation initialization**, not OS process birth. Neither binds
+the exact runtime image or source revision. Environment revision assertions are
+not provenance. Retain the externally verified running image/config or platform
+manifest receipt, container/pod identity, start time and restart count separately.
+
+Optional `--expected-profile NativeRootV1` records the caller receipt's profile
+assertion only. Current metrics do not expose the effective blame profile: the
+receipt explicitly reports it as **unverified**, even when freshness succeeds.
+Do not use this field as a profile gate or claim an exact-image receipt was proved.
+
+Remaining real-fixture gates include an actual Prometheus run, externally bound
+runtime/image/profile evidence, controlled gauge changes, and an authorized
+owned-app restart demonstrating counter reset/new process identity. A new pod
+creates a new series and need not produce a positive `resets(...)` result. Zero
+legacy/native/subprocess counters are not proof of no native execution. No existing
+or protected k3s installation needs to be accessed or reset for this probe.
+
+The focused protocol tests (static Prometheus HTTP responses, injected clock, and
+a small loopback HTTP fake for transport bounds) can be run separately:
+
+```sh
+python3 -m unittest discover -s tests -p metrics_freshness_test.py -v
+```
