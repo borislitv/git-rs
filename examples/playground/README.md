@@ -9,7 +9,7 @@ repository or object-pack scratch is required. No Kubernetes or Compose is requi
 
 ## Prepare the VM
 
-Use a **Linux amd64** VM with Docker Engine, Python 3, Git and curl (with
+Use a **Linux amd64** VM with Docker Engine, Python 3.10 or newer, Git and curl (with
 `--aws-sigv4` support). A practical starting point is **2–4 vCPUs, 8 GiB RAM and
 40 GiB free disk**; this is a recommendation for experimentation, not a certified
 minimum. Your user must be able to run Docker.
@@ -163,10 +163,61 @@ reuse these credentials for any other service. Docker administrators can inspect
 container environments. This demo uses the PostgreSQL administrator and the S3
 root identity for convenience; it is not a production least-privilege deployment.
 
-Runtime container caps total 3840 MiB RAM, 2 CPU equivalents and 224 tasks; the app's
+The default persisted `baseline-v1` selects an app cap of 2304 MiB, 1.25 CPUs and
+112 tasks. Runtime container caps total 3840 MiB RAM, 2 CPU equivalents and 224 tasks; the app's
 1 MiB socket mount and 64 MiB `/tmp` count toward its container memory cap. Allow host headroom
 for Docker, clients, image builds and filesystem cache. Named-volume persistence
 is not a backup, HA or disaster-recovery guarantee.
+
+### Explicit application resource profile
+
+For a fresh playground, select the larger application configuration explicitly:
+
+```sh
+python3 examples/playground/playground.py up --image "$runtime_image" --resource-profile large-v1
+```
+
+`large-v1` caps the app at 6144 MiB, 3 CPUs and 96 tasks. Both profiles retain one
+actual worker and zero queued jobs. PostgreSQL remains capped at 1024 MiB, 0.5 CPU,
+64 tasks; S3 at 512 MiB, 0.25 CPU, 48 tasks. The large subtotal is 7.5 GiB, 3.75 CPUs
+and 208 tasks. Relative to an independently enforced 8 GiB / 4 CPU / 256 task
+aggregate, that leaves 512 MiB, 0.25 CPU and 48 tasks for Prometheus/controller.
+These are configured caps, not whole-VM OS sizing, RSS measurements or a successful
+qualification verdict. The launcher does not enforce that aggregate, provision
+Prometheus or compile the server.
+
+The selected closed profile is saved in `.state/config.json` and written as
+`GIT_RS_BLAME_RESOURCE_PROFILE` in the private app environment. Missing profile
+fields in legacy state mean `baseline-v1`. Restart and image-only upgrade preserve
+the selection. An ambient `GIT_RS_BLAME_RESOURCE_PROFILE` is rejected, not inherited.
+Conflicting command selections, saved environment settings and existing container
+caps fail rather than silently changing resources. Existing containers are never
+updated in place. Change profiles only through an explicit stopped upgrade:
+
+```sh
+python3 examples/playground/playground.py stop
+python3 examples/playground/playground.py upgrade --resource-profile large-v1
+python3 examples/playground/playground.py up
+```
+
+An upgrade may also select `--image`; omitting `--resource-profile` preserves the
+saved profile. It checks ownership and that all services are stopped, replaces
+only the owned app container, and preserves dependency volumes and credentials.
+It does not repair stale dependency caps or authorize adoption/removal of foreign
+resources. Neither resource-profile name changes the blame attribution profile or
+claims current-image, performance or release qualification.
+
+Before replacing the app, upgrade validates its actual caps and environment and
+the private app environment against the currently saved profile. An image-only
+upgrade cannot normalize manual resource changes. If persistence fails after the
+owned app is removed and the new `app.env` is written, but before `config.json` is
+replaced, `up` refuses the inconsistent state. Retry the same explicit
+`upgrade --resource-profile PROFILE` selection (and the intended `--image`, if
+changing it). Recovery is permitted only while the app is absent and the private
+environment exactly matches that known profile with one worker and zero queued
+jobs. Image-only upgrade or a different profile cannot adopt the partial settings.
+Repeated persistence failures can be retried the same way; do not delete state,
+regenerate credentials or remove dependency volumes to recover.
 
 ### Change the selected prebuilt runtime
 

@@ -55,6 +55,7 @@ def export(image, directory):
     archive = directory / "git-rs-runtime.tar"
     command(["docker", "image", "save", "--output", archive, image], timeout=180)
     paths = ["examples/playground/playground.py", "examples/playground/smoke.py",
+             "examples/playground/metrics_freshness.py",
              "examples/playground/README.md", "OPERATIONS.md"]
     for relative in paths:
         target = directory / relative
@@ -71,7 +72,7 @@ runtime_image=$(python3 -c 'import json; print(json.load(open("release.json"))["
 python3 examples/playground/playground.py up --image "$runtime_image"
 ```
 
-Docker Engine, Python 3 and curl are required on the VM; Git is an external client.
+Docker Engine, Python 3.10 or newer and curl are required on the VM; Git is an external client.
 The launcher does not compile the server or pull a mutable application tag.
 See examples/playground/README.md for two-client push/clone/blame and restart use.
 release.json binds distribution inputs; qualification evidence is delivered separately.

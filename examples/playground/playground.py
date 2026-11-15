@@ -20,6 +20,47 @@ LABEL = "git-rs.playground-owner"
 PG_IMAGE = "postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5"
 S3_IMAGE = "versity/versitygw@sha256:89cad13cc981986ee284cbafea4613f9533ce6fd5f37a2c96c4c4fb8adb3a316"
 PORTS = {"pg": [15432], "s3": [17070], "app": [18080, 18081]}
+RESOURCE_PROFILES = {"baseline-v1": (2304, "1.25", 112), "large-v1": (6144, "3", 96)}
+
+
+def resource_profile(config):
+    profile = config.get("resource_profile", "baseline-v1")
+    if not isinstance(profile, str) or profile not in RESOURCE_PROFILES:
+        raise RuntimeError("Unknown saved resource profile")
+    return profile
+
+
+def service_resources(config, service):
+    return RESOURCE_PROFILES[resource_profile(config)] if service == "app" else {
+        "pg": (1024, ".5", 64), "s3": (512, ".25", 48)}[service]
+
+
+def check_container_resources(config, service, item):
+    memory, cpus, pids = service_resources(config, service)
+    actual = item["HostConfig"]
+    if (actual.get("Memory") != memory * 1024 * 1024
+            or actual.get("MemorySwap") != memory * 1024 * 1024
+            or actual.get("NanoCpus") != int(float(cpus) * 1_000_000_000)
+            or actual.get("PidsLimit") != pids
+            or actual.get("CpuQuota", 0) != 0 or actual.get("CpuPeriod", 0) != 0):
+        raise RuntimeError(f"Saved {service} container caps differ; stop and review before upgrade")
+    if service == "app":
+        check_resource_settings(config, item["Config"].get("Env") or [])
+
+
+def check_app_environment(config):
+    check_resource_settings(config, private_read(STATE / "app.env").splitlines())
+
+
+def check_resource_settings(config, lines):
+    for key, expected in (("GIT_RS_BLAME_RESOURCE_PROFILE", resource_profile(config)),
+                          ("GIT_RS_BLAME_CONCURRENCY", "1"), ("GIT_RS_BLAME_WAITERS", "0")):
+        values = [line.split("=", 1)[1] for line in lines if line.startswith(key + "=")]
+        # Existing format-2 baseline state predates the explicit selector.
+        if not values and key == "GIT_RS_BLAME_RESOURCE_PROFILE" and "resource_profile" not in config:
+            continue
+        if values != [expected]:
+            raise RuntimeError("Saved application resource settings differ; use a stopped upgrade")
 
 
 def run(*args, capture=False, data=None, check=True):
@@ -87,7 +128,7 @@ def private_replace(path, content):
         temporary.unlink(missing_ok=True)
 
 
-def configuration(create, image):
+def configuration(create, image, profile=None):
     if not STATE.exists():
         if not create:
             raise RuntimeError("No playground state. Run up first.")
@@ -100,9 +141,13 @@ def configuration(create, image):
             raise RuntimeError("Missing config.json; do not replace existing volume credentials.")
         if not image:
             raise RuntimeError("Select a loaded prebuilt runtime: up --image IMAGE_OR_SHA256")
-        config = {"format": 2, "owner": secrets.token_hex(16), "image": runtime_image(image)}
+        config = {"format": 2, "owner": secrets.token_hex(16), "image": runtime_image(image),
+                  "resource_profile": profile or "baseline-v1"}
         private_write(config_path, json.dumps(config) + "\n")
     config = json.loads(private_read(config_path))
+    selected = resource_profile(config)
+    if profile is not None and profile != selected:
+        raise RuntimeError("Resource profile differs from saved configuration; use a stopped upgrade")
     if not re.fullmatch(r"[0-9a-f]{32}", config.get("owner", "")):
         raise RuntimeError("Invalid playground resource owner")
     if image and runtime_image(image) != config["image"]:
@@ -130,27 +175,49 @@ def runtime_image(reference):
     return identity
 
 
-def upgrade(config, image):
-    if not image:
-        raise RuntimeError("upgrade requires --image PREBUILT_RUNTIME")
-    identity = runtime_image(image)
+def upgrade(config, image, profile=None):
+    if not image and profile is None:
+        raise RuntimeError("upgrade requires --image PREBUILT_RUNTIME or --resource-profile PROFILE")
+    identity = runtime_image(image or config["image"])
+    selected = profile or resource_profile(config)
+    application = None
     for service in PORTS:
         item = owned("container", PREFIX + "-" + service, config["owner"])
         if item is not None and item["State"]["Running"]:
             raise RuntimeError("Stop all playground services before upgrading the runtime selection")
+        if item is not None:
+            check_container_resources(config, service, item)
+        if service == "app":
+            application = item
     environment = STATE / "app.env"
-    lines = [line for line in private_read(environment).splitlines()
-             if not line.startswith("GIT_RS_PACK_THREADS=")]
-    for key, value in [("GIT_RS_BLAME_CONCURRENCY", "1"), ("GIT_RS_BLAME_WAITERS", "0")]:
-        if not any(line.startswith(key + "=") for line in lines):
-            lines.append(key + "=" + value)
+    saved_lines = private_read(environment).splitlines()
+    try:
+        check_resource_settings(config, saved_lines)
+    except RuntimeError:
+        # A failed second file replacement can leave the requested environment
+        # written after the old app was removed. Only an explicit known selector
+        # may authorize completing that stopped upgrade; image-only never adopts it.
+        if application is not None or profile is None:
+            raise
+        check_resource_settings({"resource_profile": profile}, saved_lines)
+    replaced = ("GIT_RS_PACK_THREADS", "GIT_RS_BLAME_CONCURRENCY", "GIT_RS_BLAME_WAITERS",
+                "GIT_RS_BLAME_RESOURCE_PROFILE")
+    lines = [line for line in saved_lines
+             if not any(line.startswith(key + "=") for key in replaced)]
+    lines += ["GIT_RS_BLAME_CONCURRENCY=1", "GIT_RS_BLAME_WAITERS=0",
+              "GIT_RS_BLAME_RESOURCE_PROFILE=" + selected]
     # Only the stopped, exact-owned application container is replaced. Persistent
     # dependency volumes and their existing credentials remain the same identities.
     existing = owned("container", PREFIX + "-app", config["owner"])
     if existing is not None:
+        if existing["State"]["Running"]:
+            raise RuntimeError("Stop all playground services before upgrading the runtime selection")
+        check_container_resources(config, "app", existing)
+        check_resource_settings(config, saved_lines)
         run("docker", "rm", existing["Id"])
     private_replace(environment, "\n".join(lines) + "\n")
-    private_replace(STATE / "config.json", json.dumps({"format": 2, "owner": config["owner"], "image": identity}) + "\n")
+    private_replace(STATE / "config.json", json.dumps({"format": 2, "owner": config["owner"],
+                    "image": identity, "resource_profile": selected}) + "\n")
     print("Runtime selection updated. Run up to migrate and start the selected prebuilt image.")
 
 
@@ -191,6 +258,7 @@ def start(config, service, args):
     name = PREFIX + "-" + service
     existing = owned("container", name, config["owner"])
     if existing:
+        check_container_resources(config, service, existing)
         if not existing["State"]["Running"]:
             run("docker", "start", existing["Id"])
         return
@@ -199,11 +267,12 @@ def start(config, service, args):
 
 
 def app_options(config):
+    memory, cpus, pids = service_resources(config, "app")
     return ["--pull=never", "--network", "host", "--user", "10001:10001", "--read-only",
             "--env-file", str(STATE / "app.env"),
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
             "--tmpfs", "/run/git-rs:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=10001,gid=10001",
-            *resources("2304m", "1.25", 112), config["image"]]
+            *resources(str(memory) + "m", cpus, pids), config["image"]]
 
 
 def cli(config, *args):
@@ -215,6 +284,8 @@ def up(config):
     # Check every name/port before starting any service. Never attach foreign data.
     for service, ports in PORTS.items():
         item = owned("container", PREFIX + "-" + service, config["owner"])
+        if item:
+            check_container_resources(config, service, item)
         if item and item["State"]["Running"]:
             continue
         for port in ports:
@@ -224,6 +295,8 @@ def up(config):
     volumes = {s: PREFIX + "-" + s + "-data" for s in ["pg", "s3"]}
     for volume in volumes.values():
         owned("volume", volume, config["owner"])
+    if (STATE / "app.env").exists():
+        check_app_environment(config)
     run("docker", "image", "inspect", config["image"], capture=True)
     # Dependency pulls are explicit and pinned; the application is never pulled.
     for image in [PG_IMAGE, S3_IMAGE]:
@@ -243,7 +316,8 @@ def up(config):
                       "PGSSLMODE=disable\nPGGSSENCMODE=disable\nPGCONNECT_TIMEOUT=2\n"
                       "GIT_RS_DEV_HTTP=1\nGIT_RS_S3_ENDPOINT=http://127.0.0.1:17070\n"
                       f"GIT_RS_S3_BUCKET=git-playground\nGIT_RS_S3_ACCESS_KEY=playground\n"
-                      f"GIT_RS_S3_SECRET_KEY={secret}\nGIT_RS_BLAME_CONCURRENCY=1\nGIT_RS_BLAME_WAITERS=0\n")
+                       f"GIT_RS_S3_SECRET_KEY={secret}\nGIT_RS_BLAME_CONCURRENCY=1\nGIT_RS_BLAME_WAITERS=0\n"
+                       f"GIT_RS_BLAME_RESOURCE_PROFILE={resource_profile(config)}\n")
     for filename in ["pg.env", "s3.env", "s3.curl", "app.env"]:
         private_read(STATE / filename)
     for volume in volumes.values():
@@ -294,9 +368,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["up", "init", "upgrade", "status", "logs", "stop"])
     parser.add_argument("--image", help="loaded prebuilt runtime image or digest; immutable ID saved on first up")
+    parser.add_argument("--resource-profile", choices=tuple(RESOURCE_PROFILES),
+                        help="persisted application resources; changes require a stopped upgrade")
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("This host-network playground requires Linux")
+    if "GIT_RS_BLAME_RESOURCE_PROFILE" in os.environ:
+        raise RuntimeError("Remove ambient GIT_RS_BLAME_RESOURCE_PROFILE; select --resource-profile explicitly")
     os.umask(0o077)
     # Serialize state creation and lifecycle operations across terminal sessions.
     import fcntl
@@ -313,9 +391,11 @@ def main():
                 or stat.S_IMODE(metadata.st_mode) != 0o600):
             raise RuntimeError("Expected a private owned playground lock file")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        config = configuration(args.command in ["up", "init"], None if args.command == "upgrade" else args.image)
+        config = configuration(args.command in ["up", "init"],
+                               None if args.command == "upgrade" else args.image,
+                               None if args.command == "upgrade" else args.resource_profile)
         if args.command == "upgrade":
-            upgrade(config, args.image)
+            upgrade(config, args.image, args.resource_profile)
         elif args.command in ["up", "init"]:
             up(config)
         else:
