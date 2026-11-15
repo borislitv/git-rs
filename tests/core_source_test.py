@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "https://github.com/borislitv/gitoxide"
-REV = "ce62dd6f5b1cebe218e1182304378b57760ac03e"
+REV = "722e186055892703d04ae027cb8391c605812678"
 SOURCE = f"git+{REPO}?rev={REV}#{REV}"
 CODEC_REPO = "https://github.com/borislitv/iconv-native-rs"
 CODEC_REV = "f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"
@@ -418,6 +418,7 @@ class SourcePolicyTests(unittest.TestCase):
         path = self.root / "docs/gitoxide-source.json"
         original = json.loads(path.read_text())
         for name in ("gix-blame/src/file/prepared.rs", "gix-imara-diff/src/myers/preprocess.rs",
+                     "gix-diff/src/blob/platform.rs",
                      "gix-pack/src/data/delta.rs", "gix-pack/src/index/init.rs",
                      "gix-pack/src/index/write/mod.rs", "gix-pack/src/memory.rs",
                      "gix-revwalk/src/queue.rs", "gix-traverse/src/commit/mod.rs",

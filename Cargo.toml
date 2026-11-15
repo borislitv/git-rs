@@ -18,8 +18,8 @@ flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"]
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 git-rs-core = { version = "0.1.0", path = "crates/git-core" }
 hickory-resolver = { version = "=0.26.0", default-features = false, features = ["system-config", "tokio"] }
-gix = { git = "https://github.com/borislitv/gitoxide", rev = "ce62dd6f5b1cebe218e1182304378b57760ac03e", version = "0.90.0", default-features = false, features = ["sha1"] }
-gix-packetline = { git = "https://github.com/borislitv/gitoxide", rev = "ce62dd6f5b1cebe218e1182304378b57760ac03e", version = "=0.24.1", default-features = false, features = ["blocking-io"] }
+gix = { git = "https://github.com/borislitv/gitoxide", rev = "722e186055892703d04ae027cb8391c605812678", version = "0.90.0", default-features = false, features = ["sha1"] }
+gix-packetline = { git = "https://github.com/borislitv/gitoxide", rev = "722e186055892703d04ae027cb8391c605812678", version = "=0.24.1", default-features = false, features = ["blocking-io"] }
 k8s-openapi = { version = "=0.25.0", default-features = false, features = ["v1_33"] }
 kube-client = { version = "=1.1.0", default-features = false, features = ["client", "config", "openssl-tls"] }
 kubert = { git = "https://github.com/borislitv/kubert", rev = "5ebc70e236e14852c82ace1dc772e3c48c1839f7", version = "=0.25.0", default-features = false, features = ["lease", "openssl-tls"] }
