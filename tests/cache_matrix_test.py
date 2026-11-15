@@ -19,6 +19,34 @@ from cache_matrix import Matrix, ReplicaLag, ROOT, WireProxy, cleanup_all, load_
 
 
 class ReplicaMonitorContracts(unittest.TestCase):
+    def test_selector_setup_failure_reaps_the_client_before_returning_to_database_teardown(self):
+        for stage in ("create", "register"):
+            with self.subTest(stage=stage):
+                child = subprocess.Popen([sys.executable, "-u", "-c", "import sys; sys.stdin.read()"],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                selector = cache_matrix.selectors.DefaultSelector()
+                fixture = SimpleNamespace(env={}, processes=[])
+                try:
+                    construction = {"side_effect": OSError("synthetic selector exhaustion")} if stage == "create" else {"return_value": selector}
+                    with patch.object(cache_matrix.subprocess, "Popen", return_value=child), \
+                            patch.object(cache_matrix.selectors, "DefaultSelector", **construction), \
+                            patch.object(selector, "register", side_effect=OSError("synthetic selector exhaustion")):
+                        with self.assertRaisesRegex(OSError, "synthetic selector exhaustion"):
+                            ReplicaLag(fixture)
+                    self.assertEqual(fixture.processes, [child], "independent cleanup must retain the exact owner")
+                    self.assertEqual(child.poll(), 0, "partial construction retained a live monitor")
+                    self.assertTrue(child.stdin.closed)
+                    self.assertTrue(child.stdout.closed)
+                    if stage == "register":
+                        self.assertIsNone(selector.get_map())
+                finally:
+                    if child.poll() is None:
+                        child.terminate()
+                        child.wait(timeout=2)
+                    child.stdin.close()
+                    child.stdout.close()
+                    selector.close()
+
     def monitor(self, responses, echo=True):
         fixture = SimpleNamespace(env=dict(cache_matrix.os.environ), processes=[])
         program = ("import sys\n"

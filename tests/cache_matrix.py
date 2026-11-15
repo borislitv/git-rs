@@ -181,8 +181,13 @@ class ReplicaLag:
             env=dict(f.env, PGOPTIONS="-c statement_timeout=2000"), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         f.processes.append(self.process)
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.process.stdout, selectors.EVENT_READ)
+        self.selector = None
+        try:
+            self.selector = selectors.DefaultSelector()
+            self.selector.register(self.process.stdout, selectors.EVENT_READ)
+        except BaseException:
+            cleanup_all([self.close], {})
+            raise
 
     def sample(self):
         query = ("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),replay_lsn)::bigint "
@@ -216,7 +221,8 @@ class ReplicaLag:
                 raise AssertionError("replica monitor did not drain")
             require(code == 0, "replica monitor process failed")
         finally:
-            self.selector.close()
+            if self.selector is not None:
+                self.selector.close()
             self.process.stdout.close()
 
 
@@ -290,7 +296,7 @@ class Probe:
         try:
             self.thread.start()
         except BaseException:
-            self.monitor.close()
+            cleanup_all([self.monitor.close], self.row.setdefault("replica_monitor_cleanup", {}))
             raise
         return self
 
