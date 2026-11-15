@@ -17,8 +17,8 @@ deadpool-postgres = "0.14.2"
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 git-rs-core = { version = "0.1.0", path = "crates/git-core" }
-gix = { git = "https://github.com/borislitv/gitoxide", rev = "512750f176546e7064b05616be8805caac92d260", version = "0.90.0", default-features = false, features = ["sha1"] }
-gix-packetline = { git = "https://github.com/borislitv/gitoxide", rev = "512750f176546e7064b05616be8805caac92d260", version = "=0.24.1", default-features = false, features = ["blocking-io"] }
+gix = { git = "https://github.com/borislitv/gitoxide", rev = "964fd0c3132d48d13886432d93607aee8e05832f", version = "0.90.0", default-features = false, features = ["sha1"] }
+gix-packetline = { git = "https://github.com/borislitv/gitoxide", rev = "964fd0c3132d48d13886432d93607aee8e05832f", version = "=0.24.1", default-features = false, features = ["blocking-io"] }
 k8s-openapi = { version = "=0.25.0", default-features = false, features = ["v1_33"] }
 kube-client = { version = "=1.1.0", default-features = false, features = ["client", "config", "openssl-tls"] }
 kubert = { git = "https://github.com/borislitv/kubert", rev = "5ebc70e236e14852c82ace1dc772e3c48c1839f7", version = "=0.25.0", default-features = false, features = ["lease", "openssl-tls"] }

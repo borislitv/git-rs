@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "https://github.com/borislitv/gitoxide"
-REV = "512750f176546e7064b05616be8805caac92d260"
+REV = "964fd0c3132d48d13886432d93607aee8e05832f"
 SOURCE = f"git+{REPO}?rev={REV}#{REV}"
 CODEC_REPO = "https://github.com/borislitv/iconv-native-rs"
 CODEC_REV = "f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"
@@ -116,7 +116,8 @@ class SourcePolicyTests(unittest.TestCase):
                     "3db735ef3f90bf130a55b535e75a5134a9c66186",
                     "f71257f3c3c57b4cb5b98322391196c9e871c072",
                     "0d1d6a3e1bf4b5e698fe026d00438f34f49908c3",
-                    "dadd76048c50c1d504baddd54ecd9ea64af4711c"):
+                    "dadd76048c50c1d504baddd54ecd9ea64af4711c",
+                    "512750f176546e7064b05616be8805caac92d260"):
             with self.subTest(old=old):
                 for path in paths:
                     (self.root / path).write_text(originals[path].replace(REV, old))

@@ -17,10 +17,11 @@
     "FORK_PROVENANCE.md"
   ],
   "pull_request": "https://github.com/borislitv/gitoxide/pull/2",
-  "source_scope": "Controlled mapping/blame, single-pack ingestion, borrowed tree and submodule validation, caller-owned range delta/index primitives, original-budget ownership transfer and admitted physical topological traversal; this source record is not a runtime, native-oracle, resource or performance qualification verdict",
+  "source_scope": "Controlled mapping/blame, capacity-admitted token registries, single-pack ingestion, borrowed tree and submodule validation, caller-owned range delta/index primitives, original-budget ownership transfer and admitted physical topological traversal; this source record is not a runtime, native-oracle, resource or performance qualification verdict",
   "resolved_package_count": 49,
   "resolved_packages_sha256": "5de07bc366f57b97c05b0de77092abfc1a6ee3d449de733e2cfdcfbe86ce319d",
   "controlled_source_sha256": {
+    "gix-imara-diff/src/control.rs": "340f7699eded4bc43b71f51df76b2aac9637d7fc9fe97ed9bb2319e8a6421d53",
     "gix-object/src/tree/ref_iter.rs": "43273bf5a09c3d55e0d37d17217a6032943bf19ad83628c1f9a806e6928b135b",
     "gix-pack/src/bundle/write/admitted.rs": "d1871f3adc9d8815b0046a6daaeb6aa66134e08396c9f46e589e6225cbf064a6",
     "gix-pack/src/bundle/write/controlled.rs": "9ad179d504b10f6bff1972e2f55fb80d6d54817cd04e3fd9d869578462441286",
@@ -47,7 +48,7 @@
   },
   "source": {
     "git": "https://github.com/borislitv/gitoxide",
-    "rev": "512750f176546e7064b05616be8805caac92d260"
+    "rev": "964fd0c3132d48d13886432d93607aee8e05832f"
   },
   "upstream": {
     "base": "dd39fb66e3b1551c9fe849043e39b357a9799ca1",

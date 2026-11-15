@@ -12,8 +12,9 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/borislitv/gitoxide"
-GITOXIDE_REV = "512750f176546e7064b05616be8805caac92d260"
+GITOXIDE_REV = "964fd0c3132d48d13886432d93607aee8e05832f"
 GITOXIDE_CONTROLLED_SOURCES = {
+    "gix-imara-diff/src/control.rs",
     "gix-object/src/tree/ref_iter.rs",
     "gix-pack/src/bundle/write/admitted.rs", "gix-pack/src/bundle/write/controlled.rs",
     "gix-pack/src/bundle/write/mod.rs", "gix-pack/src/data/delta.rs",
