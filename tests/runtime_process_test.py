@@ -162,7 +162,7 @@ class RuntimeContracts(unittest.TestCase):
         row = {"Id": process.identifier, "Config": {"Labels": {runtime.LABEL: "e" * 32}},
                "State": {"Running": True}}
         self.inspect_server([(200, json.dumps(row).encode())])
-        with patch.object(runtime, "run") as external:
+        with patch.object(runtime, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as external:
             with self.assertRaisesRegex(AssertionError, "foreign"):
                 process.kill()
         external.assert_not_called()
@@ -172,7 +172,7 @@ class RuntimeContracts(unittest.TestCase):
         row = {"Id": "e" * 64, "Config": {"Labels": {runtime.LABEL: self.owner}},
                "State": {"Running": True}}
         self.inspect_server([(200, json.dumps(row).encode())])
-        with patch.object(runtime, "run") as external:
+        with patch.object(runtime, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as external:
             with self.assertRaisesRegex(AssertionError, "identity changed"):
                 process.terminate()
         external.assert_not_called()
