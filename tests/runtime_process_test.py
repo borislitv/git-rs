@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Immutable server-image and namespace/ownership contracts; no Docker required."""
 import json
+from http.server import BaseHTTPRequestHandler
 import os
 from pathlib import Path
+import socketserver
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -30,6 +33,50 @@ class RuntimeContracts(unittest.TestCase):
         with patch.object(runtime, "run", return_value=subprocess.CompletedProcess([], 0,
                            json.dumps([self.image_record()]).encode(), b"")):
             return runtime.Runtime(self.directory, self.owner, "loaded-server", None, self.revision, Mock())
+
+    def inspect_server(self, replies):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                requests.append(self.path)
+                status, body = replies.pop(0)
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        path = self.directory / "docker.sock"
+        server = socketserver.UnixStreamServer(str(path), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+        thread.start()
+
+        def close():
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+            self.assertFalse(thread.is_alive())
+
+        self.addCleanup(close)
+        override = patch.object(runtime, "DOCKER_SOCKET", str(path))
+        override.start()
+        self.addCleanup(override.stop)
+        return requests
+
+    def test_polling_observes_live_local_daemon_state_without_a_new_cli_per_sample(self):
+        process = runtime.RuntimeProcess("d" * 64, self.owner, Mock())
+        running = {"Id": process.identifier, "Config": {"Labels": {runtime.LABEL: self.owner}},
+                   "State": {"Running": True, "Status": "running", "ExitCode": 0}}
+        exited = {**running, "State": {"Running": False, "Status": "exited", "ExitCode": 17}}
+        requests = self.inspect_server([(200, json.dumps(row).encode()) for row in (running, exited)])
+        with patch.dict(os.environ, DOCKER_HOST="tcp://foreign.example.invalid:2375", DOCKER_CONTEXT="foreign"), \
+                patch.object(runtime, "run", side_effect=AssertionError("polling started a Docker CLI")):
+            self.assertIsNone(process.poll())
+            self.assertEqual(process.poll(), 17)
+        self.assertEqual(requests, ["/containers/" + process.identifier + "/json"] * 2)
 
     def test_mutable_name_resolves_once_but_wrong_role_or_revision_never_starts(self):
         for labels in [{"io.git-rs.role": "external-client-oracle"},
@@ -114,21 +161,39 @@ class RuntimeContracts(unittest.TestCase):
         process = runtime.RuntimeProcess("d" * 64, self.owner, Mock())
         row = {"Id": process.identifier, "Config": {"Labels": {runtime.LABEL: "e" * 32}},
                "State": {"Running": True}}
-        with patch.object(runtime, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps([row]).encode(), b"")) as external:
+        self.inspect_server([(200, json.dumps(row).encode())])
+        with patch.object(runtime, "run") as external:
             with self.assertRaisesRegex(AssertionError, "foreign"):
                 process.kill()
-        self.assertEqual(external.call_count, 1)
-        self.assertEqual(external.call_args.args[0][1], "inspect")
+        external.assert_not_called()
+
+    def test_mismatched_container_identity_cannot_be_signalled(self):
+        process = runtime.RuntimeProcess("d" * 64, self.owner, Mock())
+        row = {"Id": "e" * 64, "Config": {"Labels": {runtime.LABEL: self.owner}},
+               "State": {"Running": True}}
+        self.inspect_server([(200, json.dumps(row).encode())])
+        with patch.object(runtime, "run") as external:
+            with self.assertRaisesRegex(AssertionError, "identity changed"):
+                process.terminate()
+        external.assert_not_called()
+
+    def test_failed_or_oversized_inspection_never_signals_a_container(self):
+        process = runtime.RuntimeProcess("d" * 64, self.owner, Mock())
+        self.inspect_server([(404, b"{}"), (200, b"x" * (1024 * 1024 + 1))])
+        with patch.object(runtime, "run") as external:
+            for reason in ("inspection failed", "exceeded its bound"):
+                with self.subTest(reason=reason), self.assertRaisesRegex(AssertionError, reason):
+                    process.kill()
+        external.assert_not_called()
 
     def test_memory_status_comes_from_the_backend_namespace_not_docker_attach(self):
         process = runtime.RuntimeProcess("d" * 64, self.owner, Mock())
         row = {"Id": process.identifier, "Config": {"Labels": {runtime.LABEL: self.owner}},
                "State": {"Running": True}}
+        self.inspect_server([(200, json.dumps(row).encode())])
 
         def daemon(argv, **options):
-            if argv[1] == "inspect":
-                data = json.dumps([row]).encode()
-            elif argv[-1].endswith("/children"):
+            if argv[-1].endswith("/children"):
                 data = b"7 "
             else:
                 self.assertEqual(argv[-1], "/proc/7/status")

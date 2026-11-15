@@ -56,6 +56,12 @@ The Docker proxy injects slice/owner/pull-never arguments into both `run` and
 creates its fresh privileged k3s with an explicit cgroup root. It never reuses,
 resets or deletes a preexisting cluster.
 
+Repeated backend-state polling uses read-only container inspection over the same
+local Unix Docker socket, with a three-second I/O timeout and one-MiB response
+bound. Every observation revalidates the immutable container ID and fixture owner;
+it never caches running state. Signals still require this current owner check.
+This avoids a new external Docker CLI process for each readiness/resource sample.
+
 ## Successful-exec lifecycle evidence
 
 The external `bpftrace` observer attaches before work. It seeds the already-created

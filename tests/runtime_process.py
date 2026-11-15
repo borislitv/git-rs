@@ -3,10 +3,12 @@
 Only the private server directory is mounted. Client repositories, the Docker
 socket and the oracle installation never enter a backend container.
 """
+from http.client import HTTPConnection
 import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import tempfile
 import time
@@ -15,6 +17,7 @@ import uuid
 
 LABEL = "git-rs.integration-fixture"
 IMAGE_ID = r"sha256:[0-9a-f]{64}"
+DOCKER_SOCKET = "/var/run/docker.sock"
 
 
 def docker_environment(environment=None):
@@ -170,10 +173,28 @@ class RuntimeProcess:
         self.identifier, self.owner, self.attached = identifier, owner, attached
 
     def state(self):
-        rows = json.loads(run(["docker", "inspect", self.identifier]).stdout)
-        assert len(rows) == 1 and rows[0]["Id"] == self.identifier
-        assert (rows[0]["Config"].get("Labels") or {}).get(LABEL) == self.owner, "foreign runtime container"
-        return rows[0]["State"]
+        # Repeated readiness/resource polling must not launch a fresh Docker CLI
+        # for each observation in the constrained external controller. Use the
+        # same local daemon, without caching state or weakening owner checks.
+        assert re.fullmatch(r"[0-9a-f]{64}", self.identifier), "invalid runtime container ID"
+        connection = HTTPConnection("localhost", timeout=3)
+        stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stream.settimeout(3)
+        try:
+            stream.connect(DOCKER_SOCKET)
+            connection.sock = stream
+            connection.request("GET", f"/containers/{self.identifier}/json")
+            response = connection.getresponse()
+            assert response.status == 200, "runtime container inspection failed"
+            body = response.read(1024 * 1024 + 1)
+            assert len(body) <= 1024 * 1024, "runtime inspection exceeded its bound"
+            row = json.loads(body)
+            assert row["Id"] == self.identifier, "runtime container identity changed"
+            assert (row["Config"].get("Labels") or {}).get(LABEL) == self.owner, "foreign runtime container"
+            return row["State"]
+        finally:
+            connection.close()
+            stream.close()
 
     def poll(self):
         state = self.state()
