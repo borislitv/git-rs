@@ -22,6 +22,7 @@ pub mod receive_io;
 mod repository;
 pub mod scratch;
 pub mod serving_socket;
+mod system_dns;
 pub mod upload;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
