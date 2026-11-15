@@ -1396,7 +1396,12 @@ fn owned_source_s3_integrity_failure_has_no_complete_result_and_recovers() {
     // Force verified cold acquisition for each fault; a previously verified RAM
     // hit is allowed to survive corruption of its remote immutable backing.
     Arc::get_mut(&mut fixture.engine).unwrap().cache = Arc::new(git_rs::cache::Cache::new(0, 0));
-    for (field, extension) in [("idx_key", "idx"), ("pack_key", "pack")] {
+    // Indexes are verified as complete downloads. A corrupt pack signature is
+    // rejected by the range reader before it can establish a full-pack proof.
+    for (field, extension, expected_error) in [
+        ("idx_key", "idx", "immutable source object digest mismatch"),
+        ("pack_key", "pack", "Pack data type not recognized"),
+    ] {
         let path = fixture
             .root
             .join("native/objects/pack")
@@ -1424,9 +1429,10 @@ fn owned_source_s3_integrity_failure_has_no_complete_result_and_recovers() {
             Err(error) => error,
             _ => panic!("unverified S3 {extension} produced a serving outcome"),
         };
-        assert!(
-            error.to_string().contains("integrity"),
-            "wrong failure: {error}"
+        assert_eq!(
+            error.to_string(),
+            expected_error,
+            "corrupt source {extension} must fail at its verification boundary"
         );
         until(|| fixture.engine.blame.admitted() == 0);
         assert_eq!(fixture.leases(), 0);
