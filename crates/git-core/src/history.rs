@@ -81,6 +81,11 @@ impl Drop for CommitHeaders<'_> {
             for _ in 0..32 {
                 drop(self.values.pop());
             }
+            #[cfg(test)]
+            self.control
+                .observe(crate::control::TestCheckpoint::HistoryHeaderCleanup {
+                    remaining: self.values.as_slice().len(),
+                });
             let _ = self.control.check();
         }
     }
@@ -424,4 +429,180 @@ fn check(control: &Control) -> gix_error::Result {
     control
         .check()
         .map_err(|error| gix_error::Error::from_boxed(Box::new(error)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ReadLimits, StopReason,
+        control::{TestCheckpoint, TestObserver},
+    };
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
+
+    struct Source {
+        identity: SnapshotIdentity,
+        commits: BTreeMap<ObjectId, Vec<u8>>,
+    }
+
+    impl VerifiedObjectProvider for Source {
+        fn identity(&self) -> &SnapshotIdentity {
+            &self.identity
+        }
+
+        fn header(&self, id: &oid, control: &Control) -> Result<Option<Header>> {
+            control.check()?;
+            Ok(self.commits.get(id).map(|bytes| Header {
+                kind: Kind::Commit,
+                size: bytes.len() as u64,
+            }))
+        }
+
+        fn object(
+            &self,
+            id: &oid,
+            control: &Control,
+            budget: &CapacityBudget,
+            limits: ReadLimits,
+        ) -> Result<Option<Object>> {
+            let Some(bytes) = self.commits.get(id) else {
+                return Ok(None);
+            };
+            let mut data = budget.buffer(bytes.len())?;
+            data.extend_controlled(bytes, limits.max_object_bytes, control)?;
+            Ok(Some(Object {
+                kind: Kind::Commit,
+                data,
+            }))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Observations {
+        cancelled: bool,
+        moved_after_cancellation: usize,
+        pending_cleanup: Option<usize>,
+        cleanup_checks: Vec<(usize, usize)>,
+    }
+
+    #[derive(Debug)]
+    struct CancelRelocation {
+        stop: Control,
+        budget: CapacityBudget,
+        observations: Mutex<Observations>,
+    }
+
+    impl TestObserver for CancelRelocation {
+        fn observe(&self, checkpoint: TestCheckpoint) {
+            let mut state = self
+                .observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match checkpoint {
+                TestCheckpoint::VectorRelocation { moved, total: 64 } => {
+                    // The first owner has moved; the next real Control::check
+                    // must stop inside this populated relocation, not in I/O.
+                    if moved == 1 {
+                        state.cancelled = true;
+                        self.stop.cancel();
+                    }
+                    state.moved_after_cancellation = moved;
+                }
+                TestCheckpoint::HistoryHeaderCleanup { remaining } => {
+                    state.pending_cleanup = Some(remaining);
+                }
+                TestCheckpoint::Check => {
+                    if let Some(remaining) = state.pending_cleanup.take() {
+                        state.cleanup_checks.push((remaining, self.budget.used()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn history_cancellation_during_header_relocation_preserves_polled_cleanup() -> Result<()> {
+        let mut source = Source {
+            identity: SnapshotIdentity {
+                source: b"history-relocation-cleanup".to_vec(),
+                generation: b"one".to_vec(),
+                object_hash: gix_hash::Kind::Sha1,
+            },
+            commits: BTreeMap::new(),
+        };
+        let mut parent = None;
+        // The 65th retained header grows the already populated 64-owner vector.
+        for _ in 0..65 {
+            let mut bytes = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n".to_vec();
+            if let Some(id) = parent {
+                bytes.extend_from_slice(format!("parent {id}\n").as_bytes());
+            }
+            bytes.extend_from_slice(b"author A <a@example.invalid> 1 +0000\ncommitter A <a@example.invalid> 1 +0000\n\nsynthetic\n");
+            let id = gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Commit, &bytes)?;
+            source.commits.insert(id, bytes);
+            parent = Some(id);
+        }
+        let tip = parent.expect("65 physical commits");
+        let budget = CapacityBudget::new(4 * 1024 * 1024);
+        let control = Control::new(Instant::now() + Duration::from_secs(30));
+        let observer = Arc::new(CancelRelocation {
+            stop: control.clone(), // This clone has no observer: no callback cycle.
+            budget: budget.clone(),
+            observations: Mutex::new(Observations::default()),
+        });
+        let identity = source.identity.clone();
+        let session = SnapshotSession::open(
+            source,
+            &identity,
+            control.with_observer(observer.clone()),
+            budget.clone(),
+            ReadLimits::default(),
+        )?;
+        let error = match session.history(tip, 1) {
+            Ok(_) => panic!("relocation cancellation must reject even a one-commit prefix"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.downcast_ref::<StopReason>(),
+            Some(&StopReason::Cancelled)
+        );
+        let state = observer.observations.lock().expect("observation lock");
+        assert!(
+            state.cancelled,
+            "cancellation reached the populated relocation"
+        );
+        assert_eq!(
+            state
+                .cleanup_checks
+                .iter()
+                .map(|(remaining, _)| *remaining)
+                .collect::<Vec<_>>(),
+            vec![32, 0],
+            "the 64 retained headers must reach two real cleanup checks, not disappear with an interrupted drain"
+        );
+        assert_eq!(
+            state.moved_after_cancellation, 64,
+            "finish moving owners before propagating the stop"
+        );
+        assert!(
+            state.cleanup_checks[0].1 > state.cleanup_checks[1].1,
+            "admitted header backing is released between cleanup checks"
+        );
+        assert!(
+            state.cleanup_checks[1].1 > 0,
+            "outer header storage stays admitted through the last cleanup check"
+        );
+        drop(state);
+        drop(session);
+        assert_eq!(
+            budget.used(),
+            0,
+            "all request backing is released after cleanup"
+        );
+        Ok(())
+    }
 }

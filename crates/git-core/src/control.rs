@@ -7,6 +7,24 @@ use std::time::{Duration, Instant};
 pub struct Control {
     flag: Arc<AtomicBool>,
     deadline: Instant,
+    #[cfg(test)]
+    observer: Option<Arc<dyn TestObserver>>,
+}
+
+// Request-local observation for deterministic public-operation unit tests only.
+// Neither the callback nor its storage exists in a production build. Observers
+// used by these tests must not panic; they do not extend the production contract.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TestCheckpoint {
+    Check,
+    VectorRelocation { moved: usize, total: usize },
+    HistoryHeaderCleanup { remaining: usize },
+}
+
+#[cfg(test)]
+pub(crate) trait TestObserver: std::fmt::Debug + Send + Sync {
+    fn observe(&self, checkpoint: TestCheckpoint);
 }
 
 /// Opt-in clock amortization for an invocation's **bounded CPU work only**.
@@ -73,6 +91,21 @@ impl Control {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
             deadline,
+            #[cfg(test)]
+            observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_observer(mut self, observer: Arc<dyn TestObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe(&self, checkpoint: TestCheckpoint) {
+        if let Some(observer) = &self.observer {
+            observer.observe(checkpoint);
         }
     }
 
@@ -98,6 +131,8 @@ impl Control {
     }
 
     pub fn check(&self) -> Result<(), StopReason> {
+        #[cfg(test)]
+        self.observe(TestCheckpoint::Check);
         if Instant::now() >= self.deadline {
             self.cancel();
             Err(StopReason::Deadline)

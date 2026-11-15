@@ -47,12 +47,25 @@ impl<T> ChargedVec<T> {
             values.try_reserve_exact(count)?;
             reservation.resize(values.capacity() * std::mem::size_of::<T>())?;
             // Move in bounded units; old allocation remains charged until freed.
+            // A stopped drain must not drop its remaining owners (or the moved
+            // prefix) outside the caller's controlled cleanup. In production,
+            // Control::check only reads the clock/atomic flag and cannot invoke
+            // user code: finish relocation, restore ownership, then propagate.
+            let mut relocation = Ok(());
+            #[cfg(test)]
+            let total = self.values.len();
             for item in self.values.drain(..) {
-                control.check()?;
+                relocation = relocation.and(control.check());
                 values.push(item);
+                #[cfg(test)]
+                control.observe(crate::control::TestCheckpoint::VectorRelocation {
+                    moved: values.len(),
+                    total,
+                });
             }
             drop(std::mem::replace(&mut self.values, values));
             self._capacity = reservation;
+            relocation?;
         }
         self.values.push(value);
         Ok(())
