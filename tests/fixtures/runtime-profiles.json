@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "profiles": {
+    "legacy-2cpu-4g-v1": {
+      "cpu_count": 2,
+      "memory_bytes": 4294967296,
+      "tasks": 256,
+      "swap_bytes": 0,
+      "outer_seconds": 900,
+      "stop_seconds": 40
+    },
+    "candidate-4cpu-8g-v1": {
+      "cpu_count": 4,
+      "memory_bytes": 8589934592,
+      "tasks": 256,
+      "swap_bytes": 0,
+      "outer_seconds": 900,
+      "stop_seconds": 40
+    }
+  }
+}

@@ -84,13 +84,15 @@ blame-core-cleanup:
 	python3 -B -c 'import os,re,subprocess; invocation=os.environ.get("INVOCATION_ID", ""); assert re.fullmatch(r"[0-9a-f]{32}", invocation), "cleanup requires systemd INVOCATION_ID"; query=["docker","ps","-aq","--filter","label=git-rs.blame-core-owner="+invocation]; ids=subprocess.run(query,check=True,capture_output=True,text=True,timeout=5).stdout.split(); subprocess.run(["docker","rm","-f",*ids],check=True,timeout=20) if ids else None; assert not subprocess.run(query,check=True,capture_output=True,timeout=5).stdout.strip(), "owned blame fixtures remain"'
 
 # All contracts consume prebuilt inputs in independently bounded systemd units.
+RUNTIME_PROFILE ?= legacy-2cpu-4g-v1
+
 runtime-contracts-build:
 	cargo test --locked --test metadata --test maintenance --test maintenance_leader --test leader_dependency --no-run
 	python3 -B tests/runtime_gate.py export-contracts --target-dir "$${CARGO_TARGET_DIR:-target}" --destination "$${RUNTIME_CONTRACT_DIR:-.local/runtime-contracts}"
 
 # Run as root: the observer retains BPF/cgroup privileges and drops work to 10001.
 metadata integration receive upload history failures maintenance cache-matrix leader-dependency-check kubernetes istio:
-	python3 -B tests/runtime_exec.py run --phase "$(if $(filter leader-dependency-check,$@),leader,$@)" --unit "$$RUNTIME_GATE_UNIT" --slice "$$RUNTIME_GATE_SLICE" --revision "$(SOURCE_REVISION)" --runtime-image "$(RUNTIME_IMAGE)" --fixture-image "$(RUNTIME_FIXTURE_IMAGE)" --oracle-image "$(ORACLE_IMAGE)" --target-dir "$${RUNTIME_CONTRACT_DIR:-.local/runtime-contracts}" --helm "$(HELM)" --istio-artifacts "$(ISTIO_ARTIFACTS)"
+	python3 -B tests/runtime_exec.py run --profile "$(RUNTIME_PROFILE)" --phase "$(if $(filter leader-dependency-check,$@),leader,$@)" --unit "$$RUNTIME_GATE_UNIT" --slice "$$RUNTIME_GATE_SLICE" --revision "$(SOURCE_REVISION)" --runtime-image "$(RUNTIME_IMAGE)" --fixture-image "$(RUNTIME_FIXTURE_IMAGE)" --oracle-image "$(ORACLE_IMAGE)" --target-dir "$${RUNTIME_CONTRACT_DIR:-.local/runtime-contracts}" --helm "$(HELM)" --istio-artifacts "$(ISTIO_ARTIFACTS)"
 
 chart:
 	python3 tests/chart.py --helm $(HELM)

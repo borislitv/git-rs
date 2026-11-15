@@ -19,6 +19,103 @@ import blame_gate as gate
 from blame_artifacts import V2_MIGRATION_CONTRACT, V3_MIGRATION_CONTRACT, record_contracts
 
 
+def runtime_cleanup_property(argv):
+    return {"type": "a(sasbttttuii)", "data": [[argv[0], argv, False, 0, 0, 0, 0, 0, 0, 0]]}
+
+
+class RuntimeCleanupArgvContracts(unittest.TestCase):
+    def setUp(self):
+        self.unit = "git-rs-blame-cleanup123.service"
+        self.slice = "git-rs-blame-cleanup123.slice"
+        self.argv = [sys.executable, "-B", str(gate.ROOT / "tests/runtime_exec.py"),
+                     "cleanup", "--unit", self.unit, "--slice", self.slice]
+
+    def validate(self, argv, profile=gate.DEFAULT_RUNTIME_PROFILE):
+        return gate.runtime_cleanup_argv(json.dumps(runtime_cleanup_property(argv)),
+                                         self.unit, self.slice, profile)
+
+    def test_exact_legacy_and_candidate_options_accept_separate_and_equals_forms(self):
+        self.assertEqual(self.validate(self.argv), self.argv)
+        for profile in gate.RUNTIME_PROFILE_NAMES:
+            for options in (["--unit", self.unit, "--slice", self.slice, "--profile", profile],
+                            ["--slice=" + self.slice, "--profile=" + profile, "--unit=" + self.unit]):
+                argv = self.argv[:4] + options
+                with self.subTest(options=options):
+                    self.assertEqual(self.validate(argv, profile), argv)
+
+    def test_suffix_abbreviations_duplicate_owners_and_duplicate_profiles_reject(self):
+        candidate = "candidate-4cpu-8g-v1"
+        cases = [self.argv + ["--profile", candidate + ".invalid"],
+                 self.argv + ["--profile=" + candidate + ".invalid"],
+                 self.argv + ["--prof", candidate],
+                 self.argv + ["--uni", self.unit], self.argv + ["--slic", self.slice],
+                 self.argv + ["--unit", "foreign.service"],
+                 self.argv + ["--slice=foreign.slice"],
+                 self.argv + ["--unit=" + self.unit],
+                 self.argv + ["--slice", self.slice],
+                 self.argv + ["--profile", candidate, "--profile", candidate],
+                 self.argv + ["--profile=" + candidate, "--profile=legacy-2cpu-4g-v1"],
+                 self.argv + ["--profile", candidate, "--prof", "legacy-2cpu-4g-v1"],
+                 self.argv + ["--profile"], self.argv + ["--profile="]]
+        for argv in cases:
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                self.validate(argv, candidate)
+        with self.assertRaises(ValueError):
+            self.validate(self.argv + ["--prof", candidate])
+
+    def test_only_one_matching_executable_script_operation_is_accepted(self):
+        unrelated = runtime_cleanup_property(["/usr/bin/true"])["data"][0]
+        valid = runtime_cleanup_property(self.argv)
+        for records in ([unrelated, *valid["data"]], [*valid["data"], unrelated], valid["data"] * 2):
+            with self.subTest(records=records), self.assertRaises(ValueError):
+                gate.runtime_cleanup_argv(json.dumps({**valid, "data": records}),
+                                          self.unit, self.slice, gate.DEFAULT_RUNTIME_PROFILE)
+        for argv in (["/bin/sh", "-c", " ".join(self.argv)],
+                     [*self.argv[:2], str(gate.ROOT / "tests/runtime_gate.py"), *self.argv[3:]],
+                     [*self.argv[:3], "run", *self.argv[4:]],
+                     self.argv[:4] + ["--unit " + self.unit, "--slice", self.slice]):
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                self.validate(argv)
+        for field, value in ((0, "/bin/sh"), (2, True)):
+            changed = copy.deepcopy(valid)
+            changed["data"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                gate.runtime_cleanup_argv(json.dumps(changed), self.unit, self.slice, gate.DEFAULT_RUNTIME_PROFILE)
+
+    def test_human_systemctl_rendering_is_not_a_typed_argv_fallback(self):
+        for encoded in (" ".join(self.argv), "{ path=/bin/sh ; argv[]=" + " ".join(self.argv) + " }",
+                        json.dumps({"type": "as", "data": self.argv})):
+            with self.subTest(encoded=encoded), self.assertRaises(ValueError):
+                gate.runtime_cleanup_argv(encoded, self.unit, self.slice, gate.DEFAULT_RUNTIME_PROFILE)
+
+    def test_typed_property_preserves_argv_with_compact_or_pretty_completed_metadata(self):
+        value = runtime_cleanup_property(self.argv)
+        value["data"][0][3:] = [1794744000000000, 123000, 1794744001000000, 124000, 42, 1, 0]
+        for indent in (None, 2):
+            with self.subTest(indent=indent):
+                self.assertEqual(gate.runtime_cleanup_argv(json.dumps(value, indent=indent),
+                    self.unit, self.slice, gate.DEFAULT_RUNTIME_PROFILE), self.argv)
+
+    def test_strict_parser_subcommands_do_not_restore_option_abbreviation(self):
+        parser = gate.StrictArgumentParser()
+        child = parser.add_subparsers(dest="action", required=True).add_parser("cleanup")
+        child.add_argument("--profile")
+        self.assertFalse(parser.allow_abbrev)
+        self.assertFalse(child.allow_abbrev)
+        with self.assertRaises(SystemExit) as error:
+            parser.parse_args(["cleanup", "--prof", "candidate-4cpu-8g-v1"])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_manifest_format_rejects_boolean_float_and_extra_top_level_keys(self):
+        manifest = json.loads(gate.RUNTIME_PROFILES.read_text())
+        for changed in ({**manifest, "format": True}, {**manifest, "format": 1.0},
+                        {**manifest, "extra": {}}, {"format": 1}, []):
+            with self.subTest(manifest=changed), \
+                    patch.object(Path, "read_bytes", return_value=json.dumps(changed).encode()):
+                with self.assertRaises(ValueError):
+                    gate.runtime_profile()
+
+
 class ArtifactInventoryTests(unittest.TestCase):
     @staticmethod
     def outcome(count=1, code=0, ignored=0):
@@ -508,7 +605,44 @@ class GateTests(unittest.TestCase):
                     gate.cargo_artifacts("builder", self.root, self.root / str(index), ["build"])
 
     def test_exact_aggregate_caps_are_accepted(self):
-        gate.verify_limits(self.cgroup())
+        envelope = gate.verify_limits(self.cgroup())
+        self.assertEqual(envelope["profile"], "legacy-2cpu-4g-v1")
+        self.assertTrue(envelope["exact_profile"])
+
+    def test_candidate_is_explicit_and_smaller_actual_limits_are_not_exact(self):
+        directory = self.cgroup(**{"memory.max": str(8 * 1024**3), "cpu.max": "400000 100000",
+                                   "cpuset.cpus.effective": "24-27"})
+        with self.assertRaises(ValueError):
+            gate.verify_limits(directory)
+        envelope = gate.verify_limits(directory, "candidate-4cpu-8g-v1")
+        self.assertTrue(envelope["exact_profile"])
+        self.assertEqual(envelope["actual_limits"]["cpu_ids"], [24, 25, 26, 27])
+        (directory / "memory.max").write_text(str(4 * 1024**3))
+        self.assertFalse(gate.verify_limits(directory, "candidate-4cpu-8g-v1")["exact_profile"])
+        with self.assertRaisesRegex(ValueError, "unknown runtime profile"):
+            gate.verify_limits(directory, "unknown")
+
+    def test_profile_negative_bounds_and_affinity_syntax_are_rejected(self):
+        faults = [{"memory.max": "0"}, {"memory.max": "-1"}, {"pids.max": "0"},
+                  {"memory.max": str(8 * 1024**3 + 1)}, {"pids.max": "257"},
+                  {"cpu.max": "500000 100000"}, {"cpuset.cpus.effective": "24-28"},
+                  {"cpu.max": "0 100000"}, {"cpu.max": "1 0"}, {"cpu.max": "-1 100000"},
+                  {"memory.swap.max": "max"}, {"cpuset.cpus.effective": "24-23"},
+                  {"cpuset.cpus.effective": "24-25junk"}, {"cpuset.cpus.effective": "24,24"},
+                  {"cpuset.cpus.effective": ""}, {"cpuset.cpus.effective": "0-999999999"}]
+        for fault in faults:
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                gate.verify_limits(self.cgroup(**fault), "candidate-4cpu-8g-v1")
+
+    def test_profile_manifest_has_fixed_versioned_bounds(self):
+        manifest = json.loads(gate.RUNTIME_PROFILES.read_text())
+        for field, value in (("cpu_count", -1), ("memory_bytes", 0), ("tasks", True),
+                             ("swap_bytes", 1), ("outer_seconds", 901), ("stop_seconds", 41)):
+            changed = copy.deepcopy(manifest)
+            changed["profiles"][gate.DEFAULT_RUNTIME_PROFILE][field] = value
+            with self.subTest(field=field), patch.object(Path, "read_bytes", return_value=json.dumps(changed).encode()):
+                with self.assertRaises(ValueError):
+                    gate.runtime_profile()
 
     def test_overbudget_or_unbounded_aggregate_limits_are_rejected(self):
         faults = [{"memory.max": "max"}, {"memory.max": str(4 * 1024**3 + 1)},
@@ -550,6 +684,8 @@ class GateTests(unittest.TestCase):
             props = dict(base, **fault)
 
             def external(argv, **_):
+                if argv[0] == "busctl":
+                    return json.dumps(runtime_cleanup_property(runtime_argv))
                 if argv[0] == "docker":
                     return "systemd 2"
                 if "--property=ControlGroup" in argv and "--value" in argv:
@@ -563,6 +699,39 @@ class GateTests(unittest.TestCase):
                         gate.verify_unit(unit, slice_name)
                 else:
                     self.assertEqual(gate.verify_unit(unit, slice_name), token)
+
+        runtime_cleanup = "runtime_exec.py cleanup --unit " + unit + " --slice " + slice_name
+        for selection, profile, accepted in (
+                ("", gate.DEFAULT_RUNTIME_PROFILE, True),
+                (" --profile legacy-2cpu-4g-v1", gate.DEFAULT_RUNTIME_PROFILE, True),
+                (" --profile candidate-4cpu-8g-v1", "candidate-4cpu-8g-v1", True),
+                ("", "candidate-4cpu-8g-v1", False),
+                (" --profile unknown", gate.DEFAULT_RUNTIME_PROFILE, False),
+                (" --profile legacy-2cpu-4g-v1", "candidate-4cpu-8g-v1", False),
+                (" --profile candidate-4cpu-8g-v1 --profile legacy-2cpu-4g-v1", gate.DEFAULT_RUNTIME_PROFILE, False)):
+            props = dict(base, ExecStopPost=runtime_cleanup + selection)
+            runtime_argv = [sys.executable, "-B", str(gate.ROOT / "tests/runtime_exec.py"),
+                            *runtime_cleanup.split()[1:], *selection.split()]
+            with self.subTest(selection=selection, profile=profile), \
+                    patch.dict(os.environ, {"INVOCATION_ID": token}), \
+                    patch.object(gate, "output", side_effect=external), patch.object(Path, "read_text", read_host):
+                if accepted:
+                    self.assertEqual(gate.verify_unit(unit, slice_name, "runtime_exec.py cleanup", profile=profile), token)
+                else:
+                    with self.assertRaises(ValueError):
+                        gate.verify_unit(unit, slice_name, "runtime_exec.py cleanup", profile=profile)
+
+        runtime_argv = [sys.executable, "-B", str(gate.ROOT / "tests/runtime_exec.py"),
+                        "cleanup", "--unit", unit, "--slice", slice_name]
+        # systemctl v257 print_property() joins argv without quoting. Metadata
+        # differs before/after execution; neither rendering supplies argv proof.
+        for tail in ("ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0",
+                     "ignore_errors=no ; start_time=[Sun 2026-11-15 12:00:00 UTC] ; stop_time=[Sun 2026-11-15 12:00:01 UTC] ; pid=42 ; code=exited ; status=0/SUCCESS"):
+            props = dict(base, ExecStopPost="{ path=" + sys.executable + " ; argv[]="
+                         + " ".join(runtime_argv) + " ; " + tail + " }")
+            with self.subTest(tail=tail), patch.dict(os.environ, {"INVOCATION_ID": token}), \
+                    patch.object(gate, "output", side_effect=external), patch.object(Path, "read_text", read_host):
+                self.assertEqual(gate.verify_unit(unit, slice_name, "runtime_exec.py cleanup"), token)
 
     def test_proxy_injects_parent_and_owner_without_touching_harness_arguments(self):
         env = {"INVOCATION_ID": "a" * 32, "GIT_RS_GATE_SLICE": "git-rs-blame-12345678.slice"}

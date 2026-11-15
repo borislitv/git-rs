@@ -5,7 +5,6 @@ Each phase owns a fresh systemd invocation, Docker label and private directory.
 Kubernetes phases also own a fresh k3s container; an existing cluster is never
 reused. ExecStopPost repeats exact container and namespace cleanup independently.
 """
-import argparse
 import json
 import math
 import os
@@ -152,7 +151,7 @@ def confirm_drain(local, token):
                  "actual aggregate owners have not stopped")
 
 
-def observed_scope(unit, slice_name):
+def observed_scope(unit, slice_name, profile=gate.DEFAULT_RUNTIME_PROFILE):
     """Consume the root observer's unit attestation without a host passwd entry."""
     token = gate.invocation()
     path = directory(token) / "unit-proof.json"
@@ -167,12 +166,12 @@ def observed_scope(unit, slice_name):
     owned = json.loads(encoded)
     controller = Path("/proc/self/cgroup").read_text().strip().removeprefix("0::")
     group = str(Path(controller).parent)
+    envelope = gate.verify_limits(CGROUPS / group.lstrip("/"), profile)
     gate.require(re.fullmatch(gate.SLICE_PATTERN, slice_name)
                  and Path(group).name == slice_name and Path(controller).name == unit
                  and owned == {"owner": token, "group": group, "controller": controller,
-                               "unit": unit, "slice": slice_name},
+                               "unit": unit, "slice": slice_name, "envelope": envelope},
                  "unit attestation identity differs")
-    gate.verify_limits(CGROUPS / group.lstrip("/"))
     return owned
 
 
@@ -445,7 +444,7 @@ def finish(local, report, started):
 
 def run(args):
     gate.require(getattr(args, "traced", False), "run runtime contracts through the successful-exec observer")
-    owned = observed_scope(args.unit, args.slice)
+    owned = observed_scope(args.unit, args.slice, args.profile)
     token = owned["owner"]
     private(DIRECTORIES)
     local = directory(token)
@@ -462,6 +461,7 @@ def run(args):
     report = {"phase": args.phase, "completed": False, "revision": args.revision,
               "images": {"runtime": runtime, "fixture": fixture, "oracle": oracle},
               "unit": args.unit, "slice": args.slice,
+              "envelope": owned["envelope"],
               "limit_scope": "aggregate controller, backend, PG/S3, k3s and CRI pods; excludes Docker daemon overhead"}
     started = time.monotonic()
     deadline = args.deadline
@@ -636,9 +636,16 @@ def collect(args):
                 target.chmod(0o644)
 
 
+def profile_argument(parser):
+    parser.allow_abbrev = False
+    parser.add_argument("--profile", choices=gate.RUNTIME_PROFILE_NAMES,
+                        default=gate.DEFAULT_RUNTIME_PROFILE, action=gate.UniqueOption)
+
+
 def arguments(parser):
-    parser.add_argument("--unit", required=True)
-    parser.add_argument("--slice", required=True)
+    profile_argument(parser)
+    parser.add_argument("--unit", required=True, action=gate.UniqueOption)
+    parser.add_argument("--slice", required=True, action=gate.UniqueOption)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--runtime-image", required=True)
     parser.add_argument("--fixture-image", required=True)
@@ -653,7 +660,7 @@ def arguments(parser):
 def main():
     os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
     os.environ.pop("DOCKER_CONTEXT", None)
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = gate.StrictArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     cleaning = commands.add_parser("cleanup")
     cleaning.add_argument("--containers-only", action="store_true")

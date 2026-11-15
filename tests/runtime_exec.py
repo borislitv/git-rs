@@ -5,7 +5,6 @@ bpftrace is an external qualification tool, never part of a server image. The
 root observer shares the bounded slice; its work child drops to the image UID.
 Only executable paths/cgroup IDs are recorded, never argv, environment or tokens.
 """
-import argparse
 import json
 import math
 import os
@@ -81,12 +80,13 @@ def time_left(deadline, maximum):
 def scope(args, deadline):
     runtime.gate.require(os.geteuid() == 0, "the bounded process observer requires root")
     token = runtime.gate.verify_unit(args.unit, args.slice, cleanup_command=runtime.CLEANUP_COMMAND,
-                                     deadline=deadline)
+                                     deadline=deadline, profile=args.profile)
     group = runtime.gate.output(["systemctl", "show", args.slice, "--property=ControlGroup", "--value"],
                                 timeout=time_left(deadline, 5))
     controller = Path("/proc/self/cgroup").read_text().strip().removeprefix("0::")
     runtime.gate.require(Path(controller).parent == Path(group), "controller must be a direct child of its owned slice")
-    return {"owner": token, "group": group, "controller": controller}
+    envelope = runtime.gate.verify_limits(runtime.CGROUPS / group.lstrip("/"), args.profile)
+    return {"owner": token, "group": group, "controller": controller, "envelope": envelope}
 
 
 def unprivileged(arguments, deadline):
@@ -115,12 +115,13 @@ def cleanup(args, *, deadline=None):
     deadline = min(deadline or float("inf"), time.monotonic() + runtime.CLEANUP_SECONDS)
     owned = scope(args, deadline)
     local = runtime.directory(owned["owner"])
-    command = [str(runtime.ROOT / "tests/runtime_gate.py"), "cleanup", "--deadline", str(deadline)]
-    unprivileged([*command, "--containers-only"], deadline)
     if local.exists():
         private(local, UID, 0o700)
         saved = json.loads(read(local / "observer/scope.json", owner=0, mode=0o600))
         runtime.gate.require(saved == owned, "aggregate ownership changed before cleanup")
+    command = [str(runtime.ROOT / "tests/runtime_gate.py"), "cleanup", "--deadline", str(deadline)]
+    unprivileged([*command, "--containers-only"], deadline)
+    if local.exists():
         drain(owned, deadline)
         write_json(local / "drain-proof.json", {**owned, "drained": True}, mode=0o644)
     else:
@@ -307,7 +308,7 @@ def trace(args, arguments):
                        GIT_RS_RUNTIME_DEADLINE=str(deadline))
     environment.pop("DOCKER_CONTEXT", None)
     processes, streams = [], []
-    report = {"status": "failed", "observer": version}
+    report = {"status": "failed", "observer": version, "envelope": owned["envelope"]}
     selector = selectors.DefaultSelector()
     try:
         events = subprocess.Popen(["docker", "events", "--since", str(int(time.time()) - 1),
@@ -440,13 +441,14 @@ def phase(args):
 def main():
     os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
     os.environ.pop("DOCKER_CONTEXT", None)
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = runtime.gate.StrictArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     for action in ("run", "work", "phase"):
         runtime.arguments(commands.add_parser(action))
     cleaning = commands.add_parser("cleanup")
-    cleaning.add_argument("--unit", required=True)
-    cleaning.add_argument("--slice", required=True)
+    cleaning.add_argument("--unit", required=True, action=runtime.gate.UniqueOption)
+    cleaning.add_argument("--slice", required=True, action=runtime.gate.UniqueOption)
+    runtime.profile_argument(cleaning)
     args = parser.parse_args()
     if args.action == "run":
         trace(args, sys.argv[2:])

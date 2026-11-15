@@ -46,16 +46,34 @@ HARNESS_FILES = ("tests/blame_gate.py", "tests/blame_artifacts.py", "tests/deriv
                    "tests/cache_matrix.py", "tests/fixtures/cache-matrix.json", "tests/cache_storage_cost.py",
                   "tools/check-runtime-boundaries.py",
                  "tests/support/cache_faults.py", "tests/support/blame_artifact_faults.py",
-                 "tests/cache_gate.py")
+                  "tests/cache_gate.py", "tests/fixtures/runtime-profiles.json")
 LABEL = "git-rs.blame-gate="
 PREPARATION_LABEL = "git-rs.blame-preparation="
 SLICE_PATTERN = r"git-rs-blame-[a-zA-Z0-9_-]{8,80}\.slice"
 RUNTIME_SECONDS = 900
+DEFAULT_RUNTIME_PROFILE = "legacy-2cpu-4g-v1"
+RUNTIME_PROFILE_NAMES = (DEFAULT_RUNTIME_PROFILE, "candidate-4cpu-8g-v1")
+RUNTIME_PROFILES = ROOT / "tests/fixtures/runtime-profiles.json"
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+class StrictArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+
+class UniqueOption(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        supplied = vars(namespace).setdefault("_supplied_options", set())
+        if self.dest in supplied:
+            parser.error("duplicate option: " + option_string)
+        supplied.add(self.dest)
+        setattr(namespace, self.dest, value)
 
 
 def command(argv, *, timeout=30, **kwargs):
@@ -318,22 +336,113 @@ def seconds(value):
     return sum(float(a) * units[b] for a, b in parts)
 
 
-def verify_limits(directory):
+def runtime_profile(name=DEFAULT_RUNTIME_PROFILE):
+    require(name in RUNTIME_PROFILE_NAMES, "unknown runtime profile")
+    encoded = RUNTIME_PROFILES.read_bytes()
+    require(len(encoded) <= 64 * 1024, "oversized runtime profiles")
+    manifest = json.loads(encoded)
+    require(type(manifest) is dict and set(manifest) == {"format", "profiles"}
+            and type(manifest["format"]) is int and manifest["format"] == 1
+            and type(manifest["profiles"]) is dict
+            and set(manifest["profiles"]) == set(RUNTIME_PROFILE_NAMES),
+            "invalid runtime profile inventory")
+    value = manifest["profiles"][name]
+    require(type(value) is dict and set(value) == {"cpu_count", "memory_bytes", "tasks", "swap_bytes",
+                           "outer_seconds", "stop_seconds"}
+            and all(type(item) is int for item in value.values()), "invalid runtime profile fields")
+    require(value["cpu_count"] in {2, 4} and 0 < value["memory_bytes"] <= 8 * 1024**3
+            and value["tasks"] == 256 and value["swap_bytes"] == 0
+            and value["outer_seconds"] == RUNTIME_SECONDS and value["stop_seconds"] == 40,
+            "invalid runtime profile bounds")
+    expected_cpu = 2 if name == DEFAULT_RUNTIME_PROFILE else 4
+    require(value["cpu_count"] == expected_cpu and value["memory_bytes"] == expected_cpu * 2 * 1024**3,
+            "runtime profile identity/bounds differ")
+    identity = {"format": 1, "name": name, "limits": value}
+    return {**identity, "sha256": hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+
+
+def cpu_set(value):
+    require(re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", value) is not None,
+            "invalid aggregate CPU affinity")
+    result = []
+    for part in value.split(","):
+        bounds = list(map(int, part.split("-")))
+        start, end = bounds[0], bounds[-1]
+        require(0 <= start <= end < 2**20 and end - start < 256,
+                "invalid aggregate CPU affinity range")
+        result.extend(range(start, end + 1))
+    require(len(result) == len(set(result)), "overlapping aggregate CPU affinity")
+    return sorted(result)
+
+
+def verify_limits(directory, profile=DEFAULT_RUNTIME_PROFILE):
+    selected = runtime_profile(profile)
+    limits = selected["limits"]
     memory = (directory / "memory.max").read_text().strip()
     pids = (directory / "pids.max").read_text().strip()
     cpu = (directory / "cpu.max").read_text().split()
-    require(memory.isdigit() and 0 < int(memory) <= 4 * 1024**3, "aggregate memory >4 GiB/unbounded")
+    require(memory.isdigit() and 0 < int(memory) <= limits["memory_bytes"], "aggregate memory exceeds profile/unbounded")
     require(pids.isdigit() and 0 < int(pids) <= 256, "aggregate tasks >256/unbounded")
     require(len(cpu) == 2 and all(x.isdigit() for x in cpu)
-            and 0 < int(cpu[0]) <= 2 * int(cpu[1]), "aggregate CPU >2/unbounded")
+            and int(cpu[1]) > 0 and 0 < int(cpu[0]) <= limits["cpu_count"] * int(cpu[1]),
+            "aggregate CPU exceeds profile/unbounded")
     require((directory / "memory.swap.max").read_text().strip() == "0", "aggregate swap enabled")
     cpus = (directory / "cpuset.cpus.effective").read_text().strip()
-    count = sum(int(b)-int(a)+1 if b else 1
-                for a, b in re.findall(r"(\d+)(?:-(\d+))?", cpus))
-    require(0 < count <= 2, "aggregate CPU affinity must select at most two CPUs")
+    cpus = cpu_set(cpus)
+    require(0 < len(cpus) <= limits["cpu_count"], "aggregate CPU affinity exceeds profile")
+    actual = {"memory_bytes": int(memory), "tasks": int(pids), "cpu_quota": int(cpu[0]),
+              "cpu_period": int(cpu[1]), "cpu_ids": cpus, "swap_bytes": 0}
+    exact = (int(memory) == limits["memory_bytes"] and int(pids) == limits["tasks"]
+             and int(cpu[0]) == limits["cpu_count"] * int(cpu[1])
+             and len(cpus) == limits["cpu_count"])
+    return {"profile": selected["name"], "profile_sha256": selected["sha256"],
+            "actual_limits": actual, "exact_profile": exact}
 
 
-def verify_unit(unit, slice_name, cleanup_command="blame_gate.py cleanup", *, deadline=None):
+def runtime_cleanup_argv(encoded, unit, slice_name, profile):
+    """Validate busctl's lossless ExecStopPost a(sasbttttuii), not show's joined argv.
+
+    systemd v257 systemctl-show.c print_property() uses strv_join(argv, " ").
+    Quotes/escapes in that display cannot reconstruct argument boundaries.
+    Require one typed command and the supported Python/script/cleanup invocation.
+    """
+    require(len(encoded) <= 64 * 1024, "oversized runtime cleanup property")
+    value = json.loads(encoded)
+    require(type(value) is dict and set(value) == {"type", "data"}
+            and value["type"] == "a(sasbttttuii)"
+            and type(value["data"]) is list and len(value["data"]) == 1,
+            "one typed runtime cleanup command required")
+    row = value["data"][0]
+    require(type(row) is list and len(row) == 10 and type(row[0]) is str
+            and type(row[1]) is list and all(type(arg) is str for arg in row[1])
+            and row[2] is False and all(type(field) is int for field in row[3:]),
+            "invalid runtime cleanup command record")
+    executable, argv = row[:2]
+    require(len(argv) >= 4 and argv[0] == executable and Path(executable).is_absolute()
+            and Path(executable).resolve() == Path(sys.executable).resolve()
+            and argv[1] == "-B" and Path(argv[2]).resolve() == ROOT / "tests/runtime_exec.py"
+            and argv[3] == "cleanup", "runtime cleanup executable/operation differs")
+    options = {}
+    rest = argv[4:]
+    while rest:
+        key, separator, inline = rest[0].partition("=")
+        require(key in {"--unit", "--slice", "--profile"} and key not in options,
+                "unknown or duplicate runtime cleanup option")
+        require(separator or len(rest) >= 2, "missing runtime cleanup option value")
+        options[key] = inline if separator else rest[1]
+        rest = rest[1:] if separator else rest[2:]
+    require(options.get("--unit") == unit and options.get("--slice") == slice_name,
+            "runtime cleanup owner differs")
+    require(options.get("--profile", DEFAULT_RUNTIME_PROFILE) == profile,
+            "runtime cleanup profile differs")
+    return argv
+
+
+def verify_unit(unit, slice_name, cleanup_command="blame_gate.py cleanup", *, deadline=None,
+                profile=DEFAULT_RUNTIME_PROFILE):
+    runtime_profile(profile)
+
     def bounded_output(argv):
         timeout = 30 if deadline is None else min(5, deadline - time.monotonic())
         require(timeout > 0, "unit attestation absolute deadline expired")
@@ -350,13 +459,22 @@ def verify_unit(unit, slice_name, cleanup_command="blame_gate.py cleanup", *, de
     require(0 < seconds(props["RuntimeMaxUSec"]) <= RUNTIME_SECONDS, "unit runtime exceeds 900s")
     require(0 < seconds(props["TimeoutStopUSec"]) <= 40 and props["KillMode"] == "control-group",
             "bounded control-group shutdown required")
-    require(cleanup_command in props["ExecStopPost"], "independent cleanup required")
+    if cleanup_command == "runtime_exec.py cleanup":
+        # systemctl's human display is lossy. The unit path encoding is systemd's
+        # reversible D-Bus label escaping; unit names above are bounded ASCII.
+        label = re.sub(r"[^A-Za-z0-9]", lambda match: "_" + format(ord(match[0]), "02x"), unit)
+        encoded = bounded_output(["busctl", "--system", "--json=short", "get-property",
+            "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/" + label,
+            "org.freedesktop.systemd1.Service", "ExecStopPost"])
+        runtime_cleanup_argv(encoded, unit, slice_name, profile)
+    else:
+        require(cleanup_command in props["ExecStopPost"], "independent cleanup required")
     group = bounded_output(["systemctl", "show", slice_name, "--property=ControlGroup", "--value"])
     require(group.startswith("/") and ".." not in Path(group).parts
             and props["ControlGroup"].startswith(group + "/"), "unit is outside aggregate slice")
     require(Path("/proc/self/cgroup").read_text().strip() == "0::" + props["ControlGroup"],
             "controller is not in its attested systemd unit")
-    verify_limits(Path("/sys/fs/cgroup") / group.lstrip("/"))
+    verify_limits(Path("/sys/fs/cgroup") / group.lstrip("/"), profile)
     require(bounded_output(["docker", "info", "--format", "{{.CgroupDriver}} {{.CgroupVersion}}"])
             == "systemd 2", "systemd Docker cgroup-v2 driver required")
     return token
@@ -678,7 +796,7 @@ def focused_gate():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = StrictArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     prep = sub.add_parser("prepare")
     prep.add_argument("--bundle", type=Path, required=True)

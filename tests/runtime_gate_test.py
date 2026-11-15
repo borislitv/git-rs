@@ -247,7 +247,7 @@ class SupervisorContracts(unittest.TestCase):
         token = "c" * 32
         args = SimpleNamespace(phase="integration", unit="owned.service", slice="owned.slice",
             revision="d" * 40, runtime_image="runtime", fixture_image="fixture", oracle_image="oracle",
-            traced=True, deadline=time.monotonic() + 600)
+            traced=True, deadline=time.monotonic() + 600, profile=runtime.gate.DEFAULT_RUNTIME_PROFILE)
         local = self.root / token
         local.mkdir(mode=0o700)
         ready = local / "trace-ready"
@@ -263,7 +263,8 @@ class SupervisorContracts(unittest.TestCase):
                 return SimpleNamespace(st_mode=0o100644, st_uid=0)
             return real_lstat(path, *a, **kw)
 
-        with patch.object(runtime, "observed_scope", return_value={"owner": token, "group": "/owned.slice"}), \
+        with patch.object(runtime, "observed_scope", return_value={"owner": token, "group": "/owned.slice",
+                    "envelope": {"profile": runtime.gate.DEFAULT_RUNTIME_PROFILE}}), \
                 patch.object(runtime, "inspect_image", side_effect=["sha256:" + digit * 64 for digit in "567"]), \
                 patch.object(runtime.gate, "output", return_value="/owned.slice"), \
                 patch.object(runtime.gate, "command", side_effect=work_error), patch.object(Path, "stat", stat), patch.object(Path, "lstat", lstat), \
@@ -279,6 +280,14 @@ class SupervisorContracts(unittest.TestCase):
         self.assertFalse(report["completed"])
         self.assertNotIn("cleanup_completed", report)
         self.assertEqual(report["cleanup_errors"], ["RuntimeError"])
+
+    def test_report_preserves_the_attested_envelope(self):
+        with self.phase() as (args, local, _):
+            runtime.run(args)
+        report = json.loads((local / "report.json").read_text())
+        self.assertEqual(report["envelope"], {"profile": runtime.gate.DEFAULT_RUNTIME_PROFILE})
+        self.assertTrue(report["work_completed"])
+        self.assertFalse(report["completed"], "only the outer observer may attest completion")
 
     def test_cleanup_failure_preserves_the_foreground_error_and_private_report(self):
         original = ValueError("runtime work failed")
@@ -388,6 +397,8 @@ class ObservedScopeContracts(unittest.TestCase):
                             "cpuset.cpus.effective": "24-25"}.items():
             (cgroup / name).write_text(value)
         self.cgroup = cgroup
+        self.proof["envelope"] = runtime.gate.verify_limits(cgroup)
+        self.path.write_text(json.dumps(self.proof))
         real_read_text, real_fstat = Path.read_text, os.fstat
 
         def read_text(path, *args, **kwargs):
@@ -409,6 +420,34 @@ class ObservedScopeContracts(unittest.TestCase):
 
     def test_exact_root_proof_and_live_limits_work_without_system_bus_access(self):
         self.assertEqual(runtime.observed_scope(self.unit, self.slice), self.proof)
+
+    def test_candidate_proof_binds_profile_digest_and_actual_limits(self):
+        candidate = "candidate-4cpu-8g-v1"
+        for name, value in {"memory.max": str(8 * 1024**3), "cpu.max": "400000 100000",
+                            "cpuset.cpus.effective": "24-27"}.items():
+            (self.cgroup / name).write_text(value)
+        self.proof["envelope"] = runtime.gate.verify_limits(self.cgroup, candidate)
+        self.path.write_text(json.dumps(self.proof))
+        self.assertTrue(runtime.observed_scope(self.unit, self.slice, candidate)["envelope"]["exact_profile"])
+        with self.assertRaises(ValueError):
+            runtime.observed_scope(self.unit, self.slice)
+        for field, replacement in (("profile_sha256", "0" * 64), ("profile", runtime.gate.DEFAULT_RUNTIME_PROFILE)):
+            proof = json.loads(json.dumps(self.proof))
+            proof["envelope"][field] = replacement
+            self.path.write_text(json.dumps(proof))
+            with self.assertRaises(ValueError):
+                runtime.observed_scope(self.unit, self.slice, candidate)
+
+    def test_within_profile_changes_to_bound_actual_limits_are_rejected(self):
+        for name, value in {"memory.max": str(3 * 1024**3), "pids.max": "255",
+                            "cpu.max": "100000 100000", "cpuset.cpus.effective": "26-27"}.items():
+            path = self.cgroup / name
+            before = path.read_text()
+            with self.subTest(name=name):
+                path.write_text(value)
+                with self.assertRaisesRegex(ValueError, "attestation identity"):
+                    runtime.observed_scope(self.unit, self.slice)
+                path.write_text(before)
 
     def test_image_owned_or_replayed_proof_and_changed_limits_are_rejected(self):
         for fault in ("owner", "token", "controller", "unit", "mode", "limits"):

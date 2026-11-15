@@ -34,8 +34,56 @@ unit, dedicated slice, current process cgroup, `RuntimeMaxSec<=900`,
 `ExecStopPost=.../tests/runtime_exec.py cleanup --unit ... --slice ...`. It rejects an unbounded/remote
 Docker context and requires the local systemd/cgroup-v2 Docker driver.
 
-The aggregate slice must enforce at most 4 GiB memory, 2 CPUs, 256 tasks and zero
-extra swap. CPU affinity selects at most two available CPUs. The controller,
+The default qualification envelope is `legacy-2cpu-4g-v1`: at most 4 GiB memory,
+2 CPU equivalents, 256 tasks and zero extra swap. CPU affinity selects at most
+two available CPUs. The explicit `candidate-4cpu-8g-v1` envelope permits at most
+8 GiB memory, 4 CPU equivalents, 256 tasks and zero extra swap, with at most four
+available affinity CPUs. Both profiles retain the finite 900-second outer and
+40-second stop ceilings. `tests/fixtures/runtime-profiles.json` versions their
+resource contracts; a candidate name is not a qualification verdict.
+
+Select the envelope with `tests/runtime_exec.py run --profile NAME` or
+`RUNTIME_PROFILE=NAME make <runtime-phase>`. Omission retains the legacy profile.
+Unknown names fail argument parsing. For the candidate, the independently installed
+systemd `ExecStopPost` must also select
+`tests/runtime_exec.py cleanup --unit UNIT --slice SLICE --profile candidate-4cpu-8g-v1`.
+Legacy cleanup may omit `--profile`; explicit legacy selection is also accepted.
+The root verifier reads the lossless D-Bus `ExecStopPost` property using
+`busctl --system --json=short get-property` (`a(sasbttttuii)`). The human
+`systemctl show` rendering joins arguments with spaces and is not parsed as a
+shell command or used as an argv fallback. A missing/unsupported typed response
+fails attestation. Exactly one non-ignore-errors command is permitted: the same
+resolved Python interpreter, `-B`, the matching runtime observer script, and the
+`cleanup` operation. Only complete `--unit`, `--slice` and optional `--profile`
+options are accepted, in separate-value or `--name=value` form, once each.
+Owner and profile values must match completely. Extra commands, wrappers,
+abbreviations, duplicate options and profile suffixes fail attestation. All three
+owned Python entrypoints disable argparse option abbreviation; runtime owner and
+profile options also reject repetition at the CLI boundary.
+The launcher owns the actual slice limits and CPU affinity IDs. No portable profile
+contains host CPU numbers, and the selector does not change systemd/container caps.
+
+The root observer binds the selected profile's canonical SHA-256 identity and
+normalized live cgroup limits into its private scope record and read-only unit
+attestation. The image-user validator recomputes the profile identity and live
+limits before accepting that proof. Reports include `envelope.profile`,
+`profile_sha256`, `actual_limits` (memory, tasks, CPU quota/period, CPU IDs and swap),
+and `exact_profile`. Smaller envelopes remain bounded, but `exact_profile` is false
+unless memory, tasks, CPU quota and affinity count all equal the selected profile.
+The profile name alone must never be reported as an exact measured allocation.
+Changed limits, CPU IDs, profile identities or invocation owners invalidate the
+bound proof. Root cleanup rechecks the saved scope before removing containers or
+draining tasks; a profile mismatch does not authorize removal.
+
+The existing deadline arithmetic is unchanged: the observer starts an outer
+deadline of start + 900 seconds; the work helper gives the phase subprocess
+outer - 40 seconds, and the phase's work deadline is outer - 40 - 35 seconds.
+Thus the work cutoff is start + 825 seconds before startup/attestation overhead,
+not an 840-second work guarantee. The 40-second phase reserve and 35-second
+inner cleanup reserve are separate deductions. A tighter independent systemd
+runtime can stop the invocation earlier; selecting a profile does not extend it.
+
+The controller,
 backend, PostgreSQL/S3, owned k3s and actual CRI tasks belong to that aggregate;
 Docker daemon overhead is explicitly outside the measurement scope. Individual
 container limits alone do not prove aggregate placement. The fixture checks real
@@ -90,7 +138,8 @@ coverage. Names in a checkout directory are not executable identities.
 
 Raw observer inputs are root-owned/private, separate from the work child's files.
 After verifying the actual unit, the root observer publishes a bounded root-owned
-read-only attestation bound to its invocation, unit, slice and current cgroup.
+read-only attestation bound to its invocation, unit, slice, current cgroup and
+selected resource envelope with its actual live limits.
 The image UID validates that attestation and live aggregate limits without needing
 a host passwd entry or system-bus access. Image-owned replacements and proofs from
 a different invocation are rejected.
@@ -248,6 +297,12 @@ the client is registered for independent cleanup and joined before database
 teardown. This does not use a serving SQL subprocess or authorize source work.
 
 These files define checks. They do not attest that a changed checkout has passed.
+Existing results retain their original resource envelope; adding a candidate
+profile does not relabel historical runs. This selector changes qualification
+plumbing only: application worker/job-memory/decoder limits, individual fixture
+container caps and the persistent VM launcher remain independently configured.
+In particular, selecting the larger envelope does not increase those inner caps
+or establish that a larger application/VM profile is supported or qualified.
 Bind every result to its source/dependency revision, lockfile, executable/image
 identities, discovered inventory, resource envelope, actual outcomes and cleanup.
 Filesystem absence and zero subprocess metrics are not alone process-lifecycle

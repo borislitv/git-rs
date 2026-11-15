@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Lifecycle evidence and exact cgroup drain contracts without BPF or Docker."""
+import argparse
 import json
 import os
 from pathlib import Path
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -231,6 +233,87 @@ class FilesystemContracts(unittest.TestCase):
         self.assertEqual((pods / "cgroup.kill").read_text(), "1\n")
         self.assertFalse((foreign / "cgroup.kill").exists())
         self.assertEqual((foreign / "cgroup.events").read_text(), "populated 1\nfrozen 0\n")
+
+
+class ProfileOwnershipContracts(unittest.TestCase):
+    def test_runtime_arguments_default_to_legacy_and_accept_explicit_candidate(self):
+        parser = argparse.ArgumentParser()
+        trace.runtime.arguments(parser)
+        required = ["--unit", "owned.service", "--slice", "owned.slice", "--revision", "a" * 40,
+                    "--runtime-image", "runtime", "--fixture-image", "fixture", "--oracle-image", "oracle",
+                    "--phase", "runtime"]
+        self.assertEqual(parser.parse_args(required).profile, "legacy-2cpu-4g-v1")
+        self.assertEqual(parser.parse_args([*required, "--profile", "candidate-4cpu-8g-v1"]).profile,
+                         "candidate-4cpu-8g-v1")
+
+    def test_unknown_profile_cli_rejects_before_work_or_cleanup(self):
+        for action in ("run", "work", "phase", "cleanup"):
+            argv = ["runtime_exec.py", action, "--unit", "owned.service", "--slice", "owned.slice",
+                    "--profile", "unknown"]
+            if action != "cleanup":
+                argv += ["--revision", "a" * 40, "--runtime-image", "runtime", "--fixture-image", "fixture",
+                         "--oracle-image", "oracle", "--phase", "runtime"]
+            with self.subTest(action=action), patch.object(trace.sys, "argv", argv), \
+                    patch.object(trace, "trace") as work, patch.object(trace, "cleanup") as cleanup:
+                with self.assertRaises(SystemExit) as error:
+                    trace.main()
+                self.assertEqual(error.exception.code, 2)
+                work.assert_not_called()
+                cleanup.assert_not_called()
+
+    def test_cleanup_cli_preserves_legacy_default_and_explicit_selection(self):
+        for selection in ([], ["--profile", "candidate-4cpu-8g-v1"]):
+            argv = ["runtime_exec.py", "cleanup", "--unit", "owned.service", "--slice", "owned.slice", *selection]
+            with self.subTest(selection=selection), patch.object(trace.sys, "argv", argv), \
+                    patch.object(trace, "cleanup") as cleanup:
+                trace.main()
+                self.assertEqual(cleanup.call_args.args[0].profile,
+                                 selection[-1] if selection else "legacy-2cpu-4g-v1")
+
+    def test_cleanup_cli_rejects_abbreviations_and_duplicate_options(self):
+        base = ["runtime_exec.py", "cleanup", "--unit", "owned.service", "--slice", "owned.slice"]
+        for extra in (["--prof", "candidate-4cpu-8g-v1"], ["--unit", "foreign.service"],
+                      ["--slice=foreign.slice"], ["--profile", "legacy-2cpu-4g-v1", "--profile=legacy-2cpu-4g-v1"],
+                      ["--profile", "candidate-4cpu-8g-v1.invalid"]):
+            with self.subTest(extra=extra), patch.object(trace.sys, "argv", base + extra), \
+                    patch.object(trace, "cleanup") as cleanup:
+                with self.assertRaises(SystemExit) as error:
+                    trace.main()
+                self.assertEqual(error.exception.code, 2)
+                cleanup.assert_not_called()
+
+    def test_root_scope_binds_selected_profile_to_live_limits(self):
+        profile = "candidate-4cpu-8g-v1"
+        group = "/git-rs-blame-fixture123.slice"
+        controller = group + "/owned.service"
+        args = SimpleNamespace(unit="owned.service", slice=group[1:], profile=profile)
+        envelope = {"profile": profile, "actual_limits": {"cpu_ids": [24, 25, 26, 27]}}
+        with patch.object(trace.os, "geteuid", return_value=0), \
+                patch.object(trace.runtime.gate, "verify_unit", return_value="a" * 32) as verify, \
+                patch.object(trace.runtime.gate, "verify_limits", return_value=envelope) as limits, \
+                patch.object(trace.runtime.gate, "output", return_value=group), \
+                patch.object(Path, "read_text", return_value="0::" + controller):
+            result = trace.scope(args, time.monotonic() + 5)
+        self.assertEqual(verify.call_args.kwargs["profile"], profile)
+        self.assertEqual(limits.call_args.args[1], profile)
+        self.assertEqual(result["envelope"], envelope)
+
+    def test_cleanup_profile_or_actual_limit_replay_fails_before_removal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary)
+            owned = {"owner": "a" * 32, "group": "/owned.slice", "controller": "/owned.slice/owned.service",
+                     "envelope": {"profile": "candidate-4cpu-8g-v1", "actual_limits": {"cpu_ids": [24, 25, 26, 27]}}}
+            for fault in ("profile", "actual_limits"):
+                saved = json.loads(json.dumps(owned))
+                saved["envelope"][fault] = "different"
+                with self.subTest(fault=fault), patch.object(trace, "scope", return_value=owned), \
+                        patch.object(trace.runtime, "directory", return_value=local), \
+                        patch.object(trace, "private"), patch.object(trace, "read", return_value=json.dumps(saved)), \
+                        patch.object(trace, "unprivileged") as remove, patch.object(trace, "drain") as drain:
+                    with self.assertRaisesRegex(ValueError, "ownership changed"):
+                        trace.cleanup(SimpleNamespace())
+                    remove.assert_not_called()
+                    drain.assert_not_called()
 
 
 if __name__ == "__main__":
