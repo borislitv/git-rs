@@ -16,15 +16,85 @@ use git_rs_core::blame::memo::{
     Algorithm, MappingBoundary, MappingKey, MappingMemo, MappingStatistics, MemoryMappingRequest,
 };
 use git_rs_core::{
-    CapacityBudget, Control,
+    CapacityBudget, Control, Object, ReadLimits,
     blame::{BlameError, BlameOptions, ProducerVersion},
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, LockResult, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
-pub(crate) type WorkSet = Arc<Mutex<BatchSnapshot>>;
+#[derive(Clone)]
+pub(crate) struct WorkSet {
+    units: Arc<Mutex<BatchSnapshot>>,
+    policy: [u8; 32],
+    limits: ReadLimits,
+}
+
+impl WorkSet {
+    pub(crate) fn new(
+        batch: BatchSnapshot,
+        resources: super::ResourceProfile,
+        limits: ReadLimits,
+    ) -> Self {
+        Self {
+            units: Arc::new(Mutex::new(batch)),
+            policy: resources.digest(limits),
+            limits,
+        }
+    }
+
+    pub(crate) fn lock(&self) -> LockResult<MutexGuard<'_, BatchSnapshot>> {
+        self.units.lock()
+    }
+
+    pub(crate) fn attach(
+        self,
+        resources: super::ResourceProfile,
+        limits: ReadLimits,
+        budget: &CapacityBudget,
+    ) -> Result<Self> {
+        if self.policy != resources.digest(limits) {
+            return Err(invalid("blame workset resource policy mismatch"));
+        }
+        if !self
+            .lock()
+            .map_err(|_| invalid("blame workset poisoned"))?
+            .budget()
+            .shares_with(budget)
+        {
+            return Err(invalid("workset job budget mismatch"));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn object(
+        &self,
+        id: gix::ObjectId,
+        kind: gix::objs::Kind,
+        limits: ReadLimits,
+        control: &Control,
+    ) -> Result<Option<Object>> {
+        control.check()?;
+        // Decoded bytes are not a physical chain-plan witness. Any different
+        // restriction must fall through to the original physical provider.
+        if !same_read_limits(self.limits, limits) {
+            return Ok(None);
+        }
+        self.lock()
+            .map_err(|_| invalid("blame workset poisoned"))?
+            .object(id, kind, control)
+    }
+}
+
+fn same_read_limits(left: ReadLimits, right: ReadLimits) -> bool {
+    left.max_object_bytes == right.max_object_bytes
+        && left.max_metadata_bytes == right.max_metadata_bytes
+        && left.max_graph_objects == right.max_graph_objects
+        && left.max_graph_edges == right.max_graph_edges
+        && left.max_delta_depth == right.max_delta_depth
+        && left.max_decode_bytes == right.max_decode_bytes
+}
 
 /// The same pure clock boundary is used by production callbacks and tests.
 pub(super) struct Cadence {
@@ -57,7 +127,7 @@ pub(super) struct Profile {
     pub id: String,
 }
 impl Profile {
-    pub fn verified(options: &BlameOptions) -> Result<Self> {
+    pub fn verified(options: &BlameOptions, resources: super::ResourceProfile) -> Result<Self> {
         let core = ProducerVersion::verified()?;
         // Bind the exact new root codec/callback code, not just the core package
         // version. Core binds the committed manifest-referenced pins and source
@@ -73,10 +143,16 @@ impl Profile {
             include_bytes!("blame_source.rs").as_slice(),
             include_bytes!("blame_jobs.rs").as_slice(),
             include_bytes!("blame_warm.rs").as_slice(),
+            include_bytes!("blame_resources.rs").as_slice(),
+            include_bytes!("cpu_jobs.rs").as_slice(),
+            include_bytes!("object_source.rs").as_slice(),
         ] {
             hash.update(&(bytes.len() as u64).to_be_bytes());
             hash.update(bytes);
         }
+        let policy = resources.canonical_bytes(resources.read_limits(options));
+        hash.update(&(policy.len() as u64).to_be_bytes());
+        hash.update(&policy);
         let id = format!(
             "git-rs/completed-native-root-v1/{}",
             crate::protocol::hex(&hash.finish())
@@ -91,7 +167,7 @@ impl Profile {
 }
 
 pub(super) fn checkpoint_key(
-    source: &Source,
+    snapshot: &crate::metadata::Snapshot,
     principal: &str,
     query: &super::Request,
     options: &BlameOptions,
@@ -99,13 +175,13 @@ pub(super) fn checkpoint_key(
 ) -> Result<ArtifactKey> {
     ProducerVersion::verified()?;
     ArtifactKey::new(KeyParts {
-        repository: source.snapshot.id.as_bytes(),
+        repository: snapshot.id.as_bytes(),
         security: principal.as_bytes(),
         object_format: "sha1",
         kind: "complete-blame-workset",
         inputs: &[
-            &source.snapshot.generation.to_be_bytes(),
-            &source.snapshot.storage_epoch.to_be_bytes(),
+            &snapshot.generation.to_be_bytes(),
+            &snapshot.storage_epoch.to_be_bytes(),
             &query.commit.0,
             &query.path,
         ],
@@ -455,11 +531,78 @@ mod tests {
     }
 
     #[test]
+    fn workset_attachment_is_policy_bound_and_changed_limits_are_object_misses() {
+        let resources = super::super::ResourceProfile::BaselineV1;
+        let limits = resources.read_limits(&BlameOptions::default());
+        let budget = CapacityBudget::new(8 * 1024 * 1024);
+        let control = Control::new(Instant::now() + Duration::from_secs(5));
+        let id = gix::ObjectId::from_hex(b"ce013625030ba8dba906f756967f9e9ca394464a").unwrap();
+        let mut batch = BatchSnapshot::new(budget.clone()).unwrap();
+        batch
+            .insert(
+                UnitKey::Object {
+                    oid: id,
+                    kind: gix::objs::Kind::Blob,
+                },
+                b"hello\n",
+                &control,
+            )
+            .unwrap();
+        let work = WorkSet::new(batch, resources, limits)
+            .attach(resources, limits, &budget)
+            .unwrap();
+        let object = work
+            .object(id, gix::objs::Kind::Blob, limits, &control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.data.as_slice(), b"hello\n");
+        drop(object);
+        let used = budget.used();
+        for field in 0..6 {
+            let mut tighter = limits;
+            match field {
+                0 => tighter.max_object_bytes -= 1,
+                1 => tighter.max_metadata_bytes -= 1,
+                2 => tighter.max_graph_objects -= 1,
+                3 => tighter.max_graph_edges -= 1,
+                4 => tighter.max_delta_depth -= 1,
+                5 => tighter.max_decode_bytes -= 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                work.object(id, gix::objs::Kind::Blob, tighter, &control)
+                    .unwrap()
+                    .is_none(),
+                "field {field} cannot be proven from decoded bytes"
+            );
+            assert!(work.clone().attach(resources, tighter, &budget).is_err());
+            assert_eq!(budget.used(), used);
+        }
+        assert!(
+            work.clone()
+                .attach(super::super::ResourceProfile::LargeV1, limits, &budget)
+                .is_err()
+        );
+        assert!(
+            work.clone()
+                .attach(resources, limits, &CapacityBudget::new(8 * 1024 * 1024))
+                .is_err()
+        );
+        assert_eq!(work.lock().unwrap().objects_reused, 1);
+        drop(work);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn callback_copies_share_job_capacity_and_remain_owned_through_cancellation() {
         let budget = CapacityBudget::new(8 * 1024 * 1024);
         let control = Control::new(Instant::now() + Duration::from_secs(5));
         let options = BlameOptions::default().mapping_options(true).unwrap();
-        let work = Arc::new(Mutex::new(BatchSnapshot::new(budget.clone()).unwrap()));
+        let work = WorkSet::new(
+            BatchSnapshot::new(budget.clone()).unwrap(),
+            super::super::ResourceProfile::BaselineV1,
+            BlameOptions::default().read_limits(),
+        );
         let base = budget.used();
         let mut memory = Memory {
             work: work.clone(),

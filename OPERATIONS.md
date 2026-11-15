@@ -28,6 +28,7 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `GIT_RS_METADATA_BYTES` | per-snapshot allocation-accounting budget, default/max 134217728 bytes; minimum 4096 |
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..3600`, default 120 |
 | `GIT_RS_BLAME_CONCURRENCY`, `GIT_RS_BLAME_WAITERS` | shared receive/upload/blame/history CPU runtime: 1 / 0; concurrency 1–4, waiters 0–3, total at most 4 |
+| `GIT_RS_BLAME_RESOURCE_PROFILE` | startup-only blame policy: `baseline-v1` (default) or explicit `large-v1`; large requires concurrency 1 / queued waiters 0; see [blame resource policy](docs/blame.md#explicit-blame-resource-policy) |
 | `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` | optional protected absolute 32-byte signing-key file; requires explicit cache configuration |
 | `GIT_RS_BLAME_WARM_PATH` | optional single literal percent-encoded path; requires authenticated checkpoint cache; disabled by default |
 | `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |
@@ -200,7 +201,8 @@ quotas explicitly, and quiesce old writers/readers before separately fenced clea
 
 The bounded WorkSet stores at most 16 MiB of framed records plus 3072-record
 metadata, 2048 mappings, 4 MiB per mapping and 1 MiB per object. Capacity and
-temporary copies share the 1 GiB job budget, not a process RSS guarantee. Imports
+temporary copies share the selected blame job budget (baseline 1 GiB; explicit
+large 4 GiB), not a process RSS guarantee. Imports
 become visible only after cache-consumption and fresh source fences. Callbacks do
 no SQL/network I/O. Complete-edge checkpoints occur after 256 successful mapping
 insertions or five seconds, plus a final complete batch. Optional storage writes

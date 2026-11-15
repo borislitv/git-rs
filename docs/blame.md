@@ -169,10 +169,66 @@ cancellation and codec-runtime errors remain operation errors.
 
 Bounds are 16 MiB framed record storage plus 3072-record metadata, 2048 retained
 mappings, 4 MiB per mapping and 1 MiB per physical object. Actual backing capacity
-and temporary copies share the original 1 GiB job capacity budget; these are not
+and temporary copies share the selected job capacity budget (baseline 1 GiB,
+explicit large 4 GiB); these are not
 whole-process RSS limits. Source catalogs additionally cap 4096 refs, 1 MiB of
 ref names and 4096 indexes; metadata streaming has its existing <=128 MiB bound.
 Selected indexes cap at 128 MiB. Graph and original deadline limits remain active.
+
+## Explicit blame resource policy
+
+`GIT_RS_BLAME_RESOURCE_PROFILE` is read once at serving startup, before CPU workers
+or listeners. Omission and `baseline-v1` retain the existing defaults. Explicit
+`large-v1` selects a candidate blame-only resource policy; unknown/non-UTF-8 values
+fail startup. It is not an attribution/tuning selector or a qualification verdict.
+
+| Bound | `baseline-v1` | `large-v1` |
+| --- | --- | --- |
+| Actual CPU workers / queued actual jobs | existing configuration, default 1 / 0 | exactly 1 / 0 |
+| Live admitted blame job capacity | 1 GiB | 4 GiB |
+| Decoder object slots / header slots | 4096 / 4096 | 4096 / 4096 |
+| Decoder entry-capacity quota | 32 MiB | 512 MiB |
+| Maximum decoder entry | 1 MiB | 128 MiB |
+| Retained mapped decoder workspace | 0 | 64 MiB |
+| Per-physical-chain expanded decode work | 256 MiB | 8 GiB |
+
+The candidate requires a 64-bit runtime and rejects conflicting
+`GIT_RS_BLAME_CONCURRENCY` / `GIT_RS_BLAME_WAITERS` values rather than clamping them.
+Queued actual jobs are distinct from the existing bounded attached request waiters
+and single-flight joiners. Foreground and opt-in warming use the same immutable
+policy and actual-job slot; retained results and storage-owning errors keep that
+slot until cleanup. `Blame::new` and default constructors remain baseline;
+`new_with_resource_profile` is the explicit in-process counterpart, and
+`with_capacity` preserves and revalidates the selected policy.
+
+Generic CPU admission remains 1 GiB. Receive/upload/history/backup/maintenance
+source adapters retain their existing decoder and read defaults; the selector is
+not read by admin CLI constructors. Object size (128 MiB), complete porcelain
+body size (256 MiB), metadata-header, graph, delta-depth and operation deadlines
+are unchanged. The decoder quota is charged inside the live job budget, not on
+top of it. Optional WorkSet bounds remain 1 MiB per object and 16 MiB per batch.
+
+The 8 GiB limit is cumulative expansion/reconstruction work for one physical delta
+chain, not a request-total counter or allocation reservation. Current core
+`ReadLimits::max_decode_bytes` also constrains workspace plans; this selector does
+not implement a separate workspace ceiling. All actual participating allocations
+still require the finite 4 GiB job admission. Retained workspace applies only to
+mapped `PackSet`; serving uses `RangePackSet`, which does not reuse that scratch
+owner. These capacities are not process RSS guarantees or proof that a complete
+deployment fits an 8 GiB aggregate. External launcher/container caps are unchanged.
+
+Complete-body, checkpoint and build-claim keys bind the full versioned resource
+policy as well as the existing source/security/producer/attribution scope. A body
+or signed WorkSet from another resource profile is not reused. Core mapping
+producer/options remain unchanged. In-memory WorkSets carry a private policy
+digest checked on attachment. Their decoded objects have no physical chain-plan
+witness: any difference in a caller's `ReadLimits`, including a tighter object
+bound, forces physical-provider fallback rather than trusting reusable bytes.
+Authentication, source fences and protected signing-file checks remain mandatory.
+
+Selecting the candidate changes no historical result and establishes no native,
+resource or performance qualification. Work/workspace error classification and a
+typed separation of those core limits are independent follow-up changes.
 
 ## Optional post-confirmation warming
 

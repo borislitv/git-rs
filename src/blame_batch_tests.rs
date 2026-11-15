@@ -36,6 +36,106 @@ fn hello() -> UnitKey {
 }
 
 #[test]
+fn resource_profiles_partition_body_checkpoint_and_signed_import_without_changing_mapping_options()
+{
+    use crate::blame::{
+        Request, ResourceProfile, artifact_key,
+        memo::{Profile, checkpoint_key},
+    };
+    use git_rs_core::blame::BlameOptions;
+    let options = BlameOptions::default();
+    let baseline = Profile::verified(&options, ResourceProfile::BaselineV1).unwrap();
+    let large = Profile::verified(&options, ResourceProfile::LargeV1).unwrap();
+    assert_ne!(baseline.id, large.id);
+    assert_eq!(
+        baseline.producer, large.producer,
+        "core mapping producer is unchanged"
+    );
+    assert_eq!(
+        baseline.options, large.options,
+        "core mapping semantics are unchanged"
+    );
+    let snapshot = crate::metadata::Snapshot {
+        id: "33333333-3333-3333-3333-333333333333".into(),
+        generation: 7,
+        storage_epoch: 3,
+        default_ref: b"refs/heads/main".to_vec(),
+        refs: Default::default(),
+        packs: Vec::new(),
+    };
+    let query =
+        Request::parse("1111111111111111111111111111111111111111", "path=file.txt").unwrap();
+    let baseline_body = artifact_key(
+        &snapshot,
+        "alice",
+        &query,
+        &options,
+        ResourceProfile::BaselineV1,
+    )
+    .unwrap();
+    let large_body = artifact_key(
+        &snapshot,
+        "alice",
+        &query,
+        &options,
+        ResourceProfile::LargeV1,
+    )
+    .unwrap();
+    assert_ne!(
+        baseline_body, large_body,
+        "body/build keys must not cross resource policies"
+    );
+    let baseline_key = checkpoint_key(&snapshot, "alice", &query, &options, &baseline).unwrap();
+    let large_key = checkpoint_key(&snapshot, "alice", &query, &options, &large).unwrap();
+    assert_ne!(
+        baseline_key, large_key,
+        "checkpoint/build keys must not cross resource policies"
+    );
+    let mut baseline_scope = scope(&[7; 32], b"alice");
+    baseline_scope.key = baseline_key;
+    baseline_scope.producer = baseline.producer;
+    baseline_scope.options = baseline.options;
+    let mut large_scope = baseline_scope.clone();
+    large_scope.key = large_key;
+    let control = control();
+    let budget = CapacityBudget::new(8 * 1024 * 1024);
+    let mut batch = BatchSnapshot::new(budget.clone()).unwrap();
+    batch.insert(hello(), b"hello\n", &control).unwrap();
+    let frame = batch.encode(&large_scope, &control).unwrap();
+    let used = budget.used();
+    assert!(
+        BatchSnapshot::decode(
+            &[frame.as_slice()],
+            &baseline_scope,
+            budget.clone(),
+            &control
+        )
+        .is_err()
+    );
+    assert_eq!(budget.used(), used);
+    let mut restored =
+        BatchSnapshot::decode(&[frame.as_slice()], &large_scope, budget.clone(), &control).unwrap();
+    let UnitKey::Object { oid, kind } = hello() else {
+        unreachable!()
+    };
+    assert_eq!(
+        restored
+            .object(oid, kind, &control)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"hello\n"
+    );
+    assert_eq!(OBJECT_BYTES, 1024 * 1024);
+    assert_eq!(WORK_BYTES, 16 * 1024 * 1024);
+    drop(restored);
+    drop(frame);
+    drop(batch);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn complete_body_authentication_binds_full_key_writer_and_rotated_secret() {
     let control = control();
     let owner = scope(&[7; 32], b"alice");

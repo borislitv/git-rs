@@ -20,24 +20,34 @@ type JobResult<T> = Result<Option<Arc<Completed<T>>>>;
 struct Background<F> {
     prepare: F,
     operation: Arc<process::Operation>,
-    permit: process::Permit,
+    budget: CapacityBudget,
+    permit: Arc<process::Permit>,
 }
 impl<F> Background<F>
 where
     F: FnOnce(&Control, &CapacityBudget) -> Result<()>,
 {
     fn run(self, control: &Control) -> Result<()> {
-        let _permit = self.permit;
+        let permit = self.permit;
         let operation = self.operation;
         let prepare = self.prepare;
-        let budget = CapacityBudget::new(JOB_BYTES);
-        operation.enter(|| {
-            control.check()?;
-            let result = prepare(control, &budget);
-            control.check()?;
-            operation.check()?;
-            result
-        })
+        let budget = self.budget;
+        operation
+            .enter(|| {
+                crate::cpu_jobs::catch_job_unwind(|| {
+                    control.check()?;
+                    let result = prepare(control, &budget);
+                    control.check()?;
+                    operation.check()?;
+                    result
+                })
+            })
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(crate::cpu_jobs::Failed {
+                    error,
+                    _permit: permit.clone(),
+                })
+            })
     }
 }
 
@@ -169,12 +179,20 @@ impl<T: Send + Sync + 'static> Jobs<T> {
         self
     }
     pub fn new(workers: usize, queued: usize) -> Result<Self> {
-        if !(1..=4).contains(&workers) || queued > 3 || workers + queued > 4 {
-            return Err(invalid(
-                "blame capacity requires concurrency in 1..=4, waiters in 0..=3 and total <=4",
-            ));
-        }
-        Ok(Self::with_cpu(Arc::new(CpuJobs::new(workers, queued)?)))
+        Self::new_with_resource_profile(workers, queued, super::ResourceProfile::BaselineV1)
+    }
+
+    pub fn new_with_resource_profile(
+        workers: usize,
+        queued: usize,
+        profile: super::ResourceProfile,
+    ) -> Result<Self> {
+        profile.validate_capacity(workers, queued)?;
+        Ok(Self::with_cpu(Arc::new(CpuJobs::with_blame_job_bytes(
+            workers,
+            queued,
+            profile.job_bytes(),
+        )?)))
     }
 
     /// Inject the application's existing runtime; never create a second pool.
@@ -225,7 +243,8 @@ impl<T: Send + Sync + 'static> Jobs<T> {
         let background = Background {
             prepare,
             operation,
-            permit,
+            budget: self.cpu.blame_budget(),
+            permit: Arc::new(permit),
         };
         match self
             .cpu
@@ -310,6 +329,7 @@ impl<T: Send + Sync + 'static> Jobs<T> {
             let running = flight.clone();
             let operation = process::Operation::until(flight.control.deadline());
             let observer = self.observer.clone();
+            let budget = self.cpu.blame_budget();
             let submitted = self.cpu.executor.submit(
                 flight.control.clone(),
                 JobOptions::default(),
@@ -324,18 +344,23 @@ impl<T: Send + Sync + 'static> Jobs<T> {
                         }
                         state.phase = Phase::Running;
                     }
-                    if let Some(observer) = observer {
-                        observer.observe(&running.key, JobEvent::Started, control.deadline());
-                    }
                     let (prepare, _done) = prepared.start();
-                    let budget = CapacityBudget::new(JOB_BYTES);
                     let result: std::result::Result<Arc<Completed<T>>, Error> = operation
                         .enter(|| -> Result<T> {
-                            control.check()?;
-                            let value = prepare(control, &budget)?;
-                            control.check()?;
-                            operation.check()?;
-                            Ok(value)
+                            crate::cpu_jobs::catch_job_unwind(|| {
+                                if let Some(observer) = observer {
+                                    observer.observe(
+                                        &running.key,
+                                        JobEvent::Started,
+                                        control.deadline(),
+                                    );
+                                }
+                                control.check()?;
+                                let value = prepare(control, &budget)?;
+                                control.check()?;
+                                operation.check()?;
+                                Ok(value)
+                            })
                         })
                         .map(|value| {
                             Arc::new(Completed {
@@ -343,7 +368,12 @@ impl<T: Send + Sync + 'static> Jobs<T> {
                                 _permit: running.permit.clone(),
                             })
                         })
-                        .map_err(Arc::from);
+                        .map_err(|error| -> Error {
+                            Arc::new(crate::cpu_jobs::Failed {
+                                error,
+                                _permit: running.permit.clone(),
+                            })
+                        });
                     let mut state = running.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.result = Some(result);
                     state.phase = Phase::Complete;

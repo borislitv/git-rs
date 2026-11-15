@@ -267,9 +267,12 @@ fn serve(args: &[String]) -> Result<()> {
             "GIT_RS_BLAME_WORKER is obsolete; remove it: blame now runs directly in the bounded Rust core executor",
         ));
     }
-    let mut blame = git_rs::blame::Blame::new(
+    let selected_resources = std::env::var_os("GIT_RS_BLAME_RESOURCE_PROFILE");
+    let resources = git_rs::blame::ResourceProfile::from_os_value(selected_resources.as_deref())?;
+    let mut blame = git_rs::blame::Blame::new_with_resource_profile(
         blame_capacity("GIT_RS_BLAME_CONCURRENCY", 1)?,
         blame_capacity("GIT_RS_BLAME_WAITERS", 0)?,
+        resources,
     )?;
     if let Some(key_file) = std::env::var_os("GIT_RS_BLAME_CHECKPOINT_KEY_FILE") {
         let config = git_rs::derived_cache::CacheConfig::from_env()?;

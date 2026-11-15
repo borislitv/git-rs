@@ -21,7 +21,7 @@ use git_rs_core::{
     blame::{BlameError, BlameOptions, BlameRequest},
     porcelain::Porcelain,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(super) struct Environment {
@@ -31,6 +31,7 @@ pub(super) struct Environment {
     pub writer: Option<WriterProof>,
     pub observer: Option<Arc<dyn Observer>>,
     pub options: BlameOptions,
+    pub resources: super::ResourceProfile,
     pub reuse: bool,
     pub body_lookup: bool,
 }
@@ -82,30 +83,38 @@ pub(super) fn derive(
     }
     observe(&env.observer, Phase::SourceAcquired, control)?;
     let options = env.options.clone();
-    let profile = Profile::verified(&options)?;
+    let limits = env.resources.read_limits(&options);
+    let profile = Profile::verified(&options, env.resources)?;
     let work: Option<WorkSet> = if env.writer.is_some() && env.derived.is_some() {
         optional_cache(control, || BatchSnapshot::new(budget.clone()))?
-            .map(|batch| Arc::new(Mutex::new(batch)))
+            .map(|batch| WorkSet::new(batch, env.resources, limits))
     } else {
         None
     };
     let identity = source.identity();
-    let provider = LazySnapshot::new(
-        source.clone(),
-        env.store,
-        env.files,
-        budget.clone(),
-        options.read_limits(),
-        control,
-    )?
-    .with_workset(work.clone());
-    let session = SnapshotSession::open(
-        provider,
-        &identity,
-        control.clone(),
-        budget.clone(),
-        options.read_limits(),
-    )?;
+    let provider = if env.resources == super::ResourceProfile::BaselineV1 {
+        LazySnapshot::new(
+            source.clone(),
+            env.store,
+            env.files,
+            budget.clone(),
+            limits,
+            control,
+        )
+    } else {
+        LazySnapshot::new_with_resource_profile(
+            source.clone(),
+            env.store,
+            env.files,
+            budget.clone(),
+            limits,
+            env.resources,
+            control,
+        )
+    }?
+    .with_workset(work.clone())?;
+    let session =
+        SnapshotSession::open(provider, &identity, control.clone(), budget.clone(), limits)?;
     let commit = gix::ObjectId::from(query.commit.0);
     if expected.is_none() {
         let reachable = session.reachable_from_refs(
@@ -122,7 +131,13 @@ pub(super) fn derive(
     // Warm hints already bind a currently visible authorized branch tip; do not
     // scan all repository refs merely to rediscover that explicit reachability.
     source.check()?;
-    let body_key = artifact_key(&source, &principal, &query, &options)?;
+    let body_key = artifact_key(
+        &source.snapshot,
+        &principal,
+        &query,
+        &options,
+        env.resources,
+    )?;
     let body_access: Arc<dyn Access> = Arc::new(SourceAccess {
         source: source.clone(),
         key: body_key.clone(),
@@ -151,7 +166,8 @@ pub(super) fn derive(
     let mut checkpoints = if let (Some(cache), Some(writer), Some(work)) =
         (&env.derived, env.writer.as_ref(), work.as_ref())
     {
-        let key = super::memo::checkpoint_key(&source, &principal, &query, &options, &profile)?;
+        let key =
+            super::memo::checkpoint_key(&source.snapshot, &principal, &query, &options, &profile)?;
         let access: Arc<dyn Access> = Arc::new(SourceAccess {
             source: source.clone(),
             key: key.clone(),

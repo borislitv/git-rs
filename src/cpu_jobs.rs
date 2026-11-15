@@ -12,7 +12,9 @@ use git_rs_core::{
 };
 use std::{ops::Deref, sync::Arc, time::Duration};
 
-/// Per-job live capacity shared by provider, decoder, vendor and serializer.
+/// Baseline/generic live capacity shared by provider, decoder, vendor and serializer.
+/// Explicit blame policies can select a different allowance on this same runtime;
+/// generic admission below always retains this baseline value.
 /// Source mappings retain their separate catalog/file bounds. Admission counts
 /// completed outputs too; a configured 2+1 admits at most three such owners.
 pub const JOB_BYTES: usize = 1024 * 1024 * 1024;
@@ -33,9 +35,9 @@ impl<T> Deref for Completed<T> {
 
 // A provider error can itself own backing storage or source pins. Preserve its
 // cause, but do not refund admission while that returned owner is still live.
-struct Failed {
-    error: Box<dyn std::error::Error + Send + Sync>,
-    _permit: Arc<process::Permit>,
+pub(crate) struct Failed {
+    pub(crate) error: Box<dyn std::error::Error + Send + Sync>,
+    pub(crate) _permit: Arc<process::Permit>,
 }
 impl std::fmt::Debug for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,6 +52,20 @@ impl std::fmt::Display for Failed {
 impl std::error::Error for Failed {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.error.as_ref())
+    }
+}
+
+/// Call only while the actual job owner/permit is still live. A panic payload
+/// can itself own admitted storage or source pins: destroy it here, before the
+/// executor's outer unwind boundary can acknowledge work or refund admission.
+/// Payload destruction, like callback cleanup, must be finite and non-panicking.
+pub(crate) fn catch_job_unwind<T>(run: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(payload) => {
+            drop(payload);
+            Err(invalid("CPU job panicked"))
+        }
     }
 }
 
@@ -118,14 +134,16 @@ impl<J: CpuJob> Work<J> {
         let budget = self.budget;
         operation
             .enter(|| {
-                control.check()?;
-                operation.check()?;
-                let value = job.run(control, &budget)?;
-                control.check()?;
-                operation.check()?;
-                Ok(Completed {
-                    value,
-                    _permit: permit.clone(),
+                catch_job_unwind(|| {
+                    control.check()?;
+                    operation.check()?;
+                    let value = job.run(control, &budget)?;
+                    control.check()?;
+                    operation.check()?;
+                    Ok(Completed {
+                        value,
+                        _permit: permit.clone(),
+                    })
                 })
             })
             .map_err(|error| {
@@ -142,10 +160,19 @@ pub struct CpuJobs {
     // its independent operation, admission and result ownership through cleanup.
     pub(crate) executor: CpuExecutor,
     pub(crate) admission: Arc<process::Admission>,
+    blame_job_bytes: usize,
 }
 
 impl CpuJobs {
     pub fn new(workers: usize, queued: usize) -> Result<Self> {
+        Self::with_blame_job_bytes(workers, queued, JOB_BYTES)
+    }
+
+    pub(crate) fn with_blame_job_bytes(
+        workers: usize,
+        queued: usize,
+        bytes: usize,
+    ) -> Result<Self> {
         if !(1..=4).contains(&workers) || queued > 3 || workers + queued > 4 {
             return Err(invalid(
                 "CPU capacity requires concurrency in 1..=4, waiters in 0..=3 and total <=4",
@@ -160,7 +187,12 @@ impl CpuJobs {
                 queue_capacity: total,
             })?,
             admission: process::Admission::new(total),
+            blame_job_bytes: bytes,
         })
+    }
+
+    pub(crate) fn blame_budget(&self) -> CapacityBudget {
+        CapacityBudget::new(self.blame_job_bytes)
     }
 
     /// All admitted preparation, CPU work and retained outputs across callers.
@@ -390,6 +422,42 @@ mod tests {
         assert_eq!(cpu.admitted(), 1);
         assert_eq!(budget.used(), 4096);
         assert!(cpu.try_run(Operation::new(5), Value).unwrap().is_none());
+        drop(error);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(cpu.admitted(), 0);
+    }
+
+    #[test]
+    fn blame_failure_keeps_admission_after_the_executor_has_finished_flight_cleanup() {
+        let cpu = Arc::new(CpuJobs::with_blame_job_bytes(1, 0, 4usize << 30).unwrap());
+        let jobs = Jobs::<usize>::with_cpu(cpu.clone());
+        let (sent, received) = mpsc::channel();
+        let error = match Operation::new(5).enter(|| {
+            jobs.run(b"owned-error".to_vec(), 5, move |_, budget| {
+                sent.send(budget.clone()).unwrap();
+                Err(Box::new(FailedBytes(budget.buffer(4096)?)))
+            })
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("provider error was accepted"),
+        };
+        let budget = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        // An executor-only sentinel is a cleanup barrier, not application work:
+        // the single worker must drop the prior flight before processing it.
+        // This avoids mistaking scheduler lag for retained-error admission.
+        cpu.executor
+            .submit(
+                Control::new(Instant::now() + Duration::from_secs(3)),
+                git_rs_core::JobOptions::default(),
+                |_, _| Ok(()),
+            )
+            .unwrap()
+            .wait_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.used(), 4096);
+        assert_eq!(cpu.admitted(), 1, "returned error still owns its backing");
+        assert!(cpu.try_admit(Operation::new(5)).unwrap().is_none());
         drop(error);
         assert_eq!(budget.used(), 0);
         assert_eq!(cpu.admitted(), 0);

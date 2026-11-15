@@ -195,6 +195,27 @@ impl RangeStore {
         limits: ReadLimits,
         control: &Control,
     ) -> Result<RangePackSet<Self>> {
+        Self::open_with_decoder_options(
+            source,
+            store,
+            cache,
+            budget,
+            limits,
+            crate::blame::ResourceProfile::BaselineV1.decoder_options(),
+            control,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit source, capacity and decoder policy boundary.
+    pub(crate) fn open_with_decoder_options(
+        source: Arc<Source>,
+        store: Store,
+        cache: Arc<Cache>,
+        budget: CapacityBudget,
+        limits: ReadLimits,
+        decoder: DecoderOptions,
+        control: &Control,
+    ) -> Result<RangePackSet<Self>> {
         let identity = source.identity();
         RangePackSet::new(
             Self {
@@ -206,13 +227,7 @@ impl RangeStore {
             identity,
             budget,
             limits,
-            DecoderOptions {
-                cache_slots: 4096,
-                cache_bytes: 32 * 1024 * 1024,
-                max_cache_entry_bytes: 1024 * 1024,
-                header_slots: 4096,
-                retained_workspace_bytes: 0,
-            },
+            decoder,
             control,
         )
     }

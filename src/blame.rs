@@ -25,10 +25,13 @@ mod derive;
 mod jobs;
 #[path = "blame_memo.rs"]
 pub(crate) mod memo;
+#[path = "blame_resources.rs"]
+mod resources;
 #[path = "blame_warm.rs"]
 mod warm;
 pub use derive::WorkStatistics;
 pub use jobs::{Completed, JOB_BYTES, JobEvent, JobObserver, Jobs};
+pub use resources::ResourceProfile;
 pub use warm::{WarmDisposition, WarmPolicy, WarmStatistics};
 
 pub const MAX_BLOB: u64 = 128 * 1024 * 1024;
@@ -87,6 +90,7 @@ pub struct Blame {
     writer: Option<batch::WriterProof>,
     warming: Option<WarmPolicy>,
     options: BlameOptions,
+    resources: ResourceProfile,
     reuse: bool,
     body_lookup: bool,
 }
@@ -127,6 +131,10 @@ impl Default for Blame {
     }
 }
 impl Blame {
+    pub fn resource_profile(&self) -> ResourceProfile {
+        self.resources
+    }
+
     pub fn cpu(&self) -> Arc<crate::cpu_jobs::CpuJobs> {
         self.jobs.cpu()
     }
@@ -140,27 +148,39 @@ impl Blame {
         self.warming.as_ref().map(WarmPolicy::statistics)
     }
     pub fn new(concurrency: usize, waiters: usize) -> Result<Self> {
+        Self::new_with_resource_profile(concurrency, waiters, ResourceProfile::BaselineV1)
+    }
+
+    pub fn new_with_resource_profile(
+        concurrency: usize,
+        waiters: usize,
+        resources: ResourceProfile,
+    ) -> Result<Self> {
+        resources.validate_capacity(concurrency, waiters)?;
         ProducerVersion::verified()?;
         Ok(Self {
-            jobs: Jobs::new(concurrency, waiters)?,
+            jobs: Jobs::new_with_resource_profile(concurrency, waiters, resources)?,
             cache: None,
             observer: None,
             writer: None,
             warming: None,
             options: BlameOptions::default(),
+            resources,
             reuse: true,
             body_lookup: true,
         })
     }
     pub fn with_capacity(self, concurrency: usize, waiters: usize) -> Result<Self> {
+        self.resources.validate_capacity(concurrency, waiters)?;
         ProducerVersion::verified()?;
         Ok(Self {
-            jobs: Jobs::new(concurrency, waiters)?,
+            jobs: Jobs::new_with_resource_profile(concurrency, waiters, self.resources)?,
             cache: self.cache,
             observer: self.observer,
             writer: self.writer,
             warming: self.warming,
             options: self.options,
+            resources: self.resources,
             reuse: self.reuse,
             body_lookup: self.body_lookup,
         })
@@ -225,6 +245,7 @@ impl Blame {
             writer: self.writer.clone(),
             observer: self.observer.clone(),
             options: self.options.clone(),
+            resources: self.resources,
             reuse: self.reuse,
             body_lookup: self.body_lookup,
         }
@@ -401,26 +422,27 @@ impl Access for SourceAccess {
         self.source.check()
     }
 }
-fn artifact_key(
-    source: &Source,
+pub(crate) fn artifact_key(
+    snapshot: &crate::metadata::Snapshot,
     principal: &str,
     query: &Request,
     options: &BlameOptions,
+    resources: ResourceProfile,
 ) -> Result<ArtifactKey> {
     ArtifactKey::new(KeyParts {
-        repository: source.snapshot.id.as_bytes(),
+        repository: snapshot.id.as_bytes(),
         security: principal.as_bytes(),
         object_format: "sha1",
         kind: "complete-blame",
         inputs: &[
-            &source.snapshot.generation.to_be_bytes(),
-            &source.snapshot.storage_epoch.to_be_bytes(),
+            &snapshot.generation.to_be_bytes(),
+            &snapshot.storage_epoch.to_be_bytes(),
             &query.commit.0,
             &query.path,
         ],
         options: options.canonical_bytes(),
         representation: "native-root-line-porcelain-v1",
-        producer: &memo::Profile::verified(options)?.id,
+        producer: &memo::Profile::verified(options, resources)?.id,
     })
 }
 fn optional_cache<T>(control: &Control, work: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
@@ -499,4 +521,43 @@ fn publish_body(
         let _ = artifacts.publish(build, ArtifactKind::CompleteBody, &chunks)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_reconfiguration_keeps_the_actual_large_job_allowance() {
+        let service = Blame::new_with_resource_profile(1, 0, ResourceProfile::LargeV1)
+            .unwrap()
+            .with_capacity(1, 0)
+            .unwrap();
+        let output = process::Operation::new(5)
+            .enter(|| {
+                service.jobs.run(b"reconfigured".to_vec(), 5, |_, budget| {
+                    let _reservation = budget.reservation(4usize << 30)?;
+                    assert!(budget.reservation(1).is_err());
+                    Ok(Outcome::NotFound)
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.admitted(), 1);
+        assert!(
+            service
+                .cpu()
+                .try_admit(process::Operation::new(5))
+                .unwrap()
+                .is_none()
+        );
+        drop(output);
+        // The worker may still be dropping its completion owner. A bounded
+        // public retry observes the actual cleanup acknowledgement, not sleep.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while service.admitted() != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
 }

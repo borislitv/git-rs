@@ -15,6 +15,7 @@ pub(crate) struct LazySnapshot {
     work: Option<crate::blame::memo::WorkSet>,
     budget: CapacityBudget,
     limits: ReadLimits,
+    resources: crate::blame::ResourceProfile,
 }
 
 impl LazySnapshot {
@@ -26,17 +27,49 @@ impl LazySnapshot {
         limits: ReadLimits,
         control: &Control,
     ) -> Result<Self> {
+        Self::new_with_resource_profile(
+            source,
+            store,
+            cache,
+            budget,
+            limits,
+            crate::blame::ResourceProfile::BaselineV1,
+            control,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Immutable policy accompanies the exact admitted source.
+    pub(crate) fn new_with_resource_profile(
+        source: Arc<Source>,
+        store: Store,
+        cache: Arc<Cache>,
+        budget: CapacityBudget,
+        limits: ReadLimits,
+        resources: crate::blame::ResourceProfile,
+        control: &Control,
+    ) -> Result<Self> {
         Ok(Self {
-            packs: RangeStore::open(source, store, cache, budget.clone(), limits, control)?,
+            packs: RangeStore::open_with_decoder_options(
+                source,
+                store,
+                cache,
+                budget.clone(),
+                limits,
+                resources.decoder_options(),
+                control,
+            )?,
             work: None,
             budget,
             limits,
+            resources,
         })
     }
 
-    pub fn with_workset(mut self, work: Option<crate::blame::memo::WorkSet>) -> Self {
-        self.work = work;
-        self
+    pub fn with_workset(mut self, work: Option<crate::blame::memo::WorkSet>) -> Result<Self> {
+        self.work = work
+            .map(|work| work.attach(self.resources, self.limits, &self.budget))
+            .transpose()?;
+        Ok(self)
     }
 }
 
@@ -75,14 +108,8 @@ impl VerifiedObjectProvider for LazySnapshot {
         // A checkpoint owns bytes rather than a physical decoder-chain plan.
         // Preserve the original restriction: tighter chain limits must use the
         // physical decoder and cannot infer a plan from authenticated bytes.
-        if let Some(work) = &self.work
-            && limits.max_delta_depth == self.limits.max_delta_depth
-            && limits.max_decode_bytes == self.limits.max_decode_bytes
-        {
-            let object = work
-                .lock()
-                .map_err(|_| invalid("blame workset poisoned"))?
-                .object(id.to_owned(), header.kind, control)?;
+        if let Some(work) = &self.work {
+            let object = work.object(id.to_owned(), header.kind, limits, control)?;
             if let Some(object) = object {
                 if object.kind != header.kind || object.data.as_slice().len() as u64 != header.size
                 {
