@@ -1,11 +1,11 @@
 //! A bounded process-local Tokio PostgreSQL pool. Failed or interrupted sessions
 //! are destroyed, never recycled with an unfinished transaction or unread reply.
+use self::manager::{Client, Manager, Pool};
 use crate::{
     Result, invalid,
     metrics::{self, Metric, Stage},
     process,
 };
-use deadpool_postgres::{Client, Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
 use postgres_native_tls::MakeTlsConnector;
 use std::{pin::pin, sync::OnceLock, time::Duration};
@@ -13,6 +13,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_postgres::SimpleQueryMessage;
 
 pub(crate) mod config;
+pub(crate) mod manager;
 
 const CONNECTIONS: usize = 8;
 // The protocol codecs retain reusable write buffers. Large accepted publication
@@ -62,13 +63,7 @@ impl Drop for Checkout {
 impl Database {
     fn new() -> Result<Self> {
         let config::ConnectionConfig { config, tls } = config::ConnectionConfig::from_env(false)?;
-        let manager = Manager::from_config(
-            config,
-            tls.clone(),
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
+        let manager = Manager::new(config, tls.clone());
         let pool = Pool::builder(manager)
             .max_size(CONNECTIONS)
             .runtime(deadpool_postgres::Runtime::Tokio1)

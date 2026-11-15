@@ -1,9 +1,13 @@
 use crate::{
     Result,
-    database::{Checkout, config::ConnectionConfig, sql_error},
+    database::{
+        Checkout,
+        config::ConnectionConfig,
+        manager::{Manager, Pool},
+        sql_error,
+    },
     invalid, process,
 };
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
 use postgres_native_tls::MakeTlsConnector;
 use std::{
@@ -26,13 +30,7 @@ pub(crate) struct Postgres {
 impl Postgres {
     pub fn from_env(connections: usize) -> Result<Self> {
         let ConnectionConfig { config, tls } = ConnectionConfig::from_env(true)?;
-        let manager = Manager::from_config(
-            config,
-            tls.clone(),
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
+        let manager = Manager::new(config, tls.clone());
         let pool = Pool::builder(manager)
             .max_size(connections)
             .runtime(deadpool_postgres::Runtime::Tokio1)

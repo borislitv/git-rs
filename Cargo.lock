@@ -807,6 +807,7 @@ version = "0.1.0-rc.3"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
+ "deadpool",
  "deadpool-postgres",
  "flate2",
  "futures-util",
@@ -823,6 +824,7 @@ dependencies = [
  "percent-encoding",
  "postgres-native-tls",
  "quick-xml",
+ "rand",
  "reqwest",
  "rustix",
  "serde",
