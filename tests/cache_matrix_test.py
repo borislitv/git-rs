@@ -271,8 +271,13 @@ class EvidenceContracts(unittest.TestCase):
 
     def test_cell_cleanup_attempts_both_databases_and_role_and_persists_the_original_failure(self):
         with tempfile.TemporaryDirectory() as directory:
-            fixture = SimpleNamespace(base=Path(directory), env={"PGDATABASE": "original"}, results={}, daemons={},
-                                      cli=Mock(side_effect=RuntimeError("foreground migration failure")))
+            process = SimpleNamespace(identifier="d" * 64, state=Mock(return_value={"Running": True}))
+            fixture = SimpleNamespace(base=Path(directory), env={"PGDATABASE": "original"}, results={}, daemons={})
+            def start(name):
+                fixture.daemons[name] = process
+                return process, 1
+            fixture.start = start
+            fixture.stop = lambda name: fixture.daemons.pop(name)
             matrix = Matrix(fixture, load_config(ROOT / "tests/fixtures/cache-matrix.json"))
             created, dropped, roles = [], [], []
 
@@ -287,7 +292,8 @@ class EvidenceContracts(unittest.TestCase):
                     roles.append(query.split()[-1])
                 return "0"
 
-            with patch.object(cache_matrix, "sql", side_effect=database):
+            with patch.object(cache_matrix, "sql", side_effect=database), \
+                    patch.object(cache_matrix, "command", side_effect=RuntimeError("foreground migration failure")):
                 with self.assertRaisesRegex(RuntimeError, "foreground migration failure"):
                     matrix.cell(0, 0, "disabled", "derivation", None, None, None, None, None)
             self.assertEqual(dropped, created)
@@ -297,6 +303,20 @@ class EvidenceContracts(unittest.TestCase):
             self.assertEqual(row["status"], "failed")
             self.assertEqual(row["failure"], "RuntimeError")
             self.assertEqual(row["cleanup_errors"], ["OSError"])
+
+    def test_preparation_uses_the_live_owned_image_and_refuses_a_stopped_publisher(self):
+        process = SimpleNamespace(identifier="d" * 64, state=Mock(return_value={"Running": True}))
+        fixture = SimpleNamespace(results={}, daemons={"publisher": process})
+        matrix = Matrix(fixture, load_config(ROOT / "tests/fixtures/cache-matrix.json"))
+        with patch.object(cache_matrix, "command", return_value=SimpleNamespace(returncode=0)) as external:
+            matrix.prepare("publisher", "create", "matrix/history", "alice")
+        self.assertEqual(external.call_args.args[0],
+                         ["docker", "exec", process.identifier, "/usr/local/bin/git-rs", "create", "matrix/history", "alice"])
+        process.state.return_value = {"Running": False}
+        with patch.object(cache_matrix, "command") as external:
+            with self.assertRaisesRegex(AssertionError, "preparation runtime is not running"):
+                matrix.prepare("publisher", "migrate")
+        external.assert_not_called()
 
     def test_wire_close_reaps_live_forwarding_owners_after_counting_actual_bytes(self):
         listener = socket.socket()

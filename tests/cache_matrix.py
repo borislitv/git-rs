@@ -410,6 +410,11 @@ class Matrix:
             "credentials": "distinct synthetic PG role/database and S3 bucket; one synthetic S3 account",
             "aggregate": "outer supervisor: <=4 GiB, <=2 CPUs, <=256 tasks, no extra swap"})
 
+    def prepare(self, publisher, *arguments):
+        process = self.f.daemons[publisher]
+        require(process.state()["Running"], "source preparation runtime is not running")
+        return command(["docker", "exec", process.identifier, "/usr/local/bin/git-rs", *arguments])
+
     def fetch(self, name, port, target, row, label):
         require(time.monotonic() < self.deadline, "matrix cell absolute deadline expired")
         process = self.f.daemons[name]
@@ -539,7 +544,6 @@ class Matrix:
             role_created = True
             sql(f, f"GRANT CREATE ON DATABASE {cache_db} TO {role}", admin)
             f.env["PGDATABASE"] = source_db
-            f.cli("migrate")
             if placement != "disabled":
                 pg = WireProxy("127.0.0.1", f.env["PGPORT"])
                 proxies.append(pg)
@@ -550,10 +554,16 @@ class Matrix:
                     GIT_RS_CACHE_INLINE_BYTES=str(8 * 1024 * 1024 if placement == "all-pg" else 0),
                     GIT_RS_CACHE_S3_ENDPOINT=f"http://127.0.0.1:{s3.port}", GIT_RS_CACHE_S3_BUCKET="matrix-derived",
                     GIT_RS_CACHE_S3_ACCESS_KEY="test-access", GIT_RS_CACHE_S3_SECRET_KEY="synthetic-secret-key")
-                f.cli("cache-migrate")
+            publisher_name = "publisher-" + str(ordinal)
+            _, publish = f.start(publisher_name)
+            # This listener stays idle until real source/cache migrations and
+            # repository creation finish. Its SQL pools are initialized lazily.
+            # CLI children share the same owned image, environment and limits.
+            self.prepare(publisher_name, "migrate")
+            if placement != "disabled":
+                self.prepare(publisher_name, "cache-migrate")
             for slug in ("matrix/control", "matrix/history", "matrix/mutable", "matrix/contended"):
-                f.cli("create", slug, "alice")
-            _, publish = f.start("publisher-" + str(ordinal))
+                self.prepare(publisher_name, "create", slug, "alice")
             publisher = f"http://127.0.0.1:{publish}"
             f.git(seed, "push", publisher + "/matrix/control.git", commits[0] + ":refs/heads/main")
             f.git(seed, "push", publisher + "/matrix/history.git", "main", "--tags")

@@ -225,6 +225,13 @@ cover allocator/kernel/TLS copies. Cold means fresh application state, without
 flushing OS or PostgreSQL buffers. A physical replay fence is not an HA result.
 The smoke does not replace a separately configured full-corpus/GitLab campaign.
 
+Cell preparation executes the genuine Rust migration/repository CLI in its owned
+source-publisher container, sharing that immutable image, environment and resource
+limits. The development listener is idle until source/cache migrations and all
+repository creation finish; no native traffic or measured work precedes them.
+This avoids a separate container for each CLI command. Listener startup is not a
+readiness/schema-availability assertion or a change to Kubernetes migration hooks.
+
 Each matrix response still records the daemon's kernel RSS high-water mark. The
 test-only HTTP fixture reads bounded `/proc/self/status` and exports `VmHWM` in
 its existing metrics response, avoiding two external execs for every sample.
