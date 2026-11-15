@@ -276,12 +276,28 @@ impl From<CapacityError> for BlameError {
     }
 }
 
-pub(crate) fn source_error(error: &(dyn std::error::Error + 'static)) -> BlameError {
-    if let Some(reason) = error.downcast_ref::<StopReason>() {
-        return (*reason).into();
-    }
-    if let Some(reason) = error.downcast_ref::<CapacityError>() {
-        return (*reason).into();
+pub(crate) fn source_error(mut error: &(dyn std::error::Error + 'static)) -> BlameError {
+    loop {
+        if let Some(reason) = error.downcast_ref::<StopReason>() {
+            return (*reason).into();
+        }
+        if let Some(reason) = error.downcast_ref::<CapacityError>() {
+            return (*reason).into();
+        }
+        // gix contexts retain an error tree, not just a native source chain.
+        // Inspect it with the same typed recovery used by FindBridge::try_find.
+        if let Some(context) = error.downcast_ref::<gix_error::Error>() {
+            if let Some(reason) = context.downcast_any_ref::<StopReason>() {
+                return (*reason).into();
+            }
+            if let Some(reason) = context.downcast_any_ref::<CapacityError>() {
+                return (*reason).into();
+            }
+        }
+        let Some(source) = error.source() else {
+            break;
+        };
+        error = source;
     }
     BlameError::Corrupt("object provider failed")
 }
