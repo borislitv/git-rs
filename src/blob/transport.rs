@@ -26,6 +26,9 @@ use tokio::{
     sync::{Semaphore, mpsc},
 };
 
+#[path = "system_dns.rs"]
+mod system_dns;
+
 struct Transport {
     runtime: Runtime,
     client: Client,
@@ -68,6 +71,13 @@ impl Transport {
                 .tls_version_min(reqwest::tls::Version::TLS_1_2)
                 .http1_only()
                 .no_proxy()
+                // getaddrinfo's running blocking tasks cannot be aborted. Repeated
+                // cancelled lookups could otherwise fill the blocking work queue
+                // after these request permits have already been returned.
+                // Do not use reqwest's lazy Hickory adapter: it falls back to
+                // public DNS on system-config errors. Our adapter fails closed.
+                .no_hickory_dns()
+                .dns_resolver(std::sync::Arc::new(system_dns::SystemDns::new()?))
                 .no_gzip()
                 .no_brotli()
                 .no_deflate()
@@ -126,8 +136,10 @@ impl Transport {
 
 impl Store {
     /// Upload a borrowed admitted body through a bounded two-chunk channel.
-    /// The sender and HTTP future are joined inside the same absolute timeout;
-    /// neither a detached pump nor a file/memfd bridge survives cancellation.
+    /// The borrowed sender and HTTP response future share the absolute timeout;
+    /// neither a detached application pump nor a file/memfd bridge is created.
+    /// Hyper's connection driver has separate SDK-owned teardown: dropping the
+    /// request is not a join of that driver or its copied transport buffers.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn request_memory(
         &self,
@@ -371,3 +383,7 @@ impl Store {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "transport_dns_tests.rs"]
+mod dns_tests;
