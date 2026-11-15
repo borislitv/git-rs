@@ -587,11 +587,13 @@ class GateTests(unittest.TestCase):
 
     def test_docker_transport_is_pinned_to_the_attested_local_daemon(self):
         environment = {"DOCKER_HOST": "tcp://unrelated.invalid:2375", "DOCKER_CONTEXT": "remote"}
-        with patch.dict(os.environ, environment), patch.object(gate.subprocess, "run") as run:
-            gate.command(["docker", "info"])
-        actual = run.call_args.kwargs["env"]
-        self.assertEqual(actual["DOCKER_HOST"], "unix:///var/run/docker.sock")
-        self.assertNotIn("DOCKER_CONTEXT", actual)
+        for executable in ("docker", "/usr/bin/docker"):
+            with self.subTest(executable=executable), patch.dict(os.environ, environment), \
+                    patch.object(gate.subprocess, "run") as run:
+                gate.command([executable, "info"])
+                actual = run.call_args.kwargs.get("env", dict(os.environ))
+            self.assertEqual(actual["DOCKER_HOST"], "unix:///var/run/docker.sock")
+            self.assertNotIn("DOCKER_CONTEXT", actual)
 
     def test_failed_cleanup_cannot_publish_completed_report(self):
         bundle, _ = self.bundle()
@@ -737,6 +739,30 @@ class RuntimeHandoffTests(unittest.TestCase):
         during = daemon.start_observation
         self.assertEqual(during[daemon.outer]["HostConfig"]["NanoCpus"], 250000000)
         self.assertEqual(during[daemon.child]["HostConfig"]["NanoCpus"], 1000000000)
+        self.assertEqual(set(daemon.containers), {daemon.outer, daemon.sentinel})
+        self.assertEqual(daemon.containers[daemon.outer]["HostConfig"]["NanoCpus"], 1000000000)
+        self.assertEqual(daemon.containers[daemon.sentinel], daemon.preserved)
+
+    def test_installed_fixture_proxy_does_not_reject_the_attested_root_runtime_create(self):
+        daemon = RuntimeDaemon()
+
+        def transport(argv, **kwargs):
+            # A PATH-resolved create reaches the installed fixture proxy. Its
+            # escape guard must remain strict for ordinary fixture commands.
+            if argv[:2] == ["docker", "create"]:
+                with patch.object(gate.os, "execv"):
+                    gate.docker_proxy(argv[1:])
+            return daemon.command(argv, **kwargs)
+
+        with patch.dict(os.environ, {"INVOCATION_ID": daemon.token, "GIT_RS_GATE_SLICE": daemon.slice}), \
+                patch.object(gate, "command", side_effect=transport):
+            try:
+                result = gate.run_root_runtime({"runtime_image": "sha256:" + "f" * 64},
+                                               Path("/gate/bin/blame_core"), {}, None)
+            except ValueError as error:
+                self.fail("attested root runtime was rejected by the fixture proxy: " + str(error))
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNotNone(daemon.start_observation)
         self.assertEqual(set(daemon.containers), {daemon.outer, daemon.sentinel})
         self.assertEqual(daemon.containers[daemon.outer]["HostConfig"]["NanoCpus"], 1000000000)
         self.assertEqual(daemon.containers[daemon.sentinel], daemon.preserved)

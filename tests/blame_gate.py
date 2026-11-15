@@ -60,7 +60,7 @@ def require(condition, message):
 
 def command(argv, *, timeout=30, **kwargs):
     argv = [str(x) for x in argv]
-    if argv[0] == "docker":
+    if argv[0] in ("docker", "/usr/bin/docker"):
         # A remote Docker context cannot share this host's attested cgroup slice.
         env = dict(kwargs.get("env") or os.environ)
         env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
@@ -552,7 +552,9 @@ def run_root_runtime(manifest, executable, env, stream):
         command(["docker", "update", "--cpus", ".25", outer_id], timeout=10)
         runtime_outer(token, slice_name, outer_id, (250000000,))
         donated = True
-        arguments = ["docker", "create", "--pull=never", "--init", "--read-only", "--network", "host", "--user", "0:0",
+        # This attested supervisor supplies the exact parent/owner itself. The
+        # PATH fixture proxy deliberately rejects caller-supplied cgroup parents.
+        arguments = ["/usr/bin/docker", "create", "--pull=never", "--init", "--read-only", "--network", "host", "--user", "0:0",
                      "--name", name, "--label", LABEL + token,
                      "--label", "git-rs.blame-runtime-outer=" + outer_id,
                      "--cgroup-parent", slice_name, "--cpus", "1", "--memory", "256m",
