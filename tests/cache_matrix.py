@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import socket
 import subprocess
@@ -173,6 +174,52 @@ def resource(identifier):
         stream.close()
 
 
+class ReplicaLag:
+    """One owned external psql session for repeated fixed read-only lag queries."""
+    def __init__(self, f):
+        self.process = subprocess.Popen(["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-P", "pager=off"],
+            env=dict(f.env, PGOPTIONS="-c statement_timeout=2000"), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        f.processes.append(self.process)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.process.stdout, selectors.EVENT_READ)
+
+    def sample(self):
+        query = ("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),replay_lsn)::bigint "
+                 "FROM pg_stat_replication WHERE application_name='matrix-standby' AND state='streaming';\n"
+                 "\\echo git_rs_matrix_replica_done\n").encode()
+        self.process.stdin.write(query)
+        self.process.stdin.flush()
+        deadline, body = time.monotonic() + 4, bytearray()
+        while not body.endswith(b"\ngit_rs_matrix_replica_done\n"):
+            remaining = deadline - time.monotonic()
+            require(remaining > 0 and self.selector.select(remaining), "replica monitor response deadline exceeded")
+            chunk = os.read(self.process.stdout.fileno(), 1025 - len(body))
+            require(chunk, "replica monitor closed before completing its observation")
+            body.extend(chunk)
+            require(len(body) <= 1024, "replica monitor output exceeded its bound")
+        rows = body.splitlines()
+        require(len(rows) == 2 and rows[0].isdigit(), "real streaming replica disappeared")
+        return int(rows[0])
+
+    def close(self):
+        try:
+            self.process.stdin.close()
+        except BrokenPipeError:
+            pass
+        try:
+            try:
+                code = self.process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=1)
+                raise AssertionError("replica monitor did not drain")
+            require(code == 0, "replica monitor process failed")
+        finally:
+            self.selector.close()
+            self.process.stdout.close()
+
+
 class Replica:
     def __init__(self, f):
         self.f = f
@@ -193,12 +240,6 @@ class Replica:
             "exec postgres -D /replica/data -c shared_buffers=16MB -c listen_addresses='' "])
         until(lambda: sql(f, "SELECT count(*) FROM pg_stat_replication WHERE application_name='matrix-standby' "
                              "AND state='streaming' AND replay_lsn IS NOT NULL") == "1", "actual streaming replay", 30)
-
-    def lag(self):
-        answer = sql(self.f, "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),replay_lsn)::bigint "
-                            "FROM pg_stat_replication WHERE application_name='matrix-standby' AND state='streaming'")
-        require(answer and int(answer) >= 0, "real streaming replica disappeared")
-        return int(answer)
 
     def fence(self, seconds):
         lsn = sql(self.f, "SELECT pg_current_wal_lsn()")
@@ -233,7 +274,7 @@ class Probe:
                 self.samples.append(int(fields[1]) / 1_000_000)
                 if self.done.is_set():
                     break
-                self.lags.append(self.replica.lag())
+                self.lags.append(self.monitor.sample())
                 sample = {}
                 for name, identity in (("primary", self.f.containers[0]), ("replica", self.replica.identifier)):
                     if self.done.is_set():
@@ -245,7 +286,12 @@ class Probe:
             self.errors.append(type(error).__name__ + ": " + str(error)[:256])
 
     def __enter__(self):
-        self.thread.start()
+        self.monitor = ReplicaLag(self.f)
+        try:
+            self.thread.start()
+        except BaseException:
+            self.monitor.close()
+            raise
         return self
 
     def __exit__(self, error_type, *_):
@@ -256,6 +302,7 @@ class Probe:
         if self.samples:
             self.row["source_snapshot_ms"] = distribution(self.samples)
         require(not self.thread.is_alive(), "actual source probe did not stop")
+        cleanup_all([self.monitor.close], self.row.setdefault("replica_monitor_cleanup", {}))
         if error_type is None:
             require(not self.errors, "source latency observation failed")
 

@@ -232,6 +232,14 @@ Before the first measured cell, the controller verifies this observation between
 two original external namespace readings of that exact container. Missing or
 invalid observations fail; there is no zero-value fallback or RSS limit increase.
 
+The physical-replica probe reuses one owned external `psql` session per cell for
+its fixed read-only lag query, rather than starting a client for every sample.
+Each observation requires its complete response marker, a fresh nonnegative
+value, the same two-second SQL/four-second client bounds and at most one KiB of
+output. The probe retains its existing sampling interval and resource inventory;
+the client is registered for independent cleanup and joined before database
+teardown. This does not use a serving SQL subprocess or authorize source work.
+
 These files define checks. They do not attest that a changed checkout has passed.
 Bind every result to its source/dependency revision, lockfile, executable/image
 identities, discovered inventory, resource envelope, actual outcomes and cleanup.

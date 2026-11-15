@@ -5,6 +5,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,7 +15,50 @@ import unittest
 from unittest.mock import Mock, patch
 
 import cache_matrix
-from cache_matrix import Matrix, ROOT, WireProxy, cleanup_all, load_config, require_compaction
+from cache_matrix import Matrix, ReplicaLag, ROOT, WireProxy, cleanup_all, load_config, require_compaction
+
+
+class ReplicaMonitorContracts(unittest.TestCase):
+    def monitor(self, responses, echo=True):
+        fixture = SimpleNamespace(env=dict(cache_matrix.os.environ), processes=[])
+        program = ("import sys\n"
+                   f"responses=iter({responses!r})\n"
+                   "for line in sys.stdin:\n"
+                   " if line.startswith('SELECT '):\n"
+                   "  value=next(responses)\n"
+                   "  if value is None: sys.exit(0)\n"
+                   "  print(value, flush=True)\n"
+                   f" elif line.startswith('\\\\echo ') and {echo!r}:\n"
+                   "  print('git_rs_matrix_replica_done', flush=True)\n")
+        original = subprocess.Popen
+        with patch.object(cache_matrix.subprocess, "Popen", side_effect=lambda *args, **options:
+                          original([sys.executable, "-u", "-c", program], **options)):
+            monitor = ReplicaLag(fixture)
+        self.assertEqual(fixture.processes, [monitor.process])
+        self.addCleanup(monitor.close)
+        return monitor
+
+    def test_one_owned_session_returns_fresh_observations_and_closes_all_pipe_owners(self):
+        monitor = self.monitor([0, 37])
+        self.assertEqual(monitor.sample(), 0)
+        self.assertEqual(monitor.sample(), 37)
+        monitor.close()
+        self.assertEqual(monitor.process.returncode, 0)
+        self.assertTrue(monitor.process.stdin.closed)
+        self.assertTrue(monitor.process.stdout.closed)
+
+    def test_missing_replica_truncated_reply_and_oversized_output_are_not_observations(self):
+        for responses, reason in (([""], "replica disappeared"), ([None], "closed before"),
+                                  (["x" * 1025], "exceeded its bound")):
+            with self.subTest(reason=reason):
+                monitor = self.monitor(responses)
+                with self.assertRaisesRegex(AssertionError, reason):
+                    monitor.sample()
+
+    def test_a_missing_completion_marker_times_out_and_the_owned_client_can_still_drain(self):
+        monitor = self.monitor([0], echo=False)
+        with self.assertRaisesRegex(AssertionError, "response deadline exceeded"):
+            monitor.sample()
 
 
 class HttpContracts(unittest.TestCase):
