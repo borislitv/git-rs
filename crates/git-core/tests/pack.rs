@@ -187,6 +187,15 @@ fn full_blob(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn ofs_delta(base_distance: usize, base_size: u8, result_size: u8) -> Vec<u8> {
+    ofs_delta_with_suffix(base_distance, base_size, result_size, b'!')
+}
+
+fn ofs_delta_with_suffix(
+    base_distance: usize,
+    base_size: u8,
+    result_size: u8,
+    suffix: u8,
+) -> Vec<u8> {
     // All OFS fixture distances fit Git's single-byte distance encoding.
     let mut entry = vec![0x66, u8::try_from(base_distance).unwrap()];
     entry.extend_from_slice(&compressed(&[
@@ -195,9 +204,631 @@ fn ofs_delta(base_distance: usize, base_size: u8, result_size: u8) -> Vec<u8> {
         0x90,
         base_size,
         1,
-        b'!',
+        suffix,
     ]));
     entry
+}
+
+#[test]
+fn cold_ofs_target_publishes_verified_intermediate_and_reuses_it_for_a_sibling() {
+    let root = Directory::new();
+    let base_entry = full_hello();
+    let middle_entry = ofs_delta(base_entry.len(), 5, 6);
+    let target_entry = ofs_delta(middle_entry.len(), 6, 7);
+    let sibling_entry = ofs_delta_with_suffix(middle_entry.len() + target_entry.len(), 6, 7, b'?');
+    let wrong_entry = ofs_delta(
+        middle_entry.len() + target_entry.len() + sibling_entry.len(),
+        6,
+        7,
+    );
+    let middle = blob(b"hello!");
+    let target = blob(b"hello!!");
+    let sibling = blob(b"hello!?");
+    let wrong = blob(b"hello??");
+    let index = root.write(
+        "cold-intermediate",
+        &[
+            (blob(b"hello"), base_entry),
+            (middle, middle_entry),
+            (target, target_entry),
+            (sibling, sibling_entry),
+            (wrong, wrong_entry),
+        ],
+    );
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let budget = CapacityBudget::new(128 * 1024);
+    let limits = ReadLimits::default();
+    let packs = PackSet::open_with_options(
+        [index],
+        root,
+        gix_hash::Kind::Sha1,
+        &control,
+        limits,
+        acceleration(),
+        budget.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        packs
+            .decode(&target, &control, &budget, limits)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"hello!!",
+    );
+    let pin = packs
+        .cached_object(&middle, &control, limits)
+        .unwrap()
+        .expect("a cold target must expose its independently verified OFS intermediate");
+    assert_eq!(pin.id(), middle);
+    assert_eq!(pin.as_slice(), b"hello!");
+    assert_eq!(packs.cache_stats(&control).unwrap().entries, 2);
+    assert_eq!(packs.cache_stats(&control).unwrap().decodes, 1);
+    assert_eq!(
+        packs
+            .decode(&middle, &control, &budget, limits)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"hello!",
+    );
+    let before = packs.cache_stats(&control).unwrap();
+    assert_eq!(
+        before.decodes, 1,
+        "reading the intermediate must not decode again"
+    );
+    assert_eq!(
+        packs
+            .decode(&sibling, &control, &budget, limits)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"hello!?",
+    );
+    let after = packs.cache_stats(&control).unwrap();
+    assert_eq!(after.decodes, 2);
+    assert_eq!(after.entries, 3);
+    assert_eq!(
+        after.hits - before.hits,
+        2,
+        "one internal base fetch plus the completed sibling's final pin"
+    );
+    assert!(
+        packs
+            .decode(&wrong, &control, &budget, limits)
+            .unwrap_err()
+            .to_string()
+            .contains("hash mismatch")
+    );
+    assert!(
+        packs
+            .cached_object(&wrong, &control, limits)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(packs.cache_stats(&control).unwrap().entries, 3);
+    control.cancel();
+    assert!(packs.decode(&middle, &control, &budget, limits).is_err());
+    assert_eq!(pin.as_slice(), b"hello!");
+    drop(packs);
+    assert!(budget.used() >= pin.capacity());
+    drop(pin);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn ofs_intermediate_publication_requires_its_exact_indexed_physical_location() {
+    // Exercise both a missing digest and a digest indexed at another location.
+    for duplicate_elsewhere in [false, true] {
+        let root = Directory::new();
+        let base_entry = full_hello();
+        let middle_entry = ofs_delta(base_entry.len(), 5, 6);
+        let target_entry = ofs_delta(middle_entry.len(), 6, 7);
+        let middle = blob(b"hello!");
+        let wrong = blob(b"hello?");
+        let target = blob(b"hello!!");
+        let mut entries = Vec::new();
+        if duplicate_elsewhere {
+            entries.push((middle, full_blob(b"hello!")));
+        }
+        entries.extend([
+            (blob(b"hello"), base_entry),
+            (wrong, middle_entry),
+            (target, target_entry),
+        ]);
+        let index = root.write("unproven-intermediate", &entries);
+        let control = Control::new(Instant::now() + Duration::from_secs(10));
+        let budget = CapacityBudget::new(128 * 1024);
+        let limits = ReadLimits::default();
+        let packs = PackSet::open_with_options(
+            [index],
+            root,
+            gix_hash::Kind::Sha1,
+            &control,
+            limits,
+            acceleration(),
+            budget.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            packs
+                .decode(&target, &control, &budget, limits)
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+            b"hello!!",
+            "unprovable optional intermediate caching must not reject a valid target",
+        );
+        assert!(
+            packs
+                .cached_object(&wrong, &control, limits)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            packs
+                .cached_object(&middle, &control, limits)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(packs.cache_stats(&control).unwrap().entries, 1);
+        assert!(
+            packs
+                .decode(&wrong, &control, &budget, limits)
+                .unwrap_err()
+                .to_string()
+                .contains("hash mismatch")
+        );
+        assert_eq!(packs.cache_stats(&control).unwrap().entries, 1);
+        drop(packs);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
+fn discovered_ofs_intermediate_retains_original_chain_limits() {
+    let root = Directory::new();
+    let base_entry = full_hello();
+    // Shrink a five-byte base to one byte, so checking only cached output size
+    // would hide the original maximum object size and reconstruction work.
+    let mut middle_entry = vec![0x64, u8::try_from(base_entry.len()).unwrap()];
+    middle_entry.extend_from_slice(&compressed(&[5, 1, 1, b'x']));
+    let target_entry = ofs_delta(middle_entry.len(), 1, 2);
+    let middle = blob(b"x");
+    let target = blob(b"x!");
+    let index = root.write(
+        "intermediate-limits",
+        &[
+            (blob(b"hello"), base_entry),
+            (middle, middle_entry),
+            (target, target_entry),
+        ],
+    );
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let budget = CapacityBudget::new(128 * 1024);
+    let limits = ReadLimits::default();
+    let packs = PackSet::open_with_options(
+        [index],
+        root,
+        gix_hash::Kind::Sha1,
+        &control,
+        limits,
+        acceleration(),
+        budget.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        packs
+            .decode(&target, &control, &budget, limits)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"x!",
+    );
+    assert_eq!(
+        packs
+            .cached_object(&middle, &control, limits)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"x"
+    );
+    // Original middle: maximum object 5, expanded work 5+4+1=10,
+    // depth 1, workspace 2*5+4=14; its cached payload itself is only one byte.
+    for tighter in [
+        ReadLimits {
+            max_object_bytes: 4,
+            ..limits
+        },
+        ReadLimits {
+            max_decode_bytes: 9,
+            ..limits
+        },
+        ReadLimits {
+            max_decode_bytes: 13,
+            ..limits
+        },
+        ReadLimits {
+            max_delta_depth: 0,
+            ..limits
+        },
+    ] {
+        assert!(packs.cached_object(&middle, &control, tighter).is_err());
+        assert!(packs.decode(&middle, &control, &budget, tighter).is_err());
+    }
+    assert_eq!(packs.cache_stats(&control).unwrap().decodes, 1);
+    drop(packs);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn oversized_optional_ofs_intermediate_does_not_prevent_a_verified_target() {
+    let root = Directory::new();
+    let base_entry = full_hello();
+    let middle_entry = ofs_delta(base_entry.len(), 5, 6);
+    let target_entry = ofs_delta(middle_entry.len(), 6, 7);
+    let middle = blob(b"hello!");
+    let target = blob(b"hello!!");
+    let index = root.write(
+        "oversized-intermediate",
+        &[
+            (blob(b"hello"), base_entry),
+            (middle, middle_entry),
+            (target, target_entry),
+        ],
+    );
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let budget = CapacityBudget::new(128 * 1024);
+    let limits = ReadLimits::default();
+    let packs = PackSet::open_with_options(
+        [index],
+        root,
+        gix_hash::Kind::Sha1,
+        &control,
+        limits,
+        DecoderOptions {
+            max_cache_entry_bytes: 5,
+            retained_workspace_bytes: 0,
+            ..acceleration()
+        },
+        budget.clone(),
+    )
+    .unwrap();
+    let baseline = budget.used();
+    assert_eq!(
+        packs
+            .decode(&target, &control, &budget, limits)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"hello!!",
+    );
+    assert!(
+        packs
+            .cached_object(&middle, &control, limits)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(packs.cache_stats(&control).unwrap().entries, 0);
+    assert_eq!(budget.used(), baseline);
+    drop(packs);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn pinned_quota_denial_skips_optional_ofs_intermediate_without_losing_the_target() {
+    let root = Directory::new();
+    let mut indexes = Vec::new();
+    for (name, base, middle, target) in [
+        ("first", b"hello", b"hello!", b"hello!!"),
+        ("second", b"world", b"world!", b"world!!"),
+    ] {
+        let base_entry = full_blob(base);
+        let middle_entry = ofs_delta(base_entry.len(), 5, 6);
+        let target_entry = ofs_delta(middle_entry.len(), 6, 7);
+        indexes.push(root.write(
+            name,
+            &[
+                (blob(base), base_entry),
+                (blob(middle), middle_entry),
+                (blob(target), target_entry),
+            ],
+        ));
+    }
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let budget = CapacityBudget::new(128 * 1024);
+    let limits = ReadLimits::default();
+    let packs = PackSet::open_with_options(
+        indexes,
+        root,
+        gix_hash::Kind::Sha1,
+        &control,
+        limits,
+        DecoderOptions {
+            cache_slots: 1,
+            cache_bytes: 6,
+            max_cache_entry_bytes: 6,
+            retained_workspace_bytes: 0,
+            ..acceleration()
+        },
+        budget.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        packs
+            .decode(&blob(b"hello!!"), &control, &budget, limits)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"hello!!",
+    );
+    let pin = packs
+        .cached_object(&blob(b"hello!"), &control, limits)
+        .unwrap()
+        .expect("the first intermediate owns the single cache slot");
+    let pinned_usage = budget.used();
+    assert_eq!(
+        packs
+            .decode(&blob(b"world!!"), &control, &budget, limits)
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+        b"world!!",
+    );
+    assert!(
+        packs
+            .cached_object(&blob(b"world!"), &control, limits)
+            .unwrap()
+            .is_none()
+    );
+    let stats = packs.cache_stats(&control).unwrap();
+    assert_eq!(stats.entries, 1);
+    assert_eq!(stats.pinned_entries, 1);
+    assert_eq!(pin.as_slice(), b"hello!");
+    assert_eq!(budget.used(), pinned_usage);
+    drop(packs);
+    drop(pin);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn optional_ofs_intermediate_cannot_spend_the_oversized_targets_return_buffer() {
+    let root = Directory::new();
+    let base_entry = full_hello();
+    let middle_entry = ofs_delta(base_entry.len(), 5, 6);
+    let expected = vec![b'x'; 32 * 1024];
+    // Delta header: base length 6, result length 32768. Literal instructions
+    // intentionally do not reuse the base; the physical dependency still exists.
+    let mut instructions = vec![6, 0x80, 0x80, 0x02];
+    for literal in expected.chunks(127) {
+        instructions.push(u8::try_from(literal.len()).unwrap());
+        instructions.extend_from_slice(literal);
+    }
+    // Reuse only the synthetic entry size/zlib writer, replacing the object kind
+    // and inserting the one-byte OFS distance before the compressed stream.
+    let mut target_entry = full_blob(&instructions);
+    let header_end = target_entry
+        .iter()
+        .position(|byte| byte & 0x80 == 0)
+        .unwrap()
+        + 1;
+    target_entry[0] = 0x60 | (target_entry[0] & 0x8f);
+    target_entry.insert(header_end, u8::try_from(middle_entry.len()).unwrap());
+    let target = blob(&expected);
+    let index = root.write(
+        "protected-return-buffer",
+        &[
+            (blob(b"hello"), base_entry),
+            (blob(b"hello!"), middle_entry),
+            (target, target_entry),
+        ],
+    );
+    let limits = ReadLimits {
+        max_delta_depth: 2,
+        ..ReadLimits::default()
+    };
+    let attempt = |capacity, max_entry| {
+        let budget = CapacityBudget::new(capacity);
+        let control = Control::new(Instant::now() + Duration::from_secs(10));
+        let result = (|| {
+            let packs = PackSet::open_with_options(
+                [index.clone()],
+                (),
+                gix_hash::Kind::Sha1,
+                &control,
+                limits,
+                DecoderOptions {
+                    cache_slots: 2,
+                    cache_bytes: 64 * 1024,
+                    max_cache_entry_bytes: max_entry,
+                    header_slots: 0,
+                    retained_workspace_bytes: 0,
+                },
+                budget.clone(),
+            )
+            .ok()?;
+            let object = packs.decode(&target, &control, &budget, limits).ok()??;
+            assert_eq!(object.data.as_slice(), expected.as_slice());
+            let stats = packs.cache_stats(&control).unwrap();
+            drop(object);
+            drop(packs);
+            Some(stats)
+        })();
+        assert_eq!(
+            budget.used(),
+            0,
+            "all successful and denied attempts clean up"
+        );
+        result
+    };
+    // Find the actual baseline boundary, independently of private metadata sizes
+    // and allocator capacity. Entry limit 5 excludes the six-byte intermediate;
+    // entry limit 6 permits it, while the 32768-byte target is never eligible.
+    let (mut low, mut high) = (0, 256 * 1024);
+    assert!(attempt(high, 5).is_some());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if attempt(middle, 5).is_some() {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    assert_eq!(attempt(low, 5).unwrap().entries, 0);
+    let tight = attempt(low, 6)
+        .expect("optional intermediate admission must not steal mandatory target backing");
+    assert_eq!(
+        tight.entries, 0,
+        "deny the intermediate, not the target result"
+    );
+    let room = attempt(low + 4096, 6).expect("spare capacity permits optional publication");
+    assert_eq!(
+        room.entries, 1,
+        "only the six-byte intermediate is cacheable"
+    );
+    let cacheable_target = attempt(low + 4096, expected.len())
+        .expect("denied optional target copying must preserve mandatory result backing");
+    assert_eq!(cacheable_target.entries, 1);
+    let cached_target = attempt(low + 64 * 1024, expected.len())
+        .expect("sufficient headroom preserves optional target caching");
+    assert_eq!(cached_target.entries, 2);
+}
+
+#[test]
+fn protected_ofs_result_stays_owned_through_mutable_conversion_with_retained_workspace() {
+    fn literal_delta(distance: usize, base_size: usize, result: &[u8]) -> Vec<u8> {
+        let mut instructions = Vec::new();
+        for mut size in [base_size, result.len()] {
+            loop {
+                let byte = u8::try_from(size & 127).unwrap();
+                size >>= 7;
+                instructions.push(byte | if size == 0 { 0 } else { 0x80 });
+                if size == 0 {
+                    break;
+                }
+            }
+        }
+        for literal in result.chunks(127) {
+            instructions.push(u8::try_from(literal.len()).unwrap());
+            instructions.extend_from_slice(literal);
+        }
+        let mut entry = Vec::new();
+        gix_pack::data::entry::Header::OfsDelta {
+            base_distance: u64::try_from(distance).unwrap(),
+        }
+        .write_to(u64::try_from(instructions.len()).unwrap(), &mut entry)
+        .unwrap();
+        entry.extend_from_slice(&compressed(&instructions));
+        entry
+    }
+
+    let root = Directory::new();
+    let base_entry = full_hello();
+    let middle_bytes = vec![b'm'; 16 * 1024];
+    let target_bytes = vec![b't'; 32 * 1024];
+    let middle_entry = literal_delta(base_entry.len(), 5, &middle_bytes);
+    let target_entry = literal_delta(middle_entry.len(), middle_bytes.len(), &target_bytes);
+    let middle = blob(&middle_bytes);
+    let target = blob(&target_bytes);
+    let index = root.write(
+        "owned-mutable-result",
+        &[
+            (blob(b"hello"), base_entry),
+            (middle, middle_entry),
+            (target, target_entry),
+        ],
+    );
+    let limits = ReadLimits {
+        max_delta_depth: 2,
+        ..ReadLimits::default()
+    };
+    let attempt = |capacity, cache_enabled, explicit_conversion| {
+        let budget = CapacityBudget::new(capacity);
+        let control = Control::new(Instant::now() + Duration::from_secs(10));
+        let result = (|| {
+            let packs = PackSet::open_with_options(
+                [index.clone()],
+                (),
+                gix_hash::Kind::Sha1,
+                &control,
+                limits,
+                DecoderOptions {
+                    cache_slots: if cache_enabled { 2 } else { 0 },
+                    cache_bytes: if cache_enabled { 64 * 1024 } else { 0 },
+                    max_cache_entry_bytes: if cache_enabled { 32 * 1024 } else { 0 },
+                    header_slots: 0,
+                    retained_workspace_bytes: 256 * 1024,
+                },
+                budget.clone(),
+            )
+            .ok()?;
+            let object = if explicit_conversion {
+                // Exercise the witness-to-mutable seam used by sessions as well
+                // as PackSet::decode. The fix must not depend on a decode flag.
+                let verified = packs
+                    .decode_verified(&target, &control, &budget, limits)
+                    .ok()??;
+                verified.into_object(&control, &budget).ok()?
+            } else {
+                packs.decode(&target, &control, &budget, limits).ok()??
+            };
+            assert_eq!(object.data.as_slice(), target_bytes.as_slice());
+            let stats = packs.cache_stats(&control).unwrap();
+            assert!(stats.workspace_capacity >= 2 * target_bytes.len());
+            if cache_enabled {
+                let pin = packs
+                    .cached_object(&middle, &control, limits)
+                    .unwrap()
+                    .expect("the tight run must really retain the 16 KiB intermediate");
+                assert_eq!(pin.as_slice(), middle_bytes.as_slice());
+            }
+            drop(object);
+            drop(packs);
+            Some(stats)
+        })();
+        assert_eq!(
+            budget.used(),
+            0,
+            "retained workspace and all entries are released"
+        );
+        result
+    };
+    // Locate the cache-disabled boundary without copying internal admission
+    // arithmetic. Add enough for the 16 KiB intermediate and fixed metadata,
+    // but less than another mandatory 32 KiB mutable target allocation.
+    let (mut low, mut high) = (0, 512 * 1024);
+    assert!(attempt(high, false, false).is_some());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if attempt(middle, false, false).is_some() {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let capacity = low + 24 * 1024;
+    for explicit_conversion in [false, true] {
+        assert_eq!(
+            attempt(capacity, false, explicit_conversion)
+                .unwrap()
+                .entries,
+            0
+        );
+        let enabled = attempt(capacity, true, explicit_conversion)
+            .expect("optional caching cannot force a second mandatory mutable target copy");
+        assert_eq!(
+            enabled.entries, 1,
+            "only the intermediate fits optional cache admission"
+        );
+    }
 }
 
 #[test]

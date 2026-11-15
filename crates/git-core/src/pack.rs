@@ -1,6 +1,7 @@
 //! Explicit pack/index pairs and controlled cross-pack delta decoding. Pack
 //! mappings are dropped before the caller's immutable source/pin guard.
 
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -80,9 +81,20 @@ pub struct PackSet<G> {
 }
 
 struct Prepared {
-    plans: Vec<(PackLocation, DecodePlan)>,
+    plans: Vec<PreparedPlan>,
     active: Vec<PackLocation>,
+    // Optional intermediates may not spend the backing needed by the caller's
+    // mandatory result. Keep actual backing, not an advisory free-byte check.
+    output: RefCell<Option<crate::CapacityBuffer>>,
+    output_compressed: Cell<usize>,
     _metadata: crate::CapacityReservation,
+}
+
+struct PreparedPlan {
+    location: PackLocation,
+    key: Key,
+    plan: DecodePlan,
+    is_ofs_delta: bool,
 }
 
 impl Prepared {
@@ -95,10 +107,7 @@ impl Prepared {
             .and_then(|n| n.checked_mul(128))
             .ok_or_else(|| invalid("delta metadata allocation overflow"))?;
         let bytes = count
-            .checked_mul(
-                std::mem::size_of::<(PackLocation, DecodePlan)>()
-                    + std::mem::size_of::<PackLocation>(),
-            )
+            .checked_mul(std::mem::size_of::<PreparedPlan>() + std::mem::size_of::<PackLocation>())
             .and_then(|n| n.checked_add(vendor))
             .ok_or_else(|| invalid("delta metadata allocation overflow"))?;
         let mut metadata = budget.reservation(bytes)?;
@@ -107,22 +116,62 @@ impl Prepared {
         plans.try_reserve_exact(count)?;
         active.try_reserve_exact(count)?;
         metadata.resize(
-            plans.capacity() * std::mem::size_of::<(PackLocation, DecodePlan)>()
+            plans.capacity() * std::mem::size_of::<PreparedPlan>()
                 + active.capacity() * std::mem::size_of::<PackLocation>()
                 + vendor,
         )?;
         Ok(Self {
             plans,
             active,
+            output: RefCell::new(None),
+            output_compressed: Cell::new(0),
             _metadata: metadata,
         })
     }
     fn plan(&self, location: PackLocation) -> DecodePlan {
         self.plans
             .iter()
-            .find(|(at, _)| *at == location)
+            .find(|prepared| prepared.location == location)
             .expect("preflight covered each resolver entry")
-            .1
+            .plan
+    }
+
+    fn is_root(&self, location: PackLocation) -> bool {
+        self.plans
+            .last()
+            .is_some_and(|plan| plan.location == location)
+    }
+
+    fn protect_output(
+        &self,
+        budget: &CapacityBudget,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<bool> {
+        check()?;
+        if self.output.borrow().is_some() {
+            return Ok(true);
+        }
+        // Preflight already converted every result size to usize.
+        let size = self
+            .plans
+            .last()
+            .expect("preflight has a root")
+            .plan
+            .header
+            .size as usize;
+        let output = match budget.buffer(size) {
+            Ok(output) => output,
+            Err(crate::executor::CapacityError::Stopped(reason)) => {
+                return Err(gix_error::Error::from_boxed(Box::new(reason)));
+            }
+            Err(_) => {
+                check()?;
+                return Ok(false);
+            }
+        };
+        check()?;
+        *self.output.borrow_mut() = Some(output);
+        Ok(true)
     }
 }
 
@@ -347,6 +396,32 @@ impl<G> PackSet<G> {
         );
         out.buffer().reconcile()?;
         let kind = kind?;
+        if let Some(mut data) = prepared.output.borrow_mut().take() {
+            for chunk in out.bytes().chunks(32 * 1024) {
+                control.check()?;
+                let start = data.as_slice().len();
+                data.resize(start + chunk.len(), 0)?;
+                data.as_mut_slice()[start..].copy_from_slice(chunk);
+            }
+            control.check()?;
+            let runtime = self
+                .runtime
+                .as_ref()
+                .expect("only acceleration protects output");
+            let check = || {
+                control
+                    .check()
+                    .map_err(|error| gix_error::Error::from_boxed(Box::new(error)))
+            };
+            return Ok(Some(runtime.returned_verified(
+                self.key(location)?,
+                id.to_owned(),
+                plan,
+                prepared.output_compressed.get(),
+                data,
+                &check,
+            )?));
+        }
         if let Some(runtime) = &self.runtime {
             let check = || {
                 control
@@ -500,7 +575,18 @@ impl<G> PackSet<G> {
             plan.validate(limits)?;
             // An empty object still needs no output backing.
             plan.workspace = plan.workspace.max(plan.header.size as usize);
-            prepared.plans.push((location, plan));
+            prepared.plans.push(PreparedPlan {
+                location,
+                key: Key {
+                    pack: bundle.pack.id,
+                    offset: entry.data_offset,
+                },
+                plan,
+                is_ofs_delta: matches!(
+                    entry.header,
+                    gix_pack::data::entry::Header::OfsDelta { .. }
+                ),
+            });
             Ok(plan)
         })();
         prepared.active.pop();
@@ -550,6 +636,8 @@ impl<G> PackSet<G> {
             runtime: self.runtime.clone(),
             key,
             plan,
+            bundle,
+            prepared,
         };
         let outcome = bundle.pack.decode_entry_controlled(
             entry,
@@ -588,14 +676,20 @@ impl<G> PackSet<G> {
         }
         verify_hash_with(id, outcome.kind, out, &check)?;
         if let Some(runtime) = &self.runtime {
-            runtime.store_verified(
-                key,
-                id.to_owned(),
-                plan,
-                outcome.compressed_size,
-                out,
-                &check,
-            )?;
+            if prepared.is_root(location) && prepared.output.borrow().is_some() {
+                // decode_verified keeps this backing owned through any mutable
+                // conversion. Target caching may admit a separate optional copy.
+                prepared.output_compressed.set(outcome.compressed_size);
+            } else {
+                runtime.store_verified(
+                    key,
+                    id.to_owned(),
+                    plan,
+                    outcome.compressed_size,
+                    out,
+                    &check,
+                )?;
+            }
             runtime.remember(key, id.to_owned(), plan, control)?;
         }
         control.check()?;
@@ -609,18 +703,29 @@ fn verify_hash_with(
     bytes: &[u8],
     check: &dyn Fn() -> gix_error::Result,
 ) -> gix_error::Result {
+    if hash_object_with(id.kind(), kind, bytes, check)?.as_ref() != id {
+        return Err(gix_error::corruption("physical pack object hash mismatch").into());
+    }
     check()?;
-    let mut hash = gix_hash::hasher(id.kind());
+    Ok(())
+}
+
+fn hash_object_with(
+    hash_kind: gix_hash::Kind,
+    kind: gix_object::Kind,
+    bytes: &[u8],
+    check: &dyn Fn() -> gix_error::Result,
+) -> gix_error::Result<gix_hash::ObjectId> {
+    check()?;
+    let mut hash = gix_hash::hasher(hash_kind);
     hash.update(&gix_object::encode::loose_header(kind, bytes.len() as u64));
     for chunk in bytes.chunks(32 * 1024) {
         check()?;
         hash.update(chunk);
     }
-    if hash.try_finalize()?.as_ref() != id {
-        return Err(gix_error::corruption("physical pack object hash mismatch").into());
-    }
+    let id = hash.try_finalize()?;
     check()?;
-    Ok(())
+    Ok(id)
 }
 
 pub struct PackProvider<G> {

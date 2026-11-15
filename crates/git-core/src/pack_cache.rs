@@ -11,7 +11,7 @@ use gix_object::{Header, Kind};
 
 use super::DecodePlan;
 use crate::executor::{CapacityError, CapacityReservation};
-use crate::objects::{AdmittedVec, Result, invalid};
+use crate::objects::{AdmittedVec, Result, VerifiedObject, invalid};
 use crate::{CapacityBudget, CapacityBuffer, Control};
 
 /// Existing `PackSet::open` reserves no acceleration memory. Explicit options
@@ -111,6 +111,17 @@ pub(super) struct Entry {
     // Candidates and pinned entries can coexist with every indexed slot. Their
     // ownership metadata must therefore be charged per allocation, not per slot.
     _metadata: CapacityReservation,
+}
+
+struct EntryAdmission {
+    quota: QuotaPermit,
+    metadata: CapacityReservation,
+}
+
+// Actual backing precedes its optional cache charges on every failure path.
+struct EntryStorage {
+    data: CapacityBuffer,
+    admission: EntryAdmission,
 }
 
 #[derive(Clone, Copy)]
@@ -414,7 +425,25 @@ impl Runtime {
             }
             return Ok(());
         }
-        let mut permit = self.quota.reserve(bytes.len());
+        let Some(mut storage) = self.entry_storage(bytes.len(), check)? else {
+            return Ok(());
+        };
+        Self::copy_entry(bytes, &mut storage.data, check)?;
+        let candidate = Self::entry(key, id, plan, compressed, storage);
+        self.publish(&candidate, check)?;
+        Ok(())
+    }
+
+    fn entry_admission(
+        &self,
+        bytes: usize,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<Option<EntryAdmission>> {
+        check()?;
+        if self.options.cache_slots == 0 || bytes > self.options.max_cache_entry_bytes {
+            return Ok(None);
+        }
+        let mut permit = self.quota.reserve(bytes);
         for _ in 0..self.options.cache_slots {
             if permit.is_some() {
                 break;
@@ -422,11 +451,11 @@ impl Runtime {
             if !self.evict_one(check)? {
                 break;
             }
-            permit = self.quota.reserve(bytes.len());
+            permit = self.quota.reserve(bytes);
         }
-        let Some(mut permit) = permit else {
+        let Some(permit) = permit else {
             check()?;
-            return Ok(());
+            return Ok(None);
         };
         let metadata = match self
             .budget
@@ -438,27 +467,51 @@ impl Runtime {
             }
             Err(_) => {
                 check()?;
-                return Ok(());
+                return Ok(None);
             }
         };
-        let mut data = match self.budget.buffer(bytes.len()) {
+        check()?;
+        Ok(Some(EntryAdmission {
+            quota: permit,
+            metadata,
+        }))
+    }
+
+    fn entry_storage(
+        &self,
+        bytes: usize,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<Option<EntryStorage>> {
+        let Some(mut admission) = self.entry_admission(bytes, check)? else {
+            return Ok(None);
+        };
+        let data = match self.budget.buffer(bytes) {
             Ok(data) => data,
             Err(CapacityError::Stopped(reason)) => {
                 return Err(gix_error::Error::from_boxed(Box::new(reason)));
             }
             Err(_) => {
                 check()?;
-                return Ok(());
+                return Ok(None);
             }
         };
         if data.capacity() > self.options.max_cache_entry_bytes {
             check()?;
-            return Ok(());
+            return Ok(None);
         }
-        if !permit.grow_to(data.capacity()) {
+        if !admission.quota.grow_to(data.capacity()) {
             check()?;
-            return Ok(());
+            return Ok(None);
         }
+        check()?;
+        Ok(Some(EntryStorage { data, admission }))
+    }
+
+    fn copy_entry(
+        bytes: &[u8],
+        data: &mut CapacityBuffer,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result {
         for chunk in bytes.chunks(32 * 1024) {
             check()?;
             let start = data.as_slice().len();
@@ -467,15 +520,33 @@ impl Runtime {
             data.as_mut_slice()[start..].copy_from_slice(chunk);
         }
         check()?;
-        let candidate = Arc::new(Entry {
+        Ok(())
+    }
+
+    fn entry(
+        key: Key,
+        id: ObjectId,
+        plan: DecodePlan,
+        compressed: usize,
+        storage: EntryStorage,
+    ) -> Arc<Entry> {
+        Arc::new(Entry {
             key,
             id,
             plan,
             compressed,
-            data,
-            _quota: permit,
-            _metadata: metadata,
-        });
+            data: storage.data,
+            _quota: storage.admission.quota,
+            _metadata: storage.admission.metadata,
+        })
+    }
+
+    fn publish(
+        &self,
+        candidate: &Arc<Entry>,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<bool> {
+        let key = candidate.key;
         // Races can consume the optional slot after admission. Skip publication
         // rather than retaining unindexed storage or evicting pinned entries.
         for _ in 0..=self.options.cache_slots {
@@ -487,7 +558,7 @@ impl Runtime {
                     .binary_search_by_key(&key, |&(key, _)| key)
                     .is_ok()
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if let Some(slot) = tables.entries.iter().position(|slot| slot.is_none()) {
                     let position = tables
@@ -496,15 +567,81 @@ impl Runtime {
                         .expect_err("new entry key is absent");
                     assert!(tables.entry_index.len() < tables.entry_index.capacity());
                     tables.entry_index.insert(position, (key, slot));
-                    tables.entries[slot] = Some(candidate);
-                    return Ok(());
+                    tables.entries[slot] = Some(candidate.clone());
+                    return Ok(true);
                 }
             }
             if !self.evict_one(check)? {
-                return Ok(());
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// Keep mandatory result backing owned through later mutable conversions.
+    /// A cache pin would force into_object to admit another mandatory body, so
+    /// target caching must instead admit its own independently optional copy.
+    pub fn returned_verified(
+        &self,
+        key: Key,
+        id: ObjectId,
+        plan: DecodePlan,
+        compressed: usize,
+        data: CapacityBuffer,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<VerifiedObject> {
+        self.store_verified(key, id, plan, compressed, data.as_slice(), check)?;
+        check()?;
+        Ok(VerifiedObject::from_pack_verified(
+            id.as_ref(),
+            plan.header.kind,
+            data,
+            plan,
+        ))
+    }
+
+    /// A bounded, advisory eligibility check before optional intermediate hashing.
+    /// Publication still admits actual backing and rechecks races in store_verified.
+    fn may_store_intermediate(
+        &self,
+        key: Key,
+        bytes: usize,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<bool> {
+        check()?;
+        if self.options.cache_slots == 0 || bytes > self.options.max_cache_entry_bytes {
+            return Ok(false);
+        }
+        let eligible = {
+            let tables = self.lock();
+            if tables
+                .entry_index
+                .binary_search_by_key(&key, |&(key, _)| key)
+                .is_ok()
+            {
+                false
+            } else {
+                let mut available = self
+                    .quota
+                    .limit
+                    .saturating_sub(self.quota.used.load(Ordering::Acquire));
+                let mut slot_available = false;
+                // At most 4096 metadata-only inspections, with no owners dropped.
+                for entry in &tables.entries {
+                    match entry {
+                        None => slot_available = true,
+                        Some(entry) if Arc::strong_count(entry) == 1 => {
+                            slot_available = true;
+                            available = available.saturating_add(entry.data.capacity());
+                        }
+                        Some(_) => {}
+                    }
+                }
+                slot_available && bytes <= available
+            }
+        };
+        check()?;
+        Ok(eligible)
     }
 
     pub fn note_decode(&self) {
@@ -631,12 +768,17 @@ impl Drop for Workspace {
     }
 }
 
-pub(super) struct EntryCache {
+pub(super) struct EntryCache<'a> {
     pub runtime: Option<Arc<Runtime>>,
     pub key: Key,
     pub plan: DecodePlan,
+    pub bundle: &'a gix_pack::Bundle,
+    pub prepared: &'a super::Prepared,
 }
-impl gix_pack::cache::DecodeEntry for EntryCache {
+impl gix_pack::cache::DecodeEntry for EntryCache<'_> {
+    fn cache_intermediate_objects(&self) -> bool {
+        self.runtime.is_some()
+    }
     fn get_controlled(
         &mut self,
         pack_id: u32,
@@ -680,7 +822,7 @@ impl gix_pack::cache::DecodeEntry for EntryCache {
         offset: u64,
         data: &[u8],
         kind: Kind,
-        _compressed: usize,
+        compressed: usize,
         check: &dyn Fn() -> gix_error::Result,
     ) -> gix_error::Result {
         check()?;
@@ -690,6 +832,60 @@ impl gix_pack::cache::DecodeEntry for EntryCache {
                 offset,
             })
         {
+            let Some(runtime) = &self.runtime else {
+                return Ok(());
+            };
+            let key = Key {
+                pack: pack_id,
+                offset,
+            };
+            if pack_id != self.bundle.pack.id
+                || !runtime.may_store_intermediate(key, data.len(), check)?
+            {
+                return Ok(());
+            }
+            // Prepared metadata is bounded by admitted chain depth. Bind the
+            // decoder's data offset to this physical entry and its original full
+            // chain plan, not the requested target's resource summary.
+            for prepared in &self.prepared.plans {
+                check()?;
+                if prepared.key != key || !prepared.is_ofs_delta {
+                    continue;
+                }
+                if kind != prepared.plan.header.kind
+                    || data.len() as u64 != prepared.plan.header.size
+                {
+                    return Err(gix_error::corruption(
+                        "decoded intermediate disagrees with its preflight header",
+                    )
+                    .into());
+                }
+                // First protect the root's mandatory returned backing. Then
+                // admit this optional entry's actual allocation and metadata
+                // before hashing: repeated global-admission misses do no hash
+                // work and cannot consume the caller's result capacity.
+                if !self.prepared.protect_output(&runtime.budget, check)? {
+                    return Ok(());
+                }
+                let Some(mut storage) = runtime.entry_storage(data.len(), check)? else {
+                    return Ok(());
+                };
+                let id =
+                    super::hash_object_with(self.bundle.index.object_hash(), kind, data, check)?;
+                // No reverse index or caller-provided proof is needed: only a
+                // digest indexed at this exact physical location may be sealed.
+                let Some(position) = self.bundle.index.lookup(id.as_ref()) else {
+                    return Ok(());
+                };
+                if self.bundle.index.pack_offset_at_index(position) != prepared.location.offset {
+                    return Ok(());
+                }
+                check()?;
+                Runtime::copy_entry(data, &mut storage.data, check)?;
+                let candidate = Runtime::entry(key, id, prepared.plan, compressed, storage);
+                runtime.publish(&candidate, check)?;
+                return Ok(());
+            }
             return Ok(());
         }
         if kind != self.plan.header.kind || data.len() as u64 != self.plan.header.size {
