@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from cache_storage_cost import WireProxy
 from blame_concurrency import Gates
@@ -431,6 +431,8 @@ class Matrix:
             cleanup_all(actions, row.setdefault("contention_cleanup", {}))
 
     def mixed(self, row, target, name, port, mutable, tip, fetch_url, publisher):
+        require(urlsplit(fetch_url).netloc != urlsplit(publisher).netloc,
+                "mixed upload and receive require separate foreground admission owners")
         f = self.f
         gateway = FaultGateway(f.env["GIT_RS_S3_ENDPOINT"])
         active = None
@@ -506,6 +508,16 @@ class Matrix:
             f.git(seed, "push", publisher + "/matrix/contended.git", "main")
             for commit in commits[:7] + [tip]:
                 f.git(seed, "push", publisher + "/matrix/mutable.git", commit + ":refs/heads/main")
+            # Each production process retains worker=1/queue=0. Concurrent native
+            # receive and upload therefore use distinct replicas, not competing
+            # requests that this profile must immediately reject.
+            reader = "source-reader-" + str(ordinal)
+            _, read_port = f.start(reader)
+            row["foreground_source_instances"] = {
+                "receive": f.daemons["publisher-" + str(ordinal)].identifier,
+                "upload": f.daemons[reader].identifier}
+            require(len(set(row["foreground_source_instances"].values())) == 2,
+                    "mixed source replicas must be distinct actual runtime containers")
             targets = [{"path": path, "url": f"/matrix/history.git/blame/{tip}?path={quote(path, safe='')}", "expected": body}
                        for path, body in expected.items()]
             row["artifact_identities"] = [{"path": target["path"], "bytes": len(target["expected"]),
@@ -540,7 +552,8 @@ class Matrix:
                         self.fetch(second + "-outage", outage, target, row, "cache-outage")
                     f.stop(second + "-outage")
                     sql(f, f"GRANT CONNECT ON DATABASE {cache_db} TO {role}", admin)
-                self.mixed(row, targets[0], first, port, seed, tip, publisher + "/matrix/history.git", publisher)
+                self.mixed(row, targets[0], first, port, seed, tip,
+                           f"http://127.0.0.1:{read_port}/matrix/history.git", publisher)
                 until(lambda: len(probe.samples) >= self.limits["minimum_source_samples"] or probe.errors,
                       "minimum actual source sample inventory", 5)
             row["replica_catchup_seconds"] = replica.fence(self.limits["replica_catchup_seconds"])
@@ -583,6 +596,10 @@ class Matrix:
                 write_report(f)
 
     def score(self, row):
+        sources = row.get("foreground_source_instances", {})
+        require(set(sources) == {"receive", "upload"} and len(set(sources.values())) == 2
+                and all(isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity)
+                        for identity in sources.values()), "mixed foreground runtime owners are not distinct")
         require(not row["source_probe_errors"] and row["source_sample_count"] >= self.limits["minimum_source_samples"],
                 "incomplete source observations")
         require(row["source_snapshot_ms"]["p99"] <= self.limits["source_p99_ms"], "source tail exceeded the frozen budget")

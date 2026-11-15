@@ -210,7 +210,11 @@ records owned/pending build claims and actual duplicate computations; it does no
 assume that a shared cache is a distributed CPU scheduler. Native full porcelain
 is prepared outside the measured cells, and each response must match it exactly.
 Mixed source work uses separate repositories and an explicitly held maintenance
-GET. Reported primary WAL includes probes/source work; measured copies do not
+GET. Concurrent native receive and upload use distinct recorded production
+containers, each retaining its one-worker/zero-waiter admission profile. They do
+not compete for a single process's only CPU permit. The additional replica counts
+against the same aggregate bounds in every placement and repetition. Reported
+primary WAL includes probes/source work; measured copies do not
 cover allocator/kernel/TLS copies. Cold means fresh application state, without
 flushing OS or PostgreSQL buffers. A physical replay fence is not an HA result.
 The smoke does not replace a separately configured full-corpus/GitLab campaign.

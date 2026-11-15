@@ -77,6 +77,7 @@ class EvidenceContracts(unittest.TestCase):
         config = load_config(ROOT / "tests/fixtures/cache-matrix.json")
         self.matrix = Matrix(SimpleNamespace(results={}), config)
         self.row = {"placement": "all-pg", "profile": "derivation", "source_probe_errors": [],
+                    "foreground_source_instances": {"receive": "1" * 64, "upload": "2" * 64},
                     "source_sample_count": 3, "source_snapshot_ms": {"p99": 12}, "requests": [],
                     "mixed": {"before": {"generation": 8, "epoch": 0, "packs": 8, "operations": []},
                               "after": {"generation": 10, "epoch": 1, "packs": 1, "operations": [{
@@ -102,9 +103,16 @@ class EvidenceContracts(unittest.TestCase):
         row["requests"] = [event for event in row["requests"] if event["phase"] != "restart"]
         with self.assertRaisesRegex(AssertionError, "request inventory"):
             self.matrix.score(row)
+
         row = copy.deepcopy(self.row)
         row["requests"].append(copy.deepcopy(row["requests"][0]))
         with self.assertRaisesRegex(AssertionError, "request inventory"):
+            self.matrix.score(row)
+
+    def test_a_shared_runtime_cannot_claim_successful_concurrent_foreground_owners(self):
+        row = copy.deepcopy(self.row)
+        row["foreground_source_instances"]["upload"] = row["foreground_source_instances"]["receive"]
+        with self.assertRaisesRegex(AssertionError, "runtime owners are not distinct"):
             self.matrix.score(row)
 
     def test_ready_body_and_job_local_hits_do_not_prove_distributed_derivation_reuse(self):
