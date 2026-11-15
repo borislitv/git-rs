@@ -369,7 +369,10 @@ impl Drop for Multipart {
             )
         });
         if result.is_err() {
-            eprintln!("multipart abort unconfirmed; durable intent retained");
+            // Cleanup must not wait for a diagnostic sink, including library/CLI
+            // callers that never initialized service logging. The durable intent
+            // is the recovery record; this best-effort event is not that record.
+            metrics::service_event(metrics::ServiceEvent::MultipartAbortUnconfirmed);
         }
     }
 }
@@ -415,6 +418,341 @@ fn xml_field(input: &[u8], root: &[u8], target: Option<&[u8]>) -> Result<Option<
                     .all(u8::is_ascii_whitespace) => {}
             Event::Eof if closed => return Ok(found),
             _ => return Err(invalid("invalid or failed S3 multipart XML response")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::{Store, UploadPlan};
+    use crate::{
+        Result,
+        cpu_jobs::{CpuJob, CpuJobs},
+        process::Operation,
+    };
+    use git_rs_core::{
+        CapacityBudget, Control, Object, ReadLimits, SnapshotIdentity, SnapshotSession,
+        VerifiedObjectProvider,
+    };
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::{Child, Command, Stdio},
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    const CONTENTS: &[u8] = b"synthetic pack body";
+
+    // Faithful immutable in-memory source: real object hashing, selection and
+    // pack encoding remain production code. The weak witness observes its hold
+    // without keeping the provider alive on behalf of the job.
+    struct BlobSource {
+        identity: SnapshotIdentity,
+        id: gix::ObjectId,
+        _hold: Arc<()>,
+    }
+    impl VerifiedObjectProvider for BlobSource {
+        fn identity(&self) -> &SnapshotIdentity {
+            &self.identity
+        }
+
+        fn header(
+            &self,
+            id: &gix::hash::oid,
+            control: &Control,
+        ) -> Result<Option<gix::objs::Header>> {
+            control.check()?;
+            Ok((id == self.id.as_ref()).then_some(gix::objs::Header {
+                kind: gix::objs::Kind::Blob,
+                size: CONTENTS.len() as u64,
+            }))
+        }
+
+        fn object(
+            &self,
+            id: &gix::hash::oid,
+            control: &Control,
+            budget: &CapacityBudget,
+            limits: ReadLimits,
+        ) -> Result<Option<Object>> {
+            if self.header(id, control)?.is_none() {
+                return Ok(None);
+            }
+            if CONTENTS.len() > limits.max_object_bytes {
+                return Err(crate::invalid("fixture object exceeds read limit"));
+            }
+            let mut data = budget.buffer(CONTENTS.len())?;
+            data.extend_controlled(CONTENTS, CONTENTS.len(), control)?;
+            Ok(Some(Object {
+                kind: gix::objs::Kind::Blob,
+                data,
+            }))
+        }
+    }
+
+    struct FailedPlan {
+        plan: UploadPlan,
+        source: BlobSource,
+    }
+    impl CpuJob for FailedPlan {
+        type Output = ();
+        fn run(self, control: &Control, budget: &CapacityBudget) -> Result<()> {
+            let identity = self.source.identity().clone();
+            let id = self.source.id;
+            let source = SnapshotSession::open(
+                self.source,
+                &identity,
+                control.clone(),
+                budget.clone(),
+                ReadLimits::default(),
+            )?;
+            let selection = source.select_objects([id], None, &[])?;
+            // Exercise the component's public operation, including real pack
+            // writing and its failure cleanup. Never construct Multipart here.
+            self.plan.write(&source, &selection, control, budget)?;
+            Ok(())
+        }
+    }
+
+    struct NextJob;
+    impl CpuJob for NextJob {
+        type Output = usize;
+        fn run(self, control: &Control, _: &CapacityBudget) -> Result<usize> {
+            control.check()?;
+            Ok(42)
+        }
+    }
+
+    // Start at a faithfully pre-established plan, i.e. the state returned by
+    // UploadPlan::begin after its SQL transaction. This fixture does NOT execute
+    // or prove that transaction, durable intent retention, SQL publication or GC.
+    // It tests UploadPlan::write's public contract without a new production seam.
+    #[test]
+    fn multipart_diagnostic_fixture() {
+        if std::env::var("GIT_RS_MULTIPART_DIAGNOSTIC_FIXTURE").as_deref() != Ok("1") {
+            return;
+        }
+        let logs = if std::env::var("GIT_RS_MULTIPART_SERVICE_LOGS").as_deref() == Ok("1") {
+            crate::metrics::init_service_logs().unwrap()
+        } else {
+            None
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let store = Store {
+            endpoint: format!("http://{}", listener.local_addr().unwrap()),
+            bucket: "synthetic".into(),
+            region: "us-east-1".into(),
+            access: "synthetic".into(),
+            secret: "synthetic".into(),
+        };
+        let repo = "00000000-0000-0000-0000-000000000001";
+        let operation = "00000000-0000-0000-0000-000000000002";
+        let plan = UploadPlan {
+            store,
+            repo: repo.into(),
+            operation: operation.into(),
+            pack_key: format!("repos/{repo}/operations/{operation}/output.pack"),
+            index_key: format!("repos/{repo}/operations/{operation}/output.idx"),
+            guard: String::new(),
+        };
+        let hold = Arc::new(());
+        let witness = Arc::downgrade(&hold);
+        let source = BlobSource {
+            identity: SnapshotIdentity {
+                source: b"synthetic-multipart-source".to_vec(),
+                generation: b"one".to_vec(),
+                object_hash: gix::hash::Kind::Sha1,
+            },
+            id: gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, CONTENTS)
+                .unwrap(),
+            _hold: hold,
+        };
+        let cpu = Arc::new(CpuJobs::new(1, 0).unwrap());
+        let admitted = cpu.try_admit(Operation::new(20)).unwrap().unwrap();
+        let budget = admitted.budget().clone();
+        std::thread::scope(|scope| {
+            let observed_cpu = cpu.clone();
+            let observed_budget = budget.clone();
+            let observed_source = witness.clone();
+            let peer = scope.spawn(move || {
+                let mut requests = Vec::new();
+                for ordinal in 0..3 {
+                    let (stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream.read_line(&mut line).unwrap();
+                    requests.push(line.trim().to_owned());
+                    assert!(requests[ordinal].contains("/output.pack?"));
+                    let mut length = 0;
+                    loop {
+                        line.clear();
+                        assert!(stream.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    assert!(length <= 1024);
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).unwrap();
+                    let (status, response) = if ordinal == 0 {
+                        assert!(requests[0].starts_with("POST "));
+                        assert!(requests[0].contains("?uploads "));
+                        (
+                            "200 OK",
+                            concat!(
+                                "<InitiateMultipartUploadResult>",
+                                "<UploadId>owned-upload</UploadId>",
+                                "</InitiateMultipartUploadResult>",
+                            ),
+                        )
+                    } else {
+                        assert!(requests[ordinal].contains("uploadId=owned-upload"));
+                        if ordinal == 1 {
+                            assert!(requests[1].starts_with("PUT "));
+                            assert!(requests[1].contains("partNumber=1"));
+                            assert!(body.len() > 32);
+                            assert_eq!(&body[..12], b"PACK\0\0\0\x02\0\0\0\x01");
+                        } else {
+                            assert!(requests[2].starts_with("DELETE "));
+                            assert_eq!(observed_cpu.admitted(), 1);
+                            assert!(observed_budget.used() > 0);
+                            assert!(
+                                observed_source.upgrade().is_some(),
+                                "source hold released during abort"
+                            );
+                            println!("\nabort-ready");
+                            std::io::stdout().flush().unwrap();
+                            // The parent releases this real fault boundary only
+                            // after observing admission held and stderr full.
+                            std::io::stdin().read_exact(&mut [0]).unwrap();
+                        }
+                        ("503 Service Unavailable", "")
+                    };
+                    write!(
+                        stream.get_mut(),
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .unwrap();
+                }
+                requests
+            });
+            let error = match admitted.run(FailedPlan { plan, source }) {
+                Err(error) => error,
+                Ok(_) => panic!("failed S3 part must not produce a publication input"),
+            };
+            assert!(error.to_string().contains("HTTP 503"));
+            drop(error);
+            assert_eq!(cpu.admitted(), 0, "abort diagnostic retained CPU admission");
+            assert_eq!(budget.used(), 0, "multipart backing survived cleanup");
+            assert!(
+                witness.upgrade().is_none(),
+                "source hold survived completed cleanup"
+            );
+            let next = cpu.try_run(Operation::new(5), NextJob).unwrap().unwrap();
+            assert_eq!(*next, 42, "the actual CPU slot must accept subsequent work");
+            drop(next);
+            let requests = peer.join().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|line| line.starts_with("POST "))
+                    .count(),
+                1,
+                "failed output must never send CompleteMultipartUpload"
+            );
+        });
+        drop(logs);
+        // Avoid unrelated libtest final output/diagnostics after our receipt.
+        println!("cleanup-complete");
+        std::io::stdout().flush().unwrap();
+        std::process::exit(0);
+    }
+
+    struct Running(Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn upload_plan_write_failed_abort_diagnostic_releases_source_and_cpu() {
+        for service_logs in ["0", "1"] {
+            let (undrained, stderr) = rustix::pipe::pipe_with(
+                rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+            )
+            .unwrap();
+            for bytes in [&[b'x'; 4096][..], b"x"] {
+                loop {
+                    match rustix::io::write(&stderr, bytes) {
+                        Ok(count) => assert!(count > 0),
+                        Err(rustix::io::Errno::AGAIN) => break,
+                        Err(error) => panic!("fill multipart diagnostic pipe: {error}"),
+                    }
+                }
+            }
+            let flags = rustix::fs::fcntl_getfl(&stderr).unwrap();
+            rustix::fs::fcntl_setfl(&stderr, flags & !rustix::fs::OFlags::NONBLOCK).unwrap();
+            let (stdout, writer) = UnixStream::pair().unwrap();
+            stdout
+                .set_read_timeout(Some(Duration::from_secs(8)))
+                .unwrap();
+            let stdout_fd: OwnedFd = writer.into();
+            let mut child = Running(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "blob::multipart::diagnostics_tests::multipart_diagnostic_fixture",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env_clear()
+                    .env("GIT_RS_MULTIPART_DIAGNOSTIC_FIXTURE", "1")
+                    .env("GIT_RS_MULTIPART_SERVICE_LOGS", service_logs)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::from(stdout_fd))
+                    .stderr(Stdio::from(stderr))
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut output = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                assert!(output.read_line(&mut line).unwrap() > 0);
+                if line.trim() == "abort-ready" {
+                    break;
+                }
+            }
+            child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "cleanup-complete");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(Instant::now() < deadline, "multipart fixture did not exit");
+                std::thread::yield_now();
+            }
+            drop(undrained);
         }
     }
 }

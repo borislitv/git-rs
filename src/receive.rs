@@ -501,15 +501,17 @@ fn validate(
         }
         Ok(Some((object.header().kind, object.as_slice().len())))
     };
-    let outcome = pack::prepare(
-        input,
-        &commands,
-        boundary,
-        limits,
-        budget.as_ref(),
-        &resolve,
-        &|| vendor_check(control),
-    )?;
+    let outcome = metrics::measure(Metric::Phase(Phase::ReceivePackPrepare), || {
+        pack::prepare(
+            input,
+            &commands,
+            boundary,
+            limits,
+            budget.as_ref(),
+            &resolve,
+            &|| vendor_check(control),
+        )
+    })?;
     let normalized = outcome.as_ref().map(pack::Normalized::open).transpose()?;
     let mut entries = pack::Entries::new(normalized.as_ref());
     let combined = pack::Combined {

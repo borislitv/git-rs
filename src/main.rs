@@ -612,6 +612,32 @@ fn run() -> Result<()> {
     }
 }
 
+/// A terminal CLI diagnostic may own a blocked sink until process exit, but it
+/// must never hold the exiting caller. Service diagnostics remain closed events;
+/// neither an unavailable service worker nor a full queue triggers a sync write.
+fn report_terminal_failure(error: Box<dyn std::error::Error + Send + Sync>) {
+    // Exit follows immediately. Even thread-start failure must not run an
+    // arbitrary error destructor on the exiting caller.
+    let error = std::mem::ManuallyDrop::new(error);
+    if metrics::service_event(ServiceEvent::TerminalFailure) {
+        return;
+    }
+    let (done, finished) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("git-rs-terminal-error".into())
+        .spawn(move || {
+            // Formatting is off-thread too: an error's Display implementation is
+            // not a bounded operation. Never join this process-lifetime helper.
+            let error = std::mem::ManuallyDrop::into_inner(error);
+            eprintln!("git-rs: {error}");
+            let _ = done.send(());
+        })
+        .is_ok()
+    {
+        let _ = finished.recv_timeout(Duration::from_millis(200));
+    }
+}
+
 fn main() {
     // The default hook may block indefinitely on stderr before an executor can
     // catch a panic. Do not format untrusted payloads or perform I/O here. The
@@ -621,7 +647,7 @@ fn main() {
     let result = run();
     drop(timings);
     if let Err(error) = result {
-        eprintln!("git-rs: {error}");
+        report_terminal_failure(error);
         std::process::exit(1);
     }
 }

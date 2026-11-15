@@ -189,10 +189,15 @@ fn probe(mut stream: TcpStream, status: &Status, cache: &Cache) -> Result<()> {
             "/leaderz" if status.election.fence().is_some() => ("200 OK", "authoritative maintenance leader\n".into()),
             "/leaderz" => ("503 Service Unavailable", "no maintenance authority\n".into()),
             "/metrics" => {
-                let mut body = metrics::global().render(usize::from(status.running.load(Ordering::Acquire)), cache.allocated());
+                let mut body = metrics::global().render(0, cache.allocated());
                 use std::fmt::Write;
+                writeln!(body, "# HELP git_rs_maintenance_active_jobs Currently running maintenance jobs.\n# TYPE git_rs_maintenance_active_jobs gauge")?;
+                writeln!(body, "git_rs_maintenance_active_jobs {}", usize::from(status.running.load(Ordering::Acquire)))?;
+                writeln!(body, "# HELP git_rs_maintenance_leader Whether this process currently holds maintenance leadership.\n# TYPE git_rs_maintenance_leader gauge")?;
                 writeln!(body, "git_rs_maintenance_leader {}", usize::from(status.election.fence().is_some()))?;
+                writeln!(body, "# HELP git_rs_maintenance_jobs_completed_total Successfully completed maintenance jobs.\n# TYPE git_rs_maintenance_jobs_completed_total counter")?;
                 writeln!(body, "git_rs_maintenance_jobs_completed_total {}", status.completed.load(Ordering::Acquire))?;
+                writeln!(body, "# HELP git_rs_maintenance_jobs_failed_total Failed maintenance jobs.\n# TYPE git_rs_maintenance_jobs_failed_total counter")?;
                 writeln!(body, "git_rs_maintenance_jobs_failed_total {}", status.failed.load(Ordering::Acquire))?;
                 ("200 OK", body)
             }

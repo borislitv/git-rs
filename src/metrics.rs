@@ -29,6 +29,8 @@ pub enum ServiceEvent {
     ServingSocketCleanupFailed,
     LeaseReleaseFailed,
     ScratchCleanupFailed,
+    MultipartAbortUnconfirmed,
+    TerminalFailure,
 }
 
 impl ServiceEvent {
@@ -45,6 +47,8 @@ impl ServiceEvent {
             }
             Self::LeaseReleaseFailed => b"git_rs_error event=lease_release_failed\n",
             Self::ScratchCleanupFailed => b"git_rs_error event=scratch_cleanup_failed\n",
+            Self::MultipartAbortUnconfirmed => b"git_rs_error event=multipart_abort_unconfirmed\n",
+            Self::TerminalFailure => b"git_rs_error event=terminal_failure\n",
         }
     }
 }
@@ -182,8 +186,10 @@ pub enum Phase {
     Graph,
     Upload,
     Publish,
+    ReceivePackPrepare,
+    UploadServe,
 }
-const PHASES: [&str; 9] = [
+const PHASES: [&str; 11] = [
     "snapshot",
     "materialize",
     "scratch_init",
@@ -193,6 +199,8 @@ const PHASES: [&str; 9] = [
     "graph",
     "upload",
     "publish",
+    "receive_pack_prepare",
+    "upload_serve",
 ];
 
 #[derive(Clone, Copy)]
@@ -355,6 +363,7 @@ pub struct Registry {
     dependencies: [Histogram; DEPENDENCIES.len()],
     subprocesses: [Histogram; PROGRAMS.len()],
     cache_wait: Histogram,
+    cache_waiters: AtomicU64,
     cache_results: [AtomicU64; CACHE_RESULTS.len()],
     admission_rejections: [AtomicU64; LISTENERS.len()],
     bytes: [AtomicU64; DIRECTIONS.len()],
@@ -380,6 +389,7 @@ impl Registry {
             dependencies: std::array::from_fn(|_| Histogram::new()),
             subprocesses: std::array::from_fn(|_| Histogram::new()),
             cache_wait: Histogram::new(),
+            cache_waiters: AtomicU64::new(0),
             cache_results: std::array::from_fn(|_| AtomicU64::new(0)),
             admission_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             bytes: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -533,7 +543,7 @@ impl Registry {
             header(
                 &mut output,
                 &errors,
-                "Failed completed operations; subprocess errors mean failed spawn or nonzero exit.",
+                "Completed operations that failed or whose measurement scope ended without success; subprocess errors mean failed spawn or nonzero exit.",
                 "counter",
             );
             for (name, histogram) in names.iter().zip(histograms) {
@@ -569,6 +579,18 @@ impl Registry {
             .render(&mut output, "git_rs_cache_wait_duration_seconds", "");
         header(
             &mut output,
+            "git_rs_cache_waiters",
+            "Callers currently in a single-flight cache wait scope.",
+            "gauge",
+        );
+        writeln!(
+            output,
+            "git_rs_cache_waiters {}",
+            self.cache_waiters.load(Ordering::Relaxed)
+        )
+        .unwrap();
+        header(
+            &mut output,
             "git_rs_admission_rejections_total",
             "Connections closed because listener admission or request thread creation failed.",
             "counter",
@@ -584,7 +606,7 @@ impl Registry {
         header(
             &mut output,
             "git_rs_s3_transferred_bytes_total",
-            "Verified downloaded or acknowledged uploaded object bytes; excludes cache hits and protocol overhead.",
+            "Length-checked downloaded payload bytes or acknowledged uploaded payload bytes, including multipart parts; excludes cache hits and protocol overhead; does not imply object validation or publication.",
             "counter",
         );
         for (i, name) in DIRECTIONS.iter().enumerate() {
@@ -616,6 +638,9 @@ pub struct Timer {
 }
 impl Timer {
     pub fn start(metric: Metric) -> Self {
+        if matches!(metric, Metric::CacheWait) {
+            global().cache_waiters.fetch_add(1, Ordering::Relaxed);
+        }
         Self {
             metric,
             start: Instant::now(),
@@ -631,6 +656,9 @@ impl Drop for Timer {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed();
         global().observe(self.metric, elapsed, self.success);
+        if matches!(self.metric, Metric::CacheWait) {
+            global().cache_waiters.fetch_sub(1, Ordering::Relaxed);
+        }
         let (kind, name) = match self.metric {
             Metric::Phase(value) => ("phase", PHASES[value as usize]),
             Metric::Stage(value) => ("stage", STAGES[value as usize]),

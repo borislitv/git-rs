@@ -163,6 +163,9 @@ impl Upload {
         control: &Control,
         budget: &CapacityBudget,
     ) -> Result<Arc<Source>> {
+        let timer = crate::metrics::Timer::start(crate::metrics::Metric::Phase(
+            crate::metrics::Phase::UploadServe,
+        ));
         let Self {
             source,
             store,
@@ -231,6 +234,7 @@ impl Upload {
             }
         }
         control.check()?;
+        timer.finish(true);
         Ok(source)
     }
 }

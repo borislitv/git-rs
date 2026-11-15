@@ -9,22 +9,23 @@ policy; the health listener has no authentication.
 No metrics library or background exporter is required. Collection uses bounded
 process-local atomic counters and histograms. Labels are closed enumerations;
 repository names, principals, refs, object keys, credentials, SQL and error text
-never become labels. All series are initialized to zero and reset on process
-restart. Scrapes do not perform SQL or S3 requests.
+never become labels. Counters and histogram accumulators start at zero and reset
+on process restart; gauges report current state or static metadata. Scrapes do
+not perform SQL or S3 requests.
 
 ## Metric families
 
 | Family | Type | Labels / meaning |
 | --- | --- | --- |
-| `git_rs_build_info` | Gauge | `version`, one per build |
+| `git_rs_build_info` | Gauge | Cargo package `version`; does not distinguish builds of the same version |
 | `git_rs_process_start_time_seconds` | Gauge | Instrumentation initialization time since Unix epoch |
 | `git_rs_active_requests` | Gauge | Admitted Git transport connections; excludes health handlers |
-| `git_rs_cache_allocated_bytes` | Gauge | Cache reservations, entries and reader-pinned files, rounded to 4 KiB; not total RSS |
+| `git_rs_cache_allocated_bytes` | Gauge | RAM cache reservations, entries and reader-pinned buffers; not total RSS |
 | `git_rs_timing_logs_dropped_total` | Counter | Diagnostic records discarded by the bounded timing queue; not sink write errors |
 | `git_rs_service_logs_dropped_total` | Counter | Fixed service error records discarded by the bounded service queue; not sink write errors |
 | `git_rs_requests_total` | Counter | `transport=ssh,http`; `outcome=success,error,unauthorized,bad_request` |
 | `git_rs_request_duration_seconds` | Histogram | `transport`; complete admitted connection lifetime including cleanup |
-| `git_rs_phase_duration_seconds` | Histogram | `phase=snapshot,materialize,scratch_init,git,pre_receive,validate,graph,upload,publish` |
+| `git_rs_phase_duration_seconds` | Histogram | `phase=snapshot,materialize,scratch_init,git,pre_receive,validate,graph,upload,publish,receive_pack_prepare,upload_serve` |
 | `git_rs_phase_errors_total` | Counter | Failed phase outcomes, with the same `phase` labels |
 | `git_rs_stage_duration_seconds` | Histogram | Fixed `stage` labels detailed below |
 | `git_rs_stage_errors_total` | Counter | Unsuccessful completed/dropped stage spans, with the same `stage` labels |
@@ -34,30 +35,53 @@ restart. Scrapes do not perform SQL or S3 requests.
 | `git_rs_subprocess_errors_total` | Counter | Failed spawn or nonzero exit, with the same `program` labels |
 | `git_rs_cache_lookups_total` | Counter | `result=hit,miss,bypass`; miss means this caller attempted a fill |
 | `git_rs_cache_wait_duration_seconds` | Histogram | Time waiting for another caller's single-flight fill; `_count` counts waits |
+| `git_rs_cache_waiters` | Gauge | Callers currently in a single-flight wait scope |
 | `git_rs_admission_rejections_total` | Counter | `listener=ssh,http,health`; connections closed at the admission limit |
-| `git_rs_s3_transferred_bytes_total` | Counter | `direction=download,upload`; verified downloaded / acknowledged uploaded object bytes |
+| `git_rs_s3_transferred_bytes_total` | Counter | `direction=download,upload`; length-checked downloaded payload / acknowledged uploaded payload, including multipart parts; not proof of object validation or publication |
+| `git_rs_maintenance_active_jobs` | Gauge | Currently running maintenance jobs; maintenance reports zero Git transport active requests |
+| `git_rs_maintenance_leader` | Gauge | Current maintenance leadership state |
+| `git_rs_maintenance_jobs_completed_total` | Counter | Successfully completed maintenance jobs |
+| `git_rs_maintenance_jobs_failed_total` | Counter | Failed maintenance jobs |
 
 Histograms expose cumulative `_bucket` series and `_sum`/`_count`, with finite
 buckets at 1, 5, 10, 25, 50, 100, 250, 500 milliseconds and 1, 2.5, 5, 10, 30, 60,
 120 seconds, plus `+Inf`. They measure wall time, not CPU time. Nested phases,
 dependencies and subprocess durations **overlap** and must not be added together.
 
-`snapshot` includes committing a reader lease and then reading a consistent
-catalog on the same SQL connection. `git` includes the native RPC and its hooks;
-`validate` includes graph checks, uploads and publication. `s3_get` includes size
-and SHA-256 verification. Cache hits do not add S3 bytes. Failed, partial or
-unknown-outcome transfers are not a wire-byte accounting mechanism.
-The historical `curl` and `sha256sum` subprocess label values remain in the fixed metric schema;
-the current S3 and hashing paths do not increment those subprocess series. S3 connection reuse
-and signing remain included in the existing dependency observations.
+`snapshot` includes authorized source acquisition, committing a reader lease and
+reading a consistent catalog. `graph` measures Rust receive graph validation;
+`upload` measures receive pack/index storage and `publish` measures metadata
+publication. `receive_pack_prepare` measures the inclusive `pack::prepare` call,
+including input reads, pack normalization and base resolution. `upload_serve`
+measures Rust upload preparation, advertisement/negotiation, protocol writes and
+final checks; it excludes earlier admission, source acquisition and HTTP body
+decoding. Both are inclusive wall time, not CPU time.
+
+The legacy phase labels `materialize`, `scratch_init`, `git`, `pre_receive` and
+`validate` remain exported for compatibility but have no production observations
+in the Rust data plane. All subprocess labels (`git`, `curl`, `sha256sum`, `other`)
+and their counter/histogram families are retained. Zero subprocess/native-call
+counters are not proof that native execution is impossible: that requires the
+independent runtime/security gates, exact-image inspection and operation evidence.
+Synthetic metric observations in tests do not establish production coverage.
+
+S3 GET measurements include transport framing/length checks; whole-object reads
+also verify SHA-256, while range bytes are counted before higher-level object
+validation. Multipart upload bytes count acknowledged parts even if completion
+later fails. Cache hits do not add S3 bytes. These counters are not wire-byte,
+durability or ref-publication accounting.
+
+Cache waits are observed exactly once per caller that encounters a busy flight,
+including error, cancellation and unwind. Repeated timed wakeups do not create
+additional observations. Nonwaiting cache hits/fills do not count as waits.
 
 HTTP discovery and each RPC are separate requests; one Git command can create
 multiple requests. HTTP 400/401 responses have their own outcomes. Other parsing,
 authorization, dependency or transport failures use `error`; this is not an HTTP
 status-code metric. Request observations include failures before repository
 selection and record unwinding as an error. Admission rejections have a separate
-counter and no admitted-request duration. Subprocess histograms count
-application-owned invocations, not every descendant fork inside native Git.
+counter and no admitted-request duration. Retained subprocess histograms must not
+be interpreted as an exhaustive execution audit.
 Successful RPC handling is not a successful ref publication: Git can report
 rejected ref commands inside a successful RPC. Inspect validation/publication
 phase errors as well. SQL measurements include pool acquisition, connection establishment when
@@ -76,25 +100,71 @@ simply the Git command count.
 | `lease_commit` | Serving snapshot's first SQL message through committed-lease response completion |
 | `catalog_read` | Consistent snapshot message through full catalog consumption and COMMIT completion |
 | `lease_release` | Bounded metadata cleanup, including its checkout/query/reset |
-| `cache_fill` | Admitted memfd setup, load/verification/sealing and cache publication |
-| `cache_link` | Link a verified, reader-pinned cached file into private request scratch |
-| `object_hash` | SHA-256 input reads and hashing; a digest mismatch is reported by its enclosing transfer/fill |
-| `restore_refs` | Build and execute native ref restoration, including an empty ref set |
-| `restore_head` | Native HEAD restoration for non-main defaults; main reuses the empty template |
-| `hook_setup` | Private hook socket/nonce and application-owned hook installation |
-| `git_input` | Client input forwarding, potentially waiting for EOF; overlaps output and hooks |
-| `git_output` | Native stdout/CGI forwarding and response flush |
-| `git_wait` | Final child wait after output EOF, not the whole native RPC lifetime |
-| `ref_validate` | Native ref-name and expected-old-OID checks, in both hook rounds |
-| `tip_validate` | Branch-tip type and fast-forward classification; excludes the separate graph phase |
-| `fast_forward` | Native ancestry checks; a non-ancestor's nonzero exit counts as unsuccessful |
-| `scratch_cleanup` | Private directory removal, before reader pins are released |
-| `process_spawn` | Application-owned child spawn only, separate from subprocess lifetime |
+| `cache_fill` | Actual admitted RAM loader callback, including its verification; excludes allocation and cache publication |
+
+The following stage labels remain exported but are inactive in production:
+`cache_link`, `object_hash`, `restore_refs`, `restore_head`, `hook_setup`,
+`git_input`, `git_output`, `git_wait`, `ref_validate`, `tip_validate`,
+`fast_forward`, `scratch_cleanup`, `process_spawn`. They are not measurements
+of their corresponding current Rust operations.
 
 Stages overlap phases, dependencies and other stages. They are not an additive CPU profile.
 An error, cancellation or unwind before a timer's successful finish counts as an error.
 Administrative commands, probes and cleanup may contribute independently of transport requests.
 The retained `program="sha256sum"` series is zero for current in-process hashing.
+
+## Identity and live scrape freshness
+
+No Prometheus instance or target is provisioned by this instrumentation. A local
+CLI timing log, successful `/metrics` curl or static source inspection is not a
+live scrape-freshness verdict.
+
+`git_rs_build_info` contains package version only, not source revision or image
+identity. `git_rs_process_start_time_seconds` is the registry initialization time,
+not OS process birth time. It is stable during one registry lifetime. Capture
+the exact running container image ID/start time/restart count, or Kubernetes Pod
+UID/container ID/resolved imageID/start time/restart count, alongside the release
+receipt. Resolve registry manifest digests versus platform/config image IDs using
+that receipt; they are not interchangeable identifiers. Keep these identities in
+the fixture receipt, not unbounded application metric labels.
+
+For an explicitly selected, owned serving target and reachable Prometheus URL:
+
+1. Read `/api/v1/targets?state=active`. Match one exact scrape URL and its
+   `job`/`instance` labels to the runtime receipt. Require `health="up"`, empty
+   `lastError`, recent `lastScrape`, and an advancing `lastScrape` on a later poll.
+   Set a finite deadline and an explicit freshness allowance derived from the
+   scrape interval and timeout, with synchronized clocks.
+2. Query `/api/v1/query` for the following expressions, replacing both selectors
+   with the exact target labels. Require a unique result, `up=1`, and recent,
+   advancing sample timestamps. Read the value of `timestamp(...)`, not merely
+   the query response's evaluation timestamp.
+
+   ```promql
+   up{job="FIXTURE_JOB",instance="EXACT_TARGET"}
+   timestamp(git_rs_build_info{job="FIXTURE_JOB",instance="EXACT_TARGET"})
+   timestamp(git_rs_requests_total{job="FIXTURE_JOB",instance="EXACT_TARGET",transport="http",outcome="success"})
+   ```
+
+3. With other transport traffic quiescent, baseline after a completed scrape.
+   Send one successful synthetic HTTP discovery request. After a newer successful
+   scrape require HTTP success and HTTP duration count each increase by exactly
+   one. Repeat; then send one malformed request and require `bad_request` increase
+   by one with success unchanged. Scrapes/probes alone must not change transport
+   counts. A whole clone/push can issue multiple HTTP requests. Background SQL
+   readiness/lease activity prevents exact SQL-count expectations.
+4. Hold one admitted incomplete transport connection, synchronize on an active
+   request sample, close it and require the gauge return to baseline. Exercise a
+   controlled cold source read for cache/S3 evidence; idle unchanged gauges are
+   not stale if their sample timestamps advance. Do not require retained cache
+   buffers to drop to zero while entries/readers remain live.
+5. In an authorized disposable fixture only, pre-increment a selected counter,
+   record the receipt, and restart only the owned application. Require a new
+   runtime receipt, newer instrumentation initialization, fresh target scrapes
+   and a counter reset before repeating the controlled request. For unchanged
+   series identity corroborate with a decrease or `resets(...[window])`; a new
+   pod/instance creates a new series and need not show a PromQL reset. Inspect
+   old and new target identities separately. Never reset shared/protected k3s.
 
 ## Bounded service diagnostics
 

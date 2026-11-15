@@ -255,6 +255,7 @@ impl Cache {
             .busy
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let wait = (*busy).then(|| metrics::Timer::start(metrics::Metric::CacheWait));
         while *busy {
             check()?;
             busy = flight
@@ -264,6 +265,9 @@ impl Cache {
                 .0;
         }
         check()?;
+        if let Some(wait) = wait {
+            wait.finish(true);
+        }
         if let Some(hit) = self.hit(key, size)? {
             return Ok(Some(hit));
         }

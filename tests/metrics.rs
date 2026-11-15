@@ -332,6 +332,8 @@ fn service_log_fixture() {
         ServingSocketCleanupFailed,
         LeaseReleaseFailed,
         ScratchCleanupFailed,
+        MultipartAbortUnconfirmed,
+        TerminalFailure,
     ] {
         assert!(service_event(event));
     }
@@ -358,6 +360,8 @@ fn service_diagnostics_have_only_fixed_records_with_or_without_timing_logs() {
                 "git_rs_error event=serving_socket_cleanup_failed\n",
                 "git_rs_error event=lease_release_failed\n",
                 "git_rs_error event=scratch_cleanup_failed\n",
+                "git_rs_error event=multipart_abort_unconfirmed\n",
+                "git_rs_error event=terminal_failure\n",
             )
         );
     }
@@ -517,4 +521,145 @@ fn timing_logs_are_opt_in_correlated_and_exclude_private_values() {
             );
         }
     }
+}
+
+#[test]
+fn exposition_retains_legacy_contract_and_adds_rust_phases() {
+    let registry = Registry::new();
+    registry.observe(
+        Metric::Phase(Phase::ReceivePackPrepare),
+        Duration::from_millis(2),
+        false,
+    );
+    registry.observe(
+        Metric::Phase(Phase::UploadServe),
+        Duration::from_millis(3),
+        true,
+    );
+    let text = registry.render(0, 0);
+    for expected in [
+        "git_rs_phase_duration_seconds_count{phase=\"receive_pack_prepare\"} 1\n",
+        "git_rs_phase_errors_total{phase=\"receive_pack_prepare\"} 1\n",
+        "git_rs_phase_duration_seconds_sum{phase=\"upload_serve\"} 0.003000000\n",
+        "git_rs_phase_duration_seconds_count{phase=\"git\"} 0\n",
+        "git_rs_stage_duration_seconds_count{stage=\"process_spawn\"} 0\n",
+        "# TYPE git_rs_subprocess_duration_seconds histogram\n",
+        "# TYPE git_rs_subprocess_errors_total counter\n",
+        "git_rs_subprocess_errors_total{program=\"git\"} 0\n",
+        "# HELP git_rs_cache_waiters Callers currently in a single-flight cache wait scope.\n",
+        "# TYPE git_rs_cache_waiters gauge\n",
+        "git_rs_cache_waiters 0\n",
+        "including multipart parts; excludes cache hits and protocol overhead; does not imply object validation or publication.",
+        "Completed operations that failed or whose measurement scope ended without success;",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing exposition contract: {expected}"
+        );
+    }
+    assert!(text.len() < 64 * 1024);
+}
+
+#[test]
+fn cache_wait_fixture() {
+    if std::env::var("GIT_RS_CACHE_WAIT_FIXTURE").as_deref() != Ok("1") {
+        return;
+    }
+    use git_rs_core::Control;
+    use std::{sync::mpsc, time::Instant};
+
+    // A separate process isolates exact global metric deltas from parallel tests.
+    for cancel in [false, true] {
+        let cache = git_rs::cache::Cache::new(4096, 4);
+        let before = sample("git_rs_cache_wait_duration_seconds_count");
+        let fills = sample("git_rs_stage_duration_seconds_count{stage=\"cache_fill\"}");
+        let control = Control::new(Instant::now() + Duration::from_secs(10));
+        let (started, loading) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let loader_cache = &cache;
+            let loader = scope.spawn(move || {
+                loader_cache.get_or_load("private-wait-key", 4, |out| {
+                    started.send(()).unwrap();
+                    released
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| git_rs::invalid("fixture loader release timed out"))?;
+                    out.copy_from_slice(b"data");
+                    Ok(())
+                })
+            });
+            loading.recv_timeout(Duration::from_secs(2)).unwrap();
+            let waiter = scope.spawn(|| {
+                cache.get_or_load_controlled("private-wait-key", 4, &control, |_| {
+                    panic!("a waiter must not load or take over the live fill")
+                })
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while sample("git_rs_cache_waiters") != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "waiter never entered the real wait scope"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(sample("git_rs_cache_wait_duration_seconds_count"), before);
+            if cancel {
+                control.cancel();
+                assert!(waiter.join().unwrap().is_err());
+                assert_eq!(sample("git_rs_cache_waiters"), 0);
+                // The caller's cancellation must leave the actual loader alive.
+                assert_eq!(
+                    sample("git_rs_stage_duration_seconds_count{stage=\"cache_fill\"}"),
+                    fills
+                );
+                release.send(()).unwrap();
+            } else {
+                release.send(()).unwrap();
+                let bytes = waiter.join().unwrap().unwrap().unwrap();
+                assert_eq!(&bytes[..], b"data");
+            }
+            let bytes = loader.join().unwrap().unwrap().unwrap();
+            assert_eq!(&bytes[..], b"data");
+        });
+        assert_eq!(sample("git_rs_cache_waiters"), 0);
+        assert_eq!(
+            sample("git_rs_cache_wait_duration_seconds_count"),
+            before + 1
+        );
+        assert_eq!(
+            sample("git_rs_stage_duration_seconds_count{stage=\"cache_fill\"}"),
+            fills + 1
+        );
+        assert_eq!(
+            &cache
+                .get_or_load("private-wait-key", 4, |_| panic!("fill must survive"))
+                .unwrap()
+                .unwrap()[..],
+            b"data"
+        );
+        assert_eq!(
+            sample("git_rs_cache_wait_duration_seconds_count"),
+            before + 1
+        );
+        assert!(
+            !git_rs::metrics::global()
+                .render(0, cache.allocated())
+                .contains("private-wait-key")
+        );
+    }
+}
+
+#[test]
+fn actual_singleflight_wait_and_cancel_are_observable_once_per_caller() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "cache_wait_fixture", "--nocapture"])
+        .env("GIT_RS_CACHE_WAIT_FIXTURE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
