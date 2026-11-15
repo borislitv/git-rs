@@ -137,7 +137,7 @@ def main():
                 with STATE:
                     print(f"gated DNS messages: {len(GATED)}; all DNS messages: {len(SEEN)}", flush=True)
                 if result.returncode == 0 and "1 passed;" not in result.stdout:
-                    raise RuntimeError("prebuilt metadata binary did not run exactly one contract")
+                    raise RuntimeError("prebuilt pg_dns binary did not run exactly one contract")
                 if args.expect_starvation:
                     assert result.returncode != 0, "GAI mutant unexpectedly passed"
                     assert "pg-dns: TLS SQL preflight passed" in result.stdout

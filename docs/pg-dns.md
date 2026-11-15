@@ -25,7 +25,7 @@ The application does not use such an API.
 - A disposable, owned PostgreSQL instance with real TLS and a CA trusted through
   `PGSSLROOTCERT`. Its certificate must cover `PGHOST`, a synthetic FQDN, but not
   `wrong-identity.invalid`. Use a writable disposable database and role with schema
-  migration rights. The metadata contracts consume this fixture; they do not
+  migration rights. The DNS and manager contracts consume this fixture; they do not
   provision PostgreSQL or certificates themselves.
 - Set `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
   `PGSSLMODE=verify-full`, and `PGSSLROOTCERT`. Set `GIT_RS_PG_DNS_ADDRESS` to the
@@ -65,17 +65,22 @@ cargo fmt --all -- --check
 cargo test --locked --lib database::manager::tests::manager_rejects_unsupported_routes_and_cardinality_before_connecting
 cargo test --locked --lib database::manager::tests::manager_preserves_startup_settings_sdk_statement_cache_and_detach -- --ignored --exact --test-threads=1
 cargo test --locked --lib database::manager::tests::manager_host_fallback_preserves_tls_identity_and_cancel_endpoint -- --ignored --exact --test-threads=1
-cargo test --locked --test metadata --no-run --message-format=json > pg-dns-build.jsonl
-METADATA_TEST_BINARY="$(python3 -c 'import json, sys; rows = [json.loads(line) for line in open(sys.argv[1])]; matches = [row["executable"] for row in rows if row.get("reason") == "compiler-artifact" and row.get("target", {}).get("name") == "metadata" and row.get("profile", {}).get("test") and row.get("executable")]; assert len(matches) == 1, matches; print(matches[0])' pg-dns-build.jsonl)"
+cargo test --locked --test pg_dns --no-run --message-format=json > pg-dns-build.jsonl
+PG_DNS_TEST_BINARY="$(python3 -c 'import json, sys; rows = [json.loads(line) for line in open(sys.argv[1])]; matches = [row["executable"] for row in rows if row.get("reason") == "compiler-artifact" and row.get("target", {}).get("name") == "pg_dns" and row.get("profile", {}).get("test") and row.get("executable")]; assert len(matches) == 1, matches; print(matches[0])' pg-dns-build.jsonl)"
 ```
 
 Select the `executable` from the `compiler-artifact` JSON row whose target name is
-`metadata` and whose profile has `test=true`. Pass that exact absolute path as
-`METADATA_TEST_BINARY` to the isolated fixture environment:
+`pg_dns` and whose profile has `test=true`. Pass that exact absolute path as
+`PG_DNS_TEST_BINARY` to the isolated fixture environment:
 
 ```bash
-python3 tests/support/pg_dns_fixture.py "$METADATA_TEST_BINARY"
+python3 tests/support/pg_dns_fixture.py "$PG_DNS_TEST_BINARY"
 ```
+
+The DNS contract is in the dedicated `tests/pg_dns.rs` target, separate from
+ordinary metadata contracts discovered by the plaintext SQL runtime gate. Keep
+that target boundary: the DNS test requires its actual TLS/DNS fixture and must
+not skip itself or return success when the fixture is absent.
 
 The contract uses one real public DerivedCache instance with two connections and
 the unchanged cache runtime's two blocking workers after a separate healthy
@@ -113,12 +118,12 @@ self.connect(self.config.clone()).await
 This deliberately restores SDK hostname/GAI creation while retaining the same
 custom pool, SDK wrapper, cancellation, five-second timeout and actual two-worker
 cache runtime. Do not change the authoritative runtime's blocking-thread limit.
-Rebuild that copy's metadata test binary with the same locked no-run command and
-JSON executable-selection command (assigning `MUTANT_METADATA_TEST_BINARY`), then
+Rebuild that copy's `pg_dns` test binary with the same locked no-run command and
+JSON executable-selection command (assigning `MUTANT_PG_DNS_TEST_BINARY`), then
 pass its exact executable to a fresh isolated fixture:
 
 ```bash
-python3 tests/support/pg_dns_fixture.py "$MUTANT_METADATA_TEST_BINARY" --expect-starvation
+python3 tests/support/pg_dns_fixture.py "$MUTANT_PG_DNS_TEST_BINARY" --expect-starvation
 ```
 
 The harness accepts RED only after a successful TLS/SQL preflight, both observed
