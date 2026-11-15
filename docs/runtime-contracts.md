@@ -225,6 +225,13 @@ cover allocator/kernel/TLS copies. Cold means fresh application state, without
 flushing OS or PostgreSQL buffers. A physical replay fence is not an HA result.
 The smoke does not replace a separately configured full-corpus/GitLab campaign.
 
+Each matrix response still records the daemon's kernel RSS high-water mark. The
+test-only HTTP fixture reads bounded `/proc/self/status` and exports `VmHWM` in
+its existing metrics response, avoiding two external execs for every sample.
+Before the first measured cell, the controller verifies this observation between
+two original external namespace readings of that exact container. Missing or
+invalid observations fail; there is no zero-value fallback or RSS limit increase.
+
 These files define checks. They do not attest that a changed checkout has passed.
 Bind every result to its source/dependency revision, lockfile, executable/image
 identities, discovered inventory, resource envelope, actual outcomes and cleanup.

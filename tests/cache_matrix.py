@@ -387,9 +387,8 @@ class Matrix:
                          "git_rs_dependency_duration_seconds_count", "git_rs_s3_transferred_bytes_total", "git_rs_cache_lookups_total"))})
         require(event["work_completions"] + event["body_hits"] == 1, "neither real derivation nor verified body reuse observed")
         require(elapsed <= self.limits["request_seconds"], "foreground request deadline exceeded")
-        status = self.f.process_status(process)
-        event["rss_hwm_bytes"] = int(re.search(r"VmHWM:\s+(\d+)", status)[1]) * 1024
-        require(event["rss_hwm_bytes"] <= self.limits["daemon_rss_bytes"], "daemon RSS exceeded the versioned budget")
+        event["rss_hwm_bytes"] = int(after["git_rs_fixture_rss_hwm_bytes"])
+        require(0 < event["rss_hwm_bytes"] <= self.limits["daemon_rss_bytes"], "daemon RSS exceeded the versioned budget")
         return event
 
     def start(self, name, profile, enabled, **options):
@@ -524,6 +523,16 @@ class Matrix:
                                           "sha256": hashlib.sha256(target["expected"]).hexdigest()} for target in targets]
             first, second = "first-" + str(ordinal), "second-" + str(ordinal)
             _, port = self.start(first, profile, placement != "disabled")
+            if ordinal == 0:
+                # Attest the fixture's own kernel reading against the original
+                # external namespace observer, before the measured cell starts.
+                process = f.daemons[first]
+                before = int(re.search(r"VmHWM:\s+(\d+)", f.process_status(process))[1]) * 1024
+                observed = metrics(f, first)["git_rs_fixture_rss_hwm_bytes"]
+                after = int(re.search(r"VmHWM:\s+(\d+)", f.process_status(process))[1]) * 1024
+                require(0 < before <= observed <= after, "fixture RSS differs from the external kernel observer")
+                f.results["rss_observer_control"] = {"container": process.identifier, "kernel_before_bytes": before,
+                                                     "fixture_bytes": observed, "kernel_after_bytes": after}
             self.deadline = time.monotonic() + self.limits["cell_seconds"]
             started = time.monotonic()
             row["status"] = "running"

@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -16,6 +17,31 @@ from cache_matrix import Matrix, ROOT, WireProxy, cleanup_all, load_config, requ
 
 
 class HttpContracts(unittest.TestCase):
+    def test_response_rss_uses_the_kernel_metric_and_preserves_the_frozen_bound(self):
+        config = load_config(ROOT / "tests/fixtures/cache-matrix.json")
+        fixture = SimpleNamespace(results={}, daemons={"measured": SimpleNamespace(identifier="d" * 64)},
+                                  process_status=Mock(side_effect=AssertionError("matrix started external RSS sampling")))
+        matrix = Matrix(fixture, config)
+        target = {"path": "large.txt", "url": "/synthetic", "expected": b"complete"}
+        before = {"git_rs_active_requests": 0, 'git_rs_fixture_work_completions{kind="foreground"}': 0,
+                  "git_rs_fixture_body_hits_total": 0, "git_rs_cache_allocated_bytes": 0}
+        before.update({f'git_rs_fixture_body_build_claims_total{{outcome="{outcome}"}}': 0
+                       for outcome in ("owned", "pending", "unavailable")})
+        for hwm in (128 * 1024, 0, config["limits"]["daemon_rss_bytes"] + 1):
+            with self.subTest(hwm=hwm):
+                matrix.deadline = time.monotonic() + 10
+                after = {**before, "git_rs_fixture_body_hits_total": 1, "git_rs_fixture_rss_hwm_bytes": hwm}
+                with patch.object(cache_matrix, "metrics", side_effect=[before, after, after]), \
+                        patch.object(cache_matrix, "resource", return_value={"cpu_ns": 0, "memory_bytes": 0}), \
+                        patch.object(cache_matrix, "http", return_value=(200, target["expected"])):
+                    if hwm == 128 * 1024:
+                        event = matrix.fetch("measured", 1, target, {"requests": []}, "cold")
+                        self.assertEqual(event["rss_hwm_bytes"], 128 * 1024)
+                    else:
+                        with self.assertRaisesRegex(AssertionError, "daemon RSS exceeded"):
+                            matrix.fetch("measured", 1, target, {"requests": []}, "cold")
+        fixture.process_status.assert_not_called()
+
     def test_actual_http_client_preserves_response_status_and_byte_bound(self):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):

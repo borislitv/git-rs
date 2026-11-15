@@ -91,6 +91,30 @@ fn option(args: &[String], name: &str) -> Result<String> {
         .map(|pair| pair[1].clone())
         .ok_or_else(|| invalid(&format!("missing fixture {name}")))
 }
+fn rss_high_water() -> Result<u64> {
+    let mut status = String::new();
+    std::fs::File::open("/proc/self/status")?
+        .take(65537)
+        .read_to_string(&mut status)?;
+    if status.len() > 65536 {
+        return Err(invalid("fixture process status exceeded its bound"));
+    }
+    let mut fields = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .ok_or_else(|| invalid("fixture RSS high water unavailable"))?
+        .split_ascii_whitespace();
+    let value = fields
+        .next()
+        .ok_or_else(|| invalid("fixture RSS high water missing"))?
+        .parse::<u64>()?;
+    if fields.next() != Some("kB") || fields.next().is_some() || value == 0 {
+        return Err(invalid("invalid fixture RSS high water"));
+    }
+    value
+        .checked_mul(1024)
+        .ok_or_else(|| invalid("fixture RSS high water overflow"))
+}
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--prepared") {
@@ -194,7 +218,13 @@ fn run() -> Result<()> {
                 if let Some(stats) = monitor.blame.warming_statistics() {
                     body.push_str(&format!("git_rs_fixture_warm_admitted {}\ngit_rs_fixture_warm_completed {}\ngit_rs_fixture_warm_failed {}\n", stats.admitted, stats.completed, stats.failed));
                 }
-                (200, body)
+                match rss_high_water() {
+                    Ok(bytes) => {
+                        body.push_str(&format!("git_rs_fixture_rss_hwm_bytes {bytes}\n"));
+                        (200, body)
+                    }
+                    Err(_) => (503, "fixture RSS observation failed\n".into()),
+                }
             } else if line.starts_with("GET /source-probe ") {
                 match source_probe.as_deref() {
                     Some(slug) => {
