@@ -254,7 +254,27 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         self.walk_commits(tips, None).map(|(ids, _)| ids)
     }
 
-    fn walk_commits(&self, mut pending: IdList, target: Option<&oid>) -> Result<(Reachable, bool)> {
+    pub(crate) fn visit_commits(
+        &self,
+        tip: ObjectId,
+        visit: impl FnMut(ObjectId, &crate::Object) -> Result<()>,
+    ) -> Result<Reachable> {
+        let mut tips = IdList::new(self, self.limits.max_graph_objects)?;
+        tips.push(&tip, self)?;
+        self.walk_commits_with(tips, None, visit)
+            .map(|(ids, _)| ids)
+    }
+
+    fn walk_commits(&self, pending: IdList, target: Option<&oid>) -> Result<(Reachable, bool)> {
+        self.walk_commits_with(pending, target, |_, _| Ok(()))
+    }
+
+    fn walk_commits_with(
+        &self,
+        mut pending: IdList,
+        target: Option<&oid>,
+        mut visit: impl FnMut(ObjectId, &crate::Object) -> Result<()>,
+    ) -> Result<(Reachable, bool)> {
         let mut seen = IdList::new(self, self.limits.max_graph_objects)?;
         let mut membership = Seen::new(self)?;
         let mut edges = 0usize;
@@ -267,6 +287,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             let object = self.required(&id, Kind::Commit)?;
             seen.push(&id, self)?;
             membership.insert(id, self)?;
+            visit(id, &object)?;
             found |= target.is_some_and(|target| id.as_ref() == target);
             // parent_ids() deliberately suppresses parse errors, so use tokens.
             for token in gix_object::CommitRefIter::from_bytes(object.data.as_slice(), id.kind()) {

@@ -62,11 +62,31 @@ impl gix_traverse::commit::topo::Budget for TopoBudget {
     }
 }
 
-struct HeaderFind<'a, P> {
-    snapshot: &'a SnapshotSession<P>,
-    known: &'a Set<ObjectId>,
+struct HeaderFind<'a> {
+    control: &'a Control,
+    known: &'a Map<ObjectId, usize>,
+    headers: &'a [CapacityBuffer],
 }
-impl<P: VerifiedObjectProvider> gix_object::Find for HeaderFind<'_, P> {
+
+struct CommitHeaders<'a> {
+    values: ChargedVec<CapacityBuffer>,
+    control: &'a Control,
+}
+
+impl Drop for CommitHeaders<'_> {
+    fn drop(&mut self) {
+        // Headers own separate allocations. Finish their cleanup even after a
+        // stopped traversal, polling between bounded batches of destructions.
+        while !self.values.as_slice().is_empty() {
+            for _ in 0..32 {
+                drop(self.values.pop());
+            }
+            let _ = self.control.check();
+        }
+    }
+}
+
+impl gix_object::Find for HeaderFind<'_> {
     fn try_find<'a>(
         &self,
         id: &oid,
@@ -74,23 +94,20 @@ impl<P: VerifiedObjectProvider> gix_object::Find for HeaderFind<'_, P> {
     ) -> gix_error::Result<Option<gix_object::Data<'a>>> {
         buffer.clear();
         let result = (|| -> Result<()> {
-            self.snapshot.control.check()?;
-            if !self.known.contains(&id.to_owned()) {
-                return Err(invalid("topological read escaped the complete inventory"));
-            }
-            let object = self.snapshot.required(id, Kind::Commit)?;
-            let end = metadata_header_end(
-                object.data.as_slice(),
-                self.snapshot.limits.max_metadata_bytes,
-                &self.snapshot.control,
-            )?;
-            if buffer.capacity() < end {
+            self.control.check()?;
+            let position = self
+                .known
+                .get(&id.to_owned())
+                .ok_or_else(|| invalid("topological read escaped the complete inventory"))?;
+            let header = self.headers[*position].as_slice();
+            if buffer.capacity() < header.len() {
                 return Err(invalid("topological Find buffer was not admitted"));
             }
-            // The maintained walker needs only headers. Physical bytes were hash
-            // verified first; messages/signatures are not reparsed as graph data.
-            for chunk in object.data.as_slice()[..end].chunks(32 * 1024) {
-                self.snapshot.control.check()?;
+            // Reuse the exact header copied from this invocation's hash-verified
+            // physical commit. Keep its admitted owner until the walker drops;
+            // repeated topology lookups must not decode the whole object again.
+            for chunk in header.chunks(32 * 1024) {
+                self.control.check()?;
                 buffer.extend_from_slice(chunk);
             }
             Ok(())
@@ -107,20 +124,22 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         if max == 0 || max > self.limits.max_graph_objects {
             return Err(invalid("history count limit exceeded"));
         }
-        let reachable = self.reachable_from_refs([(b"tip".as_slice(), tip)])?;
-        if reachable.is_empty() {
-            return Err(invalid("history tip must name a physical commit"));
-        }
-        let mut known = Set::new(self.capacity.clone(), self.limits.max_graph_objects)?;
+        let mut known = Map::new(self.capacity.clone(), self.limits.max_graph_objects)?;
+        let mut headers = CommitHeaders {
+            values: ChargedVec::new(self.capacity.clone(), self.limits.max_graph_objects)?,
+            control: &self.control,
+        };
         let mut edges = 0usize;
-        for id in reachable.iter() {
-            known.insert(id, &self.control)?;
-            let commit = self.required(&id, Kind::Commit)?;
+        let reachable = self.visit_commits(tip, |id, commit| {
             let end = metadata_header_end(
                 commit.data.as_slice(),
                 self.limits.max_metadata_bytes,
                 &self.control,
             )?;
+            let mut header = self.capacity.buffer(end)?;
+            header.extend_controlled(&commit.data.as_slice()[..end], end, &self.control)?;
+            known.insert(id, headers.values.as_slice().len(), &self.control)?;
+            headers.values.push(header, &self.control)?;
             for token in
                 gix_object::CommitRefIter::from_bytes(&commit.data.as_slice()[..end], id.kind())
             {
@@ -136,7 +155,8 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                     _ => {}
                 }
             }
-        }
+            Ok(())
+        })?;
         let _setup = self.capacity.reservation(4096)?;
         let admission = Arc::new(TopoBudget {
             control: self.control.clone(),
@@ -144,8 +164,9 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             reservation: Mutex::new(None),
         });
         let mut walk = gix_traverse::commit::topo::Builder::new(HeaderFind {
-            snapshot: self,
+            control: &self.control,
             known: &known,
+            headers: headers.values.as_slice(),
         })
         .with_tips([tip])
         .sorting(gix_traverse::commit::topo::Sorting::TopoOrder)
