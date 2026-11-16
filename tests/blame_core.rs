@@ -1434,6 +1434,7 @@ fn owned_source_s3_integrity_failure_has_no_complete_result_and_recovers() {
             expected_error,
             "corrupt source {extension} must fail at its verification boundary"
         );
+        drop(error);
         until(|| fixture.engine.blame.admitted() == 0);
         assert_eq!(fixture.leases(), 0);
         assert!(fixture.source_files().is_empty());
