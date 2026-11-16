@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -14,6 +15,23 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CHART = ROOT / "charts/git-rs"
 ENDPOINT = {"s3": {"endpoint": "https://objects.example.invalid"}}
+
+
+def vendor_source_contract():
+    """The vendor job must test the same immutable Gitoxide source as the application."""
+    source = json.loads((ROOT / "docs/gitoxide-source.json").read_text())["source"]
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yaml").read_text())
+    checkouts = [step["with"] for step in workflow["jobs"]["vendor"]["steps"]
+                 if step.get("uses", "").split("@", 1)[0] == "actions/checkout"
+                 and step.get("with", {}).get("path") == ".local/gitoxide"]
+    assert len(checkouts) == 1, "vendor must have exactly one Gitoxide source checkout"
+    checkout = checkouts[0]
+    assert re.fullmatch(r"[0-9a-f]{40}", checkout.get("ref", "")), (
+        "vendor Gitoxide checkout must use a full immutable revision", checkout.get("ref"))
+    actual = {"git": "https://github.com/" + checkout.get("repository", ""),
+              "rev": checkout["ref"]}
+    assert actual == source, ("vendor Gitoxide checkout differs from application provenance",
+                              {"expected": source, "actual": actual})
 
 
 def render(helm, values=None, *, file=None, error=None):
@@ -146,6 +164,7 @@ def main():
     parser.add_argument("--operator-schemas", action="store_true",
                         help="validate rendered resources against pinned public CNPG/Barman/OBC/Gateway CRDs")
     args = parser.parse_args()
+    vendor_source_contract()
     subprocess.run([args.helm, "lint", str(CHART), "--strict", "--values",
                     str(CHART / "values-example.yaml")], check=True, timeout=30)
     metadata = yaml.safe_load((CHART / "Chart.yaml").read_text())
