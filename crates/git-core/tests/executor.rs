@@ -589,6 +589,55 @@ fn live_capacity_not_logical_length_or_shared_slice_weight() {
 }
 
 #[test]
+fn bounded_append_preserves_payload_across_chunk_boundary_without_growth() {
+    let budget = CapacityBudget::new(64 * 1024);
+    let mut buffer = budget.buffer(32 * 1024 + 1).unwrap();
+    let capacity = buffer.capacity();
+    let backing = buffer.as_slice().as_ptr();
+    let charge = budget.used();
+    buffer.extend_from_slice(&[0xa5; 32 * 1024]).unwrap();
+    buffer.extend_from_slice(&[0xff]).unwrap();
+    buffer.extend_from_slice(&[]).unwrap();
+    assert_eq!(&buffer.as_slice()[..32 * 1024], &[0xa5; 32 * 1024]);
+    assert_eq!(&buffer.as_slice()[32 * 1024..], &[0xff]);
+    assert_eq!(buffer.as_slice().as_ptr(), backing);
+    assert_eq!(buffer.capacity(), capacity);
+    assert_eq!(budget.used(), charge);
+    assert_eq!(charge, capacity);
+    drop(buffer);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn bounded_append_rejects_excess_without_mutation_even_with_budget_available() {
+    let budget = CapacityBudget::new(64 * 1024);
+    let mut buffer = budget.buffer(8).unwrap();
+    buffer.extend_from_slice(b"abc").unwrap();
+    let capacity = buffer.capacity();
+    let backing = buffer.as_slice().as_ptr();
+    let too_large = vec![b'x'; capacity - 3 + 1];
+    assert_eq!(
+        buffer.extend_from_slice(&too_large),
+        Err(CapacityError::Exhausted)
+    );
+    assert_eq!(buffer.as_slice(), b"abc");
+    assert_eq!(buffer.as_slice().as_ptr(), backing);
+    assert_eq!(buffer.capacity(), capacity);
+    assert_eq!(budget.used(), capacity);
+    buffer.extend_from_slice(b"\0\xff").unwrap();
+    assert_eq!(buffer.as_slice(), b"abc\0\xff");
+    drop(buffer);
+    assert_eq!(budget.used(), 0);
+
+    let mut empty = budget.buffer(0).unwrap();
+    empty.extend_from_slice(&[]).unwrap();
+    assert_eq!(empty.extend_from_slice(b"x"), Err(CapacityError::Exhausted));
+    assert_eq!(empty.as_slice(), b"");
+    assert_eq!(empty.capacity(), 0);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn result_keeps_capacity_reserved_until_consumer_releases_it() {
     let executor = pool(1, 1);
     let budget = CapacityBudget::new(512);

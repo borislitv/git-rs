@@ -1611,6 +1611,68 @@ fn snapshot_pack_ids_are_exact_unique_decoder_identities_at_equal_offsets() {
 }
 
 #[test]
+fn cache_copy_crosses_chunk_boundary_and_remains_independent_of_mutable_output() {
+    let root = Directory::new();
+    let mut body = vec![0xa5; 32 * 1024];
+    body.push(0xff);
+    let id = blob(&body);
+    let index = root.write("chunk-boundary", &[(id, full_blob(&body))]);
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let budget = CapacityBudget::new(512 * 1024);
+    let limits = ReadLimits {
+        max_delta_depth: 1,
+        ..ReadLimits::default()
+    };
+    let packs = PackSet::open_with_options(
+        [index],
+        root,
+        gix_hash::Kind::Sha1,
+        &control,
+        limits,
+        DecoderOptions {
+            cache_slots: 1,
+            cache_bytes: 32 * 1024 + 1,
+            max_cache_entry_bytes: 32 * 1024 + 1,
+            ..DecoderOptions::default()
+        },
+        budget.clone(),
+    )
+    .unwrap();
+    let mut output = packs
+        .decode(&id, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&output.data.as_slice()[..32 * 1024], &[0xa5; 32 * 1024]);
+    assert_eq!(&output.data.as_slice()[32 * 1024..], &[0xff]);
+    let pin = packs.cached_object(&id, &control, limits).unwrap().unwrap();
+    assert_eq!(
+        packs.cache_stats(&control).unwrap().entry_bytes,
+        pin.capacity()
+    );
+    let with_output = budget.used();
+    let output_capacity = output.data.capacity();
+    output.data.as_mut_slice()[0] = 0;
+    output.data.as_mut_slice()[32 * 1024] = 0;
+    assert_eq!(&pin.as_slice()[..32 * 1024], &[0xa5; 32 * 1024]);
+    assert_eq!(&pin.as_slice()[32 * 1024..], &[0xff]);
+    drop(output);
+    assert_eq!(budget.used(), with_output - output_capacity);
+    let warm = packs
+        .decode(&id, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&warm.data.as_slice()[..32 * 1024], &[0xa5; 32 * 1024]);
+    assert_eq!(&warm.data.as_slice()[32 * 1024..], &[0xff]);
+    assert_eq!(packs.cache_stats(&control).unwrap().decodes, 1);
+    drop(warm);
+    drop(packs);
+    assert_eq!(&pin.as_slice()[32 * 1024..], &[0xff]);
+    assert!(budget.used() >= pin.capacity());
+    drop(pin);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn tiny_pin_keeps_full_backing_and_metadata_after_snapshot_drop() {
     let root = Directory::new();
     let body = vec![b'a'; 4096];

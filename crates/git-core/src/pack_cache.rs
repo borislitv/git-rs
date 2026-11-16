@@ -514,10 +514,8 @@ impl Runtime {
     ) -> gix_error::Result {
         for chunk in bytes.chunks(32 * 1024) {
             check()?;
-            let start = data.as_slice().len();
-            data.resize(start + chunk.len(), 0)
+            data.extend_from_slice(chunk)
                 .map_err(|error| gix_error::Error::from_boxed(Box::new(error)))?;
-            data.as_mut_slice()[start..].copy_from_slice(chunk);
         }
         check()?;
         Ok(())

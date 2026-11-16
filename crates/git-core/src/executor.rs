@@ -499,6 +499,17 @@ impl CapacityBuffer {
         Ok(())
     }
 
+    /// Append an already bounded small chunk without growing backing capacity or
+    /// initializing bytes before copying them. Failure leaves bytes and admission
+    /// unchanged. Callers must poll between chunks for large copies.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), CapacityError> {
+        if bytes.len() > self.data.capacity() - self.data.len() {
+            return Err(CapacityError::Exhausted);
+        }
+        self.data.extend_from_slice(bytes);
+        Ok(())
+    }
+
     /// Append with old/new overlap admitted before growth. Initialization and
     /// copying poll the original control; backing and its reservation always move
     /// together. A failed append never exposes a partial logical result.
