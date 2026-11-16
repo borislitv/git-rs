@@ -186,6 +186,363 @@ fn full_blob(bytes: &[u8]) -> Vec<u8> {
     entry
 }
 
+#[test]
+fn complete_blame_moves_owned_and_pins_cached_physical_blobs_with_identical_porcelain() {
+    use git_rs_core::objects::{Result, VerifiedObject};
+    use git_rs_core::{
+        BlameOptions, BlameRequest, Porcelain, SnapshotIdentity, SnapshotSession,
+        VerifiedObjectProvider,
+    };
+    use gix_hash::{ObjectId, oid};
+    use gix_object::{Header, Kind};
+
+    struct Source {
+        identity: SnapshotIdentity,
+        packs: Arc<PackSet<()>>,
+        budget: CapacityBudget,
+        base: ObjectId,
+        panic_base: Arc<AtomicBool>,
+    }
+    impl VerifiedObjectProvider for Source {
+        fn identity(&self) -> &SnapshotIdentity {
+            &self.identity
+        }
+        fn header(&self, id: &oid, control: &Control) -> Result<Option<Header>> {
+            // The session's limit/budget identities are fixed by this fixture.
+            self.packs.header(
+                id,
+                control,
+                &self.budget,
+                BlameOptions::default().read_limits(),
+            )
+        }
+        fn object(
+            &self,
+            _: &oid,
+            _: &Control,
+            _: &CapacityBudget,
+            _: ReadLimits,
+        ) -> Result<Option<git_rs_core::Object>> {
+            panic!("overridden verified_object must not fall back to mutable provider reads")
+        }
+        fn verified_object(
+            &self,
+            id: &oid,
+            control: &Control,
+            budget: &CapacityBudget,
+            limits: ReadLimits,
+        ) -> Result<Option<VerifiedObject>> {
+            assert!(
+                !(id == self.base.as_ref() && self.panic_base.load(Ordering::Relaxed)),
+                "physical source panic while a cached opposite-side raw owner is live"
+            );
+            self.packs.decode_verified(id, control, budget, limits)
+        }
+    }
+    struct MissMemo {
+        stores: usize,
+        packs: Option<Arc<PackSet<()>>>,
+        control: Control,
+    }
+    impl git_rs_core::blame::memo::MappingMemo for MissMemo {
+        fn load(
+            &mut self,
+            _: &git_rs_core::blame::memo::MappingKey,
+            _: &mut [u8],
+        ) -> std::result::Result<Option<usize>, git_rs_core::BlameError> {
+            if let Some(packs) = &self.packs {
+                assert_eq!(
+                    packs.cache_stats(&self.control).unwrap().pinned_entries,
+                    2,
+                    "both physical raw blobs must remain pinned during read-only mapping, not copied into mutable objects"
+                );
+            }
+            Ok(None)
+        }
+        fn completed(
+            &mut self,
+            _: &git_rs_core::blame::memo::MappingKey,
+            _: &[u8],
+        ) -> std::result::Result<(), git_rs_core::BlameError> {
+            self.stores += 1;
+            Ok(())
+        }
+    }
+    struct CancelPinnedMemo {
+        packs: Arc<PackSet<()>>,
+        control: Control,
+        observed_two_pins: bool,
+    }
+    impl git_rs_core::blame::memo::MappingMemo for CancelPinnedMemo {
+        fn load(
+            &mut self,
+            _: &git_rs_core::blame::memo::MappingKey,
+            _: &mut [u8],
+        ) -> std::result::Result<Option<usize>, git_rs_core::BlameError> {
+            assert_eq!(
+                self.packs
+                    .cache_stats(&self.control)
+                    .unwrap()
+                    .pinned_entries,
+                2,
+                "cancel only after both actual warmed raw owners are live"
+            );
+            self.observed_two_pins = true;
+            self.control.cancel();
+            // Exercise the public callback bridge's strict post-call check,
+            // rather than manufacturing a stop error in the fixture itself.
+            Ok(None)
+        }
+        fn completed(
+            &mut self,
+            _: &git_rs_core::blame::memo::MappingKey,
+            _: &[u8],
+        ) -> std::result::Result<(), git_rs_core::BlameError> {
+            panic!("cancelled raw mapping cannot publish a completed unit")
+        }
+    }
+    let root = Directory::new();
+    let mut entries = Vec::new();
+    let mut insert = |kind: Kind, bytes: Vec<u8>| -> ObjectId {
+        let id = gix_object::compute_hash(gix_hash::Kind::Sha1, kind, &bytes).unwrap();
+        let mut entry = full_blob(&bytes);
+        let code = match kind {
+            Kind::Commit => 1,
+            Kind::Tree => 2,
+            Kind::Blob => 3,
+            Kind::Tag => 4,
+        };
+        entry[0] = (entry[0] & !0x70) | (code << 4);
+        entries.push((id, entry));
+        id
+    };
+    let base_blob = insert(Kind::Blob, b"one\ntwo\n".to_vec());
+    let tip_blob = insert(Kind::Blob, b"one\nnew\n".to_vec());
+    let mut commit = |blob: ObjectId, parent: Option<ObjectId>, time| {
+        let mut tree = b"100644 file\0".to_vec();
+        tree.extend_from_slice(blob.as_bytes());
+        let tree = insert(Kind::Tree, tree);
+        let parent = parent.map_or(String::new(), |id| format!("parent {id}\n"));
+        insert(Kind::Commit, format!("tree {tree}\n{parent}author Example <example@example.test> {time} +0000\ncommitter Example <example@example.test> {time} +0000\n\nPhysical history\n").into_bytes())
+    };
+    let first = commit(base_blob, None, 1);
+    let tip = commit(tip_blob, Some(first), 2);
+    let index = root.write("raw-blame", &entries);
+    let mut expected = None;
+    for cached in [false, true] {
+        for memoized in [false, true] {
+            let budget = CapacityBudget::new(8 * 1024 * 1024);
+            let control = Control::new(Instant::now() + Duration::from_secs(60));
+            let limits = BlameOptions::default().read_limits();
+            let packs = if cached {
+                PackSet::open_with_options(
+                    [index.clone()],
+                    (),
+                    gix_hash::Kind::Sha1,
+                    &control,
+                    limits,
+                    DecoderOptions {
+                        cache_slots: 16,
+                        cache_bytes: 64 * 1024,
+                        max_cache_entry_bytes: 64 * 1024,
+                        header_slots: 16,
+                        retained_workspace_bytes: 1024,
+                    },
+                    budget.clone(),
+                )
+            } else {
+                PackSet::open([index.clone()], (), gix_hash::Kind::Sha1, &control, limits)
+            }
+            .unwrap();
+            if cached {
+                for (id, _) in &entries {
+                    drop(
+                        packs
+                            .decode_verified(id, &control, &budget, limits)
+                            .unwrap()
+                            .expect("physical warm object"),
+                    );
+                }
+            }
+            let pin = if cached {
+                Some(
+                    packs
+                        .cached_object(&base_blob, &control, limits)
+                        .unwrap()
+                        .expect("warm verified base pin"),
+                )
+            } else {
+                None
+            };
+            if let Some(pin) = &pin {
+                assert_eq!(pin.as_slice(), b"one\ntwo\n");
+            }
+            drop(pin);
+            let before = packs.cache_stats(&control).unwrap();
+            let packs = Arc::new(packs);
+            let identity = SnapshotIdentity {
+                source: b"physical-raw-blame".to_vec(),
+                generation: b"one".to_vec(),
+                object_hash: gix_hash::Kind::Sha1,
+            };
+            let panic_base = Arc::new(AtomicBool::new(false));
+            let source = Source {
+                identity: identity.clone(),
+                packs: packs.clone(),
+                budget: budget.clone(),
+                base: base_blob,
+                panic_base: panic_base.clone(),
+            };
+            let session =
+                SnapshotSession::open(source, &identity, control.clone(), budget.clone(), limits)
+                    .unwrap();
+            let mut memo = MissMemo {
+                stores: 0,
+                packs: cached.then(|| packs.clone()),
+                control: control.clone(),
+            };
+            let request = BlameRequest {
+                commit: &tip,
+                path: b"file",
+            };
+            let blame = if memoized {
+                session.blame_complete_with_memo(
+                    request,
+                    &BlameOptions::default(),
+                    git_rs_core::blame::memo::MemoryMappingRequest {
+                        reuse: true,
+                        memo: &mut memo,
+                        boundary: None,
+                    },
+                )
+            } else {
+                session.blame_complete(request, &BlameOptions::default())
+            }
+            .unwrap();
+            assert_eq!(blame.statistics().mapping.computations, 1);
+            assert_eq!(memo.stores, usize::from(memoized));
+            let after = packs.cache_stats(&control).unwrap();
+            if cached {
+                assert_eq!(
+                    after.decodes, before.decodes,
+                    "all physical bodies were served from verified immutable pins"
+                );
+                assert!(after.hits > before.hits);
+                assert_eq!(
+                    after.pinned_entries, 0,
+                    "raw pins cannot escape through complete output"
+                );
+            }
+            let body = Porcelain::encode_complete(
+                &blame,
+                &control,
+                &budget,
+                git_rs_core::blame::MAX_BODY_BYTES,
+            )
+            .unwrap();
+            let bytes: Vec<_> = body.chunks().flatten().copied().collect();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let origins: Vec<_> = text
+                .lines()
+                .filter(|line| {
+                    line.split(' ').next().is_some_and(|word| {
+                        word.len() == 40 && word.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                })
+                .collect();
+            assert_eq!(origins, [format!("{first} 1 1 1"), format!("{tip} 2 2 1")]);
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &bytes, expected,
+                    "owned/pinned and memo/no-memo must preserve complete porcelain"
+                );
+            }
+            expected = Some(bytes);
+            drop(body);
+            drop(blame);
+            drop(memo);
+            if cached {
+                let baseline = budget.used();
+                panic_base.store(true, Ordering::Relaxed);
+                let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.blame_complete(
+                        BlameRequest {
+                            commit: &tip,
+                            path: b"file",
+                        },
+                        &BlameOptions::default(),
+                    )
+                }));
+                assert!(
+                    failed.is_err(),
+                    "reach a provider panic on old-side acquisition"
+                );
+                assert_eq!(
+                    packs.cache_stats(&control).unwrap().pinned_entries,
+                    0,
+                    "unwind releases the opposite raw cache pin"
+                );
+                assert_eq!(
+                    budget.used(),
+                    baseline,
+                    "unwind releases operation metadata and scratch, not source cache admission"
+                );
+                panic_base.store(false, Ordering::Relaxed);
+                let mut cancel_memo = CancelPinnedMemo {
+                    packs: packs.clone(),
+                    control: control.clone(),
+                    observed_two_pins: false,
+                };
+                let cancelled = session.blame_complete_with_memo(
+                    BlameRequest {
+                        commit: &tip,
+                        path: b"file",
+                    },
+                    &BlameOptions::default(),
+                    git_rs_core::blame::memo::MemoryMappingRequest {
+                        reuse: true,
+                        memo: &mut cancel_memo,
+                        boundary: None,
+                    },
+                );
+                assert!(
+                    cancel_memo.observed_two_pins,
+                    "reach the public load callback with two live physical cache pins"
+                );
+                assert_eq!(
+                    cancelled.err(),
+                    Some(git_rs_core::BlameError::Stopped(
+                        git_rs_core::StopReason::Cancelled
+                    )),
+                    "request cancellation returns no complete output and preserves its typed cause"
+                );
+                assert_eq!(control.check(), Err(git_rs_core::StopReason::Cancelled));
+                // The request's control is now stopped; cache inspection uses an
+                // independent finite control, not a reset of request authority.
+                let inspection = Control::new(Instant::now() + Duration::from_secs(60));
+                assert_eq!(
+                    packs.cache_stats(&inspection).unwrap().pinned_entries,
+                    0,
+                    "cancellation releases both raw owners"
+                );
+                assert_eq!(
+                    budget.used(),
+                    baseline,
+                    "cancelled mapping releases its scratch and metadata ledger while source cache admission stays live"
+                );
+                drop(cancel_memo);
+            }
+            drop(session);
+            drop(packs);
+            assert_eq!(
+                budget.used(),
+                0,
+                "all source, result and raw metadata admission is released"
+            );
+        }
+    }
+}
+
 fn ofs_delta(base_distance: usize, base_size: u8, result_size: u8) -> Vec<u8> {
     ofs_delta_with_suffix(base_distance, base_size, result_size, b'!')
 }

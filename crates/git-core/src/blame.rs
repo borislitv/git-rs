@@ -11,7 +11,8 @@ use gix_object::{Find, FindHeader, Header, Kind};
 use hashbrown::HashTable;
 use sha2::{Digest, Sha256};
 
-use crate::objects::{MAX_METADATA_HEADER_BYTES, MAX_METADATA_OBJECT_BYTES};
+use crate::objects::{MAX_METADATA_HEADER_BYTES, MAX_METADATA_OBJECT_BYTES, VerifiedObject};
+use crate::storage::ChargedVec;
 use crate::{
     CapacityBudget, CapacityBuffer, CapacityError, CapacityReservation, Control, ReadLimits,
     SnapshotSession, StopReason, VerifiedObjectProvider,
@@ -405,6 +406,98 @@ struct FindBridge<'a, P> {
     session: &'a SnapshotSession<P>,
     cause: Arc<Cause>,
 }
+
+/// No mutable bytes or weak handles escape this private raw input owner.
+struct RawBlameBlob(VerifiedObject);
+impl AsRef<[u8]> for RawBlameBlob {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+// Conservative std Arc allocation-layout bound: its strong/weak AtomicUsize
+// counts plus the sized inline payload, with room for four counter widths and
+// two payload-alignment units instead of the two counts and alignment padding.
+// This includes the inline witness/handles, not its separately charged byte
+// capacity. Arc unsizing/cloning does not allocate another control block; the
+// outer RawBlob record is covered by the vendor's cache metadata admission.
+// Allocator-private overhead/RSS is outside CapacityBudget's contract. Review
+// this bound with Rust/Arc or RawBlameBlob layout changes (image Rust: 1.99.1).
+const RAW_BLOB_METADATA_BYTES: usize = std::mem::size_of::<RawBlameBlob>()
+    + 4 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+    + 2 * std::mem::align_of::<RawBlameBlob>();
+
+struct RawBlobMetadata {
+    tokens: ChargedVec<CapacityReservation>,
+    control: Control,
+}
+impl Drop for RawBlobMetadata {
+    fn drop(&mut self) {
+        let mut released = 0usize;
+        while let Some(token) = self.tokens.pop() {
+            drop(token);
+            released += 1;
+            // A stop cannot skip cleanup. Unwind must not re-enter observers.
+            if released.is_multiple_of(32) && !std::thread::panicking() {
+                let _ = self.control.check();
+            }
+        }
+        // ChargedVec frees its now-empty backing before its capacity lease.
+    }
+}
+
+impl<P: VerifiedObjectProvider> FindBridge<'_, P> {
+    fn raw_blob(
+        &self,
+        id: &oid,
+        metadata: &mut RawBlobMetadata,
+    ) -> gix_error::Result<Option<gix_diff::blob::raw::RawBlob>> {
+        let result = (|| -> Result<_, BlameError> {
+            self.session.control.check()?;
+            // This session seam preserves physical membership, the complete
+            // hash/collision witness, original decode plan and budget identity.
+            // Moving the witness retains either owned bytes or the cache pin;
+            // object()/into_object() would copy pinned bytes here.
+            let Some(object) = self
+                .session
+                .verified_object(id)
+                .map_err(|error| source_error(error.as_ref()))?
+            else {
+                return Ok(None);
+            };
+            if object.header().kind != Kind::Blob {
+                return Err(BlameError::Corrupt("raw blame object is not a blob"));
+            }
+            if object.as_slice().len() > MAX_BLOB_BYTES {
+                return Err(BlameError::BlobTooLarge);
+            }
+            let reservation = self.session.capacity.reservation(RAW_BLOB_METADATA_BYTES)?;
+            // Complete every fallible ledger insertion BEFORE Arc allocation.
+            // Tokens live outside the Arc, beyond even its final deallocation.
+            metadata
+                .tokens
+                .push(reservation, &self.session.control)
+                .map_err(|error| {
+                    if error.is::<std::collections::TryReserveError>() {
+                        BlameError::Capacity(CapacityError::Allocation)
+                    } else {
+                        source_error(error.as_ref())
+                    }
+                })?;
+            let raw = gix_diff::blob::raw::RawBlob::new(
+                object.id().to_owned(),
+                Kind::Blob,
+                Arc::new(RawBlameBlob(object)),
+            );
+            self.session.control.check()?;
+            Ok(Some(raw))
+        })();
+        result.map_err(|error| {
+            self.cause.record(error);
+            gix_error::Error::from_boxed(Box::new(error))
+        })
+    }
+}
 impl<P: VerifiedObjectProvider> FindHeader for FindBridge<'_, P> {
     fn try_header(&self, id: &oid) -> gix_error::Result<Option<Header>> {
         let result = (|| {
@@ -609,6 +702,23 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             cause: cause.clone(),
         });
         let platform_metadata = self.capacity.reservation(PLATFORM_BOOTSTRAP_BYTES)?;
+        // Declare before the platform: on every return/unwind all raw owners
+        // (including final Arc control blocks) die before these metadata tokens.
+        // The ledger retains reservations only, never blob bytes. Its Vec and
+        // relocation overlap are themselves charged by ChargedVec. The maximum
+        // follows Vec's addressable byte layout, not an arbitrary owner ceiling;
+        // the existing shared budget bounds actual admission first.
+        // Conservative first version: tokens accumulate for all acquisitions,
+        // even after eviction. This can deny long histories earlier than exact
+        // live-owner accounting; it never refunds still-allocated Arc metadata.
+        let mut raw_metadata = RawBlobMetadata {
+            tokens: ChargedVec::new(
+                self.capacity.clone(),
+                isize::MAX as usize / std::mem::size_of::<CapacityReservation>(),
+            )
+            .map_err(|error| source_error(error.as_ref()))?,
+            control: self.control.clone(),
+        };
         let mut platform = raw_platform(self.identity().object_hash);
         platform
             .validate_controlled_raw()
@@ -657,6 +767,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             session: self,
             cause: cause.clone(),
         };
+        let mut raw_blobs = |id: &oid| source.raw_blob(id, &mut raw_metadata);
         let result = if let Some(memo) = memo {
             let identities = options.mapping_options(memo.reuse)?;
             let mut memory = CallbackBridge {
@@ -669,8 +780,8 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 control: &self.control,
                 cause: &cause,
             });
-            gix_blame::file_with_allocations_trace_and_memo(
-                source,
+            gix_blame::file_with_allocations_trace_and_raw_blobs(
+                &source,
                 gix_blame::Start::Commit(request.commit.to_owned()),
                 None,
                 &mut platform,
@@ -679,17 +790,18 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 options.tuning,
                 allocator,
                 &mut check,
-                gix_blame::memo::MappingRequest {
+                &mut raw_blobs,
+                Some(gix_blame::memo::MappingRequest {
                     options: identities,
                     memo: &mut memory,
                     boundary: boundary
                         .as_mut()
                         .map(|callback| callback as &mut dyn gix_blame::memo::MappingBoundary),
-                },
+                }),
             )
         } else {
-            gix_blame::file_with_allocations_and_trace(
-                source,
+            gix_blame::file_with_allocations_trace_and_raw_blobs(
+                &source,
                 gix_blame::Start::Commit(request.commit.to_owned()),
                 None,
                 &mut platform,
@@ -698,6 +810,8 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 options.tuning,
                 allocator,
                 &mut check,
+                &mut raw_blobs,
+                None,
             )
         };
         let admitted = result.map_err(|_| {
@@ -706,6 +820,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 .unwrap_or(BlameError::Corrupt("blame or native origin trace failed"))
         })?;
         drop(platform);
+        drop(raw_metadata);
         drop(platform_metadata);
         // Wrap before post-work validation so every failure uses polled output
         // cleanup, rather than silently dropping a large admitted trace at once.
