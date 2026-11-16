@@ -436,8 +436,16 @@ impl<'a, P: VerifiedObjectProvider> UploadSession<'a, P> {
         }
         let mut first_ack = None;
         let mut rounds = 0;
+        // A stateless depth-info-only RPC ends after its shallow-update flush.
+        // Once any negotiation packet arrives, ordinary termination is required.
+        let mut allow_depth_info_eof = stateless && request.deepening();
         loop {
-            let packet = wire.required(&self.snapshot, input)?;
+            let packet = match wire.next(&self.snapshot, input)? {
+                Some(packet) => packet,
+                None if allow_depth_info_eof => return Ok(()),
+                None => return Err(invalid("truncated upload request")),
+            };
+            allow_depth_info_eof = false;
             if packet == PacketLineRef::Flush {
                 rounds += 1;
                 if rounds > MAX_ROUNDS {
