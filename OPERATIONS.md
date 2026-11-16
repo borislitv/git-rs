@@ -342,6 +342,30 @@ mid-stream; every publication rechecks current write authorization under the rep
 
 ## Publication, crashes and retries
 
+The catalog admits at most 4096 physical packs per repository on supported
+publication paths. An actual new insert taking it above that limit raises
+`maintenance catalog pack bound exceeded` in the AFTER INSERT trigger. The entire
+publication rolls back, including refs, audit/journal, generation and earlier pack
+inserts in the same transaction. Previously committed staged upload intents remain
+available for fenced cleanup. Deduplicated `ON CONFLICT DO NOTHING` attachments
+and ref-only pushes do not consume a catalog slot. Final DB-clock lease checks
+still apply. Compaction deletes the old catalog before inserting its replacement,
+so a catalog at exactly 4096 can still be compacted.
+
+Before refreshing the function, retire or upgrade every older binary that can run
+source `git-rs migrate`: an old migrator can otherwise reinstall the old v2
+function. Run `git-rs migrate` with the updated binary even on schema v2: it
+refreshes the trigger function transactionally and is repeatable. Verify that the
+enabled `maintenance_catalog_enqueue` trigger on `git_rs.packs` calls the installed
+`git_rs.maintenance_compact_enqueue()` function, and that its definition matches
+the updated migration. The migration does not scan/reject or repair existing
+oversized catalogs. Legacy metadata can still be read through the
+metadata API, but bounded source loading and compaction can reject such catalogs;
+this guard is prevention, not an oversized-catalog recovery procedure. Do not
+delete catalog rows or objects as an improvised recovery. The concurrency guarantee
+is for supported repository-locked publication paths, not arbitrary administrative
+SQL using stale repeatable-read snapshots.
+
 1. A request authorizes, acquires a committed shared repository lease and takes a fresh metadata
    snapshot. Rust reads catalogued physical objects through bounded authenticated ranges.
 2. One complete immutable command batch is sealed before SQL/status. Controlled Rust ingestion

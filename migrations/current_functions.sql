@@ -260,10 +260,18 @@ CREATE TRIGGER maintenance_retired_enqueue AFTER INSERT ON retired_objects FOR E
 
 CREATE OR REPLACE FUNCTION maintenance_compact_enqueue() RETURNS trigger LANGUAGE plpgsql
 SET search_path = pg_catalog, git_rs, pg_temp AS $$
-DECLARE g bigint;
+DECLARE g bigint; n bigint;
 BEGIN
+    -- Supported publishers hold the repository lock before catalog writes (the
+    -- nonreuse BEFORE trigger also takes it). Count actual inserts, not attempted
+    -- ON CONFLICT DO NOTHING rows; any overflow aborts the whole publication.
+    SELECT count(*) INTO n FROM (SELECT 1 FROM packs WHERE repo_id=NEW.repo_id LIMIT 4097) p;
+    -- Preserve a distinct SQLSTATE for database-side diagnostics.
+    IF n>4096 THEN
+        RAISE EXCEPTION 'maintenance catalog pack bound exceeded' USING ERRCODE='P1C01';
+    END IF;
     SELECT generation INTO STRICT g FROM repositories WHERE id=NEW.repo_id;
-    IF (SELECT count(*) FROM (SELECT 1 FROM packs WHERE repo_id=NEW.repo_id LIMIT 8) p)>=8 THEN
+    IF n>=8 THEN
         PERFORM maintenance_enqueue(NEW.repo_id,'compact','compact:'||NEW.repo_id::text||':'||g::text||':v1',convert_to(g::text,'UTF8'));
     END IF;
     RETURN NEW;
