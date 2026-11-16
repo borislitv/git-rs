@@ -291,7 +291,6 @@ fn serve(args: &[String]) -> Result<()> {
         blame = blame.with_warming(git_rs::blame::WarmPolicy::one_path(path)?)?;
     }
     metrics::global();
-    let _diagnostics = metrics::init_service_logs()?;
     // Validate credentials before opening any serving listener. Production and
     // fixed-principal development HTTP can never be enabled in the same process.
     let production_http = args
@@ -329,7 +328,6 @@ fn serve(args: &[String]) -> Result<()> {
         None
     };
     let socket = PathBuf::from(option(args, "--socket")?);
-    let listener = serving_socket::ServingSocket::bind(&socket)?;
     let cache_bytes = std::env::var("GIT_RS_CACHE_BYTES")
         .unwrap_or_else(|_| "67108864".into())
         .parse()?;
@@ -339,6 +337,10 @@ fn serve(args: &[String]) -> Result<()> {
         cache: Arc::new(Cache::new(cache_bytes, 8 * 1024 * 1024)),
         operation_seconds: operation_seconds()?,
     });
+    // Keep startup configuration failures on the bounded CLI diagnostic path;
+    // service diagnostics intentionally emit only closed runtime events.
+    let _diagnostics = metrics::init_service_logs()?;
+    let listener = serving_socket::ServingSocket::bind(&socket)?;
     let active = Admission::new(4);
     if let Ok(address) = option(args, "--health") {
         health(&address, engine.clone(), active.clone())?;

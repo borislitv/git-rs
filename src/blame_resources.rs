@@ -39,7 +39,7 @@ impl ResourceProfile {
 
     pub fn validate_capacity(self, workers: usize, queued: usize) -> Result<()> {
         if !(1..=4).contains(&workers) || queued > 3 || workers + queued > 4 {
-            return Err(invalid("invalid bounded blame CPU capacity"));
+            return Err(invalid("invalid bounded blame capacity"));
         }
         if self == Self::LargeV1 && (workers != 1 || queued != 0 || usize::BITS < 64) {
             return Err(invalid(
