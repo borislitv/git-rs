@@ -7,6 +7,7 @@ It does not install CNPG/Rook operators or establish production durability.
 import argparse
 import base64
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -51,54 +52,96 @@ class Cluster:
                                    ok=False).stdout.decode())
 
 
-def import_image(cluster, image):
+def import_image(cluster, image, *, base_name=None):
+    options = ["--local", "--digests", "--base-name", base_name] if base_name else []
     save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+    failure = None
     try:
-        # Register immutable references explicitly after joining the imported
-        # named image. Generated digest names can point at an archive wrapper
-        # index instead of the image identity exposed by kubelet.
         result = subprocess.run(["docker", "exec", "-i", cluster, "ctr", "images",
-                                 "import", "-"], stdin=save.stdout, capture_output=True, timeout=120)
+                                 "import", *options, "-"], stdin=save.stdout, capture_output=True, timeout=120)
         assert result.returncode == 0, result.stderr.decode()
         assert save.wait(timeout=10) == 0, "Docker image export failed"
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        save.stdout.close()
-        if save.poll() is None:
-            save.terminate()
-            try:
-                save.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                save.kill()
-                save.wait(timeout=5)
+        cleanup_errors = []
+        try:
+            save.stdout.close()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            if save.poll() is None:
+                try:
+                    save.terminate()
+                except ProcessLookupError:
+                    pass  # The exporter exited between poll and terminate; still reap it.
+                try:
+                    save.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        save.kill()
+                    except ProcessLookupError:
+                        pass
+                    save.wait(timeout=5)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            # A pipe/reaping error must not replace the import/cancellation cause.
+            primary = failure if failure is not None else cleanup_errors[0]
+            for error in cleanup_errors:
+                if error is not primary:
+                    primary.add_note(f"Docker image export cleanup failed: {type(error).__name__}: {error}")
+            if failure is None:
+                raise primary
 
 
 def bound_image(cluster, image, revision, role):
     identity = inspect_image(image, revision, role)
     repository = "git-rs.fixture.invalid/" + role
-    # Unique content-bound aliases let containerd import an untagged Docker-ID
-    # handoff without giving a mutable tag to the Helm deployment.
-    alias = repository + ":" + revision + "-" + identity.removeprefix("sha256:")
-    existing = command(["docker", "image", "inspect", alias], ok=False)
-    created = bool(existing.returncode)
-    if created:
-        command(["docker", "tag", identity, alias])
+    # Name digest records inside owned containerd, never on the host daemon:
+    # removing a last host tag can try to delete the active controller's image.
+    base_name = repository + "/" + revision + "-" + identity.removeprefix("sha256:")
+    import_image(cluster, identity, base_name=base_name)
+    assert inspect_image(identity, revision, role) == identity, "image identity changed during export"
+    rows = command(["docker", "exec", cluster, "ctr", "images", "list"]).stdout.decode().splitlines()
+    matches = [row.split() for row in rows if row.split() and row.split()[0].startswith(base_name + "@")]
+    assert len(matches) == 1, "expected exactly one imported image manifest"
+    record = matches[0]
+    assert len(record) >= 3 and re.fullmatch(r"sha256:[0-9a-f]{64}", record[2]), "invalid imported manifest digest"
+    assert record[1] in {"application/vnd.oci.image.manifest.v1+json",
+                         "application/vnd.docker.distribution.manifest.v2+json"}, "unsupported imported manifest type"
+    reference = record[0]
+    assert reference == base_name + "@" + record[2], "imported reference differs from its manifest digest"
+    raw_manifest = command(["docker", "exec", cluster, "ctr", "content", "get", record[2]]).stdout
+    assert "sha256:" + hashlib.sha256(raw_manifest).hexdigest() == record[2], "imported manifest content digest differs"
     try:
-        assert inspect_image(alias, revision, role) == identity
-        import_image(cluster, alias)
-        assert inspect_image(alias, revision, role) == identity, "image alias changed during export"
-    finally:
-        if created:
-            assert inspect_image(alias, revision, role) == identity, "refusing to remove a replaced image alias"
-            command(["docker", "image", "rm", alias])
-    rows = command(["docker", "exec", cluster, "ctr", "images", "list", "name==" + alias]).stdout.decode().splitlines()
-    matches = [row.split() for row in rows if row.split() and row.split()[0] == alias]
-    assert len(matches) == 1 and re.fullmatch(r"sha256:[0-9a-f]{64}", matches[0][2]), "imported manifest not found"
-    reference = repository + "@" + matches[0][2]
-    command(["docker", "exec", cluster, "ctr", "images", "tag", alias, reference])
+        manifest = json.loads(raw_manifest)
+    except (ValueError, UnicodeDecodeError) as error:
+        raise AssertionError("invalid imported image manifest JSON") from error
+    assert (isinstance(manifest, dict) and type(manifest.get("schemaVersion")) is int
+            and manifest["schemaVersion"] == 2 and "manifests" not in manifest
+            and isinstance(manifest.get("config"), dict)
+            and isinstance(manifest.get("layers"), list)), "invalid imported schema-2 image manifest"
+    assert manifest.get("mediaType", record[1]) == record[1], "imported manifest media type differs"
+    config_digest = manifest["config"].get("digest")
+    assert isinstance(config_digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest), "invalid imported config digest"
+    proven_ids = (config_digest, record[2])
+    # Classic Docker exposes the config ID; manifest-backed stores can expose
+    # the manifest ID. Both must be linked by these exact verified bytes.
+    assert identity in proven_ids, (
+        f"imported image is not linked to Docker identity: docker_id={identity}, "
+        f"config_digest={config_digest}, manifest_digest={record[2]}")
     imported = json.loads(command(["docker", "exec", cluster, "crictl", "inspecti", reference]).stdout)
+    cri_id = imported["status"]["id"]
+    # Only after proving the manifest bytes and their config linkage may CRI
+    # identify this image by either the config digest or the manifest digest.
+    assert cri_id in proven_ids, (
+        f"unsupported imported CRI identity: cri_id={cri_id}, docker_id={identity}, "
+        f"config_digest={config_digest}, manifest_digest={record[2]}, reference={reference}")
     labels = imported["info"]["imageSpec"]["config"]["Labels"]
     assert labels["io.git-rs.role"] == role and labels["org.opencontainers.image.revision"] == revision
-    return {"docker_id": identity, "reference": reference, "cri_id": imported["status"]["id"]}
+    return {"docker_id": identity, "reference": reference, "cri_id": cri_id}
 
 
 def bound_dependency(cluster, image):

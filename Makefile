@@ -33,6 +33,7 @@ check: core-source-check
 	python3 -B tests/runtime_gate_test.py
 	python3 -B tests/runtime_exec_test.py
 	python3 -B tests/kubernetes_processes_test.py
+	python3 -B tests/kubernetes_image_handoff_test.py
 	python3 -B tests/istio_artifacts_test.py
 	python3 -B tests/playground_test.py
 	python3 -B tests/cache_matrix_test.py
