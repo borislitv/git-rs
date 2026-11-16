@@ -3,6 +3,7 @@
 (() => {
   const raw = globalThis.GIT_RS_ARCH;
   const data = raw && typeof raw === 'object' ? raw : {};
+  const { numericFields, validate: validateEvidence, MAX_BYTES } = globalThis.GitRsEvidence;
   const list = (value) => Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
   const text = (value, fallback = 'Не указано') => {
     if (typeof value === 'string' && value.trim()) return value;
@@ -89,6 +90,9 @@
       byId(tab.getAttribute('aria-controls')).hidden = !active;
     });
     if (focus) selected.focus();
+    else if (document.activeElement?.closest('[role="tabpanel"]')?.hidden) {
+      byId(selected.getAttribute('aria-controls')).focus();
+    }
   }
   tabs.forEach((tab, index) => {
     tab.addEventListener('click', () => { window.location.hash = tab.dataset.tab; activateTab(tab.dataset.tab); });
@@ -113,10 +117,12 @@
   let selectedFlow = 0;
   let selectedStep = 0;
   let evidenceItems = [];
+  let graph;
   const componentButtons = [];
   function showComponent(index) {
     const component = components[index];
     if (!component) return;
+    graph?.selectComponent(component.id);
     componentButtons.forEach((button, i) => button.setAttribute('aria-pressed', String(i === index)));
     const panel = byId('component-detail');
     panel.replaceChildren(el('span', 'eyebrow', 'КОМПОНЕНТ СИСТЕМЫ'), el('h3', '', component.title), el('p', '', component.summary));
@@ -161,6 +167,19 @@
     empty(byId('component-map'), 'Карта ещё не заполнена', 'Добавьте components в architecture-data.js.');
     empty(byId('component-detail'), 'Выберите компонент', 'После подключения данных здесь появятся описание, исходники и связанные запросы.');
   }
+
+  graph = globalThis.GitRsGraph.mount(byId('architecture-graph'), {
+    components, flows,
+    onComponent(id) { showComponent(components.findIndex((component) => component.id === id)); },
+    onFlow(id) {
+      selectedFlow = flows.findIndex((flow) => flow.id === id);
+      selectedStep = 0;
+      renderFlow();
+      window.location.hash = 'flows';
+      activateTab('flows');
+    },
+  });
+  if (components.length) graph.selectComponent(components[0].id);
 
   const picker = byId('flow-select');
   flows.forEach((flow, index) => {
@@ -229,6 +248,8 @@
       const label = el('span');
       const component = components.find((entry) => entry.id === step.component);
       label.append(el('strong', '', step.title), el('small', '', component ? component.title : step.component));
+      const measurements = evidenceItems.filter((item) => item.flow_id === flow.id && item.step_id === step.id);
+      if (measurements.length) label.append(badge(`Evidence: ${measurements.length} · scope внутри`));
       button.append(el('span', 'step-number', String(index + 1).padStart(2, '0')), label);
       button.addEventListener('click', () => { selectedStep = index; renderStep(); });
       item.append(button);
@@ -237,6 +258,24 @@
     renderStep();
   }
   renderFlow();
+
+  list(data.cacheLayers).forEach((layer) => {
+    const card = el('article', 'cache-layer detail-card');
+    card.append(el('h3', '', layer.title), badge(text(layer.scope)), facts([
+      ['Идентичность и ключ', layer.identity], ['Время жизни / TTL', layer.lifetime],
+      ['Размер и admission', layer.capacity], ['При hit', layer.hit], ['При miss / bypass', layer.miss],
+      ['Проверки', layer.checks], ['Копии и pins', layer.copies], ['Метрики', layer.metrics],
+    ]), sources(layer.sources));
+    byId('cache-layers').append(card);
+  });
+  list(data.parameters).forEach((parameter) => {
+    const card = el('article', 'parameter-card detail-card');
+    card.append(el('h3', '', parameter.name), facts([
+      ['Значение из кода', parameter.value], ['Единица', parameter.unit], ['Область', parameter.scope],
+      ['Что означает', parameter.meaning], ['Что даёт изменение / компромисс', parameter.tradeoff],
+    ]), sources(parameter.sources));
+    byId('parameters').append(card);
+  });
 
   const metrics = list(data.metrics);
   metrics.forEach((metric) => {
@@ -278,69 +317,66 @@
   const clearButton = byId('clear-evidence');
   const status = byId('evidence-status');
   const evidence = byId('evidence-content');
-  const numericFields = ['wall_seconds', 'user_cpu_seconds', 'system_cpu_seconds', 'peak_rss_bytes'];
-  const stringFields = ['id', 'title', 'scope', 'revision', 'workload', 'outcome', 'limitations', 'source', 'flow_id', 'step_id'];
   let importGeneration = 0;
-  const missing = (value) => value === undefined || value === null || value === '' || value === 'unknown';
-  function validateEvidence(value) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)
-      || value.format !== 'git-rs-architecture-evidence/v1' || !Array.isArray(value.items)) {
-      throw new Error('Ожидается объект с format: git-rs-architecture-evidence/v1 и массивом items.');
-    }
-    if (value.items.length > 500) throw new Error('Допускается не более 500 записей.');
-    return value.items.map((item, index) => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error(`Запись ${index + 1}: ожидается объект.`);
-      const clean = {};
-      stringFields.forEach((field) => {
-        const entry = item[field];
-        if (!missing(entry) && (typeof entry !== 'string' || entry.length > 16000)) {
-          throw new Error(`Запись ${index + 1}, ${field}: ожидается строка до 16000 символов или null.`);
-        }
-        clean[field] = missing(entry) ? null : entry;
-      });
-      numericFields.forEach((field) => {
-        const entry = item[field];
-        if (!missing(entry) && (typeof entry !== 'number' || !Number.isFinite(entry) || entry < 0)) {
-          throw new Error(`Запись ${index + 1}, ${field}: ожидается конечное неотрицательное число или null/unknown.`);
-        }
-        clean[field] = missing(entry) ? null : entry;
-      });
-      if (item.hotspots !== undefined && (!Array.isArray(item.hotspots) || item.hotspots.length > 50)) {
-        throw new Error(`Запись ${index + 1}, hotspots: ожидается массив до 50 элементов.`);
-      }
-      clean.hotspots = (item.hotspots || []).map((hotspot, hotspotIndex) => {
-        const location = `Запись ${index + 1}, hotspot ${hotspotIndex + 1}`;
-        if (!hotspot || typeof hotspot !== 'object' || Array.isArray(hotspot)
-          || typeof hotspot.name !== 'string' || hotspot.name.length > 16000
-          || typeof hotspot.detail !== 'string' || hotspot.detail.length > 16000) {
-          throw new Error(`${location}: name и detail должны быть строками до 16000 символов.`);
-        }
-        if (typeof hotspot.self_percent !== 'number' || !Number.isFinite(hotspot.self_percent)
-          || hotspot.self_percent < 0 || hotspot.self_percent > 100) {
-          throw new Error(`${location}: self_percent должен быть конечным числом от 0 до 100.`);
-        }
-        return { name: hotspot.name, self_percent: hotspot.self_percent, detail: hotspot.detail };
-      });
-      return clean;
-    });
-  }
+  const hasMeasurement = (item) => numericFields.some((field) => item[field] !== null)
+    || item.hotspots.length > 0 || item.elapsed_spans.length > 0;
   const measured = (value, unit) => value === null ? 'нет измерения' : `${value.toLocaleString('ru-RU', { maximumSignificantDigits: 12 })} ${unit}`;
+  function chartRows(rows, maximum, unit) {
+    const chart = el('div', 'measurement-chart');
+    rows.forEach(({ name, value, detail }) => {
+      const row = el('div', 'chart-row');
+      row.append(el('strong', '', name), el('span', 'chart-value', measured(value, unit)));
+      if (value !== null) {
+        const meter = el('meter');
+        meter.min = 0;
+        meter.max = maximum > 0 ? maximum : 1;
+        meter.value = value;
+        meter.setAttribute('aria-label', `${name}: ${measured(value, unit)}`);
+        row.append(meter);
+      }
+      if (detail) row.append(el('p', 'muted', detail));
+      chart.append(row);
+    });
+    return chart;
+  }
   function evidenceCard(item) {
     const card = el('article', 'imported-evidence');
-    card.append(el('h4', '', text(item.title, text(item.id, 'Без названия'))), facts([
+    card.append(el('h4', '', text(item.title, text(item.id, 'Без названия'))),
+      el('p', 'muted', `Область: ${text(item.scope, 'не указана')}`),
+      el('p', 'evidence-outcome', `Исход: ${text(item.outcome, 'не указан')}`));
+    const context = el('details', 'evidence-context-details');
+    context.append(el('summary', '', 'Нагрузка, ревизия и источник'), facts([
       ['ID', item.id], ['Flow / step', `${text(item.flow_id, 'не указан')} / ${text(item.step_id, 'не указан')}`],
       ['Ревизия источника', text(item.revision, 'не указана')],
       ['Ревизия архитектурной карты', text(data.revision, 'не указана')],
-      ['Scope / область', item.scope], ['Workload / нагрузка', item.workload],
-      ['Исход', item.outcome],
-      ['Ограничения', text(item.limitations, 'Не указаны — применимость не подтверждена')],
+      ['Workload / нагрузка', item.workload],
       ['Источник (текст)', item.source],
     ]));
     if (item.revision && data.revision && item.revision !== data.revision) {
       card.append(el('p', 'evidence-warning', 'Ревизия источника отличается от архитектурной карты. Evidence сохранено и показано; применимость требует проверки.'));
     }
     card.append(el('p', 'evidence-warning', 'Проверяйте область измерения и ограничения: результаты mapped core нельзя автоматически переносить на range-backed serving или production-нагрузку.'));
-    card.append(facts(numericFields.map((field) => [field, measured(item[field], field === 'peak_rss_bytes' ? 'байт' : 'с')])));
+    const values = facts(numericFields.map((field) => [field, measured(item[field], field === 'peak_rss_bytes' ? 'байт' : 'с')]));
+    values.classList.add('measurement-values');
+    card.append(values);
+    const times = [
+      { name: 'Wall', value: item.wall_seconds },
+      { name: 'User CPU', value: item.user_cpu_seconds },
+      { name: 'System CPU', value: item.system_cpu_seconds },
+    ];
+    if (times.some((row) => row.value !== null)) {
+      card.append(el('h4', '', 'Время одного запуска · независимые полосы'),
+        el('p', 'muted', 'Общая шкала в секундах. Это не складываемые фазы; CPU и wall имеют разный смысл.'),
+        chartRows(times, Math.max(...times.map((row) => row.value ?? 0)), 'с'));
+    }
+    if (item.peak_rss_bytes !== null) card.append(el('p', 'rss-value', `Peak RSS: ${measured(item.peak_rss_bytes / (1024 ** 2), 'МиБ')} · не capacity budget`));
+    card.append(el('p', 'evidence-warning', `Ограничения: ${text(item.limitations, 'не указаны — применимость не подтверждена')}`));
+    if (item.elapsed_spans.length) {
+      card.append(el('h4', '', 'Inclusive elapsed spans · не CPU'),
+        el('p', 'evidence-warning', 'Вложенные интервалы перекрываются. Длины полос не складывать. Шкала включает wall этого префикса.'),
+        chartRows(item.elapsed_spans.map((span) => ({ name: span.name, value: span.seconds, detail: span.detail })),
+          Math.max(item.wall_seconds ?? 0, ...item.elapsed_spans.map((span) => span.seconds)), 'с'));
+    }
     if (item.hotspots.length) {
       card.append(el('h4', '', 'Hotspots · self samples'));
       card.append(el('p', 'hotspot-note', 'доля CPU-clock samples в указанном запуске, не wall и не CPU процент production; вложенные категории не складывать'));
@@ -349,16 +385,31 @@
         const entry = el('li');
         const share = hotspot.self_percent.toLocaleString('ru-RU', { maximumSignificantDigits: 12 });
         entry.append(el('strong', '', hotspot.name), el('span', 'hotspot-share', `${share}% self samples`), el('p', 'muted', hotspot.detail));
+        entry.append(chartRows([{ name: 'Self samples', value: hotspot.self_percent }], 100, '%'));
         entries.append(entry);
       });
       card.append(entries);
     } else {
       card.append(el('p', 'muted', 'Hotspots не импортированы — нет измерения self samples.'));
     }
+    card.append(context);
     return card;
   }
   function renderEvidence(items) {
     evidence.replaceChildren();
+    const coverage = byId('measurement-coverage');
+    coverage.replaceChildren();
+    flows.forEach((flow) => {
+      const matched = items.filter((item) => item.flow_id === flow.id
+        && list(flow.steps).some((step) => step.id === item.step_id));
+      const card = el('article', 'coverage-card');
+      const measuredItems = matched.filter(hasMeasurement);
+      card.append(el('h4', '', flow.title), el('p', '', measuredItems.length
+        ? `${measuredItems.length} записей с числовыми наблюдениями: ${[...new Set(measuredItems.map((item) => item.scope))].join('; ')}`
+        : 'Нет числовых измерений. Время, CPU и RSS неизвестны; ограничения из кода смотрите в шагах.'));
+      if (matched.length > measuredItems.length) card.append(el('p', 'muted', `Контекстных evidence без чисел: ${matched.length - measuredItems.length}.`));
+      coverage.append(card);
+    });
     if (!items.length) {
       empty(evidence, 'Нет локальных измерений', 'Выберите приватный JSON. Значения останутся только в памяти этой страницы.');
       return;
@@ -410,7 +461,7 @@
     status.classList.remove('error');
     status.textContent = 'Чтение локального файла…';
     try {
-      if (file.size > 2 * 1024 * 1024) throw new Error('Файл больше 2 МиБ.');
+      if (file.size > MAX_BYTES) throw new Error('Файл больше 2 МиБ.');
       const contents = await file.text();
       if (generation !== importGeneration) return;
       let parsed;
@@ -419,8 +470,9 @@
       const items = validateEvidence(parsed);
       evidenceItems = items;
       renderEvidence(items);
-      renderStep();
+      renderFlow();
       clearButton.disabled = false;
+      byId('deployment-scope').textContent = 'Evidence из локального файла · не live';
       status.textContent = `Локально загружено записей: ${items.length}. Исторические / частичные доказательства; данные не отправлялись.`;
     } catch (error) {
       if (generation !== importGeneration) return;
@@ -435,10 +487,27 @@
     importInput.value = '';
     evidenceItems = [];
     renderEvidence([]);
-    renderStep();
+    renderFlow();
     clearButton.disabled = true;
+    byId('local-profile-notice').hidden = true;
+    byId('deployment-scope').textContent = globalThis.GIT_RS_LOCAL_EVIDENCE
+      ? 'Локальная сборка · evidence очищено' : 'Исходники · без измерений';
     status.classList.remove('error');
     status.textContent = 'Локальные evidence очищены из интерфейса. Файл на диске не изменён.';
   });
   renderEvidence([]);
+  if (globalThis.GIT_RS_LOCAL_EVIDENCE) {
+    try {
+      evidenceItems = validateEvidence(globalThis.GIT_RS_LOCAL_EVIDENCE);
+      renderEvidence(evidenceItems);
+      renderFlow();
+      clearButton.disabled = false;
+      byId('deployment-scope').textContent = 'Локальная сборка · профиль измерений';
+      byId('local-profile-notice').hidden = false;
+      status.textContent = `Подключён локальный профиль: ${evidenceItems.length} записей. Это датированные измерения, не live dashboard; публичная сборка их не содержит.`;
+    } catch (error) {
+      status.classList.add('error');
+      status.textContent = `Локальный профиль отклонён: ${error.message}`;
+    }
+  }
 })();
