@@ -2,7 +2,13 @@
 use git_rs::{
     Result, blob::Store, cache::Cache, engine::Engine, http, invalid, metrics, process, protocol,
 };
-use std::{io::Write, net::TcpListener, os::unix::net::UnixListener, path::PathBuf, sync::Arc};
+use std::{
+    io::{BufReader, Write},
+    net::TcpListener,
+    os::unix::net::UnixListener,
+    path::PathBuf,
+    sync::Arc,
+};
 
 #[test]
 #[ignore = "process helper; launched by receive_integration.py in an owned fixture"]
@@ -34,6 +40,13 @@ fn receive_fixture_process() -> Result<()> {
     let requests = active.clone();
     std::thread::spawn(move || {
         for mut stream in health.incoming().flatten() {
+            if stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .is_err()
+                || git_rs::health::path(&mut BufReader::new(&mut stream)).is_err()
+            {
+                continue;
+            }
             let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
             let mut body = metrics::global().render(requests.active(), monitor.cache.allocated());
             body.push_str(&format!(

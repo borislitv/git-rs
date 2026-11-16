@@ -58,6 +58,32 @@ def post(port, body, headers=None):
         conn.close()
 
 
+def metrics_request_framing_case(f, port):
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as peer:
+        peer.sendall(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n")
+        # EOF before the terminating empty line is not a complete HTTP request.
+        # Half-close only the request: the response side must end cleanly without
+        # sending metrics. This distinguishes rejection from an early 200 or RST.
+        peer.shutdown(socket.SHUT_WR)
+        assert peer.recv(1) == b"", "metrics responded to incomplete HTTP headers"
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as peer:
+        for fragment in (b"GET /met", b"rics HTTP/1.1\r", b"\nHost: local",
+                         b"host\r\nConnection: close\r\n", b"\r\n"):
+            peer.sendall(fragment)
+        response = http.client.HTTPResponse(peer)
+        try:
+            response.begin()
+            assert response.status == 200
+            length = int(response.getheader("Content-Length"))
+            body = response.read()
+            assert len(body) == length, "metrics body differs from Content-Length"
+            assert metric_value(body, "git_rs_fixture_receive_admitted") == 0
+            assert peer.recv(1) == b"", "metrics response did not end cleanly"
+        finally:
+            response.close()
+    f.results["metrics_complete_request_and_fragmented_headers"] = True
+
+
 def exercise(f, helper, gateway, commit_gateway, cache_outage):
     f.cli("migrate")
     f.cli("create", "team/project", "alice")
@@ -77,6 +103,7 @@ def exercise(f, helper, gateway, commit_gateway, cache_outage):
     assert initial_cache_connections > 0
     port = int(ready().group(1))
     health_port = int(re.search(r"health 127.0.0.1:(\d+)", log_path.read_text()).group(1))
+    metrics_request_framing_case(f, health_port)
     def metrics():
         connection = http.client.HTTPConnection("127.0.0.1", health_port, timeout=5)
         try:
