@@ -260,6 +260,8 @@ fn checkpoint_reuse_child() {
                 "fenced temporary units were installed in the live workset"
             );
         }
+        // Returned errors retain actual work admission until their owner is dropped.
+        drop(response);
     } else {
         let Response::Complete(body) = response.unwrap() else {
             panic!("expected full real-source result");
