@@ -13,7 +13,12 @@ resource descriptions. The public atlas describes code rather than asserting
 production performance. Inclusive wall timers may overlap, configured
 capacities are not RSS, and missing measurements are not zero.
 
-Separate tabs describe five cache layers and fifteen parameter groups. A cache
+The readiness and improvement tabs distinguish executed small-scenario success,
+open large-workload blockers, protections, and actions with explicit conditions
+and costs. The cache tab maps five data structures to three locations: shared
+process RAM, per-job RAM, and one optional PostgreSQL/S3 derived-cache subsystem.
+Each location links back to its actual component on the main graph. Fifteen
+parameter groups retain their source-backed technical details. A cache
 hit does not replace source authority or imply a hit in another layer. The graph
 is a logical map of component transitions from request steps, not a timing trace.
 
@@ -29,6 +34,11 @@ and `detail` (at most 20 spans per item). Their inclusive elapsed bars overlap;
 they are not additive phases or CPU attribution. Historical CPU-clock self
 samples remain separate from current-source elapsed measurements.
 
+Optional `takeaways` holds up to eight bounded text strings per evidence item.
+These are supplied interpretations, not automatically inferred diagnoses. Local
+conclusions appear before raw profiles and are cleared together with the evidence;
+the public source contains no private measurements or derived numerical claims.
+
 ## Allowlisted builds and local hosting
 
 Node.js 20+ is sufficient; the builder has no package dependencies. The output
@@ -40,7 +50,7 @@ node docs/site/build.cjs --out /tmp/git-rs-atlas-local --evidence /private/profi
 python3 -m http.server 8767 --bind :: --directory /tmp/git-rs-atlas-local
 ```
 
-The basic public build physically includes only eight static assets plus its manifest
+The basic public build physically includes only nine static assets plus its manifest
 and checksums. It never walks or copies neighboring evidence, tests or build
 scripts. The explicit local build adds one validated, inert data script and
 shows a local-profile notice; it is not suitable for public hosting. Measurements
@@ -52,9 +62,9 @@ For access by the SSH host address, `--bind ::` serves IPv4 and IPv6 on port
 preview alive independently of the agent; it does not imply reboot persistence.
 Verify both address families and the actual served profile before delivery.
 
-The current preview uses `git-rs-architecture-20261116-b2.service` on the SSH
+The current preview uses `git-rs-architecture-20261117-a2.service` on the SSH
 host, port 8767. Inspect it with `systemctl status` and stop this exact unit
-with `systemctl stop git-rs-architecture-20261116-b2.service` when no longer needed.
+with `systemctl stop git-rs-architecture-20261117-a2.service` when no longer needed.
 The server remains independent of the agent session, not of a host reboot.
 
 ```sh

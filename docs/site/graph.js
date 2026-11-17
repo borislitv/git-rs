@@ -344,6 +344,12 @@
       update();
       renderRoute();
     });
+    function showAllPaths() {
+      picker.value = '';
+      activeFlow = null;
+      update();
+      renderRoute();
+    }
     search.addEventListener('input', update);
     search.addEventListener('keydown', (event) => {
       if (event.key !== 'Enter') return;
@@ -376,7 +382,7 @@
     viewport.addEventListener('lostpointercapture', endDrag);
     update();
     renderRoute();
-    return { selectComponent };
+    return { selectComponent, showAllPaths };
   }
 
   globalThis.GitRsGraph = Object.freeze({ mount });

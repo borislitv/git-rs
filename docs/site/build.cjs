@@ -6,7 +6,7 @@ const { createHash } = require('node:crypto');
 const evidence = require('./evidence.js');
 
 const assets = Object.freeze([
-  'index.html', 'style.css', 'architecture-data.js', 'app.js',
+  'index.html', 'style.css', 'architecture-data.js', 'guide-data.js', 'app.js',
   'graph.js', 'graph.css', 'evidence.js', 'favicon.svg',
 ]);
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');

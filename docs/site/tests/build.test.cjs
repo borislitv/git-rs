@@ -39,7 +39,7 @@ test('public build physically excludes local evidence, tests and source tooling'
   const output = path.join(root, 'site');
   buildSite({ output });
   assert.deepEqual(fs.readdirSync(output).sort(), [
-    'index.html', 'style.css', 'architecture-data.js', 'app.js', 'graph.js', 'graph.css',
+    'index.html', 'style.css', 'architecture-data.js', 'guide-data.js', 'app.js', 'graph.js', 'graph.css',
     'evidence.js', 'favicon.svg', 'manifest.json', 'SHA256SUMS',
   ].sort());
   const manifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
@@ -74,4 +74,39 @@ test('local evidence is explicit, inert text and absent from build metadata path
   const rejected = path.join(root, 'rejected');
   assert.throws(() => buildSite({ output: rejected, evidencePath: invalid }));
   assert.equal(fs.existsSync(rejected), false);
+});
+
+test('plain-language conclusions are bounded inert evidence and survive explicit builds', (t) => {
+  assert.deepEqual(validate(document({ takeaways: ['Measured conclusion <script>'] }))[0].takeaways,
+    ['Measured conclusion <script>']);
+  for (const takeaways of ['not an array', Array(9).fill('x'), [42], ['x'.repeat(16001)]]) {
+    assert.throws(() => validate(document({ takeaways })), /takeaways/);
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'git-rs-atlas-conclusions-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const input = path.join(root, 'profile.json');
+  const output = path.join(root, 'site');
+  const point = '</script><script>globalThis.executed=true</script>';
+  fs.writeFileSync(input, JSON.stringify(document({ takeaways: [point] })));
+  buildSite({ output, evidencePath: input });
+  const context = {};
+  vm.runInNewContext(fs.readFileSync(path.join(output, 'local-evidence.js'), 'utf8'), context);
+  assert.equal(context.GIT_RS_LOCAL_EVIDENCE.items[0].takeaways[0], point);
+  assert.equal(context.executed, undefined);
+});
+
+test('cache explanations map five structures to three actual graph components', () => {
+  const context = {};
+  for (const name of ['architecture-data.js', 'guide-data.js']) {
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', name), 'utf8'), context);
+  }
+  const groups = context.GIT_RS_GUIDE.cacheGroups;
+  assert.deepEqual(JSON.parse(JSON.stringify(groups.map((group) => [group.component, ...group.layers]))), [
+    ['source-cache', 'source-ram'], ['object-core', 'verified-decoded', 'header-preflight'],
+    ['derived-cache', 'derived-body', 'derived-checkpoint'],
+  ]);
+  const components = new Set(context.GIT_RS_ARCH.components.map((entry) => entry.id));
+  assert.ok(groups.every((group) => components.has(group.component)));
+  assert.deepEqual(Object.keys(context.GIT_RS_GUIDE.findings).sort(),
+    [...context.GIT_RS_ARCH.findings.map((finding) => finding.id)].sort());
 });

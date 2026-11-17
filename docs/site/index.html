@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="graph.css">
   <script src="architecture-data.js" defer></script>
+  <script src="guide-data.js" defer></script>
   <script src="evidence.js" defer></script>
   <script src="graph.js" defer></script>
   <script src="app.js" defer></script>
@@ -29,22 +30,33 @@
     <nav class="tab-strip" aria-label="Разделы архитектуры">
       <div role="tablist" aria-label="Архитектурный атлас">
         <button id="tab-overview" role="tab" aria-selected="true" aria-controls="panel-overview" tabindex="0" data-tab="overview"><span aria-hidden="true">01</span> Общая схема</button>
-        <button id="tab-flows" role="tab" aria-selected="false" aria-controls="panel-flows" tabindex="-1" data-tab="flows"><span aria-hidden="true">02</span> Пути запросов</button>
-        <button id="tab-caches" role="tab" aria-selected="false" aria-controls="panel-caches" tabindex="-1" data-tab="caches"><span aria-hidden="true">03</span> Кэши</button>
-        <button id="tab-parameters" role="tab" aria-selected="false" aria-controls="panel-parameters" tabindex="-1" data-tab="parameters"><span aria-hidden="true">04</span> Параметры</button>
+        <button id="tab-readiness" role="tab" aria-selected="false" aria-controls="panel-readiness" tabindex="-1" data-tab="readiness"><span aria-hidden="true">02</span> Что уже работает</button>
+        <button id="tab-flows" role="tab" aria-selected="false" aria-controls="panel-flows" tabindex="-1" data-tab="flows"><span aria-hidden="true">03</span> Пути запросов</button>
+        <button id="tab-caches" role="tab" aria-selected="false" aria-controls="panel-caches" tabindex="-1" data-tab="caches"><span aria-hidden="true">04</span> Кэши</button>
         <button id="tab-resources" role="tab" aria-selected="false" aria-controls="panel-resources" tabindex="-1" data-tab="resources"><span aria-hidden="true">05</span> Время / CPU / RAM</button>
-        <button id="tab-findings" role="tab" aria-selected="false" aria-controls="panel-findings" tabindex="-1" data-tab="findings"><span aria-hidden="true">06</span> Узкие места</button>
-        <button id="tab-reviews" role="tab" aria-selected="false" aria-controls="panel-reviews" tabindex="-1" data-tab="reviews"><span aria-hidden="true">07</span> Разбор BMAD</button>
+        <button id="tab-decisions" role="tab" aria-selected="false" aria-controls="panel-decisions" tabindex="-1" data-tab="decisions"><span aria-hidden="true">06</span> Что улучшать</button>
+        <button id="tab-parameters" role="tab" aria-selected="false" aria-controls="panel-parameters" tabindex="-1" data-tab="parameters"><span aria-hidden="true">07</span> Параметры</button>
+        <button id="tab-findings" role="tab" aria-selected="false" aria-controls="panel-findings" tabindex="-1" data-tab="findings"><span aria-hidden="true">08</span> Ограничения</button>
+        <button id="tab-reviews" role="tab" aria-selected="false" aria-controls="panel-reviews" tabindex="-1" data-tab="reviews"><span aria-hidden="true">09</span> Разбор BMAD</button>
       </div>
     </nav>
     <main id="main" tabindex="-1">
       <section id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+        <div class="reader-verdict"><strong id="overview-verdict"></strong><p>Начните с <a href="#readiness">проверенной работоспособности</a>, затем посмотрите <a href="#decisions">приоритеты улучшений</a>.</p></div>
         <div class="section-heading"><div><p class="eyebrow">СИСТЕМА В ОДНОМ ОКНЕ</p><h2>От компонента к запросу</h2></div><p>Выберите компонент, чтобы увидеть его роль и связанные шаги.</p></div>
         <p id="local-profile-notice" class="profile-notice" hidden>Подключён локальный профиль измерений: <a href="#resources">открыть время, CPU, RSS и perf</a>. Область каждого запуска подписана; это не live dashboard.</p>
         <!-- ARCHIFY_COMPANION -->
+        <div id="overview-cache-legend" class="cache-legend" aria-label="Где на схеме находятся кэши"></div>
         <div class="overview-layout"><div id="architecture-graph"></div><aside id="component-detail" class="detail-card" aria-label="Выбранный компонент"></aside></div>
         <details class="component-directory"><summary>Все компоненты списком · <span id="component-count"></span></summary><div id="component-map" class="component-grid"></div></details>
         <div class="principle"><span aria-hidden="true">↳</span><p><strong>Читайте архитектуру вместе с доказательствами.</strong> CPU, память и время в шагах — качественное описание. Измерения показываются отдельно, с областью применимости и ограничениями.</p></div>
+      </section>
+      <section id="panel-readiness" role="tabpanel" aria-labelledby="tab-readiness" tabindex="0" hidden>
+        <div class="section-heading"><div><p class="eyebrow">ПРОВЕРЕННЫЙ РЕЗУЛЬТАТ / ОТКРЫТАЯ ГРАНИЦА</p><h2>Функционально работает или нет?</h2></div></div>
+        <div id="readiness-verdict" class="reader-verdict"></div>
+        <div id="readiness" class="reader-grid"></div>
+        <h3 class="reader-subheading">Блокировки и коллизии — это не список обнаруженных поломок</h3>
+        <div id="safeguards" class="reader-grid"></div>
       </section>
       <section id="panel-flows" role="tabpanel" aria-labelledby="tab-flows" tabindex="0" hidden>
         <div class="section-heading"><div><p class="eyebrow">ПОШАГОВОЕ ИСПОЛНЕНИЕ</p><h2>Как проходит запрос</h2></div><label class="flow-picker" for="flow-select">Тип запроса<select id="flow-select"></select></label></div>
@@ -52,8 +64,14 @@
         <div class="journey-layout"><div><p class="eyebrow">ВЫБЕРИТЕ ШАГ</p><ol id="step-diagram" class="step-diagram" aria-label="Шаги выбранного запроса"></ol></div><article id="step-detail" class="detail-card step-detail" aria-label="Детали выбранного шага"></article></div>
       </section>
       <section id="panel-caches" role="tabpanel" aria-labelledby="tab-caches" tabindex="0" hidden>
-        <div class="section-heading"><div><p class="eyebrow">ОТ СЕТЕВЫХ БАЙТОВ ДО ГОТОВОГО РЕЗУЛЬТАТА</p><h2>Пять разных слоёв кэша</h2></div><p>Hit одного слоя не означает hit другого. Ни один кэш не выдаёт полномочия вместо source PostgreSQL.</p></div>
-        <div id="cache-layers" class="cache-layers"></div>
+        <div class="section-heading"><div><p class="eyebrow">ТРИ МЕСТА ХРАНЕНИЯ / ПЯТЬ ВИДОВ ДАННЫХ</p><h2>Откуда взялись кэши</h2></div><p>Не пять сервисов: RAM процесса → RAM вычисления → одна необязательная подсистема PostgreSQL/S3.</p></div>
+        <p class="reader-verdict">PostgreSQL с refs и правами на общей схеме — <strong>источник истины, не кэш</strong>. Необязательный PostgreSQL-кэш хранит результаты. RAM-структуры находятся внутри Rust backend и не требуют ещё трёх баз данных.</p>
+        <div id="cache-topology" class="cache-topology"></div>
+      </section>
+      <section id="panel-decisions" role="tabpanel" aria-labelledby="tab-decisions" tabindex="0" hidden>
+        <div class="section-heading"><div><p class="eyebrow">ПРИОРИТЕТ / УСЛОВИЕ ПОЛЬЗЫ / ЦЕНА</p><h2>Что действительно может помочь</h2></div><p>Для каждого действия: что уже есть, когда оно поможет и почему само по себе может не решить проблему.</p></div>
+        <p class="reader-verdict">Сначала отличить обязательные первые чтения от повторной дорогой работы. Параллельно проверить пользу готовых ответов и адресного прогрева. Ресурсы добавлять под установленную причину, а не вместо её поиска.</p>
+        <div id="decisions" class="reader-grid"></div>
       </section>
       <section id="panel-parameters" role="tabpanel" aria-labelledby="tab-parameters" tabindex="0" hidden>
         <div class="section-heading"><div><p class="eyebrow">ЗНАЧЕНИЕ / ОБЛАСТЬ / КОМПРОМИСС</p><h2>Что именно ограничивает каждый параметр</h2></div><p>Здесь значения из закреплённого кода. Изменение budget не добавляет CPU и не предсказывает RSS или hit rate.</p></div>
@@ -61,6 +79,10 @@
       </section>
       <section id="panel-resources" role="tabpanel" aria-labelledby="tab-resources" tabindex="0" hidden>
         <div class="section-heading"><div><p class="eyebrow">СТОИМОСТЬ И НАБЛЮДАЕМОСТЬ</p><h2>Ресурсы без иллюзий</h2></div><p>Нет измерения — нет числа. Исторический результат не является текущим SLA.</p></div>
+        <h3>Почему большой blame не укладывается в timeout</h3>
+        <div id="performance-summary" class="reader-grid"></div>
+        <div id="performance-observations" class="reader-grid" aria-live="polite"></div>
+        <p class="reader-next">Дальше: <a href="#decisions">прогрев, RAM, CPU и timeout — что поможет и при каких условиях</a>.</p>
         <div class="resource-primer"><article><span class="eyebrow">01 / ВРЕМЯ</span><h3>Wall ≠ CPU</h3><p>Wall time — время по часам, включая ожидание I/O и очередей. User + system CPU — процессорное время. В многопоточной работе сумма CPU может быть больше wall.</p></article><article><span class="eyebrow">02 / ПАМЯТЬ</span><h3>RSS ≠ размер кэша</h3><p>Пиковый RSS отражает резидентную память процесса в конкретном запуске. Это не объём логического кэша, не весь page cache ОС и не доказательство границ памяти всех процессов.</p></article><article><span class="eyebrow">03 / КОНТЕКСТ</span><h3>Результат имеет границы</h3><p>Ревизия, workload, состояние кэшей, окружение и ограничения определяют применимость результата. Пропущенное значение означает «нет измерения», а не ноль.</p></article></div>
         <section class="evidence-box" aria-labelledby="evidence-title"><div class="section-heading"><div><p class="eyebrow">ТОЛЬКО В ЭТОЙ ВКЛАДКЕ</p><h3 id="evidence-title">Приватные локальные evidence</h3></div><button id="clear-evidence" class="secondary-button" type="button" disabled>Очистить</button></div>
           <p>Файл читается локально через выбор файла. Нет отправки, сетевых запросов или сохранения в браузерное хранилище. В локальной сборке профиль может быть явно подключён при сборке; в публичную сборку он не входит. Поле source отображается как текст, без перехода по ссылке.</p>
@@ -98,7 +120,7 @@
         <div class="subheading"><h3>Какие этапы действительно измерены</h3><span class="muted">Привязка к шагу — концептуальная, scope остаётся у записи</span></div><div id="measurement-coverage" class="coverage-list"></div>
         <details class="metric-catalog"><summary>Каталог метрик · определения и границы измерений</summary><div id="metrics" class="metric-grid"></div></details>
       </section>
-      <section id="panel-findings" role="tabpanel" aria-labelledby="tab-findings" tabindex="0" hidden><div class="section-heading"><div><p class="eyebrow">ГРАНИЦЫ И КОМПРОМИССЫ</p><h2>Узкие места</h2></div><p>Статус и серьёзность — из исходного разбора. Проверяйте область влияния и ссылки на код.</p></div><div id="findings" class="finding-list"></div></section>
+      <section id="panel-findings" role="tabpanel" aria-labelledby="tab-findings" tabindex="0" hidden><div class="section-heading"><div><p class="eyebrow">ЧТО ЭТО ЗНАЧИТ / КАК ПОМОЧЬ / ЧТО НЕ ПОМОЖЕТ</p><h2>Ограничения без списка страшных слов</h2></div><p>Исправленный баг, возможная стоимость и обязательная защита — разные вещи. Medium в техническом разборе не означает воспроизведённую поломку.</p></div><div id="findings" class="finding-list"></div></section>
       <section id="panel-reviews" role="tabpanel" aria-labelledby="tab-reviews" tabindex="0" hidden><div class="section-heading"><div><p class="eyebrow">НЕСКОЛЬКО ИНЖЕНЕРНЫХ ПЕРСПЕКТИВ</p><h2>Разбор BMAD</h2></div><p>Ролевые мнения помогают обсуждению. Это не независимая runtime-квалификация.</p></div><div id="reviews" class="review-grid"></div></section>
     </main>
     <footer><span>git-rs / Архитектурный атлас</span><span>Локальные данные. Проверяемые источники. Никакой телеметрии.</span></footer>

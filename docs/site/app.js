@@ -3,6 +3,7 @@
 (() => {
   const raw = globalThis.GIT_RS_ARCH;
   const data = raw && typeof raw === 'object' ? raw : {};
+  const guide = globalThis.GIT_RS_GUIDE;
   const { numericFields, validate: validateEvidence, MAX_BYTES } = globalThis.GitRsEvidence;
   const list = (value) => Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
   const text = (value, fallback = 'Не указано') => {
@@ -181,6 +182,58 @@
   });
   if (components.length) graph.selectComponent(components[0].id);
 
+  byId('overview-verdict').textContent = guide.verdict;
+  const verdict = byId('readiness-verdict');
+  verdict.append(el('h3', '', guide.verdict), el('p', '', guide.summary), el('p', 'muted', guide.assessment));
+  guide.evidenceLinks.forEach((entry) => {
+    const link = el('a', 'source-link', entry.title);
+    link.href = entry.url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    verdict.append(link, document.createTextNode(' '));
+  });
+  guide.readiness.forEach((entry) => {
+    const card = el('article', 'reader-card readiness-card');
+    card.append(badge(entry.state), el('h3', '', entry.title), el('p', '', entry.detail),
+      facts([['Граница результата', entry.gap]]));
+    byId('readiness').append(card);
+  });
+  guide.safeguards.forEach((entry) => {
+    const card = el('article', 'reader-card safeguard-card');
+    card.append(el('h3', '', entry.title), el('p', '', entry.text));
+    byId('safeguards').append(card);
+  });
+  guide.performance.forEach((entry) => {
+    const card = el('article', 'reader-card');
+    card.append(el('h4', '', entry.title), el('p', '', entry.text));
+    byId('performance-summary').append(card);
+  });
+  guide.decisions.forEach((entry) => {
+    const card = el('article', 'reader-card decision-card');
+    card.dataset.decision = entry.id;
+    card.append(badge(entry.priority), el('h3', '', entry.title), el('p', 'decision-availability', entry.available),
+      facts([['Когда поможет', entry.helps], ['Чего не решит', entry.doesNot],
+        ['Цена и ограничения', entry.cost], ['Следующее действие', entry.next]]), sources(entry.sources));
+    byId('decisions').append(card);
+  });
+  function cacheMapButton(group, label) {
+    const button = el('button', 'secondary-button cache-map-button', label);
+    button.type = 'button';
+    button.dataset.component = group.component;
+    button.addEventListener('click', () => {
+      window.location.hash = 'overview';
+      activateTab('overview');
+      graph.showAllPaths();
+      showComponent(components.findIndex((entry) => entry.id === group.component));
+      const node = byId('architecture-graph').querySelector(`[data-component="${group.component}"]`);
+      node.focus({ preventScroll: true });
+      byId('architecture-graph').scrollIntoView({ block: 'start' });
+    });
+    return button;
+  }
+  byId('overview-cache-legend').append(el('strong', '', 'Кэширование на этой схеме:'));
+  guide.cacheGroups.forEach((group) => byId('overview-cache-legend').append(cacheMapButton(group, group.title)));
+
   const picker = byId('flow-select');
   flows.forEach((flow, index) => {
     const option = el('option', '', flow.title);
@@ -259,14 +312,28 @@
   }
   renderFlow();
 
-  list(data.cacheLayers).forEach((layer) => {
-    const card = el('article', 'cache-layer detail-card');
-    card.append(el('h3', '', layer.title), badge(text(layer.scope)), facts([
-      ['Идентичность и ключ', layer.identity], ['Время жизни / TTL', layer.lifetime],
-      ['Размер и admission', layer.capacity], ['При hit', layer.hit], ['При miss / bypass', layer.miss],
-      ['Проверки', layer.checks], ['Копии и pins', layer.copies], ['Метрики', layer.metrics],
-    ]), sources(layer.sources));
-    byId('cache-layers').append(card);
+  const cacheLayers = new Map(list(data.cacheLayers).map((layer) => [layer.id, layer]));
+  guide.cacheGroups.forEach((group) => {
+    const card = el('article', 'reader-card cache-group');
+    card.append(el('h3', '', group.title), el('p', 'muted', group.location),
+      el('p', '', group.purpose), el('p', 'cache-not', group.not),
+      cacheMapButton(group, 'Показать на общей схеме'));
+    group.layers.forEach((id) => {
+      const layer = cacheLayers.get(id);
+      const explanation = guide.cacheLayers[id];
+      const structure = el('section', 'cache-layer');
+      structure.dataset.layer = id;
+      structure.append(el('h4', '', explanation.title), el('p', '', explanation.benefit), el('p', 'muted', explanation.limit));
+      const details = el('details', 'technical-details');
+      details.append(el('summary', '', 'Технические границы и исходники'), facts([
+        ['Область', layer.scope], ['Идентичность и ключ', layer.identity], ['Время жизни / TTL', layer.lifetime],
+        ['Размер и admission', layer.capacity], ['При hit', layer.hit], ['При miss / bypass', layer.miss],
+        ['Проверки', layer.checks], ['Копии и pins', layer.copies], ['Метрики', layer.metrics],
+      ]), sources(layer.sources));
+      structure.append(details);
+      card.append(structure);
+    });
+    byId('cache-topology').append(card);
   });
   list(data.parameters).forEach((parameter) => {
     const card = el('article', 'parameter-card detail-card');
@@ -288,11 +355,18 @@
   const findings = list(data.findings);
   findings.forEach((finding) => {
     const card = el('article', 'finding-card');
+    card.dataset.finding = finding.id;
+    const explanation = guide.findings[finding.id];
+    card.append(badge(explanation.kind, 'finding-kind'), el('h3', '', explanation.title),
+      el('p', '', explanation.problem), facts([['Что может помочь', explanation.helps], ['Что не поможет', explanation.doesNot]]));
+    const details = el('details', 'technical-details');
+    details.append(el('summary', '', 'Подробный инженерный разбор и исходники'));
     const row = el('div', 'badge-row');
     const severity = text(finding.severity, 'не указана');
     const critical = /^(critical|high|p0|p1|критическая|высокая)$/i.test(severity);
     row.append(badge(`Серьёзность: ${severity}`, critical ? 'badge-critical' : 'badge-warm'), badge(`Статус: ${text(finding.status)}`));
-    card.append(row, el('h3', '', finding.title), facts([['Влияние', finding.impact], ['Рекомендация', finding.recommendation]]), sources(finding.sources));
+    details.append(row, el('h4', '', finding.title), facts([['Влияние', finding.impact], ['Рекомендация', finding.recommendation]]), sources(finding.sources));
+    card.append(details);
     byId('findings').append(card);
   });
   if (!findings.length) empty(byId('findings'), 'Находки не подключены', 'Пустой список не означает отсутствие узких мест или завершённую квалификацию.');
@@ -397,6 +471,20 @@
   }
   function renderEvidence(items) {
     evidence.replaceChildren();
+    const observations = byId('performance-observations');
+    observations.replaceChildren();
+    items.filter((item) => item.takeaways.length).forEach((item) => {
+      const card = el('article', 'reader-card performance-observation');
+      card.append(badge('Вывод из локального профиля'), el('h4', '', item.title),
+        el('p', 'muted', item.scope));
+      const points = el('ul');
+      item.takeaways.forEach((point) => points.append(el('li', '', point)));
+      card.append(points);
+      if (item.revision && item.revision !== data.revision) {
+        card.append(el('p', 'evidence-warning', 'Другая ревизия: это не текущий профиль.'));
+      }
+      observations.append(card);
+    });
     const coverage = byId('measurement-coverage');
     coverage.replaceChildren();
     flows.forEach((flow) => {

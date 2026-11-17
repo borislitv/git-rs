@@ -34,8 +34,8 @@ globalThis.GIT_RS_ARCH = {
       source: 'src/cache.rs',
     },
     {
-      id: 'object-core', title: 'RangePackSet, декодер и проверенные объекты',
-      summary: 'Index checksum, pack header/trailer, CRC physical entry, REF/OFS bases и SHA-1 восстановленного объекта. Job-local decoder cache отличается от процессного source cache. Для выдачи готового encoded entry нужна полная аутентификация source pack.',
+      id: 'object-core', title: 'Rust core: RAM объектов и планов чтения',
+      summary: 'Здесь внутри одной работы находятся две RAM-структуры: проверенные восстановленные объекты и маленькая таблица заголовков/планов. Это не отдельные PostgreSQL-кэши. Декодер проверяет индекс, framing, CRC, delta bases и Git ID; для выдачи готового encoded entry отдельно проверяет весь source pack.',
       source: 'crates/git-core/src/pack_ranges.rs',
     },
     {
@@ -59,8 +59,8 @@ globalThis.GIT_RS_ARCH = {
       source: 'src/blame_derive.rs',
     },
     {
-      id: 'derived-cache', title: 'Необязательные производные артефакты',
-      summary: 'Отдельные схема/пул PostgreSQL, S3 credentials и namespace. Готовые blame bodies и завершённые WorkSet objects/mappings. HMAC signing mode защищает и bodies, и checkpoints; ordinary digest не является авторством.',
+      id: 'derived-cache', title: 'Кэш PostgreSQL/S3: blame и части работы',
+      summary: 'Одна необязательная подсистема, два вида данных: готовые ответы blame и подписанные завершённые части вычисления. Независимые схема/пул и S3 namespace; не обязательно другой физический кластер PostgreSQL. Не источник refs/прав и не сохранённый остановленный алгоритм.',
       source: 'src/derived_cache/mod.rs',
     },
     {

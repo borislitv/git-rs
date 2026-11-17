@@ -12,6 +12,7 @@ const files = new Map([
   ['/index.html', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/architecture-data.js', ['architecture-data.js', 'text/javascript; charset=utf-8']],
+  ['/guide-data.js', ['guide-data.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
   ['/graph.js', ['graph.js', 'text/javascript; charset=utf-8']],
   ['/graph.css', ['graph.css', 'text/css; charset=utf-8']],
@@ -30,6 +31,7 @@ const evidence = {
     outcome: 'partial', limitations: 'synthetic only', source: 'not a link',
     hotspots: [{ name: '<script>bad()</script>', self_percent: 23.5, detail: 'synthetic sample' }],
     elapsed_spans: [{ name: 'Hash fixture', seconds: 0.125, detail: 'synthetic inclusive elapsed' }],
+    takeaways: ['Synthetic conclusion <img src=x onerror=alert(1)>'],
   }],
 };
 
@@ -37,7 +39,7 @@ async function exercise(page, address) {
   const errors = [];
   const externalRequests = [];
   const base = new URL('.', address);
-  const allowed = new Set([address, ...['app.js', 'architecture-data.js', 'style.css', 'graph.js', 'graph.css', 'evidence.js', 'local-evidence.js', 'favicon.svg'].map((file) => new URL(file, base).href)]);
+  const allowed = new Set([address, ...['app.js', 'architecture-data.js', 'guide-data.js', 'style.css', 'graph.js', 'graph.css', 'evidence.js', 'local-evidence.js', 'favicon.svg'].map((file) => new URL(file, base).href)]);
   page.setDefaultTimeout(10000);
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
@@ -49,11 +51,13 @@ async function exercise(page, address) {
   const bundledItems = await page.evaluate(() => globalThis.GIT_RS_LOCAL_EVIDENCE?.items.length || 0);
   if (bundledItems) {
     assert.equal(await page.locator('#evidence-content .imported-evidence').count(), bundledItems);
+    const conclusions = await page.evaluate(() => globalThis.GIT_RS_LOCAL_EVIDENCE.items.filter((item) => item.takeaways?.length).length);
+    assert.equal(await page.locator('.performance-observation').count(), conclusions);
     assert.equal(await page.locator('#local-profile-notice').isVisible(), true);
     await page.locator('#local-profile-notice a').click();
     assert.equal(await page.locator('#panel-resources').evaluate((panel) => panel.contains(document.activeElement)), true);
     if (process.env.SCREENSHOT_DIRECTORY) {
-      await page.locator('#evidence-content .evidence-profiles').scrollIntoViewIfNeeded();
+      await page.locator('#performance-observations').evaluate((node) => node.scrollIntoView({ block: 'start' }));
       await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIRECTORY, `measurements-${page.viewportSize().width}.png`) });
     }
     await page.locator('#tab-overview').click();
@@ -124,12 +128,48 @@ async function exercise(page, address) {
   await page.waitForFunction(() => document.querySelector('#tab-overview').getAttribute('aria-selected') === 'true');
   await page.locator('#tab-findings').click();
   assert.ok(await page.locator('.finding-card').count() >= 12);
-  assert.ok((await page.locator('.finding-card').first().innerText()).includes('fixed-in-current-code'));
+  assert.equal(await page.locator('.finding-card').first().locator('.finding-kind').innerText(), 'Исправленный дефект');
   assert.equal(await page.locator('.finding-card').first().locator('.badge-critical').count(), 0, 'fixed catalog finding is no longer the old P1');
+  const collision = page.locator('[data-finding="sha1-collision-check-required"]');
+  assert.ok((await collision.innerText()).includes('не обнаруженный дефект'));
+  assert.ok((await collision.innerText()).includes('Подменить защищённый SHA-1'));
+  assert.equal(await page.locator('.finding-card .technical-details[open]').count(), 0);
+  await page.locator('#tab-readiness').click();
+  assert.ok((await page.locator('#readiness-verdict').innerText()).includes('Большой blame ещё не доведён'));
+  assert.equal(await page.locator('.readiness-card').count(), 6);
+  assert.equal(await page.locator('.safeguard-card').count(), 3);
+  if (process.env.SCREENSHOT_DIRECTORY) {
+    await page.locator('#panel-readiness').evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIRECTORY, `readiness-${page.viewportSize().width}.png`) });
+  }
+  await page.locator('#tab-decisions').click();
+  assert.equal(await page.locator('.decision-card').count(), 6);
+  assert.ok((await page.locator('[data-decision="warm"]').innerText()).includes('30 секунд'));
+  assert.ok((await page.locator('[data-decision="cpu"]').innerText()).includes('не распараллелят'));
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1), false);
+  if (process.env.SCREENSHOT_DIRECTORY) {
+    await page.locator('#panel-decisions').evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIRECTORY, `decisions-${page.viewportSize().width}.png`) });
+  }
   await page.locator('#tab-reviews').click();
   assert.ok(await page.locator('.review-card').count() >= 4);
   await page.locator('#tab-caches').click();
+  assert.equal(await page.locator('.cache-group').count(), 3);
   assert.equal(await page.locator('.cache-layer').count(), 5);
+  assert.deepEqual(await page.locator('.cache-group').evaluateAll((groups) => groups.map((group) => group.querySelectorAll('.cache-layer').length)), [1, 2, 2]);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1), false);
+  if (process.env.SCREENSHOT_DIRECTORY) {
+    await page.locator('#panel-caches').evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIRECTORY, `caches-${page.viewportSize().width}.png`) });
+  }
+  for (const component of ['source-cache', 'object-core', 'derived-cache']) {
+    await page.locator(`#cache-topology .cache-map-button[data-component="${component}"]`).click();
+    assert.equal(await page.locator('#tab-overview').getAttribute('aria-selected'), 'true');
+    assert.equal(await page.locator('.grg-flow').inputValue(), '', 'cache location navigation must clear an unrelated request path');
+    assert.equal(await page.locator(`.grg-node[data-component="${component}"]`).getAttribute('aria-pressed'), 'true');
+    assert.equal(await page.locator(`.grg-node[data-component="${component}"]`).evaluate((node) => node === document.activeElement), true);
+    await page.locator('#tab-caches').click();
+  }
   await page.locator('#tab-parameters').click();
   assert.equal(await page.locator('.parameter-card').count(), 15);
   await page.locator('#tab-resources').click();
@@ -143,6 +183,8 @@ async function exercise(page, address) {
   assert.ok((await content.innerText()).includes('<script>bad()</script>'));
   assert.ok((await content.innerText()).includes('23,5'));
   assert.ok((await content.innerText()).includes('synthetic inclusive elapsed'));
+  assert.ok((await page.locator('#performance-observations').innerText()).includes('Synthetic conclusion <img'));
+  assert.equal(await page.locator('#performance-observations img').count(), 0);
   assert.equal(await content.locator('meter').count(), 3);
   assert.ok((await content.innerText()).includes('нет измерения'));
   assert.ok(!(await content.innerText()).includes('измеренный профиль — mapped core'));
@@ -170,6 +212,7 @@ async function exercise(page, address) {
   assert.ok((await content.innerText()).includes('synthetic sample'), 'invalid input keeps last good evidence');
   await page.locator('#clear-evidence').click();
   assert.equal(await content.locator('meter').count(), 0);
+  assert.equal(await page.locator('.performance-observation').count(), 0, 'clearing evidence also clears its conclusions');
   const storageCount = await page.evaluate(() => {
     try { return localStorage.length + sessionStorage.length; }
     catch (error) {

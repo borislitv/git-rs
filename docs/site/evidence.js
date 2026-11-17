@@ -30,6 +30,11 @@
         }
         clean[field] = missing(entry) ? null : entry;
       });
+      if (item.takeaways !== undefined && (!Array.isArray(item.takeaways)
+        || item.takeaways.length > 8 || item.takeaways.some((entry) => !boundedText(entry)))) {
+        throw new Error(`Запись ${index + 1}, takeaways: ожидается до 8 поясняющих строк.`);
+      }
+      clean.takeaways = item.takeaways || [];
       if (item.hotspots !== undefined && (!Array.isArray(item.hotspots) || item.hotspots.length > 50)) {
         throw new Error(`Запись ${index + 1}, hotspots: ожидается массив до 50 элементов.`);
       }
