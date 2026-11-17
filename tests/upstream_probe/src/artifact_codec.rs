@@ -6,7 +6,8 @@
 use std::borrow::Cow;
 
 use sha2::{Digest, Sha256};
-use zstd::zstd_safe::{self, CCtx, CParameter, DCtx, DParameter, InBuffer, OutBuffer};
+use zstandard::{FrameHeader, parse_frame_header};
+use zstd::zstd_safe::{CCtx, CParameter, DCtx, DParameter, InBuffer, OutBuffer};
 
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
 const STEP: usize = 64 * 1024;
@@ -14,6 +15,7 @@ const MIN_COMPRESS_BYTES: usize = 4096;
 const MIN_SAVED_BYTES: usize = 128;
 const LEVEL: i32 = 3;
 const WINDOW_LOG: u32 = 20;
+const MAX_FRAME_HEADER_BYTES: usize = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Encoding {
@@ -42,16 +44,6 @@ pub struct Encoded<'a> {
     pub stored: Cow<'a, [u8]>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum ReadPolicy {
-    #[default]
-    StrictV1,
-    /// Qualification only: validate one complete ordinary frame, exact size and
-    /// both digests. Cannot require a checksum flag or independently validate
-    /// the declared window. WindowLogMax is not a strict header check.
-    ProbeSingleFrame,
-}
-
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
     StoredLimit,
@@ -59,7 +51,6 @@ pub enum Error {
     StoredIntegrity,
     LogicalIntegrity,
     RawMetadata,
-    StrictHeaderUnavailable,
     FrameHeader,
     TrailingInput,
     DecodedSize,
@@ -104,12 +95,7 @@ pub fn encode(logical: &[u8], limits: Limits) -> Result<Encoded<'_>, Error> {
     })
 }
 
-pub fn decode(
-    stored: &[u8],
-    metadata: &Metadata,
-    limits: Limits,
-    policy: ReadPolicy,
-) -> Result<Vec<u8>, Error> {
+pub fn decode(stored: &[u8], metadata: &Metadata, limits: Limits) -> Result<Vec<u8>, Error> {
     if metadata.stored_size > limits.stored.min(MAX_BYTES) {
         return Err(Error::StoredLimit);
     }
@@ -126,18 +112,15 @@ pub fn decode(
         return Err(Error::StoredIntegrity);
     }
 
-    let logical = match (metadata.encoding, policy) {
-        (Encoding::RawV1, _) => {
+    let logical = match metadata.encoding {
+        Encoding::RawV1 => {
             let mut logical = buffer(stored.len())?;
             for (dst, src) in logical.chunks_mut(STEP).zip(stored.chunks(STEP)) {
                 dst.copy_from_slice(src);
             }
             logical
         }
-        (Encoding::ZstdV1, ReadPolicy::StrictV1) => return Err(Error::StrictHeaderUnavailable),
-        (Encoding::ZstdV1, ReadPolicy::ProbeSingleFrame) => {
-            decompress(stored, metadata.logical_size)?
-        }
+        Encoding::ZstdV1 => decompress(stored, metadata.logical_size)?,
     };
     if digest(&logical) != metadata.logical_digest {
         return Err(Error::LogicalIntegrity);
@@ -190,6 +173,7 @@ fn compress(logical: &[u8], cap: usize) -> Result<Option<Vec<u8>>, Error> {
             written += produced;
             if remaining == 0 {
                 stored.truncate(written);
+                check_header(&stored, logical.len())?;
                 return Ok(Some(stored));
             }
             if produced == 0 {
@@ -209,15 +193,23 @@ fn compress(logical: &[u8], cap: usize) -> Result<Option<Vec<u8>>, Error> {
     Ok(None)
 }
 
-fn decompress(stored: &[u8], size: usize) -> Result<Vec<u8>, Error> {
-    // Metadata selected zstd-v1 already. The fixed magic discriminator rejects
-    // skippable frames even at size zero; field interpretation stays upstream.
-    if !stored.starts_with(&zstd_safe::MAGICNUMBER.to_le_bytes())
-        || zstd_safe::get_frame_content_size(stored).ok() != Some(Some(size as u64))
-        || zstd_safe::get_dict_id_from_frame(stored).is_some()
-    {
-        return Err(Error::FrameHeader);
+fn check_header(stored: &[u8], size: usize) -> Result<(), Error> {
+    let prefix = &stored[..stored.len().min(MAX_FRAME_HEADER_BYTES)];
+    match parse_frame_header(prefix) {
+        Ok(FrameHeader::Zstandard(header))
+            if header.content_size == Some(size as u64)
+                && header.window_size <= 1 << WINDOW_LOG
+                && header.dictionary_id.is_none()
+                && header.checksum =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::FrameHeader),
     }
+}
+
+fn decompress(stored: &[u8], size: usize) -> Result<Vec<u8>, Error> {
+    check_header(stored, size)?;
     let mut logical = buffer(size)?;
     let mut ctx = DCtx::try_create().ok_or(Error::Allocation)?;
     ctx.set_parameter(DParameter::WindowLogMax(WINDOW_LOG))

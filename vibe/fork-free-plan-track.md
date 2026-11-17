@@ -24,8 +24,13 @@
   Earlier head `23db2fb` masked a source digest error; the unchanged integrity contract
   passed after `4a88308` propagated the original error from physical preflight.
 - Stages 3–4 (2026-11-18): [standalone candidates, commands and results](../tests/upstream_probe/README.md).
-  The locked workspace builds. Two native-oracle comparisons block blame cutover:
-  incomplete coverage on an independent-root merge (Gitoxide, debug and release),
-  and incorrect commit/path for same-path versus rename (libgit2). A captured
-  legacy frame decodes; strict declared-header checks are still unavailable in
-  the streaming-only probe. No production caller uses these candidates.
+  Final isolated run: 39 passed, 2 failed, none ignored. Strict upstream header
+  inspection and payload streaming preserve the tested legacy frame policy.
+  Physical origin-tree evidence recovers `previous` for the tested edited rename,
+  including after a later change removes its last unchanged line. The stored-entry,
+  encoding and codec suites passed; locked all-target check and Clippy passed.
+  Two native-oracle comparisons still block blame cutover: incomplete coverage on
+  an independent-root merge (Gitoxide, debug and release), and incorrect commit/path
+  for same-path versus rename (libgit2). No production caller uses these candidates.
+  A general application-owned attribution engine would change the responsibility
+  defined in the architecture decision; that change has not been adopted.

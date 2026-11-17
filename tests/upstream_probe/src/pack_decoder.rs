@@ -79,6 +79,7 @@ type Location = (usize, usize);
 struct Step {
     location: Location,
     entry: Entry,
+    original_header: [u8; HEADER_PROBE],
     base_id: Option<ObjectId>,
 }
 
@@ -154,13 +155,25 @@ impl<'a> PackEntryDecoder<'a> {
                 &mut stats,
             )?;
             let entry = Entry::from_bytes(&probe[..probe_len], indexed.offset, self.hash)?;
-            if entry.header_size() >= length {
+            let width = entry.header_size();
+            if width >= length {
                 bail!(corruption("original entry has no compressed payload"));
             }
+            let bytes = probe[..probe_len]
+                .get(..width)
+                .filter(|_| entry.data_offset.checked_sub(indexed.offset) == Some(width as u64))
+                .ok_or_else(|| {
+                    corruption("original entry header exceeds its probe or offset").raise()
+                })?;
+            // Retain exactly the parser-returned bytes, including any redundant
+            // size encoding. Re-encoding can change the width and payload start.
+            let mut original_header = [0; HEADER_PROBE];
+            original_header[..width].copy_from_slice(bytes);
             let next = self.base_location(location, &entry)?;
             chain[stats.depth] = Some(Step {
                 location,
                 entry,
+                original_header,
                 base_id: next.map(|(pack, pos)| self.packs[pack].entries[pos].oid),
             });
             let Some(base) = next else { break };
@@ -273,6 +286,9 @@ impl<'a> PackEntryDecoder<'a> {
         inflate: &mut gix_zlib::Inflate,
         stats: &mut Stats,
     ) -> Result<Verified> {
+        if step.base_id != base.map(|b| b.oid) {
+            bail!(corruption("original entry has no matching verified base"));
+        }
         let (indexed, length) = self.frame(step.location)?;
         let base_capacity = base.map_or(0, |b| b.bytes.capacity());
         let mut original = self.buffer(length, base_capacity, stats)?;
@@ -287,24 +303,34 @@ impl<'a> PackEntryDecoder<'a> {
         if crc32fast::hash(&original) != indexed.crc32 {
             bail!(corruption("original entry CRC mismatch"));
         }
-        if Entry::from_bytes(&original, indexed.offset, self.hash)? != step.entry {
+        let width = step.entry.header_size();
+        let (original_header, payload) = original.split_at(width);
+        if original_header != &step.original_header[..width] {
             bail!(corruption("original entry header changed after probe"));
         }
-
-        let payload = &original[step.entry.header_size()..];
         let payload_len = payload.len();
         let size = step.entry.decompressed_size;
-        let header = step
-            .base_id
-            .map_or(step.entry.header, |base_id| Header::RefDelta { base_id });
+        let replacement = match step.entry.header {
+            Header::OfsDelta { .. } => Some(Header::RefDelta {
+                base_id: step
+                    .base_id
+                    .ok_or_else(|| corruption("original OFS entry has no base").raise())?,
+            }),
+            _ => None,
+        };
+        let header_width = replacement.map_or(original_header.len(), |header| header.size(size));
         let wrapped_len = sum(
-            sum(data::header::SIZE, header.size(size))?,
+            sum(data::header::SIZE, header_width)?,
             sum(payload_len, self.hash.len_in_bytes())?,
         )?;
         let mut wrapped =
             self.buffer(wrapped_len, sum(base_capacity, original.capacity())?, stats)?;
         wrapped.extend_from_slice(&data::header::encode(data::Version::V2, 1));
-        header.write_to(size, &mut wrapped).or_error()?;
+        if let Some(header) = replacement {
+            header.write_to(size, &mut wrapped).or_error()?;
+        } else {
+            wrapped.extend_from_slice(original_header);
+        }
         wrapped.extend_from_slice(payload);
         drop(original);
         let mut hash = gix_hash::hasher(self.hash);

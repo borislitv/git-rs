@@ -49,6 +49,14 @@ impl Fixture {
         self.entry(header, &[n, n + 1, 0x90, n, 1, result[base.len()]]);
     }
 
+    /// Fixture only: add a redundant zero size group to a one-byte size field.
+    pub fn extend_size_encoding_at(&mut self, offset: u64) {
+        let start = usize::try_from(offset).unwrap();
+        assert_eq!(self.0[start] & 0x80, 0);
+        self.0[start] |= 0x80;
+        self.0.insert(start + 1, 0);
+    }
+
     pub fn finish(mut self) -> Vec<u8> {
         let mut hash = gix_hash::hasher(Sha1);
         hash.update(&self.0);
@@ -194,6 +202,7 @@ pub struct Source {
     files: Vec<(File, u64)>,
     pub reads: Vec<(usize, Range<u64>)>,
     pub fail_at: Option<(usize, u64)>,
+    pub first_prefix_override: Option<(usize, u64, Vec<u8>)>,
 }
 
 impl Source {
@@ -205,6 +214,7 @@ impl Source {
                 .collect(),
             reads: Vec::new(),
             fail_at: None,
+            first_prefix_override: None,
         }
     }
 
@@ -230,6 +240,15 @@ impl RangeSource for Source {
             .or_error();
         }
         file.seek(SeekFrom::Start(offset)).or_error()?;
-        file.read_exact(out).or_error()
+        file.read_exact(out).or_error()?;
+        if self
+            .first_prefix_override
+            .as_ref()
+            .is_some_and(|(p, start, _)| (*p, *start) == (pack, offset))
+        {
+            let (_, _, prefix) = self.first_prefix_override.take().unwrap();
+            out[..prefix.len()].copy_from_slice(&prefix);
+        }
+        Ok(())
     }
 }

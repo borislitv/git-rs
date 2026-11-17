@@ -96,6 +96,138 @@ fn native_ref_base_in_another_original_pack() {
     assert_eq!(result.stats.depth, 1);
     assert!(source.reads.iter().any(|(p, _)| *p == 0));
     assert!(source.reads.iter().any(|(p, _)| *p == 1));
+
+    let missing_base = [original.catalog()];
+    let decoder = PackEntryDecoder::new(Sha1, &missing_base, LIMITS).unwrap();
+    let mut source = Source::open(&[&original]);
+    let error = decoder.decode(mid, &mut source).unwrap_err();
+    assert!(error.is_corrupted() && error.to_string().contains("REF base missing"));
+    assert_eq!(source.reads.len(), 1, "only the original delta probe");
+
+    let mut base_entries = base_pack.entries.clone();
+    base_entries[0].crc32 ^= 1;
+    let unverified_base = [
+        original.catalog(),
+        Pack {
+            entries: &base_entries,
+            ..base_pack.catalog()
+        },
+    ];
+    let decoder = PackEntryDecoder::new(Sha1, &unverified_base, LIMITS).unwrap();
+    let mut source = Source::open(&[&original, &base_pack]);
+    let error = decoder.decode(mid, &mut source).unwrap_err();
+    assert!(error.is_corrupted() && error.to_string().contains("CRC mismatch"));
+    assert_eq!(source.reads.iter().filter(|(p, _)| *p == 0).count(), 1);
+}
+
+#[test]
+fn native_canonical_header_boundaries_and_original_ofs_location() {
+    let git = NativeGit::new();
+    let base = b"123456789abcdef";
+    let result = b"123456789abcdef!";
+    let mut fixture = Fixture::new(5);
+    fixture.entry(Header::Blob, b"");
+    let base_offset = fixture.entry(Header::Blob, base);
+    let full = fixture.entry(Header::Blob, b"123456789abcdef?");
+    fixture.entry(Header::Blob, &(0..=255).collect::<Vec<u8>>());
+    let delta = fixture.offset();
+    let distance = delta - base_offset;
+    assert!((128..=16_511).contains(&distance), "two-byte OFS distance");
+    fixture.append_byte(
+        Header::OfsDelta {
+            base_distance: distance,
+        },
+        base,
+        result,
+    );
+    let stored = git.install(&fixture.finish(), false);
+    let raw = std::fs::read(&stored.path).unwrap();
+    let original_ofs = &raw[delta as usize..delta as usize + 3];
+    assert_eq!(raw[base_offset as usize] & 0x80, 0); // size 15
+    assert_ne!(raw[full as usize] & 0x80, 0); // size 16
+    assert_ne!(original_ofs[1] & 0x80, 0);
+    assert_eq!(original_ofs[2] & 0x80, 0);
+
+    let catalog = [stored.catalog()];
+    let decoder = PackEntryDecoder::new(Sha1, &catalog, LIMITS).unwrap();
+    for id in [git.oid(base), stored.entries[2].oid, git.oid(result)] {
+        let decoded = decoder
+            .decode(id, &mut Source::open(&[&stored]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.bytes, git.blob(id));
+    }
+
+    // Only the first read sees the alternate header. The full read returns the
+    // native-indexed bytes and passes the original CRC, but disagrees with the probe.
+    let mut source = Source::open(&[&stored]);
+    source.first_prefix_override = Some((
+        0,
+        delta,
+        vec![original_ofs[0] | 0x80, 0, original_ofs[1], original_ofs[2]],
+    ));
+    let id = git.oid(result);
+    let error = decoder.decode(id, &mut source).unwrap_err();
+    assert!(error.is_corrupted() && error.to_string().contains("header changed after probe"));
+    assert_eq!(
+        source
+            .reads
+            .iter()
+            .filter(|(_, r)| r.start == delta)
+            .count(),
+        2
+    );
+
+    // The OFS distance still names the original offset. An otherwise ordered
+    // catalog that lost that exact boundary cannot substitute the next byte.
+    let mut entries = stored.entries.clone();
+    assert_eq!(entries[1].offset, base_offset);
+    entries[1].offset += 1;
+    let catalog = [Pack {
+        entries: &entries,
+        ..stored.catalog()
+    }];
+    let decoder = PackEntryDecoder::new(Sha1, &catalog, LIMITS).unwrap();
+    let mut source = Source::open(&[&stored]);
+    let error = decoder.decode(id, &mut source).unwrap_err();
+    assert!(
+        error.is_corrupted()
+            && error
+                .to_string()
+                .contains("OFS base is not an indexed entry")
+    );
+    assert_eq!(source.reads.len(), 1);
+    assert_eq!(source.reads[0].1.start, delta);
+}
+
+#[test]
+fn native_redundant_size_ofs_header_preserves_original_span() {
+    let git = NativeGit::new();
+    let mut fixture = Fixture::new(2);
+    let base = fixture.entry(Header::Blob, BASE);
+    let delta = fixture.offset();
+    fixture.append_byte(
+        Header::OfsDelta {
+            base_distance: delta - base,
+        },
+        BASE,
+        MID,
+    );
+    fixture.extend_size_encoding_at(delta);
+    // Native `index-pack --strict` is the oracle for fixture acceptance and the
+    // physical index (including its CRC); `cat-file` supplies the object bytes.
+    let stored = git.install(&fixture.finish(), false);
+    let id = git.oid(MID);
+    assert_eq!(stored.entries[1].offset, delta);
+    assert_eq!(stored.entries[1].oid, id);
+    let catalog = [stored.catalog()];
+    let decoder = PackEntryDecoder::new(Sha1, &catalog, LIMITS).unwrap();
+    let result = decoder
+        .decode(id, &mut Source::open(&[&stored]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.bytes, git.blob(id));
+    assert_eq!(result.stats.depth, 1);
 }
 
 #[test]
@@ -113,6 +245,18 @@ fn ordinary_pack_detects_catalog_integrity_mismatches() {
         ..stored.catalog()
     }];
     assert!(matches!(PackEntryDecoder::new(Sha1, &catalog, LIMITS), Err(e) if e.is_corrupted()));
+
+    for offset in [stored.entries[0].offset, stored.catalog().entries_end] {
+        let mut entries = stored.entries.clone();
+        entries[1].offset = offset;
+        let catalog = [Pack {
+            entries: &entries,
+            ..stored.catalog()
+        }];
+        assert!(
+            matches!(PackEntryDecoder::new(Sha1, &catalog, LIMITS), Err(e) if e.is_corrupted())
+        );
+    }
 
     for (change_oid, expected) in [(false, "CRC mismatch"), (true, "object ID mismatch")] {
         let mut entries = stored.entries.clone();
@@ -154,6 +298,135 @@ fn ordinary_pack_detects_catalog_integrity_mismatches() {
         error.is_corrupted() && error.to_string().contains("exact original compressed span"),
         "{error:?}"
     );
+}
+
+#[test]
+fn inconsistent_catalog_cycle_stops_at_original_header_probes() {
+    let git = NativeGit::new();
+    let (base, mid, top) = (git.oid(BASE), git.oid(MID), git.oid(TOP));
+    let mut fixture = Fixture::new(3);
+    fixture.append_byte(Header::RefDelta { base_id: mid }, MID, TOP);
+    fixture.append_byte(Header::RefDelta { base_id: base }, BASE, MID);
+    fixture.entry(Header::Blob, BASE);
+    let stored = git.install(&fixture.finish(), false);
+    assert_eq!(git.blob(top), TOP);
+    let mut entries = stored.entries.clone();
+    assert_eq!(
+        [entries[0].oid, entries[1].oid, entries[2].oid],
+        [top, mid, base]
+    );
+
+    // The physical bytes and CRCs are unchanged. Only the held identity map
+    // lies: the second REF now resolves back to the first original location.
+    entries[0].oid = base;
+    entries[2].oid = top;
+    let catalog = [Pack {
+        entries: &entries,
+        ..stored.catalog()
+    }];
+    let decoder = PackEntryDecoder::new(Sha1, &catalog, LIMITS).unwrap();
+    let mut source = Source::open(&[&stored]);
+    let error = decoder.decode(base, &mut source).unwrap_err();
+    assert!(
+        error.is_corrupted()
+            && error
+                .to_string()
+                .contains("original pack delta chain contains a cycle"),
+        "{error:?}"
+    );
+    // Each tiny entry fits in a probe. Exactly two reads: no repeat of the
+    // first location, no physical base read, and no full-read decode phase.
+    assert_eq!(
+        source.reads,
+        [
+            (0, entries[0].offset..entries[1].offset),
+            (0, entries[1].offset..entries[2].offset),
+        ]
+    );
+}
+
+#[test]
+fn stored_blob_rejects_short_read_and_framing_errors_with_matching_entry_crc() {
+    use std::io::{self, Read};
+
+    use git_rs_upstream_probe::pack_decoder::RangeSource;
+    use gix_error::ResultExt;
+
+    struct LocalBytes<'a> {
+        bytes: &'a [u8],
+        expected: std::ops::Range<usize>,
+        reads: usize,
+    }
+
+    impl RangeSource for LocalBytes<'_> {
+        fn read_exact(&mut self, pack: usize, offset: u64, out: &mut [u8]) -> gix_error::Result {
+            let start = usize::try_from(offset).unwrap();
+            assert_eq!(pack, 0);
+            assert_eq!(start..start + out.len(), self.expected);
+            self.reads += 1;
+            assert!(self.reads <= 2);
+            (&self.bytes[start..]).read_exact(out).or_error()
+        }
+    }
+
+    let git = NativeGit::new();
+    let mut fixture = Fixture::new(1);
+    let start = fixture.entry(Header::Blob, BASE) as usize;
+    let stored = git.install(&fixture.finish(), false);
+    let end = stored.catalog().entries_end as usize;
+    let raw = std::fs::read(&stored.path).unwrap();
+    let catalog = [stored.catalog()];
+    let decoder = PackEntryDecoder::new(Sha1, &catalog, LIMITS).unwrap();
+    let id = stored.entries[0].oid;
+
+    // Storage ended one byte before the indexed entry end. Keep the original
+    // catalog and require the source's short-read error, not a missing object.
+    let mut source = LocalBytes {
+        bytes: &raw[..end - 1],
+        expected: start..end,
+        reads: 0,
+    };
+    let error = decoder.decode(id, &mut source).unwrap_err();
+    assert_eq!(
+        error.downcast_any_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(source.reads, 1);
+
+    let mut bad_checksum = raw[..end].to_vec();
+    bad_checksum[end - 1] ^= 1; // One bit of the zlib Adler-32, not the compressed data.
+    let mut wrong_size = raw[..end].to_vec();
+    let written = Header::Blob
+        .write_to(
+            (BASE.len() + 1) as u64,
+            &mut &mut wrong_size[start..start + 1],
+        )
+        .unwrap();
+    assert_eq!(written, 1); // Same header width; zlib stream stays intact.
+
+    for (bytes, expected_error) in [
+        (bad_checksum, "Failed to decompress pack entry"),
+        (wrong_size, "decompressed size does not match entry header"),
+    ] {
+        // Synthetic catalog: use the CRC of the received span to exercise the
+        // independent zlib/declared-size checks, not the CRC check again.
+        let mut entry = stored.entries[0];
+        entry.crc32 = crc32fast::hash(&bytes[start..end]);
+        let entries = [entry];
+        let catalog = [Pack {
+            entries: &entries,
+            ..stored.catalog()
+        }];
+        let decoder = PackEntryDecoder::new(Sha1, &catalog, LIMITS).unwrap();
+        let mut source = LocalBytes {
+            bytes: &bytes,
+            expected: start..end,
+            reads: 0,
+        };
+        let error = decoder.decode(id, &mut source).unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error:?}");
+        assert_eq!(source.reads, 2);
+    }
 }
 
 #[test]

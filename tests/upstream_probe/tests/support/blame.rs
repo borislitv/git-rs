@@ -7,7 +7,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use git_rs_upstream_probe::blame_backend::{Annotation, AttributedRange, annotate};
+use git_rs_upstream_probe::blame_backend::{
+    Annotation, AttributedRange, annotate, rename_previous, same_path_previous,
+};
 use gix_hash::{ObjectId, oid};
 use gix_object::{Data, Find, FindExt, FindHeader, Header, Kind};
 
@@ -104,8 +106,21 @@ impl Fixture {
         time: u32,
         title: &str,
     ) -> ObjectId {
+        self.commit_mode(b"100644", path, blob, parents, time, title)
+    }
+
+    pub fn commit_mode(
+        &mut self,
+        mode: &[u8],
+        path: &[u8],
+        blob: &[u8],
+        parents: &[ObjectId],
+        time: u32,
+        title: &str,
+    ) -> ObjectId {
         let blob = self.insert(Kind::Blob, blob.to_vec());
-        let mut tree = b"100644 ".to_vec();
+        let mut tree = mode.to_vec();
+        tree.push(b' ');
         tree.extend_from_slice(path);
         tree.push(0);
         tree.extend_from_slice(blob.as_bytes());
@@ -212,8 +227,8 @@ fn quote(path: &[u8]) -> String {
     out
 }
 
-// Fixture-only serialization, not a native metadata implementation. For a
-// single parent, require either a positive path record or same-path object proof.
+// Fixture-only serialization. A non-root needs positive physical predecessor
+// evidence; lack of evidence does not establish absence of `previous`.
 fn render(f: &Fixture, annotation: &Annotation) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut lines = annotation.blob.split_inclusive(|&byte| byte == b'\n');
@@ -223,28 +238,16 @@ fn render(f: &Fixture, annotation: &Annotation) -> Result<Vec<u8>, String> {
         let source_path: &[u8] = row.source_path.as_ref();
         let previous = match commit.parents.as_slice() {
             [] => None,
-            [parent] => {
-                let mut matching = annotation.debug_path.iter().flatten().filter(|edge| {
-                    let edge_path: &[u8] = edge.source_file_path.as_ref();
-                    edge.commit_id == row.commit && edge_path == source_path
-                });
-                let previous = match (matching.next(), matching.next()) {
-                    (Some(edge), None) if edge.parent_index == 0 => {
-                        edge.previous_source_file_path.as_ref().map(|path| {
-                            (
-                                std::str::from_utf8(parent.as_ref()).unwrap().to_owned(),
-                                quote(path.as_ref()),
-                            )
-                        })
-                    }
-                    (None, None) => git_rs_upstream_probe::blame_backend::same_path_previous(
-                        f,
-                        row.commit,
-                        source_path.into(),
-                    )
-                    .map_err(|err| err.to_string())?
-                    .map(|id| (id.to_string(), quote(source_path))),
-                    _ => None,
+            [_] => {
+                let previous = if let Some(id) =
+                    same_path_previous(f, row.commit, source_path.into())
+                        .map_err(|err| err.to_string())?
+                {
+                    Some((id, quote(source_path)))
+                } else {
+                    rename_previous(f, row.commit, source_path.into())
+                        .map_err(|err| err.to_string())?
+                        .map(|(id, path)| (id, quote(path.as_ref())))
                 };
                 Some(previous.ok_or_else(|| {
                     format!(

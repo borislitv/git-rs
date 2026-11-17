@@ -372,6 +372,7 @@ dependencies = [
  "gix-zlib",
  "sha2",
  "tempfile",
+ "zstandard",
  "zstd",
 ]
 
@@ -1542,6 +1543,12 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zstandard"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb3c64fb6c5008477036b9b813ab01e1c318eaeb59459fd6b62186de728789ae"
 
 [[package]]
 name = "zstd"
