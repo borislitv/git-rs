@@ -658,18 +658,27 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
     /// does not establish ref visibility, reachability, or source authorization.
     /// False declines the shortcut (including when the prefix exceeds the graph
     /// budget); source failures and errors parsing the needed tokens propagate.
-    pub fn verify_published_blame_commit(&self, commit: &oid) -> Result<bool, BlameError> {
+    pub fn verify_published_blame_commit(&self, commit: &oid) -> crate::objects::Result<bool> {
         self.control.check()?;
         if self.limits.max_graph_objects < 1 {
             return Ok(false);
         }
-        let Some(header) = self.header(commit).map_err(|e| source_error(e.as_ref()))? else {
+        let Some(header) = self.header(commit)? else {
             return Ok(false);
         };
         if header.kind != Kind::Commit {
             return Ok(false);
         }
-        Ok(self.blame_commit_prefix(commit, header)?.is_some())
+        // This is a reachability preflight, before the blame engine's typed
+        // error boundary. Preserve physical source failures just as the full
+        // reachability walk does; successful verification is still mandatory.
+        let object = self
+            .verified_object(commit)?
+            .ok_or(BlameError::Corrupt("missing physical commit"))?;
+        if object.header().kind != header.kind || object.header().size != header.size {
+            return Err(BlameError::Corrupt("physical object header mismatch").into());
+        }
+        Ok(self.blame_commit_prefix(commit, &object)?.is_some())
     }
 
     /// Prove one unchanged byte-path edge for the fixed whole-file profile.
@@ -685,8 +694,11 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             return Ok(None);
         }
         let header = self.blame_commit_header(request.commit)?;
-        let Some((child_tree, Some(parent))) = self.blame_commit_prefix(request.commit, header)?
-        else {
+        let prefix = {
+            let object = self.blame_commit(request.commit, header)?;
+            self.blame_commit_prefix(request.commit, &object)?
+        };
+        let Some((child_tree, Some(parent))) = prefix else {
             return Ok(None);
         };
         let Some(child) = self.blame_path_entry(child_tree, request.path, true)? else {
@@ -1016,10 +1028,9 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
     fn blame_commit_prefix(
         &self,
         id: &oid,
-        expected: Header,
+        object: &VerifiedObject,
     ) -> Result<Option<(ObjectId, Option<ObjectId>)>, BlameError> {
-        let object = self.blame_commit(id, expected)?;
-        let header = self.blame_commit_header_bytes(&object)?;
+        let header = self.blame_commit_header_bytes(object)?;
         let mut tree = None;
         let mut only_parent = None;
         let mut edges = 0;
