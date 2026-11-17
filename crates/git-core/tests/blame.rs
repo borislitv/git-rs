@@ -37,7 +37,8 @@ fn blame_preflight_unchanged_child_matches_full_native_parent_porcelain() {
                 path,
             })
             .unwrap(),
-        Some(parent)
+        Some(parent),
+        "unchanged child must resolve to its parent"
     );
 
     // Run the native oracle independently for each commit; neither expected
