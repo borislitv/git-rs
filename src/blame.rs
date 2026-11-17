@@ -23,6 +23,8 @@ pub(crate) mod batch;
 mod derive;
 #[path = "blame_jobs.rs"]
 mod jobs;
+#[path = "blame_lookup.rs"]
+mod lookup;
 #[path = "blame_memo.rs"]
 pub(crate) mod memo;
 #[path = "blame_resources.rs"]
@@ -109,6 +111,10 @@ pub enum Phase {
     BodyBuildClaimed,
     BodyBuildPending,
     BodyBuildUnavailable,
+    PreflightTip,
+    PreflightWalk,
+    WorkSetPrepared,
+    ParentBodyHit,
 }
 /// In-process observation outside source/cache/workset/scheduler locks. Callbacks
 /// must honor the original control/deadline, including the statistics callback.
@@ -429,13 +435,13 @@ pub(crate) fn artifact_key(
     options: &BlameOptions,
     resources: ResourceProfile,
 ) -> Result<ArtifactKey> {
+    // Generation still fences the live source; it is not part of the immutable body key.
     ArtifactKey::new(KeyParts {
         repository: snapshot.id.as_bytes(),
         security: principal.as_bytes(),
         object_format: "sha1",
-        kind: "complete-blame",
+        kind: "complete-blame-v2",
         inputs: &[
-            &snapshot.generation.to_be_bytes(),
             &snapshot.storage_epoch.to_be_bytes(),
             &query.commit.0,
             &query.path,

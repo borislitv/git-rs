@@ -50,8 +50,10 @@
   core profile available. Production exposes no tuning/producer override; test-fixture selectors
   are not a serving API. Profile changes require fresh native, resource and performance qualification.
 - Shared blame bodies and authenticated WorkSet objects/mappings are optional derivations.
-  Preserve source authority, generation/epoch fences, complete line partitions and producer/key
-  scope. Persist completed units only, never vendor interner IDs or a suspended traversal frontier.
+  Preserve request-local source authority and generation/epoch fences. Only complete-body keys
+  omit ref generation (`complete-blame-v2`); WorkSet keys and source identity still bind it.
+  Preserve complete line partitions and all other producer/key scope. Persist completed units
+  only, never vendor interner IDs or a suspended traversal frontier.
   Keep SQL/network I/O out of memory callbacks. Do not weaken protected signing-file checks.
 - Signing mode must authenticate complete bodies as well as checkpoints. Bind the full expected
   artifact scope and ordered chunk descriptor; repaired ordinary digests cannot authorize a body.

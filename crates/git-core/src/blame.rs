@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use gix_diff::blob::control::{Allocation, Allocator, Cancelled, Stage};
 use gix_hash::{ObjectId, oid};
-use gix_object::{Find, FindHeader, Header, Kind};
+use gix_object::{Find, FindHeader, Header, Kind, commit::ref_iter::Token};
 use hashbrown::HashTable;
 use sha2::{Digest, Sha256};
 
@@ -654,6 +654,71 @@ impl Drop for CompleteBlame {
 }
 
 impl<P: VerifiedObjectProvider> SnapshotSession<P> {
+    /// Verify the physical object for a caller-selected published commit. This
+    /// does not establish ref visibility, reachability, or source authorization.
+    /// False declines the shortcut (including when the prefix exceeds the graph
+    /// budget); source failures and errors parsing the needed tokens propagate.
+    pub fn verify_published_blame_commit(&self, commit: &oid) -> Result<bool, BlameError> {
+        self.control.check()?;
+        if self.limits.max_graph_objects < 1 {
+            return Ok(false);
+        }
+        let Some(header) = self.header(commit).map_err(|e| source_error(e.as_ref()))? else {
+            return Ok(false);
+        };
+        if header.kind != Kind::Commit {
+            return Ok(false);
+        }
+        Ok(self.blame_commit_prefix(commit, header)?.is_some())
+    }
+
+    /// Prove one unchanged byte-path edge for the fixed whole-file profile.
+    /// Roots, merges, insufficient graph budget and ineligible paths return None.
+    /// Missing referenced objects, malformed data and source failures are errors.
+    /// Cache authentication and current reachability remain caller obligations.
+    pub fn unchanged_blame_parent(
+        &self,
+        request: BlameRequest<'_>,
+    ) -> Result<Option<ObjectId>, BlameError> {
+        self.validate_blame_request(request)?;
+        if self.limits.max_graph_objects < 2 || self.limits.max_graph_edges < 1 {
+            return Ok(None);
+        }
+        let header = self.blame_commit_header(request.commit)?;
+        let Some((child_tree, Some(parent))) = self.blame_commit_prefix(request.commit, header)?
+        else {
+            return Ok(None);
+        };
+        let Some(child) = self.blame_path_entry(child_tree, request.path, true)? else {
+            return Ok(None);
+        };
+        let header = self
+            .header(&parent)
+            .map_err(|e| source_error(e.as_ref()))?
+            .ok_or(BlameError::Corrupt("missing physical parent commit"))?;
+        if header.kind != Kind::Commit {
+            return Err(BlameError::Corrupt("parent commit type mismatch"));
+        }
+        let parent_tree = {
+            let object = self.blame_commit(&parent, header)?;
+            gix_object::CommitRefIter::from_bytes(
+                self.blame_commit_header_bytes(&object)?,
+                parent.kind(),
+            )
+            .tree_id()
+            .map_err(|_| BlameError::Corrupt("parent commit tree"))?
+        };
+        if self.blame_path_entry(parent_tree, request.path, true)? != Some(child) {
+            return Ok(None);
+        }
+        // The same OID denotes the same physical blob in this snapshot. Verify
+        // it once, after both independently resolved entries agree in full.
+        let blob_header = self.blame_blob_header(&child.0)?;
+        self.blame_object(&child.0, blob_header, "missing physical blob")?;
+        self.control.check()?;
+        Ok(Some(parent))
+    }
+
     pub fn blame_complete(
         &self,
         request: BlameRequest<'_>,
@@ -677,23 +742,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         options: &BlameOptions,
         memo: Option<memo::MemoryMappingRequest<'_>>,
     ) -> Result<CompleteBlame, BlameError> {
-        self.control.check()?;
-        ProducerVersion::verified()?;
-        if self.identity().object_hash != gix_hash::Kind::Sha1 {
-            return Err(BlameError::UnsupportedContract);
-        }
-        if request.commit.kind() != self.identity().object_hash
-            || request.commit.is_null()
-            || request.path.is_empty()
-            || request.path.len() > 4096
-            || request.path.contains(&0)
-            || request
-                .path
-                .split(|byte| *byte == b'/')
-                .any(|part| part.is_empty() || part == b"." || part == b"..")
-        {
-            return Err(BlameError::InvalidRequest);
-        }
+        self.validate_blame_request(request)?;
         self.blame_target(request)?;
         let cause = Arc::new(Cause::default());
         let allocator = Arc::new(BlameAllocator {
@@ -894,26 +943,130 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
 
     // Header-first literal resolution avoids inflating an oversized target just
     // to discover it violates the public blob bound. No virtual empty trees.
-    fn blame_target(&self, request: BlameRequest<'_>) -> Result<(), BlameError> {
+    fn validate_blame_request(&self, request: BlameRequest<'_>) -> Result<(), BlameError> {
+        self.control.check()?;
+        ProducerVersion::verified()?;
+        if self.identity().object_hash != gix_hash::Kind::Sha1 {
+            return Err(BlameError::UnsupportedContract);
+        }
+        if request.commit.kind() != self.identity().object_hash
+            || request.commit.is_null()
+            || request.path.is_empty()
+            || request.path.len() > 4096
+            || request.path.contains(&0)
+            || request
+                .path
+                .split(|byte| *byte == b'/')
+                .any(|part| part.is_empty() || part == b"." || part == b"..")
+        {
+            return Err(BlameError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    fn blame_commit_header(&self, commit: &oid) -> Result<Header, BlameError> {
         let header = self
-            .header(request.commit)
+            .header(commit)
             .map_err(|e| source_error(e.as_ref()))?
             .ok_or(BlameError::NotFound)?;
         if header.kind != Kind::Commit {
             return Err(BlameError::InvalidRequest);
         }
-        if header.size > MAX_METADATA_OBJECT_BYTES as u64 {
+        Ok(header)
+    }
+
+    fn blame_object(
+        &self,
+        id: &oid,
+        expected: Header,
+        missing: &'static str,
+    ) -> Result<VerifiedObject, BlameError> {
+        let object = self
+            .verified_object(id)
+            .map_err(|e| source_error(e.as_ref()))?
+            .ok_or(BlameError::Corrupt(missing))?;
+        let actual = object.header();
+        if actual.kind != expected.kind || actual.size != expected.size {
+            return Err(BlameError::Corrupt("physical object header mismatch"));
+        }
+        Ok(object)
+    }
+
+    fn blame_commit(&self, id: &oid, header: Header) -> Result<VerifiedObject, BlameError> {
+        if header.size > self.limits.max_object_bytes.min(MAX_METADATA_OBJECT_BYTES) as u64 {
             return Err(BlameError::Corrupt("commit object byte limit exceeded"));
         }
-        let commit = self
-            .required(request.commit, Kind::Commit)
-            .map_err(|e| source_error(e.as_ref()))?;
-        let mut tree_id =
-            gix_object::CommitRefIter::from_bytes(commit.data.as_slice(), request.commit.kind())
-                .tree_id()
-                .map_err(|_| BlameError::Corrupt("commit tree"))?;
+        self.blame_object(id, header, "missing physical commit")
+    }
+
+    fn blame_commit_header_bytes<'a>(
+        &self,
+        object: &'a VerifiedObject,
+    ) -> Result<&'a [u8], BlameError> {
+        let bytes = object.as_slice();
+        let end = crate::objects::metadata_header_end(
+            bytes,
+            self.limits.max_metadata_bytes,
+            &self.control,
+        )
+        .map_err(|e| source_error(e.as_ref()))?;
+        Ok(&bytes[..end])
+    }
+
+    fn blame_commit_prefix(
+        &self,
+        id: &oid,
+        expected: Header,
+    ) -> Result<Option<(ObjectId, Option<ObjectId>)>, BlameError> {
+        let object = self.blame_commit(id, expected)?;
+        let header = self.blame_commit_header_bytes(&object)?;
+        let mut tree = None;
+        let mut only_parent = None;
+        let mut edges = 0;
+        // As in the graph walk, use fallible tokens through the first author:
+        // parent_ids() hides parser errors, and receive validates later fields.
+        for token in gix_object::CommitRefIter::from_bytes(header, id.kind()) {
+            self.control.check()?;
+            match token.map_err(|_| BlameError::Corrupt("invalid commit prefix"))? {
+                Token::Tree { id } => tree = Some(id),
+                Token::Parent { id } => {
+                    if edges == self.limits.max_graph_edges || id.is_null() {
+                        return Ok(None);
+                    }
+                    edges += 1;
+                    only_parent = (edges == 1).then_some(id);
+                }
+                Token::Author { .. } => {
+                    return Ok(tree.map(|tree| (tree, only_parent)));
+                }
+                _ => {}
+            }
+        }
+        self.control.check()?;
+        Ok(None)
+    }
+
+    fn blame_target(&self, request: BlameRequest<'_>) -> Result<(), BlameError> {
+        let header = self.blame_commit_header(request.commit)?;
+        let commit = self.blame_commit(request.commit, header)?;
+        let tree = gix_object::CommitRefIter::from_bytes(commit.as_slice(), request.commit.kind())
+            .tree_id()
+            .map_err(|_| BlameError::Corrupt("commit tree"))?;
         drop(commit);
-        let mut components = request.path.split(|byte| *byte == b'/').peekable();
+        let (id, _) = self
+            .blame_path_entry(tree, request.path, false)?
+            .ok_or(BlameError::NotFound)?;
+        self.blame_blob_header(&id)?;
+        Ok(())
+    }
+
+    fn blame_path_entry(
+        &self,
+        mut tree_id: ObjectId,
+        path: &[u8],
+        require_unique: bool,
+    ) -> Result<Option<(ObjectId, u16)>, BlameError> {
+        let mut components = path.split(|byte| *byte == b'/').peekable();
         while let Some(component) = components.next() {
             self.control.check()?;
             let header = self
@@ -925,55 +1078,59 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             {
                 return Err(BlameError::Corrupt("physical tree object limit or type"));
             }
-            let tree = self
-                .required(&tree_id, Kind::Tree)
-                .map_err(|e| source_error(e.as_ref()))?;
+            let tree = self.blame_object(&tree_id, header, "missing physical tree")?;
             let mut found = None;
-            for entry in gix_object::TreeRefIter::from_bytes(tree.data.as_slice(), tree_id.kind()) {
+            let mut ambiguous = false;
+            for entry in gix_object::TreeRefIter::from_bytes(tree.as_slice(), tree_id.kind()) {
                 self.control.check()?;
                 let entry = entry.map_err(|_| BlameError::Corrupt("physical tree entry"))?;
                 let filename: &[u8] = entry.filename.as_ref();
                 if filename == component {
+                    ambiguous |= found.is_some();
                     found = Some((entry.oid.to_owned(), entry.mode));
                 }
             }
-            let (id, mode) = found.ok_or(BlameError::NotFound)?;
+            if require_unique && ambiguous {
+                return Err(BlameError::Corrupt("ambiguous physical tree path"));
+            }
+            let Some((id, mode)) = found else {
+                return Ok(None);
+            };
             if components.peek().is_none() {
-                if !mode.is_blob() && !mode.is_link() {
-                    return Err(BlameError::NotFound);
-                }
-                let header = self
-                    .header(&id)
-                    .map_err(|error| {
-                        // The selected tree entry is a blob. A provider may
-                        // reject its size during preflight before returning a
-                        // header; retain that outcome without decoding it.
-                        if error
-                            .downcast_ref::<crate::pack::ObjectSizeLimit>()
-                            .is_some_and(|size| {
-                                size.limit == MAX_BLOB_BYTES && size.size > MAX_BLOB_BYTES as u64
-                            })
-                        {
-                            BlameError::BlobTooLarge
-                        } else {
-                            source_error(error.as_ref())
-                        }
-                    })?
-                    .ok_or(BlameError::Corrupt("missing physical blob"))?;
-                if header.kind != Kind::Blob {
-                    return Err(BlameError::Corrupt("blob type mismatch"));
-                }
-                if header.size > MAX_BLOB_BYTES as u64 {
-                    return Err(BlameError::BlobTooLarge);
-                }
-                return Ok(());
+                return Ok((mode.is_blob() || mode.is_link()).then(|| (id, mode.value())));
             }
             if !mode.is_tree() {
-                return Err(BlameError::NotFound);
+                return Ok(None);
             }
             tree_id = id;
         }
-        Err(BlameError::NotFound)
+        Ok(None)
+    }
+
+    fn blame_blob_header(&self, id: &oid) -> Result<Header, BlameError> {
+        let header = self
+            .header(id)
+            .map_err(|error| {
+                // The provider may reject the blob's size during preflight.
+                if error
+                    .downcast_ref::<crate::pack::ObjectSizeLimit>()
+                    .is_some_and(|size| {
+                        size.limit == MAX_BLOB_BYTES && size.size > MAX_BLOB_BYTES as u64
+                    })
+                {
+                    BlameError::BlobTooLarge
+                } else {
+                    source_error(error.as_ref())
+                }
+            })?
+            .ok_or(BlameError::Corrupt("missing physical blob"))?;
+        if header.kind != Kind::Blob {
+            return Err(BlameError::Corrupt("blob type mismatch"));
+        }
+        if header.size > MAX_BLOB_BYTES as u64 {
+            return Err(BlameError::BlobTooLarge);
+        }
+        Ok(header)
     }
 }
 

@@ -63,8 +63,13 @@ per-name validation remain enforced.
 Commit-kind and uncompressed blob-size checks use physical Rust library headers,
 without inflating complete object bodies or spawning `cat-file`. This includes
 delta-compressed objects in verified, source-pinned packs acquired on demand.
-These checks do not grant reachability or authorization: the leased published
-snapshot, Rust reachability and literal path checks still precede annotation.
+These header checks do not grant reachability or authorization. Preflight can
+establish reachability without a graph walk only when the requested OID exactly
+matches a `refs/heads/` tip in the request's leased published snapshot and the
+target is physically read and verified as a commit. Without that proof,
+preflight uses the normal bounded Rust reachability walk; a tag ref or an
+ancestry relationship alone does not qualify for the shortcut. Literal path and
+blob checks still precede annotation.
 
 By default one shared CPU worker admits work per serving process, with no queued
 capacity. Receive, upload, history and blame use that same pool; occupied shared
@@ -114,10 +119,12 @@ must require a complete 200 response, not interpret a truncated body as an annot
 HTTP tuning, producer override or native-worker selection.
 
 The ordinary optional cache configuration can retain complete bodies: these are
-the complete line-porcelain responses, not individual Git blobs. Without an
-independent signing key, their semantics trust the cache database writer; a writer
-able to replace bytes and matching checksums can change the response. Typed
-object/mapping checkpoints and authenticated complete bodies require the explicit
+the complete line-porcelain responses, not individual Git blobs. Without the
+dedicated blame signing key, only exact-target body lookup is allowed, using the
+ordinary cache integrity checks. This mode trusts the cache database writer for
+response semantics: a writer able to replace bytes and matching checksums can
+change the response. Typed object/mapping checkpoints, authenticated exact-body
+lookup and one-edge parent reuse require the explicit
 `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` setting, alongside the existing cache namespace,
 owner and PostgreSQL/S3 configuration. The file must be an absolute path to
 exactly 32 random bytes, owned by root or the service UID, with no group/other
@@ -130,21 +137,35 @@ This is a trusted-producer MAC contract. Authorized producers sharing artifacts
 must share the namespace, authorized cache owner UUID and key. They must run the
 bound producer/options implementation. A checksum, matching producer label or
 structurally valid byte partition alone does not prove canonical Myers tie choice.
-HMAC authenticates the complete frame and its repository/principal/generation/
+The WorkSet HMAC authenticates the complete frame and its repository/principal/generation/
 storage-epoch/query/producer/options scope. Physical objects additionally verify
 their kind, size and Git OID. Mapping units contain both complete byte-line
 partitions; no vendor interner state or suspended DAG frontier is persisted.
 
-In signing mode, complete bodies use a separate HMAC domain over the full expected
-artifact key and a versioned descriptor containing ordered chunk lengths and
-digests. Namespace/writer, repository/principal/generation/storage epoch,
-target/path, producer and options are bound before a body can be accepted as a hit.
-Only newly derived local porcelain is signed; cache-loaded data is never re-signed.
-The raw response bytes are unchanged. An altered, unsigned, incompatible,
-foreign-scope or wrong-key body becomes a cache miss and is recomputed from the
-authorized source. Signing mode never falls back to unsigned acceptance. This
-protects against a cache writer without the signing key, not a compromised producer
-or signing-key holder. Source authorization and final response fences remain required.
+Complete-body keys and their build claims use `complete-blame-v2`. This key
+retains the repository, principal, object format, storage epoch, target commit,
+literal path, canonical options, porcelain representation, and producer/resource
+scope. Only ref generation is omitted. Entries in the old `complete-blame` body
+namespace are misses; there is no old-key lookup or conversion. WorkSet keys
+and source identity still bind generation.
+
+In signing mode, complete bodies use the dedicated `git-rs/authorized-complete-body/v1`
+HMAC domain, binding the cache namespace and writer, full expected canonical key,
+and versioned descriptor containing ordered chunk lengths and digests. An altered,
+unsigned, incompatible, foreign-scope or wrong-key body is a miss. There is no
+unsigned fallback with a signer configured. This protects against a cache writer
+without the signing key, not a compromised producer or signing-key holder.
+
+All hits require current reachability under the authorized leased source, the
+active limits and deadline, and source and cache fences through response delivery.
+An exact hit already binds the literal path in its key. Cache data never
+establishes source access. On an exact-body miss, the only cross-commit reuse is
+an authenticated body for the target's sole immediate parent, after the source
+proves the same literal path, entry mode and verified blob on that edge.
+There is no lookup beyond that edge. A changed file takes the ordinary blame
+calculation path. A parent hit returns the verified bytes unchanged and is never
+published or re-signed under the child key. Only newly derived local porcelain
+is eligible for signing.
 
 The generic cache may physically compress body and checkpoint chunks with zstd.
 Descriptors and MACs still bind the logical lengths/digests, while separate stored

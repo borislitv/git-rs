@@ -129,7 +129,7 @@ pub(super) struct Profile {
 impl Profile {
     pub fn verified(options: &BlameOptions, resources: super::ResourceProfile) -> Result<Self> {
         let core = ProducerVersion::verified()?;
-        // Bind the exact new root codec/callback code, not just the core package
+        // Bind the exact root reuse and serving code, not just the core package
         // version. Core binds the committed manifest-referenced pins and source
         // inventory; that is not a claim that every possible build pin is released.
         let mut hash = openssl::sha::Sha256::new();
@@ -139,6 +139,7 @@ impl Profile {
             include_bytes!("blame_batch.rs").as_slice(),
             include_bytes!("blame_memo.rs").as_slice(),
             include_bytes!("blame_derive.rs").as_slice(),
+            include_bytes!("blame_lookup.rs").as_slice(),
             include_bytes!("blame.rs").as_slice(),
             include_bytes!("blame_source.rs").as_slice(),
             include_bytes!("blame_jobs.rs").as_slice(),

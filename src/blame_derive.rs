@@ -2,7 +2,7 @@
 use super::{
     Body, Bytes, Observer, Outcome, Phase, Request, SourceAccess, artifact_key,
     batch::{BatchSnapshot, WriterProof},
-    codec_runtime_failure,
+    codec_runtime_failure, lookup,
     memo::{Checkpoints, Profile, WorkSet},
     observe, optional_cache, publish_body,
 };
@@ -10,9 +10,7 @@ use crate::{
     Result,
     blob::Store,
     cache::Cache,
-    derived_cache::{
-        Access, ArtifactKind, BlameArtifacts, BlameBuilds, BuildLimits, BuildLookup, DerivedCache,
-    },
+    derived_cache::{Access, BlameBuilds, BuildLimits, BuildLookup, DerivedCache},
     invalid, process,
     repository::blame_source::{LazySnapshot, Source},
 };
@@ -84,53 +82,42 @@ pub(super) fn derive(
     observe(&env.observer, Phase::SourceAcquired, control)?;
     let options = env.options.clone();
     let limits = env.resources.read_limits(&options);
-    let profile = Profile::verified(&options, env.resources)?;
-    let work: Option<WorkSet> = if env.writer.is_some() && env.derived.is_some() {
-        optional_cache(control, || BatchSnapshot::new(budget.clone()))?
-            .map(|batch| WorkSet::new(batch, env.resources, limits))
-    } else {
-        None
-    };
     let identity = source.identity();
-    let provider = if env.resources == super::ResourceProfile::BaselineV1 {
-        LazySnapshot::new(
-            source.clone(),
-            env.store,
-            env.files,
-            budget.clone(),
-            limits,
-            control,
-        )
-    } else {
-        LazySnapshot::new_with_resource_profile(
-            source.clone(),
-            env.store,
-            env.files,
-            budget.clone(),
-            limits,
-            env.resources,
-            control,
-        )
-    }?
-    .with_workset(work.clone())?;
-    let session =
-        SnapshotSession::open(provider, &identity, control.clone(), budget.clone(), limits)?;
+    let open_session = |work| -> Result<_> {
+        let provider = if env.resources == super::ResourceProfile::BaselineV1 {
+            LazySnapshot::new(
+                source.clone(),
+                env.store.clone(),
+                env.files.clone(),
+                budget.clone(),
+                limits,
+                control,
+            )
+        } else {
+            LazySnapshot::new_with_resource_profile(
+                source.clone(),
+                env.store.clone(),
+                env.files.clone(),
+                budget.clone(),
+                limits,
+                env.resources,
+                control,
+            )
+        }?
+        .with_workset(work)?;
+        SnapshotSession::open(provider, &identity, control.clone(), budget.clone(), limits)
+    };
+    let preflight = open_session(None)?;
     let commit = gix::ObjectId::from(query.commit.0);
-    if expected.is_none() {
-        let reachable = session.reachable_from_refs(
-            source
-                .snapshot
-                .refs
-                .iter()
-                .map(|(name, oid)| (name.as_slice(), gix::ObjectId::from(oid.0))),
-        )?;
-        if !reachable.iter().any(|id| id == commit) {
-            return Ok(Outcome::NotFound);
-        }
-    }
-    // Warm hints already bind a currently visible authorized branch tip; do not
-    // scan all repository refs merely to rediscover that explicit reachability.
+    let request = BlameRequest {
+        commit: &commit,
+        path: &query.path,
+    };
+    let reachable = lookup::reachable(&preflight, &source, commit, &env.observer, control)?;
     source.check()?;
+    if !reachable {
+        return Ok(Outcome::NotFound);
+    }
     let body_key = artifact_key(
         &source.snapshot,
         &principal,
@@ -138,23 +125,11 @@ pub(super) fn derive(
         &options,
         env.resources,
     )?;
-    let body_access: Arc<dyn Access> = Arc::new(SourceAccess {
-        source: source.clone(),
-        key: body_key.clone(),
-    });
-    if let Some(cache) = env.derived.as_ref().filter(|_| env.body_lookup)
-        && let Some(Some(body)) = optional_cache(control, || {
-            let artifacts = BlameArtifacts::new(cache);
-            if let Some(writer) = &env.writer {
-                artifacts.get_body_authenticated(&body_key, body_access.clone(), |manifest, tag| {
-                    writer.verify_body(&body_key, manifest, tag, control)
-                })
-            } else {
-                artifacts.get_verified(&body_key, ArtifactKind::CompleteBody, body_access.clone())
-            }
-        })?
-    {
-        observe(&env.observer, Phase::CacheHit, control)?;
+    if let Some((body, phase)) = lookup::body(
+        &env, &source, &preflight, &principal, request, &body_key, control,
+    )? {
+        drop(preflight);
+        observe(&env.observer, phase, control)?;
         observe(&env.observer, Phase::Complete, control)?;
         source.check()?;
         return Ok(Outcome::Complete(Body {
@@ -163,9 +138,23 @@ pub(super) fn derive(
             work: None,
         }));
     }
+    let (session, work) = if env.writer.is_some() && env.derived.is_some() {
+        // Release the preflight catalog and decoder before admitting the WorkSet.
+        drop(preflight);
+        let work = optional_cache(control, || BatchSnapshot::new(budget.clone()))?
+            .map(|batch| WorkSet::new(batch, env.resources, limits));
+        let session = open_session(work.clone())?;
+        if work.is_some() {
+            observe(&env.observer, Phase::WorkSetPrepared, control)?;
+        }
+        (session, work)
+    } else {
+        (preflight, None)
+    };
     let mut checkpoints = if let (Some(cache), Some(writer), Some(work)) =
         (&env.derived, env.writer.as_ref(), work.as_ref())
     {
+        let profile = Profile::verified(&options, env.resources)?;
         let key =
             super::memo::checkpoint_key(&source.snapshot, &principal, &query, &options, &profile)?;
         let access: Arc<dyn Access> = Arc::new(SourceAccess {
@@ -194,7 +183,10 @@ pub(super) fn derive(
         optional_cache(control, || {
             BlameBuilds::new(cache).claim(
                 &body_key,
-                body_access,
+                Arc::new(SourceAccess {
+                    source: source.clone(),
+                    key: body_key.clone(),
+                }),
                 BuildLimits {
                     hard_seconds: seconds,
                     lease_seconds: seconds.min(15),
@@ -220,21 +212,12 @@ pub(super) fn derive(
             let blamed = if let Some(checkpoints) = &mut checkpoints {
                 let mut memory = checkpoints.memory();
                 session.blame_complete_with_memo(
-                    BlameRequest {
-                        commit: &commit,
-                        path: &query.path,
-                    },
+                    request,
                     &options,
                     checkpoints.request(&mut memory, env.reuse),
                 )
             } else {
-                session.blame_complete(
-                    BlameRequest {
-                        commit: &commit,
-                        path: &query.path,
-                    },
-                    &options,
-                )
+                session.blame_complete(request, &options)
             };
             if let Some(error) = checkpoints.as_ref().and_then(Checkpoints::take_failure) {
                 return Err(error);

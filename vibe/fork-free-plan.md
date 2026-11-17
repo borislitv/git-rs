@@ -34,7 +34,8 @@ product acceptance; assertions of removed internal mechanisms are revised explic
   options, representation and verified producer. Bind new helper sources in the
   producer inventory. Keep request-local generation/epoch checks and source holds.
 - Share the warmer's existing exact leased branch-tip reachability proof with
-  foreground lookup, including physical commit-kind validation. Other targets
+  foreground lookup: exact equality with a current `refs/heads/` value plus a
+  physically verified commit read (not just an index header). Other targets
   retain the general reachability path; do not weaken graph validation APIs.
 - Look for the authorized complete body before attribution/WorkSet preparation.
   On a miss, preserve the normal computation path and account for all temporary
@@ -63,6 +64,8 @@ product acceptance; assertions of removed internal mechanisms are revised explic
 - For an already cached current branch tip require no general history walk and no
   WorkSet preparation. For one unchanged child require parent-body reuse; compare
   complete child porcelain independently, including previous paths and grouping.
+- Report exact-hit, unchanged-parent hit, and changed-file work separately. Neither
+  of the first two proves reuse when the target file itself changes.
 - Cover changed content, independent histories with equal blobs, merge, rename,
   mode change and missing parent body. Preserve ACL revoke, force-push reachability,
   epoch, signature/producer, source outage and ownership/drain checks.
@@ -125,6 +128,9 @@ contracts, not library implementations to copy. No API-extension PR is required.
 
 - Compare complete native blame for roots, merges, whole-parent preference,
   renames, symlinks, repeated-line ties, raw paths and previous/grouping metadata.
+  Start with two unrelated roots contributing a line each to one merge, and a
+  one-line replacement with a native `previous` field. Check complete line coverage
+  as well as provenance. A debug traversal log is not an origin for each line.
 - Exercise the actual pack adapter with OFS/REF chains, cross-pack/forward bases,
   cycles, invalid original offsets, noncanonical headers, malformed/trailing zlib,
   CRC/OID mismatches and source failures. A normalized input must not hide invalid
@@ -133,7 +139,8 @@ contracts, not library implementations to copy. No API-extension PR is required.
   input and output-full behavior with the independent native oracle.
 - Decode old compressed fixtures with upstream zstd; cover exact-output/footer,
   extra output, corrupt/truncated/concatenated frames and bounded concurrent work.
-  Document changed frame-policy cases instead of silently relaxing assertions.
+  Keep the old declared-frame rejection rules unless a revised reader contract
+  is explicitly approved. A worker memory ceiling alone does not check a header.
 - A failed product case blocks that adapter's cutover. Revise the application
   boundary or select another unmodified maintained implementation; never return
   to a fork. Record the exact unsupported behavior rather than a speculative hook.
@@ -156,19 +163,25 @@ Use existing independent native fixtures, not fork-generated expected values.
   termination, wait and I/O drain. No successful partial response/publication.
 - Keep the existing parent orchestration responsible for permissions, source
   leases, HTTP framing and authoritative SQL publication. Bind child work to the
-  authorized repository/query/snapshot. Limit simultaneous IPC/result buffers.
+  authorized repository/query/snapshot via parent-mediated range/object reads.
+  Limit simultaneous IPC/result buffers. Require measured effective child limits
+  and owner-death cleanup; a subprocess sharing the parent cgroup is insufficient.
+  Specify successful termination separately for streamed upload, complete blame,
+  and confirmed publication of the exact sealed receive command batch.
 - Move qualified adapters into the shared core and wire blame, receive, upload,
   history, backup and truncation planning through the same execution boundary as
   needed. Source mutation/deletion stays in the existing fenced parent orchestration.
   Do not remove controlled APIs from a caller before its replacement is qualified.
+  Qualify stored-object reads first; receive intake and pack/index output for
+  compaction and truncation need independent adapters and native interoperability.
 - Remove fork-only mapping callbacks, mixed-object WorkSet persistence and vendor
   tuning requirements from the target path. Keep complete-body authentication and
   ordinary object caches through public APIs. Old producer artifacts become misses;
   they are not re-signed or reinterpreted as new artifacts.
-- Remove advisory Kubert election and use the existing PostgreSQL campaign/fence
-  authority for maintenance. Make PG connectivity/lease validity define candidacy
-  and readiness; retain expiry, no-revival, source-job fencing and cleanup order.
-  This explicitly changes the former Kubernetes-API-outage stop policy.
+- Replace the Kubert fork via the existing upstream typed Kubernetes client for
+  named-Lease get and resourceVersion-guarded patch. Keep eligible standby readiness,
+  bounded confirmation, independent monotonic expiry and the API-outage stop policy.
+  The existing PG campaign/fence remains the sole maintenance mutation authority.
 - Replace the four fork dependency edges with qualified upstream sources. Update
   provenance checks/notices and remove obsolete source-policy assertions. Add a
   production dependency-source gate which rejects forks, local patches and hidden
@@ -196,8 +209,8 @@ runtime-contract fixtures; `migrations/current_functions.sql` maintenance fences
 - Run native push/clone/fetch/history/backup and strict physical/graph validation,
   including all-or-nothing multi-ref publication and ambiguous-COMMIT confirmation.
 - Test competing PG maintenance candidates, expired campaigns, stale fences,
-  database failover/unavailability and drain-before-release. Replace Kubernetes
-  candidacy assertions only as the explicit policy change from stage 5.
+  database failover/unavailability and drain-before-release. Run the real named
+  Lease contention, API outage, standby readiness and takeover contracts as well.
 - Check resolved production package sources, runtime image contents and every
   caller: no fork package, copied implementation or fork-backed fallback remains.
   Run codec compatibility and changed native-encoding cases in the actual image.
@@ -220,8 +233,10 @@ owned `make cache-check`. Preparation does not replace executed runtime cases.
 - Reuse artifact build leases; a background task skips an already claimed build.
   Coalesce superseded tips and repeat reconciliation after restart or eviction.
   No dependence on an in-process notification or a write in the push transaction.
-- Run with its own worker resources/admission and ordinary read-only source
-  credentials. It has no source-deletion authority. Reuse the same qualified
+- Run with its own worker resources/admission, read-only object access and a
+  scoped DB role that can acquire/check/release only authorized shared reader holds.
+  Enforce the configured repository/principal binding in that interface. It has no
+  source-publication or deletion authority. Reuse the same qualified
   backend and codec; publication success is distinct from completed computation.
 - The durable unit is a completed target result. An interrupted opaque computation
   retries normally; vendor traversal state is not a required persistence format.
@@ -241,6 +256,14 @@ worker chart/values, `OPERATIONS.md`, `docs/blame.md`.
 - Measure exact-body hits, unchanged-parent hits, changed-file cold computation
   and warming separately. Compare before/after with identical source/cache states,
   interleaved repetitions, CPU/wall time, source reads and peak retained resources.
+- On the 20,000-commit one-changing-line fixture, request the first new +1 and +100
+  tips after a restart with the old target prepared. Require a complete native-equal
+  response and count both old-history traversal and new diff work. If old history
+  is replayed, mark changed-file incremental reuse **unmet**, independently of
+  warming or exact-body hits. Qualify a single-parent summary composition above the
+  public backend before claiming this improvement; preserve native grouping and
+  previous paths, ordered whole-file diff semantics, and authenticated provenance.
+  Fall back to full calculation wherever those preconditions cannot be proved.
 - Run long-history synthetic diagnostics and separately authorized representative
   cases under their stated envelopes. A cold deadline remains a failed result,
   not a speedup explained away by warming. Do not infer causal speedups from self samples.

@@ -123,10 +123,10 @@ impl WriterProof {
         key.fill(0); // best effort only; not a claim of allocator/native zeroization
         proof
     }
-    /// Authenticate a complete-body descriptor constructed from locally derived
-    /// porcelain, never cache-supplied bytes. The descriptor binds kind, ordered
-    /// chunk lengths/digests and format; the canonical key also binds source,
-    /// security scope, generation/epoch, producer and native options.
+    /// Compute the MAC for a complete-body descriptor; publication signs only
+    /// locally derived porcelain. The MAC binds namespace, writer, the full
+    /// canonical key (including storage epoch, not ref generation in v2), and
+    /// the descriptor's kind, format and ordered chunk lengths/digests.
     pub(super) fn body_tag(
         &self,
         key: &ArtifactKey,
