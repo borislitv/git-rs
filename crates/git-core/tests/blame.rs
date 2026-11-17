@@ -8,6 +8,171 @@ use git_rs_core::{
 };
 
 #[test]
+fn blame_preflight_unchanged_child_matches_full_native_parent_porcelain() {
+    let mut fixture = Fixture::new();
+    let path = b"file";
+    let root = fixture.commit(
+        &[(path, b"intro\nold one\nold two\nfooter\n", "100644")],
+        &[],
+        1,
+        b"Root\n",
+        None,
+    );
+    let content = b"intro\nnew one\nnew two\nfooter\n";
+    let parent = fixture.commit(&[(path, content, "100644")], &[root], 2, b"Edit\n", None);
+    let child = fixture.commit(
+        &[(path, content, "100644"), (b"other", b"added\n", "100644")],
+        &[parent],
+        3,
+        b"Add an unrelated file\n",
+        None,
+    );
+
+    let session = fixture.session(CapacityBudget::new(8 * 1024 * 1024), control());
+    assert!(session.verify_published_blame_commit(&child).unwrap());
+    assert_eq!(
+        session
+            .unchanged_blame_parent(BlameRequest {
+                commit: &child,
+                path,
+            })
+            .unwrap(),
+        Some(parent)
+    );
+
+    // Run the native oracle independently for each commit; neither expected
+    // result is derived from the shortcut or from the other oracle result.
+    let parent_body = fixture.native(parent, path);
+    let child_body = fixture.native(child, path);
+    let previous = format!("previous {root} file");
+    let group_start = format!("{parent} 2 2 2");
+    let group_next = format!("{parent} 3 3");
+    for expected in [previous, group_start, group_next] {
+        assert!(
+            child_body
+                .split(|&byte| byte == b'\n')
+                .any(|line| line == expected.as_bytes()),
+            "native child porcelain lacks {expected}"
+        );
+    }
+    assert_eq!(child_body, parent_body);
+    assert_eq!(
+        render(&fixture, child, path, &BlameOptions::default()),
+        child_body
+    );
+}
+
+#[test]
+fn blame_preflight_declines_ineligible_edges_and_distinguishes_physical_targets() {
+    use git_rs_core::{ReadLimits, SnapshotSession};
+
+    let mut fixture = Fixture::new();
+    let path: &[u8] = b"file";
+    let renamed_path: &[u8] = b"renamed";
+    let content = b"shared\n";
+    let files = [(path, content.as_slice(), "100644")];
+    let root = fixture.commit(&files, &[], 1, b"Root\n", None);
+    let changed = fixture.commit(
+        &[(path, b"changed\n", "100644")],
+        &[root],
+        2,
+        b"Change content\n",
+        None,
+    );
+    let renamed = fixture.commit(
+        &[(renamed_path, content, "100644")],
+        &[root],
+        3,
+        b"Rename without edit\n",
+        None,
+    );
+    let mode = fixture.commit(
+        &[(path, content, "100755")],
+        &[root],
+        4,
+        b"Make executable\n",
+        None,
+    );
+    let left = fixture.commit(&files, &[root], 5, b"Left\n", None);
+    let right = fixture.commit(&files, &[root], 6, b"Right\n", None);
+    let merge = fixture.commit(&files, &[left, right], 7, b"Merge identical files\n", None);
+    let unrelated = fixture.commit(&files, &[], 8, b"Independent root\n", None);
+    let blob = fixture.insert(gix_object::Kind::Blob, content);
+    let missing = gix_hash::ObjectId::from([0x55; 20]);
+
+    let session = fixture.session(CapacityBudget::new(8 * 1024 * 1024), control());
+    for (case, commit, path) in [
+        ("root", root, path),
+        ("different blob", changed, path),
+        ("path absent in parent", renamed, renamed_path),
+        ("path absent in child", renamed, path),
+        ("same blob but different mode", mode, path),
+        ("merge with identical entries", merge, path),
+        ("unrelated history with the same blob", unrelated, path),
+    ] {
+        assert!(
+            session.verify_published_blame_commit(&commit).unwrap(),
+            "{case}"
+        );
+        assert_eq!(
+            session
+                .unchanged_blame_parent(BlameRequest {
+                    commit: &commit,
+                    path,
+                })
+                .unwrap(),
+            None,
+            "{case}"
+        );
+    }
+    let reachable = session
+        .reachable_from_refs([(b"refs/heads/main".as_slice(), merge)])
+        .unwrap();
+    assert!(!reachable.iter().any(|id| id == unrelated));
+    assert_ne!(fixture.native(root, path), fixture.native(unrelated, path));
+    for (target, error) in [
+        (blob, BlameError::InvalidRequest),
+        (missing, BlameError::NotFound),
+    ] {
+        assert!(!session.verify_published_blame_commit(&target).unwrap());
+        assert_eq!(
+            session.unchanged_blame_parent(BlameRequest {
+                commit: &target,
+                path,
+            }),
+            Err(error)
+        );
+    }
+
+    let provider = fixture.provider();
+    let identity = provider.identity.clone();
+    let tight = SnapshotSession::open(
+        provider,
+        &identity,
+        control(),
+        CapacityBudget::new(8 * 1024 * 1024),
+        ReadLimits {
+            max_graph_objects: 1,
+            max_graph_edges: 1,
+            ..BlameOptions::default().read_limits()
+        },
+    )
+    .unwrap();
+    assert!(tight.verify_published_blame_commit(&root).unwrap());
+    assert!(!tight.verify_published_blame_commit(&merge).unwrap());
+    assert_eq!(
+        tight
+            .unchanged_blame_parent(BlameRequest {
+                commit: &left,
+                path,
+            })
+            .unwrap(),
+        None,
+        "an unchanged edge still needs budget for two commits"
+    );
+}
+
+#[test]
 fn complete_diamond_and_unrelated_root_dags_match_native_bytes() {
     let mut fixture = Fixture::new();
     let root = fixture.commit(

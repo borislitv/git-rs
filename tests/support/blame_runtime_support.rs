@@ -149,12 +149,21 @@ fn owned_source_ready_cache_rechecks_authority_before_and_during_consumption() {
     super::until(|| fixture.engine.blame.admitted() == 0);
     assert_eq!(fixture.leases(), 0);
     fixture.restored_reader();
-    // Grant changes advance source generation, hence require a new durable key.
-    drop(fixture.complete());
-    super::until(|| fixture.engine.blame.admitted() == 0);
-    assert_eq!(roots(&admin, &namespace), "2");
+    // The restored grant authorizes a fresh source lease. Only the durable
+    // complete-blame-v2 key omits generation, so this is an exact hit.
     let body = fixture.complete();
     assert_eq!(gate.hits.load(Ordering::Acquire), 2);
+    assert_eq!(fixture.leases(), 1);
+    let mut output = Vec::new();
+    Operation::new(5)
+        .enter(|| body.write_to(&mut output))
+        .unwrap();
+    assert_eq!(output, fixture.expected);
+    drop(body);
+    super::until(|| fixture.engine.blame.admitted() == 0);
+    assert_eq!(roots(&admin, &namespace), "1");
+    let body = fixture.complete();
+    assert_eq!(gate.hits.load(Ordering::Acquire), 3);
     struct Revoking<'a> {
         fixture: &'a source_support::Fixture,
         bytes: Vec<u8>,

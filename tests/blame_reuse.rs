@@ -26,6 +26,9 @@ use std::{
 #[path = "support/blame_source_support.rs"]
 mod source_support;
 
+#[path = "support/blame_immutable_body.rs"]
+mod immutable_body;
+
 fn native_output(root: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
     let mut child = Command::new("timeout")
         .args(["--kill-after=2s", "20s", "git"])
@@ -57,6 +60,24 @@ fn native(root: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
 }
 fn text(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap().trim().to_owned()
+}
+fn native_porcelain(root: &Path, commit: &str) -> Vec<u8> {
+    native(
+        root,
+        &[
+            "--literal-pathspecs",
+            "blame",
+            "--root",
+            "--line-porcelain",
+            "--no-textconv",
+            "--no-progress",
+            "--diff-algorithm=myers",
+            commit,
+            "--",
+            "file",
+        ],
+        b"",
+    )
 }
 fn unregistered_config() -> CacheConfig {
     let id = git_rs::scratch::identifier().unwrap();
@@ -196,6 +217,10 @@ fn checkpoint_reuse_child() {
     let root = std::path::PathBuf::from(std::env::var_os("GIT_RS_REUSE_ROOT").unwrap());
     let slug = std::env::var("GIT_RS_REUSE_SLUG").unwrap();
     let tip = std::env::var("GIT_RS_REUSE_TIP").unwrap();
+    if let Some(mode) = mode.strip_prefix("immutable-") {
+        immutable_body::serve(mode, &root, &slug, &tip);
+        return;
+    }
     // Explicit fixture profile only; production BlameOptions::default is unchanged.
     let mut tuning = BlameOptions::default().tuning();
     tuning.reuse_line_tokens = true;
@@ -328,6 +353,7 @@ fn child(fixture: &source_support::Fixture, config: &CacheConfig, tip: &str, mod
         .env("GIT_RS_REUSE_ROOT", &fixture.root)
         .env("GIT_RS_REUSE_SLUG", &fixture.slug)
         .env("GIT_RS_REUSE_TIP", tip)
+        .env("GIT_RS_REUSE_BASE", &fixture.commit)
         .env("GIT_RS_REUSE_REPO", &fixture.repo)
         .env("GIT_RS_CACHE_NAMESPACE", &config.namespace)
         .env("GIT_RS_CACHE_OWNER", &config.owner)
@@ -350,21 +376,7 @@ fn real_cross_process_partial_checkpoint_reduces_actual_diff_work_and_import_fen
     publish_history(&fixture, &tip);
     fs::write(
         fixture.root.join("expected"),
-        native(
-            &native_root,
-            &[
-                "--literal-pathspecs",
-                "blame",
-                "--root",
-                "--line-porcelain",
-                "--no-textconv",
-                "--no-progress",
-                &tip,
-                "--",
-                "file",
-            ],
-            b"",
-        ),
+        native_porcelain(&native_root, &tip),
     )
     .unwrap();
     let config = config();
@@ -445,15 +457,16 @@ struct HttpServer {
     _stderr: std::io::BufReader<std::process::ChildStderr>,
 }
 impl HttpServer {
-    fn start(fixture: &source_support::Fixture, config: &CacheConfig) -> Self {
+    fn start(fixture: &source_support::Fixture, config: &CacheConfig, warm: bool) -> Self {
         use std::io::BufRead;
         use std::os::unix::process::CommandExt;
         let control_path = fixture.root.join("warm-control");
         let control = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
         control.set_nonblocking(true).unwrap();
-        let mut child = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .process_group(0)
-            .args(["--kill-after=2s", "75s"])
+            .args(["--kill-after=2s", if warm { "75s" } else { "240s" }])
             .arg(
                 std::env::var_os("GIT_RS_BLAME_HTTP_FIXTURE")
                     .expect("qualified HTTP fixture executable required"),
@@ -469,16 +482,16 @@ impl HttpServer {
                 "alice",
                 "--cache",
                 "--checkpoint-fixture-key",
-                "--warm-path",
-                "file",
                 "--measure-work",
-                "--phase",
-                "source",
             ])
             .arg("--socket")
-            .arg(fixture.root.join("serving.sock"))
-            .arg("--control")
-            .arg(control_path)
+            .arg(fixture.root.join("serving.sock"));
+        if warm {
+            command
+                .args(["--warm-path", "file", "--phase", "source", "--control"])
+                .arg(control_path);
+        }
+        let mut child = command
             .env("GIT_RS_CACHE_NAMESPACE", &config.namespace)
             .env("GIT_RS_CACHE_OWNER", &config.owner)
             .stdout(Stdio::null())
@@ -599,7 +612,7 @@ fn warm_push_gate(cache_outage: bool) {
         .unwrap()
         .with_test_options(BlameOptions::default(), true);
     let fixture = source_support::Fixture::new(blame, 10);
-    let server = HttpServer::start(&fixture, &cache_config);
+    let server = HttpServer::start(&fixture, &cache_config, true);
     let native_root = fixture.root.join("native");
     let tip = history(&native_root, 3, &fixture.commit);
     let url = format!("http://{}/{}.git", server.address, fixture.slug);
