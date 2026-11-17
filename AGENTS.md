@@ -4,6 +4,25 @@
   tokio-postgres and a bounded connection pool; never execute a SQL subprocess.
 - Prefer established, maintained Rust crates for standard functionality over
   custom implementations. This is not a restriction to the Rust standard library.
+- The target architecture is strictly fork-free. Use unmodified maintained
+  upstream libraries through public APIs; do not create, extend or retain a fork
+  as the solution to a missing hook, correctness gap, performance goal or resource
+  policy. Existing fork pins are migration debt, not approved exceptions.
+- Missing library functionality first challenges our own requirement. Simplify
+  unnecessary internal policy, choose another maintained implementation, or add a
+  narrow application abstraction over public APIs. Do not copy library internals,
+  vendor patches, hide forks behind packages/services, or recreate private APIs
+  with application FFI. Upstream patch acceptance is not a migration prerequisite.
+- Prefer complete-result caching and coarse job/resource boundaries over hooks
+  into a dependency's allocator, diff interner or traversal frontier. An optional
+  optimization may be unavailable without making the standard path invalid.
+  Preserve observable product requirements, or document their explicit revision;
+  never claim unchanged compatibility by weakening failing tests. See
+  docs/fork-free-architecture.md for the mandatory design direction.
+- Existing tuning, checkpoint and allocation-hook descriptions below document
+  the current implementation, not mandatory APIs of its fork-free replacement.
+  Requalify the observable boundaries and update obsolete mechanism-specific rules
+  when migrating each caller.
 - The target server data plane uses maintained Rust libraries for protocols, packs,
   deltas, graph validation and blame. Native Git is an external compatibility client
   and test oracle, never a server implementation or fallback. Preserve the strict

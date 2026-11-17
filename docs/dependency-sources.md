@@ -1,10 +1,18 @@
 # Dependency sources and provenance
 
 The Cargo manifests and `Cargo.lock` are the executable dependency definition.
-Normal Git dependencies use an owned public fork and a full 40-hex revision;
-registry dependencies retain lockfile checksums. There are no production path,
+The mandatory target is unmodified maintained upstream libraries, with registry
+checksums or full immutable upstream revisions. Forks are not an allowed target
+architecture or a fallback for unavailable public APIs. See the
+[fork-free architecture decision](fork-free-architecture.md).
+
+The inventory below describes the current implementation, which still contains
+owned fork pins and therefore has not reached that target. These pins are migration
+debt, not exceptions to the decision. There are currently no production path,
 branch, tag, `[patch]` or `[replace]` substitutions for these sources. The only
 application path dependency is the shared `crates/git-core` workspace member.
+
+## Current source inventory
 
 | Component | Maintained upstream / owned source | Purpose and provenance |
 | --- | --- | --- |
@@ -18,10 +26,13 @@ application path dependency is the shared `crates/git-core` workspace member.
 | quick-xml / serde | [tafia/quick-xml](https://github.com/tafia/quick-xml), [serde-rs/serde](https://github.com/serde-rs/serde) | Bounded S3 protocol response parsing; exact resolved versions/checksums in the lockfile |
 | kube-client / k8s-openapi | [kube-rs/kube](https://github.com/kube-rs/kube), [Arnavion/k8s-openapi](https://github.com/Arnavion/k8s-openapi) | Typed in-cluster TLS client and API objects; the compiled API feature does not replace qualification against the selected real Kubernetes server |
 
-Fork changes and their upstream tests remain in the dependency repositories.
-Do not copy a fork subtree into this application or add an upstream pull request
-as an implicit part of application delivery. A pin update changes executable
-behavior and requires its own source, API, native-oracle and resource review.
+Historical fork changes and their tests remain in the dependency repositories as
+migration evidence. Do not extend them or copy a fork subtree into this application.
+Use public APIs, a different maintained library, or a smaller application contract
+instead of requiring a new upstream hook. An upstream pull request is neither an
+implicit delivery action nor a prerequisite for the fork-free migration.
+A pin update changes executable behavior and requires its own source, API,
+native-oracle and resource review.
 The `gix-imara-diff` lock edge retains `hashbrown 0.16.1`; resolving another Gitoxide
 revision must not silently change that separately qualified diff dependency.
 
