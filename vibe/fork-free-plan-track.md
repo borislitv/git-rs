@@ -66,3 +66,10 @@
   following native +1 push before a changed-tip GET. The push helper still used
   a debug binary and a 1 MiB source cache. See the [architecture review and
   acceptance criteria](../docs/blame-reuse-architecture.md).
+- `2f46616`: the 20,000-commit changed-file HTTP contract passed in the
+  [push](https://github.com/borislitv/git-rs/actions/runs/44267373656/job/134683560495)
+  and [PR](https://github.com/borislitv/git-rs/actions/runs/44267385530/job/134683016859)
+  blame jobs with matched release builds and 64 MiB source caches. Both first
+  requests after restart had native-exact output and `ReplacementSeedHit`.
+  The +1 advance used native HTTP receive; cumulative +100 qualifies serving
+  after catalog publication only. No broader migration stage is marked complete.
