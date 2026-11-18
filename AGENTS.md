@@ -4,10 +4,12 @@
   tokio-postgres and a bounded connection pool; never execute a SQL subprocess.
 - Prefer established, maintained Rust crates for standard functionality over
   custom implementations. This is not a restriction to the Rust standard library.
-- The target architecture is strictly fork-free. Use unmodified maintained
-  upstream libraries through public APIs; do not create, extend or retain a fork
-  as the solution to a missing hook, correctness gap, performance goal or resource
-  policy. Existing fork pins are migration debt, not approved exceptions.
+- Prefer unmodified maintained upstream libraries. The owned, revision-pinned
+  Gitoxide fork is the approved implementation of `NativeRootV1` blame. Keep
+  changes there focused on blame parity, bounded computation and measured reuse;
+  qualify each new pin against native Git. Other forked callers and dependency
+  sources remain migration debt, including Gitoxide crates coupled to the current
+  workspace pin outside the blame path.
 - Missing library functionality first challenges our own requirement. Simplify
   unnecessary internal policy, choose another maintained implementation, or add a
   narrow application abstraction over public APIs. Do not copy library internals,

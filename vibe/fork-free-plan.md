@@ -1,16 +1,17 @@
-# Fork-free backend and useful blame caching
+# Dependency migration and useful blame caching
 
 ## Task
 
-Use unmodified maintained libraries behind small application boundaries. Cache
-complete immutable blame answers, preserve current authorization and publication
-contracts, and protect opaque library work at a qualified job boundary. Remove
-fork-only allocation, interner and traversal-checkpoint requirements from the
-target design. A missing optional hook does not justify a fork or copied internals.
+Use the owned Gitoxide fork for `NativeRootV1` blame and maintained upstream
+libraries for other callers. Cache complete immutable blame answers, preserve
+current authorization and publication contracts, and protect library work at a
+qualified job boundary. Keep focused blame changes in the fork and qualify every
+new pin against native Git.
 
 The first useful cache correction is independent of the dependency migration.
-The migration is complete only when all affected callers run qualified upstream
-implementations and the resolved production dependency graph contains no forks.
+The migration is complete when non-blame callers run qualified upstream
+implementations and only the recorded blame fork and its required dependency
+closure remain in the resolved production graph.
 
 ## Structure
 
@@ -88,9 +89,8 @@ unit, slice and manifest digest. Require executed ignored-case inventory.
 
 - Create new `tests/upstream_probe` as a standalone workspace with its own lockfile
   and `#![forbid(unsafe_code)]`. It must not depend on the fork-backed application.
-- Implement `BlameBackend::annotate` using ordinary `gix_blame::file`, a public
-  object provider and owned output metadata. Expose complete annotation, not vendor
-  interner IDs, allocation callbacks or a resumed traversal frontier.
+- Keep the ordinary `gix_blame::file` and libgit2 adapters as comparison probes.
+  Keep the production blame backend on the pinned fork.
 - Implement `PackEntryDecoder` with public entry parsing/encoding and the upstream
   `File::from_data`/`decode_entry` external-base resolver. Build a bounded valid
   single-entry thin-pack input in memory from verified original ranges. Validate
@@ -141,16 +141,18 @@ contracts, not library implementations to copy. No API-extension PR is required.
   extra output, corrupt/truncated/concatenated frames and bounded concurrent work.
   Keep the old declared-frame rejection rules unless a revised reader contract
   is explicitly approved. A worker memory ceiling alone does not check a header.
-- A failed product case blocks that adapter's cutover. Revise the application
-  boundary or select another unmodified maintained implementation; never return
-  to a fork. Record the exact unsupported behavior rather than a speculative hook.
+- Preserve the failing comparisons for both upstream blame candidates. Require
+  the pinned serving backend to match both fixtures against Git 2.56 in
+  `crates/git-core/tests/blame.rs`. A failing non-blame product case blocks that
+  adapter's cutover.
 
 **Files:** new `tests/upstream_probe/tests/{blame.rs,pack.rs,encoding.rs,codec.rs}`.
 Use existing independent native fixtures, not fork-generated expected values.
 
 **Verify:** in the bounded oracle fixture,
 `cargo test --locked --manifest-path tests/upstream_probe/Cargo.toml -- --test-threads=1`;
-`cargo tree --locked --manifest-path tests/upstream_probe/Cargo.toml`.
+`cargo tree --locked --manifest-path tests/upstream_probe/Cargo.toml`;
+`cargo test --locked -p git-rs-core --test blame`.
 
 ### Stage 5: Add one bounded executor and cut over qualified callers
 
@@ -174,18 +176,18 @@ Use existing independent native fixtures, not fork-generated expected values.
   Do not remove controlled APIs from a caller before its replacement is qualified.
   Qualify stored-object reads first; receive intake and pack/index output for
   compaction and truncation need independent adapters and native interoperability.
-- Remove fork-only mapping callbacks, mixed-object WorkSet persistence and vendor
-  tuning requirements from the target path. Keep complete-body authentication and
-  ordinary object caches through public APIs. Old producer artifacts become misses;
-  they are not re-signed or reinterpreted as new artifacts.
+- Keep admitted blame hooks within the selected backend. Retain the existing
+  WorkSet only where tests demonstrate its benefit and preserve its generation
+  fences. Keep complete-body authentication. Old incompatible producer artifacts
+  become misses; do not re-sign or reinterpret them as new artifacts.
 - Replace the Kubert fork via the existing upstream typed Kubernetes client for
   named-Lease get and resourceVersion-guarded patch. Keep eligible standby readiness,
   bounded confirmation, independent monotonic expiry and the API-outage stop policy.
   The existing PG campaign/fence remains the sole maintenance mutation authority.
-- Replace the four fork dependency edges with qualified upstream sources. Update
-  provenance checks/notices and remove obsolete source-policy assertions. Add a
-  production dependency-source gate which rejects forks, local patches and hidden
-  fork fallbacks. Existing fork pins are debt until this gate actually passes.
+- Replace the non-blame forked callers with qualified upstream sources. Update
+  provenance checks and notices. Make the production dependency-source gate
+  admit only the pinned blame fork and its required closure; reject unlisted
+  fork sources, local patches and hidden fork fallbacks.
 
 **Files:** new `src/job_executor/{mod.rs,protocol.rs,owner.rs}` and
 `crates/git-worker/{Cargo.toml,src/main.rs}`; `crates/git-core/src/`,
@@ -200,7 +202,7 @@ runtime-contract fixtures; `migrations/current_functions.sql` maintenance fences
 `cargo clippy --locked --workspace --all-targets -- -D warnings`;
 `make core-source-check`; `cargo tree --locked`.
 
-### Stage 6: Verify cutover, resources and zero-fork provenance
+### Stage 6: Verify cutover, resources and dependency provenance
 
 **Implement tests:**
 
@@ -211,9 +213,9 @@ runtime-contract fixtures; `migrations/current_functions.sql` maintenance fences
 - Test competing PG maintenance candidates, expired campaigns, stale fences,
   database failover/unavailability and drain-before-release. Run the real named
   Lease contention, API outage, standby readiness and takeover contracts as well.
-- Check resolved production package sources, runtime image contents and every
-  caller: no fork package, copied implementation or fork-backed fallback remains.
-  Run codec compatibility and changed native-encoding cases in the actual image.
+- Check resolved package sources, image contents and callers: verify the exact
+  approved blame pin and closure. Run codec compatibility and native encoding
+  cases in the actual image.
 
 **Files:** `tests/{runtime_exec.py,runtime_process.py,maintenance_leader.rs,metadata.rs}`;
 `crates/git-core/tests/{pack.rs,receive.rs,history.rs,porcelain.rs,blame.rs}`;
@@ -223,7 +225,7 @@ runtime-contract fixtures; `migrations/current_functions.sql` maintenance fences
 `make receive upload history failures maintenance`; `make cache-build` followed by
 owned `make cache-check`. Preparation does not replace executed runtime cases.
 
-### Stage 7: Reconcile warm targets with the fork-free producer
+### Stage 7: Reconcile warm targets with the selected producer
 
 **Implement:**
 
@@ -260,9 +262,10 @@ worker chart/values, `OPERATIONS.md`, `docs/blame.md`.
   tips after a restart with the old target prepared. Require a complete native-equal
   response and count both old-history traversal and new diff work. If old history
   is replayed, mark changed-file incremental reuse **unmet**, independently of
-  warming or exact-body hits. Qualify a single-parent summary composition above the
-  public backend before claiming this improvement; preserve native grouping and
-  previous paths, ordered whole-file diff semantics, and authenticated provenance.
+  warming or exact-body hits. Prototype composition of completed attribution in
+  the pinned blame backend, starting with a verified single-parent, same-path
+  replacement. Preserve native grouping and previous paths, ordered whole-file
+  diff semantics, and authenticated provenance.
   Fall back to full calculation wherever those preconditions cannot be proved.
 - Run long-history synthetic diagnostics and separately authorized representative
   cases under their stated envelopes. A cold deadline remains a failed result,

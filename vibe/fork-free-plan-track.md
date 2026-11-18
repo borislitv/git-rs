@@ -1,4 +1,4 @@
-# Progress tracker for fork-free-plan.md
+# Progress tracker for the dependency migration and blame plan
 
 `[X]` means the changes and the stage's required checks have completed.
 
@@ -7,8 +7,8 @@
 - [ ] Stage 3: Implement fork-free adapters in an isolated qualification workspace
 - [ ] Stage 4: Qualify the public-API replacements
 - [ ] Stage 5: Add one bounded executor and cut over qualified callers
-- [ ] Stage 6: Verify cutover, resources and zero-fork provenance
-- [ ] Stage 7: Reconcile warm targets with the fork-free producer
+- [ ] Stage 6: Verify cutover, resources and dependency provenance
+- [ ] Stage 7: Reconcile warm targets with the selected producer
 - [ ] Stage 8: Verify usefulness and recovery end to end
 
 ## Notes
@@ -29,8 +29,10 @@
   Physical origin-tree evidence recovers `previous` for the tested edited rename,
   including after a later change removes its last unchanged line. The stored-entry,
   encoding and codec suites passed; locked all-target check and Clippy passed.
-  Two native-oracle comparisons still block blame cutover: incomplete coverage on
-  an independent-root merge (Gitoxide, debug and release), and incorrect commit/path
-  for same-path versus rename (libgit2). No production caller uses these candidates.
-  A general application-owned attribution engine would change the responsibility
-  defined in the architecture decision; that change has not been adopted.
+  Two native-oracle comparisons disqualify the upstream blame candidates:
+  incomplete coverage on an independent-root merge (Gitoxide, debug and release),
+  and incorrect commit/path for same-path versus rename (libgit2).
+- Blame backend selected: the existing owned Gitoxide pin `0354c999` passed both
+  merge reproductions through `SnapshotSession` against Git 2.56 full porcelain.
+  The full core blame test target passed 16/16. Keep the two upstream failures as
+  comparison evidence. Changed-file +1/+100 reuse is a separate open gate.

@@ -227,6 +227,50 @@ fn complete_diamond_and_unrelated_root_dags_match_native_bytes() {
 }
 
 #[test]
+fn independent_root_merge_and_same_path_precedence_match_native_bytes() {
+    let mut fixture = Fixture::new();
+    let path: &[u8] = b"f\t\xfe";
+    let old: &[u8] = b"old\t\xff";
+    let left = fixture.commit(&[(path, b"left\n", "100644")], &[], 20, b"Left\n", None);
+    let right = fixture.commit(&[(path, b"right\n", "100644")], &[], 10, b"Right\n", None);
+    let joined = fixture.commit(
+        &[(path, b"left\nright\n", "100644")],
+        &[left, right],
+        30,
+        b"Independent roots\n",
+        None,
+    );
+    let earlier = fixture.commit(
+        &[(old, b"right\n", "100644")],
+        &[],
+        20,
+        b"Rename candidate\n",
+        None,
+    );
+    let preferred = fixture.commit(
+        &[(path, b"right\n", "100644")],
+        &[earlier, right],
+        30,
+        b"Same path candidate wins\n",
+        None,
+    );
+    for (target, expected_origins) in [(joined, vec![left, right]), (preferred, vec![right])] {
+        let native = fixture.native(target, path);
+        for origin in expected_origins {
+            assert!(native.split(|&b| b == b'\n').any(|line| {
+                let id = origin.to_string();
+                line.starts_with(id.as_bytes()) && line.get(40) == Some(&b' ')
+            }));
+        }
+        assert_eq!(
+            render(&fixture, target, path, &BlameOptions::default()),
+            native,
+            "complete porcelain for {target}"
+        );
+    }
+}
+
+#[test]
 fn woof_cold_blame_after_oversized_terminal_ref_admission_matches_native() {
     use git_rs_core::{Porcelain, ReadLimits, SnapshotSession, VerifiedObjectProvider};
     let mut fixture = Fixture::new();
