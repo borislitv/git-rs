@@ -75,10 +75,15 @@ fn get(engine: &Engine, slug: &str, commit: &str) -> Vec<u8> {
 
 pub(super) fn serve(mode: &str, root: &Path, slug: &str, tip: &str) {
     let trace = Arc::new(Trace::default());
+    let signing_key = if mode == "replacement-wrong-key" {
+        [8; 32]
+    } else {
+        [7; 32]
+    };
     let engine = Engine {
         blame: Blame::new(1, 0)
             .unwrap()
-            .with_authenticated_cache_key(CacheConfig::from_env().unwrap(), &[7; 32])
+            .with_authenticated_cache_key(CacheConfig::from_env().unwrap(), &signing_key)
             .unwrap()
             .with_observer(trace.clone()),
         store: Store::from_env().unwrap(),
@@ -141,6 +146,10 @@ pub(super) fn serve(mode: &str, root: &Path, slug: &str, tip: &str) {
                 "changed file must compute a mapping"
             );
         }
+        if mode == "replacement-wrong-key" {
+            assert!(work[0].commits_traversed > 0);
+            assert_eq!(work[0].replacement_suffix_edges, 0);
+        }
         if let Some(edges) = mode.strip_prefix("replacement-hit-") {
             let edges: usize = edges.parse().unwrap();
             let stats = work[0];
@@ -169,7 +178,9 @@ pub(super) fn serve(mode: &str, root: &Path, slug: &str, tip: &str) {
         }
         "changed" => request(tip, &[PreflightTip, WorkSetPrepared], true, false),
         "unreachable" => request(&base, &[PreflightWalk], false, true),
-        "replacement-base" => request(tip, &[PreflightTip, WorkSetPrepared], true, false),
+        "replacement-base" | "replacement-wrong-key" => {
+            request(tip, &[PreflightTip, WorkSetPrepared], true, false);
+        }
         "replacement-hit-1" | "replacement-hit-100" => {
             request(tip, &[PreflightTip, ReplacementSeedHit], true, false);
         }
@@ -197,7 +208,7 @@ fn replace_history(root: &Path, base: &str, first: usize, count: usize) -> Strin
     text(native(root, &["rev-parse", "refs/heads/replacement"], b""))
 }
 
-fn signed_replacement_restart(base_commits: usize) {
+fn signed_replacement_restart(base_commits: usize, check_wrong_key: bool) {
     let fixture = Fixture::new(Blame::default(), 128);
     let config = config();
     let root = fixture.root.join("native");
@@ -231,17 +242,29 @@ fn signed_replacement_restart(base_commits: usize) {
     // the larger fixture isolates serving from receive throughput and limits.
     super::publish_history_from(&fixture, &one, &hundred);
     child(&fixture, &config, &hundred, "immutable-replacement-hit-100");
+    if check_wrong_key {
+        // Same cache owner, namespace and source. Only the signer changes;
+        // the known-ready base seed must now fall back to normal attribution.
+        child(
+            &fixture,
+            &config,
+            &hundred,
+            "immutable-replacement-wrong-key",
+        );
+    }
     assert_eq!(fixture.leases(), 0);
 }
 
 #[test]
 #[ignore = "requires exclusively owned loopback PostgreSQL/S3 and private tmpfs"]
 fn signed_replacement_seed_serves_changed_tips_after_restart() {
-    let base_commits = match std::env::var("GIT_RS_TEST_REPLACEMENT_20K").as_deref() {
-        Ok("1") => 20_000,
-        _ => 8,
-    };
-    signed_replacement_restart(base_commits);
+    signed_replacement_restart(8, true);
+}
+
+#[test]
+#[ignore = "requires exclusively owned loopback PostgreSQL/S3 and private tmpfs"]
+fn signed_replacement_seed_serves_changed_tips_after_restart_at_20k() {
+    signed_replacement_restart(20_000, false);
 }
 
 fn append(root: &Path, parent: &str, path: &str, content: &str) -> String {

@@ -40,10 +40,11 @@
   base and composes a verified linear suffix. The 20,000-commit test reloads the
   seed in a fresh session and matches Git 2.56 at +1/+100 with no older commit
   reads. It declines +101; ordinary blame triggers the old-history read guard.
-  Signed HTTP +1 previously hit the seed after a real push and a process restart.
-  Bulk receive returned an empty reply; the separate catalog advance exposed a
-  +100 serving miss before the lookup was revised. Final short and long HTTP
-  checks are still open: the local retry stopped during Docker fixture setup,
-  before either request. The short contract is included in the default owned
-  blame gate's ignored-test inventory. Focused Clippy and locked all-targets
-  check passed locally; no HTTP performance conclusion follows from them.
+  The [short owned HTTP gate](https://github.com/borislitv/git-rs/actions/runs/44246492811/job/134612013812)
+  passed on `2c50adb`: both restarted processes returned native bytes with exact
+  suffix counts and no attribution traversal. Observed response times were 463 ms
+  at +1 and 1,715 ms at +100, on an eight-commit base. The +1 advance was a real
+  HTTP push; +100 used the production catalog transaction after bulk HTTP receive
+  returned an empty reply in an earlier local run. Bulk receive remains open.
+  The 20,000-commit HTTP contract and wrong-signing-key control are part of the
+  default owned gate's ignored-test inventory; their execution is tracked separately.
