@@ -471,16 +471,21 @@ fn fresh_source_fence_after_successful_outer_consumption_still_prevents_installa
     assert_eq!(fixture.leases(), 0);
 }
 
+fn source_cache_bytes(large_fixture: bool) -> usize {
+    // The 1 MiB small-case budget cannot admit a full 4 MiB source range.
+    if large_fixture { 64 << 20 } else { 1 << 20 }
+}
+
 struct HttpServer {
     child: std::process::Child,
     address: String,
     health: String,
     control: std::os::unix::net::UnixListener,
-    _stderr: std::io::BufReader<std::process::ChildStderr>,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
 }
 impl HttpServer {
     fn start(fixture: &source_support::Fixture, config: &CacheConfig, warm: bool) -> Self {
-        Self::start_with_seconds(fixture, config, warm, "30")
+        Self::start_with_seconds(fixture, config, warm, "30", false)
     }
 
     fn start_with_seconds(
@@ -488,6 +493,7 @@ impl HttpServer {
         config: &CacheConfig,
         warm: bool,
         seconds: &str,
+        large_fixture: bool,
     ) -> Self {
         use std::io::BufRead;
         use std::os::unix::process::CommandExt;
@@ -515,6 +521,8 @@ impl HttpServer {
                 "--checkpoint-fixture-key",
                 "--measure-work",
             ])
+            .arg("--object-cache-bytes")
+            .arg(source_cache_bytes(large_fixture).to_string())
             .arg("--socket")
             .arg(fixture.root.join("serving.sock"));
         if warm {
@@ -530,53 +538,134 @@ impl HttpServer {
             .spawn()
             .unwrap();
         let mut reader = std::io::BufReader::new(child.stderr.take().unwrap());
-        let mut health = String::new();
-        let mut address = String::new();
-        reader.read_line(&mut health).unwrap();
-        reader.read_line(&mut address).unwrap();
-        let health = health
+        let mut server = Self {
+            child,
+            address: String::new(),
+            health: String::new(),
+            control,
+            stderr_drain: None,
+        };
+        let (startup, ready) = std::sync::mpsc::sync_channel(1);
+        // Drain request logging while the server runs; reap the reader after
+        // stopping the owned process group, including on a startup error.
+        server.stderr_drain = Some(std::thread::spawn(move || {
+            use std::io::Read;
+            let addresses = (|| {
+                let mut health = String::new();
+                let mut address = String::new();
+                (&mut reader).take(128).read_line(&mut health).ok()?;
+                (&mut reader).take(128).read_line(&mut address).ok()?;
+                Some((health, address))
+            })();
+            let _ = startup.send(addresses);
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        }));
+        let (health, address) = ready
+            .recv_timeout(Duration::from_secs(10))
+            .ok()
+            .flatten()
+            .expect("fixture startup addresses unavailable");
+        server.health = health
             .trim()
             .strip_prefix("health ")
             .expect("fixture health address")
             .to_owned();
-        let address = address
+        server.address = address
             .trim()
             .strip_prefix("development HTTP ")
             .expect("fixture HTTP address")
             .to_owned();
-        Self {
-            child,
-            address,
-            health,
-            control,
-            _stderr: reader,
-        }
+        server
     }
-    fn metrics(&self) -> String {
+    fn metrics(&self) -> Option<String> {
         use std::io::Read;
-        let mut stream = std::net::TcpStream::connect(&self.health).unwrap();
+        const MAX_BYTES: usize = 128 * 1024;
+        const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: fixture\r\n\r\n";
+        let address: std::net::SocketAddr = self.health.parse().ok()?;
+        if !address.ip().is_loopback() {
+            return None;
+        }
+        let budget = Duration::from_secs(2);
+        let end = Instant::now() + budget;
+        let mut stream = std::net::TcpStream::connect_timeout(&address, budget).ok()?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream
-            .write_all(b"GET /metrics HTTP/1.1\r\nHost: fixture\r\n\r\n")
-            .unwrap();
-        let mut output = String::new();
-        stream.read_to_string(&mut output).unwrap();
-        output
+            .set_write_timeout(Some(end.checked_duration_since(Instant::now())?))
+            .ok()?;
+        if stream.write(REQUEST).ok()? != REQUEST.len() {
+            return None;
+        }
+        let mut output = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            stream
+                .set_read_timeout(Some(end.checked_duration_since(Instant::now())?))
+                .ok()?;
+            let count = stream.read(&mut chunk).ok()?;
+            if count == 0 {
+                break;
+            }
+            if output.len() + count > MAX_BYTES {
+                return None;
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+        let output = String::from_utf8(output).ok()?;
+        let (headers, body) = output.split_once("\r\n\r\n")?;
+        let length: usize = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))?
+            .parse()
+            .ok()?;
+        (headers.starts_with("HTTP/1.1 200 ") && body.len() == length).then(|| body.to_owned())
     }
     fn value(&self, name: &str) -> u64 {
-        self.metrics()
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix(name)
-                    .and_then(|s| s.strip_prefix(' '))
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(0)
+        metric_value(&self.metrics().expect("fixture metrics unavailable"), name).unwrap_or(0)
+    }
+    fn receive_diagnostics(&self) -> String {
+        use std::fmt::Write;
+        let Some(metrics) = self.metrics() else {
+            return "receive metrics unavailable".into();
+        };
+        let active = metric_value::<u64>(&metrics, "git_rs_active_requests");
+        let cache = metric_value::<u64>(&metrics, "git_rs_cache_allocated_bytes");
+        let mut summary = format!("receive metrics: active={active:?} cache_bytes={cache:?}");
+        // The fixture process owns only this repo's receive endpoint. Export
+        // only fixed metric names/labels and parsed numbers, not the wire body.
+        for phase in [
+            "snapshot",
+            "materialize",
+            "scratch_init",
+            "git",
+            "pre_receive",
+            "validate",
+            "graph",
+            "upload",
+            "publish",
+            "receive_pack_prepare",
+            "upload_serve",
+        ] {
+            let labels = format!("{{phase=\"{phase}\"}}");
+            let count = metric_value::<u64>(
+                &metrics,
+                &format!("git_rs_phase_duration_seconds_count{labels}"),
+            );
+            let errors =
+                metric_value::<u64>(&metrics, &format!("git_rs_phase_errors_total{labels}"));
+            let seconds = metric_value::<f64>(
+                &metrics,
+                &format!("git_rs_phase_duration_seconds_sum{labels}"),
+            );
+            if let (Some(count), Some(errors), Some(seconds)) = (count, errors, seconds)
+                && seconds.is_finite()
+                && seconds >= 0.0
+            {
+                let _ = write!(
+                    summary,
+                    "\n  {phase}: count={count} errors={errors} total_s={seconds:.9}"
+                );
+            }
+        }
+        summary
     }
     fn release(&self, command: u8) {
         use std::io::BufRead;
@@ -603,6 +692,13 @@ impl HttpServer {
         peer.write_all(&[command]).unwrap();
     }
 }
+
+fn metric_value<T: std::str::FromStr>(metrics: &str, name: &str) -> Option<T> {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+}
+
 impl Drop for HttpServer {
     fn drop(&mut self) {
         let _ = Command::new("timeout")
@@ -616,6 +712,9 @@ impl Drop for HttpServer {
             .status();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.stderr_drain.take() {
+            let _ = reader.join();
+        }
     }
 }
 fn wait_for(mut condition: impl FnMut() -> bool) {

@@ -1,5 +1,8 @@
 //! Immutable-body serving across real pushes and independent serving processes.
-use super::{HttpServer, child, config, native, native_porcelain, source_support::Fixture, text};
+use super::{
+    HttpServer, child, config, native, native_porcelain, source_cache_bytes,
+    source_support::Fixture, text,
+};
 use git_rs::{
     Result,
     blame::{Blame, Observer, Phase, WorkStatistics},
@@ -116,10 +119,8 @@ pub(super) fn serve(mode: &str, root: &Path, slug: &str, tip: &str) {
             .unwrap()
             .with_observer(trace.clone()),
         store: Store::from_env().unwrap(),
-        // Match the server's default 64 MiB for the large fixture. The
-        // 1 MiB small-case cache cannot admit a full 4 MiB source range.
         cache: Arc::new(Cache::new(
-            if large_fixture { 64 } else { 1 } * 1024 * 1024,
+            source_cache_bytes(large_fixture),
             8 * 1024 * 1024,
         )),
         operation_seconds: if mode.starts_with("replacement-") {
@@ -246,8 +247,9 @@ fn signed_replacement_restart(base_commits: usize, check_wrong_key: bool) {
     let fixture = Fixture::new(Blame::default(), 128);
     let config = config();
     let root = fixture.root.join("native");
+    let large_fixture = base_commits == 20_000;
     let probe = |tip: &str, mode: &str| {
-        let scale = if base_commits == 20_000 { "-20k" } else { "" };
+        let scale = if large_fixture { "-20k" } else { "" };
         child(
             &fixture,
             &config,
@@ -255,29 +257,38 @@ fn signed_replacement_restart(base_commits: usize, check_wrong_key: bool) {
             &format!("immutable-replacement-{mode}{scale}"),
         );
     };
-    let server = HttpServer::start_with_seconds(&fixture, &config, false, "90");
+    let server = HttpServer::start_with_seconds(&fixture, &config, false, "90", large_fixture);
     let url = format!("http://{}/{}.git", server.address, fixture.slug);
-    let push = |label: &str, tip: &str| {
-        let output = super::native_output_with_deadline(
-            &root,
-            &["push", &url, &format!("{tip}:refs/heads/main")],
-            b"",
-            "95s",
-        );
-        assert!(
-            output.status.success(),
-            "replacement {label} push {tip}: {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        super::wait_for(|| fixture.leases() == 0);
-    };
     let base = replace_history(&root, &fixture.commit, 1, base_commits - 1);
     // Initial fixture loading is separate from the measured pushes and reads.
     super::publish_history(&fixture, &base);
     probe(&base, "base");
     let one = replace_history(&root, &base, base_commits, 1);
-    push("+1", &one);
+    let started = Instant::now();
+    let output = super::native_output_with_deadline(
+        &root,
+        &["push", &url, &format!("{one}:refs/heads/main")],
+        b"",
+        "95s",
+    );
+    if !output.status.success() {
+        let elapsed_ms = started.elapsed().as_millis();
+        // Report the known native transport failure without printing stderr.
+        let curl_52 = output.stderr[..output.stderr.len().min(8192)]
+            .split(|&byte| byte == b'\n')
+            .any(|line| {
+                line.starts_with(b"error: RPC failed;")
+                    && line
+                        .windows(b" curl 52 ".len())
+                        .any(|part| part == b" curl 52 ")
+            });
+        panic!(
+            "replacement +1 native push: {} after {elapsed_ms} ms (curl_52={curl_52})\n{}",
+            output.status,
+            server.receive_diagnostics()
+        );
+    }
+    super::wait_for(|| fixture.leases() == 0);
     probe(&one, "hit-1");
     let hundred = replace_history(&root, &one, base_commits + 1, 99);
     // Use the production catalog transaction with an independently generated

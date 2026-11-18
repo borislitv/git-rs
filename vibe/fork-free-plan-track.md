@@ -61,3 +61,8 @@
   reported completed attribution. The gate previously built `blame_reuse` in
   Cargo's debug profile; the optimized serving contract is built in the exact
   oracle image with the unchanged 120-second deadline and reuse assertions.
+- [`2c5ca37`](https://github.com/borislitv/git-rs/actions/runs/44261018668/job/134660853089):
+  the optimized cold 20k base matched native bytes. Both runs stopped at the
+  following native +1 push before a changed-tip GET. The push helper still used
+  a debug binary and a 1 MiB source cache. See the [architecture review and
+  acceptance criteria](../docs/blame-reuse-architecture.md).

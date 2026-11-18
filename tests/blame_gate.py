@@ -172,9 +172,7 @@ def image_output(image, argv, volumes=()):
                    *volumes, "--entrypoint", argv[0], image, *argv[1:]], timeout=60)
 
 
-def copy_release_blame_reuse(image, bundle):
-    source = "/usr/local/bin/tests/blame-reuse"
-    destination = bundle / "bin/blame_reuse"
+def copy_release_executable(image, source, destination):
     with destination.open("xb"):
         pass
     # Export only this sealed test executable from the exact oracle image.
@@ -184,7 +182,7 @@ def copy_release_blame_reuse(image, bundle):
                         "--volume", f"{destination}:/output:rw",
                         "--entrypoint", "/usr/bin/cp", image, source, "/output"], timeout=60)
     expected = image_output(image, ["/usr/bin/sha256sum", source]).split()[0]
-    require(digest(destination) == expected, "release blame reuse differs from the exact image")
+    require(digest(destination) == expected, f"{destination.name} differs from the exact image")
     return destination
 
 
@@ -302,19 +300,21 @@ def prepare_bundle(args):
         require(actual == expected, "test image harness differs from checkout: " + name)
     target = bundle.parent / (bundle.name + "-current-target")
     current = cargo_artifacts(builder, ROOT, target,
-                              ["build", "--bin", "git-rs", "--example", "cache-process",
-                                "--example", "blame-http-fixture"])
+                              ["build", "--bin", "git-rs", "--example", "cache-process"])
     debug_suites = tuple(s for s in SUITES if s != "blame_reuse")
     contracts = cargo_artifacts(builder, ROOT, bundle.parent / (bundle.name + "-test-target"),
                                  ["test", "--no-run", *[x for s in debug_suites for x in ("--test", s)]])
     old = cargo_artifacts(builder, legacy, bundle.parent / (bundle.name + "-legacy-target"),
                           ["build", "--bin", "git-rs", "--example", "cache-process"])
-    paths = {"current": current["git-rs"], "fixture": current["blame-http-fixture"],
-             "cache_process": current["cache-process"], "legacy": old["git-rs"],
+    paths = {"current": current["git-rs"], "cache_process": current["cache-process"], "legacy": old["git-rs"],
              "legacy_process": old["cache-process"], **{s: contracts[s] for s in debug_suites}}
     records, names = {}, {}
     (bundle / "bin").mkdir()
-    paths["blame_reuse"] = copy_release_blame_reuse(runtime, bundle)
+    # GETs execute inside the reuse contract; native pushes execute in the
+    # spawned HTTP fixture. Both workloads must use the image's release build.
+    for name, source in (("blame_reuse", "/usr/local/bin/tests/blame-reuse"),
+                         ("fixture", "/usr/local/bin/examples/blame-http-fixture")):
+        paths[name] = copy_release_executable(runtime, source, bundle / "bin" / name)
     for name, path in paths.items():
         destination = bundle / "bin" / name
         if path != destination:
