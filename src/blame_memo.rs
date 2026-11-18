@@ -140,6 +140,7 @@ impl Profile {
             include_bytes!("blame_memo.rs").as_slice(),
             include_bytes!("blame_derive.rs").as_slice(),
             include_bytes!("blame_lookup.rs").as_slice(),
+            include_bytes!("blame_replacement.rs").as_slice(),
             include_bytes!("blame.rs").as_slice(),
             include_bytes!("blame_source.rs").as_slice(),
             include_bytes!("blame_jobs.rs").as_slice(),

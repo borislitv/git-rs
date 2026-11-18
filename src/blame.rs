@@ -27,6 +27,8 @@ mod jobs;
 mod lookup;
 #[path = "blame_memo.rs"]
 pub(crate) mod memo;
+#[path = "blame_replacement.rs"]
+mod replacement;
 #[path = "blame_resources.rs"]
 mod resources;
 #[path = "blame_warm.rs"]
@@ -115,6 +117,7 @@ pub enum Phase {
     PreflightWalk,
     WorkSetPrepared,
     ParentBodyHit,
+    ReplacementSeedHit,
 }
 /// In-process observation outside source/cache/workset/scheduler locks. Callbacks
 /// must honor the original control/deadline, including the statistics callback.
@@ -452,10 +455,15 @@ pub(crate) fn artifact_key(
     })
 }
 fn optional_cache<T>(control: &Control, work: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    optional_cache_for(control, Duration::from_secs(2), work)
+}
+fn optional_cache_for<T>(
+    control: &Control,
+    limit: Duration,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
     control.check()?;
-    let deadline = control
-        .deadline()
-        .min(Instant::now() + Duration::from_secs(2));
+    let deadline = control.deadline().min(Instant::now() + limit);
     let result = process::Operation::until(deadline).enter(work);
     control.check()?; // an optional cache failure must not hide a real job stop
     match result {

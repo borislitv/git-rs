@@ -30,8 +30,18 @@ mod source_support;
 mod immutable_body;
 
 fn native_output(root: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
-    let mut child = Command::new("timeout")
-        .args(["--kill-after=2s", "20s", "git"])
+    native_output_with_deadline(root, args, input, "20s")
+}
+
+fn native_output_with_deadline(
+    root: &Path,
+    args: &[&str],
+    input: &[u8],
+    deadline: &str,
+) -> std::process::Output {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=2s", deadline, "git"])
         .arg("-C")
         .arg(root)
         .args(args)
@@ -43,9 +53,11 @@ fn native_output(root: &Path, args: &[&str], input: &[u8]) -> std::process::Outp
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    if let Some(path) = std::env::var_os("GIT_RS_TEST_ORACLE_EXEC_PATH") {
+        command.env("GIT_EXEC_PATH", path);
+    }
+    let mut child = command.spawn().unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
 }
@@ -126,6 +138,10 @@ fn history(root: &Path, count: usize, base: &str) -> String {
     text(native(root, &["rev-parse", "refs/heads/history"], b""))
 }
 fn publish_history(fixture: &source_support::Fixture, tip: &str) {
+    publish_history_from(fixture, &fixture.commit, tip);
+}
+
+fn publish_history_from(fixture: &source_support::Fixture, previous: &str, tip: &str) {
     Operation::new(30).enter(|| {
         let native_root = fixture.root.join("native");
         let prefix = native_root.join("objects/pack/pack");
@@ -153,7 +169,7 @@ fn publish_history(fixture: &source_support::Fixture, tip: &str) {
             &operation,
             "alice",
             &[Update {
-                old: Oid::parse(fixture.commit.as_bytes()).unwrap(),
+                old: Oid::parse(previous.as_bytes()).unwrap(),
                 new: Oid::parse(tip.as_bytes()).unwrap(),
                 name: b"refs/heads/main".to_vec(),
             }],
@@ -365,6 +381,9 @@ fn child(fixture: &source_support::Fixture, config: &CacheConfig, tip: &str, mod
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    if mode.starts_with("immutable-replacement-") {
+        print!("{}", String::from_utf8_lossy(&out.stdout));
+    }
 }
 
 #[test]
@@ -458,6 +477,15 @@ struct HttpServer {
 }
 impl HttpServer {
     fn start(fixture: &source_support::Fixture, config: &CacheConfig, warm: bool) -> Self {
+        Self::start_with_seconds(fixture, config, warm, "30")
+    }
+
+    fn start_with_seconds(
+        fixture: &source_support::Fixture,
+        config: &CacheConfig,
+        warm: bool,
+        seconds: &str,
+    ) -> Self {
         use std::io::BufRead;
         use std::os::unix::process::CommandExt;
         let control_path = fixture.root.join("warm-control");
@@ -473,7 +501,7 @@ impl HttpServer {
             )
             .args([
                 "--seconds",
-                "30",
+                seconds,
                 "--concurrency",
                 "1",
                 "--waiters",

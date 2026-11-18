@@ -159,13 +159,23 @@ without the signing key, not a compromised producer or signing-key holder.
 All hits require current reachability under the authorized leased source, the
 active limits and deadline, and source and cache fences through response delivery.
 An exact hit already binds the literal path in its key. Cache data never
-establishes source access. On an exact-body miss, the only cross-commit reuse is
-an authenticated body for the target's sole immediate parent, after the source
-proves the same literal path, entry mode and verified blob on that edge.
-There is no lookup beyond that edge. A changed file takes the ordinary blame
-calculation path. A parent hit returns the verified bytes unchanged and is never
-published or re-signed under the child key. Only newly derived local porcelain
-is eligible for signing.
+establishes source access. An authenticated parent body can be returned unchanged
+after proving that the target's sole immediate parent has the same literal path,
+entry mode and verified blob. It is never published or re-signed under the child
+key.
+
+The `blame-replacement-seed-v1` optimization covers a narrow changed-file case
+in signing mode. The full pinned blame engine produces the base attribution;
+the seed certifies a linear history with one regular file at the literal path and
+root attribution at unchanged coordinates except for one replaced line. The
+signed artifact binds the same source epoch, repository, principal, producer and
+options as complete bodies. Directory hints only locate candidates. A fresh
+request verifies reachability and checks at most 100 physical suffix edges before
+using any surviving provenance. The suffix may have unchanged edges or replace
+the same line in place in a file with distinct LF-terminated ASCII lines, at most
+16 KiB and 256 lines. The unique alignment permits rebuilding complete porcelain
+with the usual encoder. Ineligible history, missing evidence or a cache miss
+uses normal blame. Composed output is not re-signed or installed as a new seed.
 
 The generic cache may physically compress body and checkpoint chunks with zstd.
 Descriptors and MACs still bind the logical lengths/digests, while separate stored

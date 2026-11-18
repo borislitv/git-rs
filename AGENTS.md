@@ -51,9 +51,9 @@
   BlameTuning switches on. Keep the vendor tuning default all-off and the explicit conservative
   core profile available. Production exposes no tuning/producer override; test-fixture selectors
   are not a serving API. Profile changes require fresh native, resource and performance qualification.
-- Shared blame bodies and authenticated WorkSet objects/mappings are optional derivations.
-  Preserve request-local source authority and generation/epoch fences. Only complete-body keys
-  omit ref generation (`complete-blame-v2`); WorkSet keys and source identity still bind it.
+- Shared blame bodies, signed replacement seeds and WorkSet objects/mappings are optional derivations.
+  Preserve request-local source authority and generation/epoch fences. Immutable complete-body
+  and replacement-seed keys omit ref generation; WorkSet keys and source identity still bind it.
   Preserve complete line partitions and all other producer/key scope. Persist completed units
   only, never vendor interner IDs or a suspended traversal frontier.
   Keep SQL/network I/O out of memory callbacks. Do not weaken protected signing-file checks.

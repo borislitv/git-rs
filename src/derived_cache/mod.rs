@@ -103,6 +103,28 @@ impl DerivedCache {
         self.inner.budget.used()
     }
 
+    /// Directory hints only. An authenticated read with a current source
+    /// hold is still required for every selected key.
+    pub(crate) fn first_ready_hint(&self, keys: &[&ArtifactKey]) -> Result<Option<usize>> {
+        process::check_operation()?;
+        if keys.len() > 68 {
+            return Err(invalid("too many derived cache hints"));
+        }
+        let hashes: Vec<&[u8]> = keys.iter().map(|key| key.hash.as_slice()).collect();
+        let rows = self.inner.pg.query(
+            "SELECT h.ordinality FROM unnest($2::bytea[]) WITH ORDINALITY h(hash, ordinality) JOIN git_rs_cache.directory d ON d.namespace=$1::text::uuid AND d.key_hash=h.hash WHERE d.state='ready' AND d.expires_at>clock_timestamp() ORDER BY h.ordinality LIMIT 1",
+            &[&self.inner.config.namespace, &hashes], 1, 64,
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let index = usize::try_from(row.try_get::<_, i64>(0)?)?
+            .checked_sub(1)
+            .filter(|index| *index < keys.len())
+            .ok_or_else(|| invalid("invalid derived cache hint"))?;
+        Ok(Some(index))
+    }
+
     pub fn get_verified(
         &self,
         key: &ArtifactKey,

@@ -4,7 +4,7 @@ use super::{
     batch::{BatchSnapshot, WriterProof},
     codec_runtime_failure, lookup,
     memo::{Checkpoints, Profile, WorkSet},
-    observe, optional_cache, publish_body,
+    observe, optional_cache, optional_cache_for, publish_body, replacement,
 };
 use crate::{
     Result,
@@ -42,6 +42,9 @@ pub(super) struct Expected {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkStatistics {
     pub commits_traversed: usize,
+    /// Edges checked by complete-seed composition, separate from traversal.
+    pub replacement_suffix_edges: usize,
+    pub replacement_edges: usize,
     pub edges_visited: u64,
     pub mapping_hits: u64,
     pub fresh_mapping_computations: u64,
@@ -138,6 +141,29 @@ pub(super) fn derive(
             work: None,
         }));
     }
+    let started = std::time::Instant::now();
+    if let Some(result) = replacement::lookup(
+        &env, &source, &preflight, &principal, request, control, budget,
+    )? {
+        drop(preflight);
+        let statistics = WorkStatistics {
+            replacement_suffix_edges: result.suffix_edges,
+            replacement_edges: result.replacement_edges,
+            elapsed: started.elapsed(),
+            ..WorkStatistics::default()
+        };
+        observe(&env.observer, Phase::ReplacementSeedHit, control)?;
+        if let Some(observer) = &env.observer {
+            observer.work_completed(expected.is_some(), statistics, control);
+        }
+        observe(&env.observer, Phase::Complete, control)?;
+        source.check()?;
+        return Ok(Outcome::Complete(Body {
+            bytes: Bytes::Local(result.body),
+            source,
+            work: Some(statistics),
+        }));
+    }
     let (session, work) = if env.writer.is_some() && env.derived.is_some() {
         // Release the preflight catalog and decoder before admitting the WorkSet.
         drop(preflight);
@@ -205,6 +231,7 @@ pub(super) fn derive(
     let checkpoint_build = checkpoints.as_ref().and_then(Checkpoints::build);
     let attempted = std::cell::Cell::new(false);
     let mut outcome = None;
+    let mut seed = None;
     let result = {
         let mut compute = || -> Result<()> {
             attempted.set(true);
@@ -253,11 +280,26 @@ pub(super) fn derive(
                         budget,
                         super::MAX_OUTPUT as usize,
                     ) {
-                        Ok(body) => Outcome::Complete(Body {
-                            bytes: Bytes::Local(body),
-                            source: source.clone(),
-                            work: checkpoints.as_ref().map(|_| statistics),
-                        }),
+                        Ok(body) => {
+                            if body_build.is_some() && replacement::enabled(&env) {
+                                let allowance = (control.remaining() / 2)
+                                    .min(std::time::Duration::from_secs(15));
+                                seed = optional_cache_for(control, allowance, || {
+                                    session
+                                        .certify_replacement_seed(request, &options, &blame)?
+                                        .map(|seed| session.encode_replacement_seed(&seed))
+                                        .transpose()
+                                        .map_err(Into::into)
+                                })?
+                                .flatten();
+                                source.check()?;
+                            }
+                            Outcome::Complete(Body {
+                                bytes: Bytes::Local(body),
+                                source: source.clone(),
+                                work: checkpoints.as_ref().map(|_| statistics),
+                            })
+                        }
                         Err(BlameError::OutputTooLarge) => Outcome::TooLarge,
                         Err(error) => return Err(error.into()),
                     }
@@ -329,6 +371,12 @@ pub(super) fn derive(
                 &env.observer,
             )
         })?;
+    }
+    if let Some(seed) = seed {
+        let _ = optional_cache(control, || {
+            replacement::publish(&env, &source, &principal, &query, seed.as_slice(), control)
+        })?;
+        source.check()?;
     }
     control.check()?;
     if matches!(&outcome, Outcome::Complete(_)) {

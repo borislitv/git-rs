@@ -18,6 +18,10 @@ use crate::{
     SnapshotSession, StopReason, VerifiedObjectProvider,
 };
 
+#[path = "blame_replacement.rs"]
+mod replacement;
+pub use replacement::{ReplacementBlame, ReplacementSeed};
+
 /// Owned request-local tuning API for consumers without a direct vendor dependency.
 /// The tuning type defaults to all-off; `BlameOptions::default()` selects the
 /// qualified NativeRootV1 profile explicitly.
@@ -213,6 +217,7 @@ impl ProducerVersion {
                 include_bytes!("../../../Cargo.lock").as_slice(),
                 include_bytes!("../../../docs/gitoxide-source.json").as_slice(),
                 include_bytes!("lib.rs").as_slice(), include_bytes!("blame.rs").as_slice(),
+                include_bytes!("blame_replacement.rs").as_slice(),
                 include_bytes!("porcelain.rs").as_slice(), include_bytes!("objects.rs").as_slice(),
                 include_bytes!("graph.rs").as_slice(), include_bytes!("pack.rs").as_slice(),
                 include_bytes!("pack_cache.rs").as_slice(), include_bytes!("control.rs").as_slice(),
@@ -611,6 +616,7 @@ impl Drop for Metadata {
 /// serialization or any other final consumer. Source authority is caller-owned.
 pub struct CompleteBlame {
     admitted: gix_blame::AdmittedOutcome,
+    target: ObjectId,
     metadata: Metadata,
     control: Control,
     capacity: CapacityBudget,
@@ -887,6 +893,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         // cleanup, rather than silently dropping a large admitted trace at once.
         let mut complete = CompleteBlame {
             admitted,
+            target: request.commit.to_owned(),
             metadata: Metadata::new(0, &self.capacity, &self.control)?,
             control: self.control.clone(),
             capacity: self.capacity.clone(),

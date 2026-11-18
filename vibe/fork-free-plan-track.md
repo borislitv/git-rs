@@ -36,3 +36,14 @@
   merge reproductions through `SnapshotSession` against Git 2.56 full porcelain.
   The full core blame test target passed 16/16. Keep the two upstream failures as
   comparison evidence. Changed-file +1/+100 reuse is a separate open gate.
+- Changed-file prototype: the pinned core serializes a certified one-coordinate
+  base and composes a verified linear suffix. The 20,000-commit test reloads the
+  seed in a fresh session and matches Git 2.56 at +1/+100 with no older commit
+  reads. It declines +101; ordinary blame triggers the old-history read guard.
+  Signed HTTP +1 previously hit the seed after a real push and a process restart.
+  Bulk receive returned an empty reply; the separate catalog advance exposed a
+  +100 serving miss before the lookup was revised. Final short and long HTTP
+  checks are still open: the local retry stopped during Docker fixture setup,
+  before either request. The short contract is included in the default owned
+  blame gate's ignored-test inventory. Focused Clippy and locked all-targets
+  check passed locally; no HTTP performance conclusion follows from them.

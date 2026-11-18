@@ -93,49 +93,34 @@ impl Porcelain {
             let metadata = blame
                 .metadata(&row.commit_id)
                 .ok_or(BlameError::Corrupt("missing attributed commit metadata"))?;
+            let origin = RenderOrigin {
+                commit: &row.commit_id,
+                metadata,
+                path: row.source_file_name.as_ref(),
+                previous: row.previous.as_ref().map(|previous| {
+                    (
+                        previous.commit_id.as_ref(),
+                        previous.source_file_name.as_ref(),
+                    )
+                }),
+                boundary: row.boundary,
+            };
             for offset in 0..row.group_count {
                 control.check()?;
                 if cursor >= blob.len() {
                     return Err(BlameError::Corrupt("trace exceeds file lines"));
                 }
-                write_oid(&mut writer, &row.commit_id)?;
-                writer.write(b" ")?;
-                write_number(
-                    &mut writer,
-                    u64::from(
-                        row.source_range
-                            .start
-                            .checked_add(offset)
-                            .and_then(|line| line.checked_add(1))
-                            .ok_or(BlameError::Corrupt("source line overflow"))?,
-                    ),
-                )?;
-                writer.write(b" ")?;
-                write_number(&mut writer, u64::from(final_line) + 1)?;
-                if offset == 0 {
-                    writer.write(b" ")?;
-                    write_number(&mut writer, u64::from(row.group_count))?;
-                }
-                writer.write(b"\n")?;
-                writer.write(metadata)?;
-                if row.boundary {
-                    writer.write(b"boundary\n")?;
-                }
-                if let Some(previous) = &row.previous {
-                    writer.write(b"previous ")?;
-                    write_oid(&mut writer, &previous.commit_id)?;
-                    writer.write(b" ")?;
-                    write_path(&mut writer, previous.source_file_name.as_ref(), control)?;
-                    writer.write(b"\n")?;
-                }
-                writer.write(b"filename ")?;
-                write_path(&mut writer, row.source_file_name.as_ref(), control)?;
-                writer.write(b"\n\t")?;
                 let end = line_end(blob, cursor, control)?;
-                writer.write(&blob[cursor..end])?;
-                if blob[end - 1] != b'\n' {
-                    writer.write(b"\n")?;
-                }
+                origin.line(
+                    &mut writer,
+                    row.source_range
+                        .start
+                        .checked_add(offset)
+                        .ok_or(BlameError::Corrupt("source line overflow"))?,
+                    final_line,
+                    (offset == 0).then_some(row.group_count),
+                    &blob[cursor..end],
+                )?;
                 cursor = end;
                 final_line = final_line
                     .checked_add(1)
@@ -150,6 +135,106 @@ impl Porcelain {
         writer.body.statistics = blame.statistics();
         Ok(writer.body)
     }
+}
+
+pub(crate) struct RenderOrigin<'a> {
+    pub commit: &'a oid,
+    pub metadata: &'a [u8],
+    pub path: &'a [u8],
+    pub previous: Option<(&'a oid, &'a [u8])>,
+    pub boundary: bool,
+}
+
+impl RenderOrigin<'_> {
+    fn line(
+        &self,
+        writer: &mut ChunkWriter<'_>,
+        source: u32,
+        target: u32,
+        group: Option<u32>,
+        bytes: &[u8],
+    ) -> Result<(), BlameError> {
+        write_oid(writer, self.commit)?;
+        writer.write(b" ")?;
+        write_number(
+            writer,
+            u64::from(
+                source
+                    .checked_add(1)
+                    .ok_or(BlameError::Corrupt("source line overflow"))?,
+            ),
+        )?;
+        writer.write(b" ")?;
+        write_number(writer, u64::from(target) + 1)?;
+        if let Some(count) = group {
+            writer.write(b" ")?;
+            write_number(writer, u64::from(count))?;
+        }
+        writer.write(b"\n")?;
+        writer.write(self.metadata)?;
+        if self.boundary {
+            writer.write(b"boundary\n")?;
+        }
+        if let Some((parent, path)) = self.previous {
+            writer.write(b"previous ")?;
+            write_oid(writer, parent)?;
+            writer.write(b" ")?;
+            write_path(writer, path, writer.control)?;
+            writer.write(b"\n")?;
+        }
+        writer.write(b"filename ")?;
+        write_path(writer, self.path, writer.control)?;
+        writer.write(b"\n\t")?;
+        writer.write(bytes)?;
+        if !bytes.ends_with(b"\n") {
+            writer.write(b"\n")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn replacement_body(
+    blob: &[u8],
+    origins: [&RenderOrigin<'_>; 2],
+    slot: usize,
+    count: usize,
+    control: &Control,
+    budget: &CapacityBudget,
+    max_bytes: usize,
+) -> Result<CompletePorcelain, BlameError> {
+    if max_bytes > MAX_BODY_BYTES || slot >= count {
+        return Err(BlameError::InvalidRequest);
+    }
+    let mut writer = ChunkWriter::new(budget, control, max_bytes)?;
+    let mut lines = blob.split_inclusive(|&b| b == b'\n');
+    for i in 0..count {
+        control.check()?;
+        let group = if i == slot {
+            Some(1)
+        } else if i == 0 {
+            Some(slot)
+        } else if i == slot + 1 {
+            Some(count - i)
+        } else {
+            None
+        };
+        let line = lines
+            .next()
+            .ok_or(BlameError::Corrupt("replacement trace exceeds file lines"))?;
+        origins[usize::from(i == slot)].line(
+            &mut writer,
+            i as u32,
+            i as u32,
+            group.map(|n| n as u32),
+            line,
+        )?;
+    }
+    if lines.next().is_some() {
+        return Err(BlameError::Corrupt("file exceeds replacement trace lines"));
+    }
+    control.check()?;
+    ProducerVersion::verified()?;
+    Ok(writer.body)
 }
 
 fn line_end(bytes: &[u8], start: usize, control: &Control) -> Result<usize, BlameError> {
