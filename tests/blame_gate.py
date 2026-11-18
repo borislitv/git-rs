@@ -172,6 +172,22 @@ def image_output(image, argv, volumes=()):
                    *volumes, "--entrypoint", argv[0], image, *argv[1:]], timeout=60)
 
 
+def copy_release_blame_reuse(image, bundle):
+    source = "/usr/local/bin/tests/blame-reuse"
+    destination = bundle / "bin/blame_reuse"
+    with destination.open("xb"):
+        pass
+    # Export only this sealed test executable from the exact oracle image.
+    # No working tree or bundle directory is writable by the container.
+    preparation_output(["--read-only", "--network", "none",
+                        "--user", f"{os.getuid()}:{os.getgid()}",
+                        "--volume", f"{destination}:/output:rw",
+                        "--entrypoint", "/usr/bin/cp", image, source, "/output"], timeout=60)
+    expected = image_output(image, ["/usr/bin/sha256sum", source]).split()[0]
+    require(digest(destination) == expected, "release blame reuse differs from the exact image")
+    return destination
+
+
 def preparation_token(value):
     require(re.fullmatch(r"[0-9a-f]{32}", value), "preparation nonce required")
     return value
@@ -287,19 +303,22 @@ def prepare_bundle(args):
     target = bundle.parent / (bundle.name + "-current-target")
     current = cargo_artifacts(builder, ROOT, target,
                               ["build", "--bin", "git-rs", "--example", "cache-process",
-                               "--example", "blame-http-fixture"])
+                                "--example", "blame-http-fixture"])
+    debug_suites = tuple(s for s in SUITES if s != "blame_reuse")
     contracts = cargo_artifacts(builder, ROOT, bundle.parent / (bundle.name + "-test-target"),
-                                ["test", "--no-run", *[x for s in SUITES for x in ("--test", s)]])
+                                 ["test", "--no-run", *[x for s in debug_suites for x in ("--test", s)]])
     old = cargo_artifacts(builder, legacy, bundle.parent / (bundle.name + "-legacy-target"),
                           ["build", "--bin", "git-rs", "--example", "cache-process"])
     paths = {"current": current["git-rs"], "fixture": current["blame-http-fixture"],
              "cache_process": current["cache-process"], "legacy": old["git-rs"],
-             "legacy_process": old["cache-process"], **{s: contracts[s] for s in SUITES}}
+             "legacy_process": old["cache-process"], **{s: contracts[s] for s in debug_suites}}
     records, names = {}, {}
     (bundle / "bin").mkdir()
+    paths["blame_reuse"] = copy_release_blame_reuse(runtime, bundle)
     for name, path in paths.items():
         destination = bundle / "bin" / name
-        shutil.copyfile(path, destination)
+        if path != destination:
+            shutil.copyfile(path, destination)
         destination.chmod(0o555)
         records[name] = {"path": f"bin/{name}", "sha256": digest(destination)}
         if name in SUITES:

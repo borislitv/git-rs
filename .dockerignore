@@ -11,6 +11,7 @@
 !tests/
 !tests/*.py
 !tests/receive_fixture.rs
+!tests/blame_reuse.rs
 !tests/support/
 !tests/support/*.rs
 !tests/support/*.py

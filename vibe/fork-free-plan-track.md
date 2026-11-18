@@ -55,3 +55,9 @@
   advance. That fixture used a 1 MiB source cache, below a single full 4 MiB
   source range. The next run uses the serving default 64 MiB for the long case
   and logs phase timings, retaining the deadline and output/reuse assertions.
+- On [`dd6aa93`](https://github.com/borislitv/git-rs/actions/runs/44255714735/job/134645051391),
+  the cold base still stopped after 120 seconds with 64 MiB. It acquired the
+  source, prepared the WorkSet and claimed the body in 3.5 seconds, but never
+  reported completed attribution. The gate previously built `blame_reuse` in
+  Cargo's debug profile; the optimized serving contract is built in the exact
+  oracle image with the unchanged 120-second deadline and reuse assertions.

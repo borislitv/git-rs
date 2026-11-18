@@ -56,7 +56,7 @@ COPY src ./src
 COPY migrations ./migrations
 COPY benches ./benches
 COPY tests/support ./tests/support
-COPY tests/receive_fixture.rs ./tests/receive_fixture.rs
+COPY tests/receive_fixture.rs tests/blame_reuse.rs ./tests/
 COPY crates/git-core ./crates/git-core
 COPY docs/*-source.json ./docs/
 COPY tools/check-core-source.py tools/dependency-notices.py ./tools/
@@ -71,10 +71,10 @@ RUN cargo build --release --offline --locked \
 
 FROM build AS test-fixture-build
 RUN cargo build --release --offline --locked --example blame-http-fixture \
-    && cargo test --release --offline --locked --test receive_fixture --no-run --message-format=json > /tmp/receive-artifacts.json \
-    && python3 -c 'import json,pathlib,shutil; rows=[json.loads(line) for line in pathlib.Path("/tmp/receive-artifacts.json").read_text().splitlines()]; found=[row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("target",{}).get("name")=="receive_fixture" and row.get("executable")]; assert len(found)==1; shutil.copyfile(found[0],"/build/target/release/receive-fixture")' \
-    && chmod 0555 /build/target/release/receive-fixture \
-    && rm /tmp/receive-artifacts.json
+    && cargo test --release --offline --locked --test receive_fixture --test blame_reuse --no-run --message-format=json > /tmp/test-artifacts.json \
+    && python3 -c 'import json,pathlib,shutil; rows=[json.loads(line) for line in pathlib.Path("/tmp/test-artifacts.json").read_text().splitlines()]; paths={name:[row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("target",{}).get("name")==name and row.get("executable")] for name in ("receive_fixture","blame_reuse")}; assert all(len(found)==1 for found in paths.values()); [shutil.copyfile(found[0],"/build/target/release/"+name.replace("_","-")) for name,found in paths.items()]' \
+    && chmod 0555 /build/target/release/receive-fixture /build/target/release/blame-reuse \
+    && rm /tmp/test-artifacts.json
 
 FROM toolchain AS git-build
 WORKDIR /tmp/git
@@ -128,6 +128,7 @@ LABEL io.git-rs.role="runtime-fixture"
 FROM client-oracle AS test
 COPY --from=build /build/target/release/git-rs /usr/local/bin/git-rs
 COPY --from=test-fixture-build /build/target/release/examples/blame-http-fixture /usr/local/bin/examples/blame-http-fixture
+COPY --from=test-fixture-build /build/target/release/blame-reuse /usr/local/bin/tests/blame-reuse
 RUN python3 -m venv /opt/test-python \
     && /opt/test-python/bin/pip install --no-cache-dir PyYAML==6.0.3 jsonschema==4.26.0 \
     && mkdir -p /opt/git-rs/.local && chown 10001:10001 /opt/git-rs/.local && chmod 0700 /opt/git-rs/.local
