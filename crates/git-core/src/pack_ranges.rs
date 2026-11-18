@@ -123,6 +123,13 @@ struct Frame {
     end: u64,
 }
 
+// A per-read witness, never reused by a different lookup or with different limits.
+// The complete entry is still read and compared against `entry` by `inflate`.
+struct PreparedEntry {
+    frame: Frame,
+    entry: gix_pack::data::Entry,
+}
+
 /// One admitted job's range-backed physical provider. All indexes, decoder
 /// caches and temporary backing drop before the source hold. No network operation
 /// is performed with a state/cache lock or RefCell borrow held.
@@ -436,7 +443,15 @@ impl<S: PackSource> RangePackSet<S> {
         let Some(location) = self.locate(id, control)? else {
             return Ok(None);
         };
-        self.prepare(location, control, self.limits, &mut [None; 65], 0, true)?;
+        self.prepare(
+            location,
+            control,
+            self.limits,
+            &mut [None; 65],
+            0,
+            true,
+            &mut [],
+        )?;
         let frame = self.frame(location, control)?;
         let bytes = self.authenticated_bytes(frame, control)?;
         let entry = gix_pack::data::Entry::from_bytes(
@@ -608,6 +623,7 @@ impl<S: PackSource> RangePackSet<S> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &self,
         location: PackLocation,
@@ -616,11 +632,21 @@ impl<S: PackSource> RangePackSet<S> {
         active: &mut [Option<PackLocation>; 65],
         depth: usize,
         authenticate: bool,
+        prepared: &mut [Option<PreparedEntry>],
     ) -> Result<DecodePlan> {
-        let result = self.prepare_source(location, control, limits, active, depth, authenticate);
+        let result = self.prepare_source(
+            location,
+            control,
+            limits,
+            active,
+            depth,
+            authenticate,
+            prepared,
+        );
         self.source_result(location.pack, control, result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_source(
         &self,
         location: PackLocation,
@@ -629,6 +655,7 @@ impl<S: PackSource> RangePackSet<S> {
         active: &mut [Option<PackLocation>; 65],
         depth: usize,
         authenticate: bool,
+        prepared: &mut [Option<PreparedEntry>],
     ) -> Result<DecodePlan> {
         control.check()?;
         if depth > limits.max_delta_depth || active[..depth].contains(&Some(location)) {
@@ -672,7 +699,15 @@ impl<S: PackSource> RangePackSet<S> {
                 }));
             }
             let base = self.base(location, &entry, control)?;
-            let base = self.prepare(base, control, limits, active, depth + 1, authenticate)?;
+            let base = self.prepare(
+                base,
+                control,
+                limits,
+                active,
+                depth + 1,
+                authenticate,
+                prepared,
+            )?;
             if base.header.size != base_size {
                 return Err(invalid("range-backed delta base size mismatch"));
             }
@@ -703,6 +738,9 @@ impl<S: PackSource> RangePackSet<S> {
         active[depth] = None;
         plan.validate(limits)?;
         control.check()?;
+        if let Some(slot) = prepared.get_mut(depth) {
+            *slot = Some(PreparedEntry { frame, entry });
+        }
         Ok(plan)
     }
 
@@ -813,29 +851,31 @@ impl<S: PackSource> RangePackSet<S> {
 
     fn decode_at(
         &self,
-        location: PackLocation,
         control: &Control,
         limits: ReadLimits,
-        active: &mut [Option<PackLocation>; 65],
+        prepared: &[Option<PreparedEntry>],
         depth: usize,
-    ) -> Result<(Object, DecodePlan)> {
-        let result = self.decode_source(location, control, limits, active, depth);
-        self.source_result(location.pack, control, result)
+    ) -> Result<(VerifiedObject, DecodePlan)> {
+        control.check()?;
+        let step = prepared
+            .get(depth)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid("missing prepared range-backed delta entry"))?;
+        let result = self.decode_source(step, control, limits, prepared, depth);
+        self.source_result(step.frame.location.pack, control, result)
     }
 
     fn decode_source(
         &self,
-        location: PackLocation,
+        step: &PreparedEntry,
         control: &Control,
         limits: ReadLimits,
-        active: &mut [Option<PackLocation>; 65],
+        prepared: &[Option<PreparedEntry>],
         depth: usize,
-    ) -> Result<(Object, DecodePlan)> {
-        control.check()?;
-        if depth > limits.max_delta_depth || active[..depth].contains(&Some(location)) {
-            return Err(invalid("range-backed delta depth or cycle limit exceeded"));
-        }
-        let frame = self.frame(location, control)?;
+    ) -> Result<(VerifiedObject, DecodePlan)> {
+        let PreparedEntry { frame, entry } = step;
+        let frame = *frame;
+        let location = frame.location;
         let key = Key {
             pack: u32::try_from(location.pack)?,
             offset: location.offset,
@@ -843,12 +883,10 @@ impl<S: PackSource> RangePackSet<S> {
         if let Some(pin) = self.runtime.pin(key, frame.id, &|| check(control))? {
             pin.plan().validate(limits)?;
             let plan = pin.plan();
-            let object = VerifiedObject::from_cached(pin).into_object(control, &self.budget)?;
-            return Ok((object, plan));
+            control.check()?;
+            return Ok((VerifiedObject::from_cached(pin), plan));
         }
-        active[depth] = Some(location);
-        let entry = self.entry(frame, control)?;
-        let bytes = self.inflate(frame, &entry, control, limits)?;
+        let bytes = self.inflate(frame, entry, control, limits)?;
         let (object, plan) = if let Some(kind) = entry.header.as_kind() {
             let size = bytes.as_slice().len();
             (
@@ -876,15 +914,18 @@ impl<S: PackSource> RangePackSet<S> {
                     limit: limits.max_object_bytes,
                 }));
             }
-            let base = self.base(location, &entry, control)?;
-            let (base, base_plan) = self.decode_at(base, control, limits, active, depth + 1)?;
-            if base.data.as_slice().len() as u64 != base_size {
+            // The prepared child location came from the same physical header
+            // that `inflate` just rechecked. Keep a cached base pinned rather
+            // than allocating and copying its verified bytes into a second buffer.
+            let (base, base_plan) = self.decode_at(control, limits, prepared, depth + 1)?;
+            if base.as_slice().len() as u64 != base_size {
                 return Err(invalid("range-backed delta base size mismatch"));
             }
+            let kind = base.header().kind;
             let mut data = self.budget.buffer(size)?;
             data.resize_controlled(size, 0, control)?;
             gix_pack::data::delta::reconstruct_controlled(
-                base.data.as_slice(),
+                base.as_slice(),
                 data.as_mut_slice(),
                 bytes.as_slice(),
                 &|| check(control),
@@ -896,7 +937,7 @@ impl<S: PackSource> RangePackSet<S> {
                 .ok_or_else(|| invalid("range-backed delta instruction size overflow"))?;
             let plan = DecodePlan {
                 header: gix_object::Header {
-                    kind: base.kind,
+                    kind,
                     size: result_size,
                 },
                 max_object,
@@ -912,13 +953,7 @@ impl<S: PackSource> RangePackSet<S> {
                     .and_then(|n| n.checked_add(instructions))
                     .ok_or_else(|| invalid("range-backed delta workspace overflow"))?,
             };
-            (
-                Object {
-                    kind: base.kind,
-                    data,
-                },
-                plan,
-            )
+            (Object { kind, data }, plan)
         };
         plan.validate(limits)?;
         super::verify_hash_with(&frame.id, object.kind, object.data.as_slice(), &|| {
@@ -934,9 +969,11 @@ impl<S: PackSource> RangePackSet<S> {
             &|| check(control),
         )?;
         self.runtime.remember(key, frame.id, plan, control)?;
-        active[depth] = None;
         control.check()?;
-        Ok((object, plan))
+        Ok((
+            VerifiedObject::from_pack_verified(frame.id.as_ref(), object.kind, object.data, plan),
+            plan,
+        ))
     }
 
     /// Enumerate every catalog index entry, including unreachable objects. The
@@ -986,8 +1023,16 @@ impl<S: PackSource> VerifiedObjectProvider for RangePackSet<S> {
             plan.validate(self.limits)?;
             return Ok(Some(plan.header));
         }
-        self.prepare(location, control, self.limits, &mut [None; 65], 0, false)
-            .map(|plan| Some(plan.header))
+        self.prepare(
+            location,
+            control,
+            self.limits,
+            &mut [None; 65],
+            0,
+            false,
+            &mut [],
+        )
+        .map(|plan| Some(plan.header))
     }
     fn object(
         &self,
@@ -1027,14 +1072,20 @@ impl<S: PackSource> VerifiedObjectProvider for RangePackSet<S> {
             pin.plan().validate(limits)?;
             return Ok(Some(VerifiedObject::from_cached(pin)));
         }
-        self.prepare(location, control, limits, &mut [None; 65], 0, false)?;
-        let (object, plan) = self.decode_at(location, control, limits, &mut [None; 65], 0)?;
-        Ok(Some(VerifiedObject::from_pack_verified(
-            id,
-            object.kind,
-            object.data,
-            plan,
-        )))
+        // Bound by ReadLimits' maximum physical delta depth. Keep the walk's
+        // frames on the stack only for this read; no unverified cache is added.
+        let mut prepared = [const { None }; 65];
+        self.prepare(
+            location,
+            control,
+            limits,
+            &mut [None; 65],
+            0,
+            false,
+            &mut prepared,
+        )?;
+        let (object, _) = self.decode_at(control, limits, &prepared, 0)?;
+        Ok(Some(object))
     }
     fn pack_location(&self, id: &oid, control: &Control) -> Result<Option<PackLocation>> {
         self.locate(id, control)

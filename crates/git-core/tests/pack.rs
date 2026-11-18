@@ -100,6 +100,189 @@ fn ref_delta(base: gix_hash::ObjectId) -> Vec<u8> {
 }
 
 #[test]
+fn range_reconstruction_reuses_prepared_headers_and_keeps_strict_limits() {
+    use git_rs_core::objects::Result;
+    use git_rs_core::pack::ranges::{PackSource, RangePackSet};
+    use git_rs_core::{CapacityBuffer, SnapshotIdentity, VerifiedObjectProvider};
+    use gix_hash::ObjectId;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Clone, Copy)]
+    enum PayloadFault {
+        None,
+        ReadError,
+        ChangedHeader,
+    }
+
+    struct Source<'a> {
+        pack: Vec<u8>,
+        index: Vec<u8>,
+        reads: &'a RefCell<Vec<u64>>,
+        target_offset: u64,
+        target_fault: &'a Cell<PayloadFault>,
+    }
+
+    impl PackSource for Source<'_> {
+        fn pack_count(&self) -> usize {
+            1
+        }
+        fn pack_size(&self, _: usize) -> Result<u64> {
+            Ok(self.pack.len() as u64)
+        }
+        fn pack_hash(&self, _: usize) -> Result<ObjectId> {
+            Ok(checksum(&self.pack[..self.pack.len() - 20]))
+        }
+        fn pack_digest(&self, _: usize) -> Result<[u8; 32]> {
+            use sha2::{Digest, Sha256};
+            Ok(Sha256::digest(&self.pack).into())
+        }
+        fn index(
+            &self,
+            _: usize,
+            control: &Control,
+            budget: &CapacityBudget,
+        ) -> Result<CapacityBuffer> {
+            let mut bytes = budget.buffer(self.index.len())?;
+            bytes.resize_controlled(self.index.len(), 0, control)?;
+            bytes.as_mut_slice().copy_from_slice(&self.index);
+            Ok(bytes)
+        }
+        fn read_exact(
+            &self,
+            _: usize,
+            offset: u64,
+            output: &mut [u8],
+            control: &Control,
+            _: &CapacityBudget,
+        ) -> Result<()> {
+            control.check()?;
+            let mut reads = self.reads.borrow_mut();
+            let target_already_read = reads.contains(&self.target_offset);
+            reads.push(offset);
+            let start = usize::try_from(offset)?;
+            output.copy_from_slice(&self.pack[start..start + output.len()]);
+            if offset == self.target_offset && target_already_read {
+                match self.target_fault.get() {
+                    PayloadFault::None => {}
+                    PayloadFault::ReadError => {
+                        return Err(std::io::Error::other("synthetic source read failed").into());
+                    }
+                    // Change the size encoded in the otherwise valid REF header.
+                    PayloadFault::ChangedHeader => output[0] ^= 1,
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let root = Directory::new();
+    let base = blob(b"hello");
+    let target = blob(b"hello!");
+    let full = full_hello();
+    let target_offset = 12 + full.len() as u64;
+    let idx = root.write("range-delta", &[(base, full), (target, ref_delta(base))]);
+    let reads = RefCell::new(Vec::new());
+    let target_fault = Cell::new(PayloadFault::None);
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    let budget = CapacityBudget::new(8 * 1024 * 1024);
+    let limits = ReadLimits::default();
+    let packs = RangePackSet::new(
+        Source {
+            pack: std::fs::read(idx.with_extension("pack")).unwrap(),
+            index: std::fs::read(idx).unwrap(),
+            reads: &reads,
+            target_offset,
+            target_fault: &target_fault,
+        },
+        SnapshotIdentity {
+            source: b"counted-synthetic-range".to_vec(),
+            generation: b"one".to_vec(),
+            object_hash: gix_hash::Kind::Sha1,
+        },
+        budget.clone(),
+        limits,
+        acceleration(),
+        &control,
+    )
+    .unwrap();
+
+    let held_base = packs
+        .verified_object(&base, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held_base.as_slice(), b"hello");
+    reads.borrow_mut().clear();
+
+    for (fault, message) in [
+        (PayloadFault::ReadError, "synthetic source read failed"),
+        (
+            PayloadFault::ChangedHeader,
+            "immutable range-backed entry header changed",
+        ),
+    ] {
+        target_fault.set(fault);
+        assert!(matches!(
+            packs.verified_object(&target, &control, &budget, limits),
+            Err(err) if err.to_string() == message
+        ));
+        reads.borrow_mut().clear();
+    }
+    target_fault.set(PayloadFault::None);
+
+    let value = packs
+        .verified_object(&target, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(value.id(), target.as_ref());
+    assert_eq!(value.as_slice(), b"hello!");
+    let count_at = |offset| {
+        reads
+            .borrow()
+            .iter()
+            .filter(|&&read| read == offset)
+            .count()
+    };
+    assert_eq!(
+        count_at(target_offset),
+        2,
+        "one header and one complete payload read"
+    );
+    assert_eq!(
+        count_at(12),
+        1,
+        "verify the physical base plan but reuse its decoded bytes"
+    );
+    drop(value);
+
+    reads.borrow_mut().clear();
+    let strict = ReadLimits {
+        max_decode_bytes: 16,
+        ..limits
+    };
+    // 5 base bytes + 6 delta instructions + 6 result bytes = 17 expanded bytes.
+    assert!(matches!(
+        packs.verified_object(&target, &control, &budget, strict),
+        Err(err) if err.to_string().contains("decoded-byte budget")
+    ));
+    assert!(
+        reads.borrow().is_empty(),
+        "the verified hit must retain the original physical plan"
+    );
+
+    control.cancel();
+    assert!(
+        packs
+            .verified_object(&target, &control, &budget, limits)
+            .is_err()
+    );
+    assert!(reads.borrow().is_empty());
+    drop(packs);
+    assert_eq!(held_base.as_slice(), b"hello");
+    drop(held_base);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn invalid_delta_identity_is_never_published_even_with_a_verified_warm_base() {
     let root = Directory::new();
     let base = blob(b"hello");
