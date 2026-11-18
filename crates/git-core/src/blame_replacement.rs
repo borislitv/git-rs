@@ -33,6 +33,33 @@ struct Step {
 }
 
 impl<P: VerifiedObjectProvider> SnapshotSession<P> {
+    /// Propose one physical, same-raw-path ancestry edge for completed-map
+    /// discovery. Verify the current commit and its exact path entry, but do
+    /// not read the parent or require a singleton tree or an unchanged blob.
+    /// The caller must already authorize the starting commit and bound the
+    /// walk. Ordinary blame still proves applicability (including the base
+    /// blob and any rename) before it can consume a completed map.
+    pub fn completed_candidate_parent(
+        &self,
+        request: BlameRequest<'_>,
+    ) -> Result<Option<ObjectId>, BlameError> {
+        self.validate_blame_request(request)?;
+        if self.limits.max_graph_objects < 2 || self.limits.max_graph_edges == 0 {
+            return Ok(None);
+        }
+        let prefix = {
+            let header = self.blame_commit_header(request.commit)?;
+            let object = self.blame_commit(request.commit, header)?;
+            self.blame_commit_prefix(request.commit, &object)?
+        };
+        let Some((tree, Some(parent))) = prefix else {
+            return Ok(None);
+        };
+        Ok(self
+            .blame_path_entry(tree, request.path, true)?
+            .map(|_| parent))
+    }
+
     /// Run ordinary blame once and certify its eligible stable origins. The
     /// proof requires one canonical regular file in each flat tree and no merges.
     pub fn prepare_replacement_seed(
@@ -54,6 +81,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
     ) -> Result<Option<ReplacementSeed>, BlameError> {
         self.validate_blame_request(request)?;
         if options.canonical_bytes() != BlameOptions::default().canonical_bytes()
+            || !complete.can_certify_local_attribution()
             || request.path.contains(&b'/')
             || request.commit != complete.target.as_ref()
             || !complete.uses_resources(&self.control, &self.capacity)

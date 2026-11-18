@@ -21,6 +21,10 @@ use crate::{
 #[path = "blame_replacement.rs"]
 mod replacement;
 pub use replacement::{ReplacementBlame, ReplacementSeed};
+#[path = "blame_completed.rs"]
+mod completed;
+pub use completed::{CompletedBlameMap, MAX_COMPLETED_MAP_BYTES};
+pub use gix_blame::native::CompletedUse;
 
 /// Owned request-local tuning API for consumers without a direct vendor dependency.
 /// The tuning type defaults to all-off; `BlameOptions::default()` selects the
@@ -218,6 +222,7 @@ impl ProducerVersion {
                 include_bytes!("../../../docs/gitoxide-source.json").as_slice(),
                 include_bytes!("lib.rs").as_slice(), include_bytes!("blame.rs").as_slice(),
                 include_bytes!("blame_replacement.rs").as_slice(),
+                include_bytes!("blame_completed.rs").as_slice(),
                 include_bytes!("porcelain.rs").as_slice(), include_bytes!("objects.rs").as_slice(),
                 include_bytes!("graph.rs").as_slice(), include_bytes!("pack.rs").as_slice(),
                 include_bytes!("pack_cache.rs").as_slice(), include_bytes!("control.rs").as_slice(),
@@ -552,17 +557,18 @@ impl<P: VerifiedObjectProvider> Find for FindBridge<'_, P> {
     }
 }
 
-struct CommitMetadata {
+struct CommitMetadata<T> {
     id: ObjectId,
-    fields: CapacityBuffer,
+    fields: T,
+    first_row: usize,
 }
-struct Metadata {
-    table: HashTable<CommitMetadata>,
+struct Metadata<T = CapacityBuffer> {
+    table: HashTable<CommitMetadata<T>>,
     _reservation: CapacityReservation,
     hash: RandomState,
     control: Control,
 }
-impl Metadata {
+impl<T> Metadata<T> {
     fn new(count: usize, budget: &CapacityBudget, control: &Control) -> Result<Self, BlameError> {
         if count == 0 {
             return Ok(Self {
@@ -578,7 +584,7 @@ impl Metadata {
             .and_then(usize::checked_next_power_of_two)
             .ok_or(BlameError::Capacity(CapacityError::Exhausted))?;
         let upper = buckets
-            .checked_mul(std::mem::size_of::<CommitMetadata>() + 1)
+            .checked_mul(std::mem::size_of::<CommitMetadata<T>>() + 1)
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or(BlameError::Capacity(CapacityError::Exhausted))?;
         let mut reservation = budget.reservation(upper)?;
@@ -594,17 +600,27 @@ impl Metadata {
             control: control.clone(),
         })
     }
-    fn get(&self, id: &oid) -> Option<&[u8]> {
+    fn get(&self, id: &oid) -> Option<&CommitMetadata<T>> {
         self.table
             .find(self.hash.hash_one(id), |entry| entry.id.as_ref() == id)
-            .map(|entry| entry.fields.as_slice())
+    }
+    fn insert(&mut self, id: ObjectId, first_row: usize, fields: T) {
+        self.table.insert_unique(
+            self.hash.hash_one(id.as_ref()),
+            CommitMetadata {
+                id,
+                fields,
+                first_row,
+            },
+            |entry| self.hash.hash_one(entry.id.as_ref()),
+        );
     }
 }
-impl Drop for Metadata {
+impl<T> Drop for Metadata<T> {
     fn drop(&mut self) {
         for (index, entry) in self.table.drain().enumerate() {
             drop(entry);
-            if index % 32 == 0 {
+            if index % 32 == 0 && !std::thread::panicking() {
                 let _ = self.control.check();
             }
         }
@@ -617,11 +633,25 @@ impl Drop for Metadata {
 pub struct CompleteBlame {
     admitted: gix_blame::AdmittedOutcome,
     target: ObjectId,
+    path_digest: [u8; 32],
+    live_scope: [u8; 32],
+    completed_use: CompletedUse,
     metadata: Metadata,
     control: Control,
     capacity: CapacityBudget,
 }
 impl CompleteBlame {
+    /// Whether this operation actually grafted complete attribution, independent of edge memo reuse.
+    pub fn completed_use(&self) -> CompletedUse {
+        self.completed_use
+    }
+
+    /// Signing/export gate for locally computed attribution. Rendering is still
+    /// valid on a graft or mapping-memo hit, but it must not certify a new record.
+    pub fn can_certify_local_attribution(&self) -> bool {
+        !matches!(self.completed_use, CompletedUse::Hit { .. })
+            && self.admitted.mapping_statistics().hits == 0
+    }
     pub fn statistics(&self) -> BlameStatistics {
         BlameStatistics {
             commits_traversed: self.admitted.outcome().statistics.commits_traversed,
@@ -641,7 +671,7 @@ impl CompleteBlame {
         &self.admitted.outcome().blob
     }
     pub(crate) fn metadata(&self, id: &oid) -> Option<&[u8]> {
-        self.metadata.get(id)
+        self.metadata.get(id).map(|entry| entry.fields.as_slice())
     }
     pub(crate) fn uses_resources(&self, control: &Control, budget: &CapacityBudget) -> bool {
         self.capacity.shares_with(budget)
@@ -742,7 +772,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         request: BlameRequest<'_>,
         options: &BlameOptions,
     ) -> Result<CompleteBlame, BlameError> {
-        self.blame_complete_inner(request, options, None)
+        self.blame_complete_inner(request, options, None, None)
     }
 
     pub fn blame_complete_with_memo(
@@ -751,7 +781,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         options: &BlameOptions,
         memo: memo::MemoryMappingRequest<'_>,
     ) -> Result<CompleteBlame, BlameError> {
-        self.blame_complete_inner(request, options, Some(memo))
+        self.blame_complete_inner(request, options, Some(memo), None)
     }
 
     fn blame_complete_inner(
@@ -759,8 +789,17 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         request: BlameRequest<'_>,
         options: &BlameOptions,
         memo: Option<memo::MemoryMappingRequest<'_>>,
+        completed: Option<([u8; 32], &CompletedBlameMap<'_>)>,
     ) -> Result<CompleteBlame, BlameError> {
         self.validate_blame_request(request)?;
+        let scopes = completed::scopes(self, options)?;
+        let scope = scopes.immutable;
+        let seed = if let Some((namespace, seed)) = completed {
+            seed.check_live(self, scopes.live, request)?;
+            seed.applies(scope, namespace).then_some(seed)
+        } else {
+            None
+        };
         self.blame_target(request)?;
         let cause = Arc::new(Cause::default());
         let allocator = Arc::new(BlameAllocator {
@@ -847,7 +886,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 control: &self.control,
                 cause: &cause,
             });
-            gix_blame::file_with_allocations_trace_and_raw_blobs(
+            gix_blame::file_with_allocations_and_completed_attribution(
                 &source,
                 gix_blame::Start::Commit(request.commit.to_owned()),
                 None,
@@ -857,7 +896,9 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 options.tuning,
                 allocator,
                 &mut check,
-                &mut raw_blobs,
+                scope,
+                seed.map(CompletedBlameMap::as_vendor),
+                Some(&mut raw_blobs),
                 Some(gix_blame::memo::MappingRequest {
                     options: identities,
                     memo: &mut memory,
@@ -867,7 +908,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 }),
             )
         } else {
-            gix_blame::file_with_allocations_trace_and_raw_blobs(
+            gix_blame::file_with_allocations_and_completed_attribution(
                 &source,
                 gix_blame::Start::Commit(request.commit.to_owned()),
                 None,
@@ -877,7 +918,9 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 options.tuning,
                 allocator,
                 &mut check,
-                &mut raw_blobs,
+                scope,
+                seed.map(CompletedBlameMap::as_vendor),
+                Some(&mut raw_blobs),
                 None,
             )
         };
@@ -889,14 +932,27 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         drop(platform);
         drop(raw_metadata);
         drop(platform_metadata);
+        let completed_use = if completed.is_some() && seed.is_none() {
+            CompletedUse::Miss
+        } else {
+            admitted.completed_use()
+        };
         // Wrap before post-work validation so every failure uses polled output
         // cleanup, rather than silently dropping a large admitted trace at once.
         let mut complete = CompleteBlame {
             admitted,
             target: request.commit.to_owned(),
+            path_digest: Sha256::digest(request.path).into(),
+            live_scope: scopes.live,
+            completed_use,
             metadata: Metadata::new(0, &self.capacity, &self.control)?,
             control: self.control.clone(),
             capacity: self.capacity.clone(),
+        };
+        let provenance = if matches!(completed_use, CompletedUse::Hit { .. }) {
+            seed
+        } else {
+            None
         };
         let trace = complete
             .admitted
@@ -927,15 +983,13 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 if metadata.table.len() >= max_commits {
                     return Err(BlameError::WorkLimit);
                 }
-                let fields = crate::porcelain::commit_metadata(self, &row.commit_id)?;
-                metadata.table.insert_unique(
-                    metadata.hash.hash_one(row.commit_id),
-                    CommitMetadata {
-                        id: row.commit_id,
-                        fields,
-                    },
-                    |entry| metadata.hash.hash_one(entry.id),
-                );
+                let fields =
+                    if let Some(fields) = provenance.and_then(|seed| seed.fields(&row.commit_id)) {
+                        completed::copy_fields(self, fields)?
+                    } else {
+                        crate::porcelain::commit_metadata(self, &row.commit_id)?
+                    };
+                metadata.insert(row.commit_id, index, fields);
             }
         }
         let mut lines = 0u32;

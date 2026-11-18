@@ -73,3 +73,12 @@
   requests after restart had native-exact output and `ReplacementSeedHit`.
   The +1 advance used native HTTP receive; cumulative +100 qualifies serving
   after catalog publication only. No broader migration stage is marked complete.
+- Core completed maps: [owned Gitoxide revision `d80e8c8`](https://github.com/borislitv/gitoxide/commit/d80e8c8f13952fef55fb8a387e64c9436537cecf)
+  preserves origin ranges, byte paths, native grouping and previous metadata.
+  A new snapshot can reuse the immutable wire; its decoded map is specific to
+  the live job and target. The synthetic cross-generation edit/rename matched
+  Git 2.56 full porcelain with a guard against reads below the base. Rebinding
+  the wire to ref generation or forcing old metadata reads failed the respective
+  controls. Mixed-parent ambiguity falls back to ordinary attribution. The fork
+  blame suite passed 91 tests and the focused application core suites passed 42.
+  This qualifies the core API, not a first, uncached request on a long history.

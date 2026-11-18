@@ -289,6 +289,43 @@ fn replacement_at_20k_base_matches_native_at_plus_one_and_plus_100() {
 }
 
 #[test]
+fn completed_candidate_checks_raw_path_without_reading_parent() {
+    let mut fixture = Fixture::new();
+    let path = b"dir/f\xff";
+    let parent = fixture.commit(&[(PATH, b"old\n", "100644")], &[], 1, b"Old\n", None);
+    let blob = fixture.insert(Kind::Blob, b"new\n");
+    let nested = fixture.tree(&[(b"f\xff", "100755", blob)]);
+    let tree = fixture.tree(&[(b"dir", "40000", nested), (PATH, "100644", blob)]);
+    let child = fixture.commit_tree(tree, &[parent], 2, b"Child\n", None);
+    let merge = fixture.commit_tree(tree, &[child, parent], 3, b"Merge\n", None);
+    let provider = fixture.provider();
+    let forbidden = BTreeSet::from([parent]);
+    let reads = ForbiddenReads::default();
+    let budget = CapacityBudget::new(64 * 1024 * 1024);
+    let session = open_guarded(&provider, &forbidden, &reads, &budget);
+
+    assert_eq!(
+        session
+            .completed_candidate_parent(BlameRequest {
+                commit: &child,
+                path
+            })
+            .unwrap(),
+        Some(parent),
+        "the edge comes from the child, not any singleton or unchanged-file proof"
+    );
+    for (commit, path) in [(&child, b"dir/f\xfe".as_slice()), (&merge, path.as_slice())] {
+        assert_eq!(
+            session
+                .completed_candidate_parent(BlameRequest { commit, path })
+                .unwrap(),
+            None
+        );
+    }
+    assert_eq!(reads.total(), 0, "discovery took a speculative parent read");
+}
+
+#[test]
 fn replacement_declines_uncertifiable_base_or_suffix() {
     let mut fixture = Fixture::new();
     let mut commit = |path: &[u8], lines: &[u8], parents: &[ObjectId], time| {

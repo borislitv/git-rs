@@ -268,7 +268,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: borislitv/gitoxide
-          ref: 0354c999d4845fa4415afc1b3728dcd96ec685ac
+          ref: d80e8c8f13952fef55fb8a387e64c9436537cecf
           path: .local/gitoxide
           persist-credentials: false
       - name: Check out the pinned owned codec source
