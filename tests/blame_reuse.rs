@@ -383,6 +383,9 @@ fn child(fixture: &source_support::Fixture, config: &CacheConfig, tip: &str, mod
     );
     if mode.starts_with("immutable-replacement-") {
         print!("{}", String::from_utf8_lossy(&out.stdout));
+        if mode.ends_with("-20k") {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        }
     }
 }
 

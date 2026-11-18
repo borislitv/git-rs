@@ -48,3 +48,10 @@
   returned an empty reply in an earlier local run. Bulk receive remains open.
   The 20,000-commit HTTP contract and wrong-signing-key control are part of the
   default owned gate's ignored-test inventory; their execution is tracked separately.
+- On [`03a8d7a`](https://github.com/borislitv/git-rs/actions/runs/44250571496/job/134628008683),
+  the eight-commit case passed with the wrong-key control: the wire stayed
+  native-exact and the request used ordinary attribution. The 20,000-commit
+  case hit its 120-second deadline during the cold base request, before either
+  advance. That fixture used a 1 MiB source cache, below a single full 4 MiB
+  source range. The next run uses the serving default 64 MiB for the long case
+  and logs phase timings, retaining the deadline and output/reuse assertions.

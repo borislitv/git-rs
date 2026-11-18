@@ -17,16 +17,32 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Default)]
 struct Trace {
     phases: Mutex<Vec<Phase>>,
     work: Mutex<Vec<WorkStatistics>>,
+    started: Option<Instant>,
 }
 impl Observer for Trace {
     fn observe(&self, phase: Phase, _: &Control) -> Result<()> {
+        if let Some(started) = self.started
+            && matches!(
+                phase,
+                Phase::SourceAcquired
+                    | Phase::WorkSetPrepared
+                    | Phase::BodyBuildClaimed
+                    | Phase::Staging
+                    | Phase::Complete
+            )
+        {
+            eprintln!(
+                "replacement phase={phase:?} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
         if matches!(
             phase,
             Phase::PreflightTip
@@ -43,6 +59,13 @@ impl Observer for Trace {
 
     fn work_completed(&self, warm: bool, stats: WorkStatistics, _: &Control) {
         assert!(!warm, "there is no push warmer in the serving probe");
+        if self.started.is_some() {
+            eprintln!(
+                "replacement work commits={} compute_ms={}",
+                stats.commits_traversed,
+                stats.elapsed.as_millis()
+            );
+        }
         self.work.lock().unwrap().push(stats);
     }
 }
@@ -74,7 +97,13 @@ fn get(engine: &Engine, slug: &str, commit: &str) -> Vec<u8> {
 }
 
 pub(super) fn serve(mode: &str, root: &Path, slug: &str, tip: &str) {
-    let trace = Arc::new(Trace::default());
+    let (mode, large_fixture) = mode
+        .strip_suffix("-20k")
+        .map_or((mode, false), |mode| (mode, true));
+    let trace = Arc::new(Trace {
+        started: large_fixture.then(Instant::now),
+        ..Trace::default()
+    });
     let signing_key = if mode == "replacement-wrong-key" {
         [8; 32]
     } else {
@@ -87,7 +116,12 @@ pub(super) fn serve(mode: &str, root: &Path, slug: &str, tip: &str) {
             .unwrap()
             .with_observer(trace.clone()),
         store: Store::from_env().unwrap(),
-        cache: Arc::new(Cache::new(1024 * 1024, 8 * 1024 * 1024)),
+        // Match the server's default 64 MiB for the large fixture. The
+        // 1 MiB small-case cache cannot admit a full 4 MiB source range.
+        cache: Arc::new(Cache::new(
+            if large_fixture { 64 } else { 1 } * 1024 * 1024,
+            8 * 1024 * 1024,
+        )),
         operation_seconds: if mode.starts_with("replacement-") {
             120
         } else {
@@ -212,6 +246,15 @@ fn signed_replacement_restart(base_commits: usize, check_wrong_key: bool) {
     let fixture = Fixture::new(Blame::default(), 128);
     let config = config();
     let root = fixture.root.join("native");
+    let probe = |tip: &str, mode: &str| {
+        let scale = if base_commits == 20_000 { "-20k" } else { "" };
+        child(
+            &fixture,
+            &config,
+            tip,
+            &format!("immutable-replacement-{mode}{scale}"),
+        );
+    };
     let server = HttpServer::start_with_seconds(&fixture, &config, false, "90");
     let url = format!("http://{}/{}.git", server.address, fixture.slug);
     let push = |label: &str, tip: &str| {
@@ -232,25 +275,20 @@ fn signed_replacement_restart(base_commits: usize, check_wrong_key: bool) {
     let base = replace_history(&root, &fixture.commit, 1, base_commits - 1);
     // Initial fixture loading is separate from the measured pushes and reads.
     super::publish_history(&fixture, &base);
-    child(&fixture, &config, &base, "immutable-replacement-base");
+    probe(&base, "base");
     let one = replace_history(&root, &base, base_commits, 1);
     push("+1", &one);
-    child(&fixture, &config, &one, "immutable-replacement-hit-1");
+    probe(&one, "hit-1");
     let hundred = replace_history(&root, &one, base_commits + 1, 99);
     // Use the production catalog transaction with an independently generated
     // pack for the bulk advance. The +1 case exercises native HTTP receive;
     // the larger fixture isolates serving from receive throughput and limits.
     super::publish_history_from(&fixture, &one, &hundred);
-    child(&fixture, &config, &hundred, "immutable-replacement-hit-100");
+    probe(&hundred, "hit-100");
     if check_wrong_key {
         // Same cache owner, namespace and source. Only the signer changes;
         // the known-ready base seed must now fall back to normal attribution.
-        child(
-            &fixture,
-            &config,
-            &hundred,
-            "immutable-replacement-wrong-key",
-        );
+        probe(&hundred, "wrong-key");
     }
     assert_eq!(fixture.leases(), 0);
 }
