@@ -4,19 +4,26 @@ set -euo pipefail
 
 phase=$1 action=$2
 case "$phase" in
-    inputs) targets=(codec-base toolchain build-inputs) ;;
-    final) targets=(test-fixture-build test release test-server) ;;
+    inputs)
+        targets=(codec-base toolchain build-inputs)
+        directory="$GITHUB_WORKSPACE/.local/blame-image-inputs"
+        build_options=(--azure-archive)
+        ;;
+    compiled)
+        targets=(build)
+        directory="$GITHUB_WORKSPACE/.local/blame-image-compiled"
+        build_options=(--prepared "$GITHUB_WORKSPACE/.local/blame-image-inputs")
+        ;;
+    final)
+        targets=(test-fixture-build test release test-server)
+        directory="$GITHUB_WORKSPACE/.local/blame-images"
+        build_options=(--prepared "$GITHUB_WORKSPACE/.local/blame-image-compiled")
+        ;;
     *) exit 2 ;;
 esac
 tag="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 [[ $tag =~ ^[0-9]+-[0-9]+$ ]]
 slice="git-rs-blame-images-$phase-$tag.slice"
-directory="$GITHUB_WORKSPACE/.local/blame-images"
-build_options=(--prepared "$GITHUB_WORKSPACE/.local/blame-image-inputs")
-if [[ $phase == inputs ]]; then
-    directory="$GITHUB_WORKSPACE/.local/blame-image-inputs"
-    build_options=(--azure-archive)
-fi
 
 case "$action" in
     build)

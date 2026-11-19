@@ -74,7 +74,7 @@ class ImageTests(unittest.TestCase):
         with patch.object(images, "output", side_effect=output), \
                 patch.object(images, "run", side_effect=lambda argv, **kw: calls.append(argv)), \
                 patch("sys.stdout", new=io.StringIO()):
-            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, inputs=False))
+            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, bundle="final"))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][:3], ["docker", "image", "load"])
         self.assertEqual(env_file.read_text(), "BLAME_GATE_BUILDER_IMAGE=" + manifest["images"]["test-fixture-build"]
@@ -89,13 +89,13 @@ class ImageTests(unittest.TestCase):
         with patch.object(images, "output", side_effect=lambda argv, **kw:
                           self.commit if argv[0] == "git" else argv[-1]), \
                 patch.object(images, "run"), patch("sys.stdout", new=io.StringIO()):
-            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, inputs=False))
+            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, bundle="final"))
         self.assertIn(manifest["images"]["test"], env_file.read_text())
 
     def test_classic_save_by_id_keeps_every_config_even_with_partial_oci_index(self):
         manifest = self.bundle(oci=True, partial_index=True)
         env_file = self.directory / "environment"
-        args = SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, inputs=False)
+        args = SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, bundle="final")
         with patch.object(images, "output", side_effect=lambda argv, **kw:
                           self.commit if argv[0] == "git" else argv[-1]), \
                 patch.object(images, "run") as run, patch("sys.stdout", new=io.StringIO()):
@@ -128,7 +128,7 @@ class ImageTests(unittest.TestCase):
                         patch.object(images, "run") as run:
                     with self.assertRaises(ValueError):
                         images.load(SimpleNamespace(directory=self.directory, commit=self.commit,
-                                                    env_file=env_file, inputs=False))
+                                                     env_file=env_file, bundle="final"))
                 run.assert_not_called()
                 self.assertFalse(env_file.exists())
 
@@ -246,9 +246,9 @@ class ImageTests(unittest.TestCase):
                 images.build(args)
             run.assert_not_called()
 
-    def test_prepared_input_inventory_is_not_accepted_as_the_final_bundle(self):
+    def test_acquisition_archive_cannot_substitute_for_compilation_or_final_images(self):
         self.bundle(oci=True, targets=images.INPUT_TARGETS)
-        input_args = SimpleNamespace(directory=self.directory, commit=self.commit, env_file=None, inputs=True)
+        input_args = SimpleNamespace(directory=self.directory, commit=self.commit, env_file=None, bundle="inputs")
         final_env = self.directory / "environment"
         with patch.object(images, "output", side_effect=lambda argv, **kw:
                           self.commit if argv[0] == "git" else argv[-1]), \
@@ -256,14 +256,19 @@ class ImageTests(unittest.TestCase):
             images.load(input_args)
             with self.assertRaisesRegex(ValueError, "wrong image targets"):
                 images.load(SimpleNamespace(directory=self.directory, commit=self.commit,
-                                             env_file=final_env, inputs=False))
+                                             env_file=None, bundle="compiled"))
+            with self.assertRaisesRegex(ValueError, "wrong image targets"):
+                images.load(SimpleNamespace(directory=self.directory, commit=self.commit,
+                                             env_file=final_env, bundle="final"))
         self.assertEqual(run.call_count, 1)
         self.assertFalse(final_env.exists())
 
-    def test_resumed_builder_uses_exact_local_inputs_and_refuses_wrong_image(self):
+    def test_resumed_builder_uses_the_correct_stage_inventory(self):
         manifest = self.bundle(targets=images.INPUT_TARGETS)
+        compiled = {key: manifest["images"][key] for key in ("codec-base", "toolchain")}
+        compiled["build"] = "sha256:" + "d" * 64
         args = SimpleNamespace(unit="unit", slice=self.slice, directory=self.directory,
-                               prepared=self.directory, target="test", tag="local/fixture:test", azure_archive=False)
+                               prepared=self.directory, target="build", tag="local/fixture:build", azure_archive=False)
         help_text = "--file --cgroup-parent --cpu-period --cpu-quota --cpuset-cpus --memory-swap --force-rm --iidfile --network --target"
         tags, builds = {}, []
 
@@ -284,20 +289,29 @@ class ImageTests(unittest.TestCase):
                 patch.object(images, "output", side_effect=output), patch.object(images, "run", side_effect=run), \
                 patch.object(images, "cleanup"):
             images.build(args)
+            args.target, args.tag = "test", "local/fixture:test"
+            with self.assertRaisesRegex(ValueError, "wrong image targets"):
+                images.build(args)
+            (self.directory / "manifest.json").write_text(json.dumps(dict(manifest, images=compiled)))
+            images.build(args)
             # A consumer on a different daemon must fail before attempting a build.
             args.target = "release"
             with patch.object(images, "output", side_effect=lambda argv, **kw:
                               help_text if argv[-1] == "--help" else "sha256:" + "0" * 64):
                 with self.assertRaisesRegex(ValueError, "prepared image identity mismatch"):
                     images.build(args)
-        [(argv, recipe)] = builds
+        [(compile_argv, compile_recipe), (argv, recipe)] = builds
+        self.assertEqual(compile_argv[compile_argv.index("--target") + 1], "build")
+        self.assertIn(b"RUN cargo build --release --offline --locked ", compile_recipe)
         self.assertEqual(argv[argv.index("--file") + 1], "-")
         self.assertNotIn(b"apt-get update", recipe)
         self.assertNotIn(b"cargo fetch", recipe)
+        self.assertNotIn(b"RUN cargo build --release --offline --locked \\", recipe)
+        self.assertIn(b"FROM build AS test-fixture-build", recipe)
         self.assertIn(b"apt-get --no-download autoremove", recipe)
         self.assertIn(b"FROM client-oracle AS test", recipe)
         self.assertIn(b"FROM runtime AS release", recipe)
-        for target, identity in manifest["images"].items():
+        for target, identity in compiled.items():
             [tag] = [tag for tag, value in tags.items() if value == identity]
             self.assertIn(f"FROM {tag} AS {target}\n".encode(), recipe)
 

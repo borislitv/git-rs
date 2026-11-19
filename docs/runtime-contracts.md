@@ -19,12 +19,12 @@ descriptors/config identities before exporting the
 IDs. A mutable tag is never the identity recorded by a measured phase. Runtime,
 fixture and oracle roles must be distinct and revision-matched.
 
-The preparatory `build-inputs` target audits and fetches the locked sources before
-the offline release/fixture builds. It is not a fifth runtime role and is not part
-of the exported four-image inventory. Each preparation/build invocation retains
-its independent deadline and worker limits; splitting preparation does not attest
-that a cold hosted job fits its overall timeout. Cleanup tolerates only exact
-owned-worker removal races and confirms an empty slice within its original budget.
+The preparatory `build-inputs` target audits and fetches the locked sources. A
+separate job compiles the offline `build` target and transfers its image with the
+same OS and toolchain images. Fixture assembly starts from that exact compiled
+image. Neither preparatory inventory is accepted as the four-role runtime
+archive. Each build invocation retains its deadline and worker limits. Cleanup
+confirms an empty owned slice within its original budget.
 
 ## Independent bounds and ownership
 

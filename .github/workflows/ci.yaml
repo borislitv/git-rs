@@ -61,8 +61,8 @@ jobs:
             .local/derived-cache-*/report.json
             .local/derived-cache-*/*.log
             .local/derived-cache-*/*.stderr
-  # Keep network acquisition and native compilation in separate bounded jobs.
-  # The next runner resumes from the exact checked-out build input images.
+  # Bound acquisition, release compilation, and fixture image creation separately.
+  # Each runner starts from the exact images from the previous phase.
   blame-image-inputs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -76,7 +76,7 @@ jobs:
         if: always()
         run: bash tests/blame_image_workers.sh inputs cleanup
       - name: Export the three immutable input images with commit and archive identity
-        run: python3 -B tests/blame_images.py export --inputs --directory .local/blame-image-inputs --commit "$GITHUB_SHA"
+        run: python3 -B tests/blame_images.py export --bundle inputs --directory .local/blame-image-inputs --commit "$GITHUB_SHA"
       - name: Upload this run and attempt's exact input archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -88,7 +88,7 @@ jobs:
           path: |
             .local/blame-image-inputs/images.tar
             .local/blame-image-inputs/manifest.json
-  blame-images:
+  blame-image-compile:
     needs: blame-image-inputs
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -99,7 +99,37 @@ jobs:
           name: blame-image-inputs-${{ github.run_id }}-${{ github.run_attempt }}
           path: .local/blame-image-inputs
       - name: Verify and load exact OS, Rust and Cargo input images
-        run: python3 -B tests/blame_images.py load --inputs --directory .local/blame-image-inputs --commit "$GITHUB_SHA"
+        run: python3 -B tests/blame_images.py load --bundle inputs --directory .local/blame-image-inputs --commit "$GITHUB_SHA"
+      - name: Compile the locked offline release in its own bounded worker
+        run: bash tests/blame_image_workers.sh compiled build
+      - name: Stop only owned release build workers
+        if: always()
+        run: bash tests/blame_image_workers.sh compiled cleanup
+      - name: Export the release builder and its exact OS and toolchain images
+        run: python3 -B tests/blame_images.py export --bundle compiled --prepared .local/blame-image-inputs --directory .local/blame-image-compiled --commit "$GITHUB_SHA"
+      - name: Upload this run and attempt's exact compiled archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blame-image-compiled-${{ github.run_id }}-${{ github.run_attempt }}
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            .local/blame-image-compiled/images.tar
+            .local/blame-image-compiled/manifest.json
+  blame-images:
+    needs: blame-image-compile
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: blame-image-compiled-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/blame-image-compiled
+      - name: Verify and load the exact compiled release builder
+        run: python3 -B tests/blame_images.py load --bundle compiled --directory .local/blame-image-compiled --commit "$GITHUB_SHA"
       - name: Build exact builder, oracle and Git-free server targets with bounded workers
         run: bash tests/blame_image_workers.sh final build
       - name: Stop only owned legacy image workers

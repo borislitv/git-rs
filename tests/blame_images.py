@@ -15,7 +15,9 @@ import blame_gate as gate
 ROOT = gate.ROOT
 TARGETS = ("test-fixture-build", "test", "release", "test-server")
 INPUT_TARGETS = ("codec-base", "toolchain", "build-inputs")
-BUILD_TARGETS = (*INPUT_TARGETS, *TARGETS)
+COMPILED_TARGETS = ("codec-base", "toolchain", "build")
+BUNDLES = {"inputs": INPUT_TARGETS, "compiled": COMPILED_TARGETS, "final": TARGETS}
+BUILD_TARGETS = (*INPUT_TARGETS, "build", *TARGETS)
 ENV = dict(os.environ, DOCKER_BUILDKIT="0", DOCKER_HOST="unix:///var/run/docker.sock")
 ENV.pop("DOCKER_CONTEXT", None)
 
@@ -101,16 +103,19 @@ def manifest_ids(directory, revision, targets):
     return manifest, ids
 
 
-def build_recipe(directory, revision):
-    _, ids = manifest_ids(directory, revision, INPUT_TARGETS)
+def build_recipe(directory, revision, target):
+    gate.require(target == "build" or target in TARGETS, "invalid prepared build target")
+    compiling = target == "build"
+    _, ids = manifest_ids(directory, revision, INPUT_TARGETS if compiling else COMPILED_TARGETS)
     runtime = b"FROM codec-base AS runtime-base\n"
     toolchain = b"FROM codec-base AS toolchain\n"
     build_stage = b"FROM build-inputs AS build\n"
+    fixture_stage = b"FROM build AS test-fixture-build\n"
     data = (ROOT / "Dockerfile").read_bytes()
-    boundaries = (runtime, toolchain, build_stage)
+    boundaries = (runtime, toolchain, build_stage, fixture_stage)
     gate.require(all(data.count(line) == 1 for line in boundaries), "image phase boundary changed")
-    a, b, c = (data.index(line) for line in boundaries)
-    gate.require(a < b < c, "image phase boundaries are out of order")
+    a, b, c, d = (data.index(line) for line in boundaries)
+    gate.require(a < b < c < d, "image phase boundaries are out of order")
     tags = {}
     for target, identity in ids.items():
         # Use local content-specific names for the legacy Dockerfile parser.
@@ -120,9 +125,10 @@ def build_recipe(directory, revision):
         gate.require(output(["docker", "image", "inspect", "--format", "{{.Id}}", tag]) == identity,
                      "prepared image identity mismatch")
         tags[target] = tag
+    dependency, start = ("build-inputs", c) if compiling else ("build", d)
     return (f"FROM {tags['codec-base']} AS codec-base\n".encode() + data[a:b]
             + f"FROM {tags['toolchain']} AS toolchain\n".encode()
-            + f"FROM {tags['build-inputs']} AS build-inputs\n\n".encode() + data[c:])
+            + f"FROM {tags[dependency]} AS {dependency}\n\n".encode() + data[start:])
 
 
 def build(args):
@@ -140,9 +146,9 @@ def build(args):
     mirror = ["--build-arg", "GIT_RS_CI_AZURE_ARCHIVE=1"] if args.azure_archive else []
     recipe = None
     if args.prepared is not None:
-        gate.require(args.target in TARGETS and not args.azure_archive, "prepared input builds require a final image role")
+        gate.require(not args.azure_archive, "prepared builds cannot acquire a new OS base")
         gate.require("--file" in help_text, "legacy Docker build does not support --file")
-        recipe = build_recipe(args.prepared, revision)
+        recipe = build_recipe(args.prepared, revision, args.target)
     dockerfile = ["--file", "-"] if recipe is not None else []
     try:
         run(["docker", "build", *dockerfile, "--target", args.target, "--tag", args.tag,
@@ -158,9 +164,13 @@ def build(args):
 
 def export(args):
     revision = commit(args.commit)
-    targets = INPUT_TARGETS if args.inputs else TARGETS
-    ids = {target: image_id((args.directory / (target + ".iid")).read_text().strip())
-           for target in targets}
+    targets = BUNDLES[args.bundle]
+    gate.require((args.prepared is not None) == (args.bundle == "compiled"),
+                 "only the compiled bundle inherits prepared images")
+    inherited = manifest_ids(args.prepared, revision, INPUT_TARGETS)[1] if args.prepared is not None else {}
+    ids = {target: inherited[target] if target in inherited
+           else image_id((args.directory / (target + ".iid")).read_text().strip()) for target in targets}
+    gate.require(len(set(ids.values())) == len(targets), "image targets must be distinct")
     archive = args.directory / "images.tar"
     gate.require(not archive.exists(), "image archive already exists")
     run(["docker", "image", "save", "--output", archive, *ids.values()], timeout=180, check=True)
@@ -173,8 +183,8 @@ def export(args):
 
 def load(args):
     revision = commit(args.commit)
-    targets = INPUT_TARGETS if args.inputs else TARGETS
-    gate.require(args.inputs == (args.env_file is None), "only final image loads export an environment")
+    targets = BUNDLES[args.bundle]
+    gate.require((args.bundle == "final") == (args.env_file is not None), "only final image loads export an environment")
     manifest, ids = manifest_ids(args.directory, revision, targets)
     archive = args.directory / "images.tar"
     gate.require(archive.stat().st_size == manifest["archive_bytes"]
@@ -241,9 +251,11 @@ def main():
         command = sub.add_parser(action)
         command.add_argument("--directory", type=Path, required=True)
         command.add_argument("--commit", required=True)
-        command.add_argument("--inputs", action="store_true")
+        command.add_argument("--bundle", choices=BUNDLES, default="final")
         if action == "load":
             command.add_argument("--env-file", type=Path)
+        else:
+            command.add_argument("--prepared", type=Path)
     cleaner = sub.add_parser("cleanup")
     cleaner.add_argument("--slice", required=True)
     args = parser.parse_args()
