@@ -124,7 +124,8 @@ class Fixture:
         labels = ["--label", "git-rs.cache-fixture=" + self.identity]
         if os.environ.get("GIT_RS_TEST_OWNER_LABEL"):
             labels += ["--label", os.environ["GIT_RS_TEST_OWNER_LABEL"]]
-        cid = run(["docker", "run", "-d", *labels, "--cpuset-cpus", self.cpus,
+        pull = ["--pull=never"] if os.environ.get("GIT_RS_TEST_CACHE_PRELOADED_IMAGES") == "1" else []
+        cid = run(["docker", "run", "-d", *pull, *labels, "--cpuset-cpus", self.cpus,
                    "--cpus", str(cpus), "--memory", memory, "--memory-swap", memory,
                    "--pids-limit", str(pids), *arguments]).stdout.decode().strip()
         self.containers.append(cid)

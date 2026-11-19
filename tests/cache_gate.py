@@ -12,6 +12,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 FAILURE_EXCERPT_BYTES = 16 * 1024
+HOST_DOCKER = "unix:///var/run/docker.sock"
 
 
 def failed_child_excerpt(log, env, error, elapsed):
@@ -46,13 +47,31 @@ def owner_label():
     return "git-rs.cache-gate=" + invocation
 
 
+def docker_environment():
+    env = dict(os.environ, DOCKER_HOST=HOST_DOCKER)
+    env.pop("DOCKER_CONTEXT", None)
+    return env
+
+
+def prepare_images():
+    from integration import PG_IMAGE, S3_IMAGE
+
+    env = docker_environment()
+    for image in (PG_IMAGE, S3_IMAGE):
+        started = time.monotonic()
+        print(f"Pulling pinned cache fixture image {image}", flush=True)
+        subprocess.run(["docker", "pull", image], env=env, check=True, timeout=120)
+        print(f"Cache fixture image ready in {time.monotonic() - started:.3f}s", flush=True)
+
+
 def cleanup(label):
     command = ["docker", "ps", "-aq", "--filter", "label=" + label]
-    ids = subprocess.run(command, check=True, capture_output=True, text=True,
+    env = docker_environment()
+    ids = subprocess.run(command, env=env, check=True, capture_output=True, text=True,
                          timeout=10).stdout.split()
     if ids:
-        subprocess.run(["docker", "rm", "-f", *ids], check=True, timeout=20)
-    if subprocess.run(command, check=True, capture_output=True, timeout=10).stdout.strip():
+        subprocess.run(["docker", "rm", "-f", *ids], env=env, check=True, timeout=20)
+    if subprocess.run(command, env=env, check=True, capture_output=True, timeout=10).stdout.strip():
         raise RuntimeError("owned cache containers remain after cleanup")
 
 
@@ -107,7 +126,9 @@ def run(args, label):
         ("--budget-contract-binary", "cache_budget"))]
     directory = ROOT / ".local" / ("cache-gate-" + os.environ["INVOCATION_ID"])
     directory.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ, GIT_RS_TEST_OWNER_LABEL=label)
+    env = dict(docker_environment(), GIT_RS_TEST_OWNER_LABEL=label)
+    if args.preloaded_images:
+        env["GIT_RS_TEST_CACHE_PRELOADED_IMAGES"] = "1"
     common = ["--provision", "--binary", str(binary), "--process-binary", str(example)]
     deadline = time.monotonic() + 840
     commands = [
@@ -138,10 +159,14 @@ def run(args, label):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("run", "cleanup"))
+    parser.add_argument("command", choices=("run", "cleanup", "prepare-images"))
     parser.add_argument("--target-dir", type=Path,
                         default=Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")))
+    parser.add_argument("--preloaded-images", action="store_true")
     args = parser.parse_args()
+    if args.command == "prepare-images":
+        prepare_images()
+        return
     label = owner_label()
     if args.command == "cleanup":
         cleanup(label)

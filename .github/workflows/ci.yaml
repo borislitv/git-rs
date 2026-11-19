@@ -24,6 +24,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config postgresql-client curl
           python3 -B tests/cache_gate_test.py
           make cache-build
+      - name: Prepare pinned PostgreSQL and S3 fixture images
+        run: python3 -B tests/cache_gate.py prepare-images
       - name: Independent PostgreSQL cache, failure and storage-cost gates
         run: |
           cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
@@ -36,7 +38,7 @@ jobs:
             --property="AllowedCPUs=$cpus" \
             --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/cache_gate.py cleanup" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
-            /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/cache_gate.py" run --target-dir "$GITHUB_WORKSPACE/target"
+            /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/cache_gate.py" run --preloaded-images --target-dir "$GITHUB_WORKSPACE/target"
       - name: Remove owned cache fixtures
         if: always()
         run: |

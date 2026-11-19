@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -31,10 +32,10 @@ class CacheGateTests(unittest.TestCase):
         self.invocation = "a" * 32
         self.directory = self.root / ".local" / ("cache-gate-" + self.invocation)
 
-    def invoke(self, output):
+    def invoke(self, output, *options):
         with patch.object(cache_gate, "ROOT", self.root), patch.dict(os.environ, {
                 "INVOCATION_ID": self.invocation, "SYNTHETIC_TEST_TOKEN": "synthetic-redaction-marker"}), \
-                patch("sys.argv", ["cache_gate.py", "run", "--target-dir", str(self.root / "target")]), \
+                patch("sys.argv", ["cache_gate.py", "run", "--target-dir", str(self.root / "target"), *options]), \
                 patch.object(cache_gate.signal, "signal"), \
                 patch.object(cache_gate, "cleanup") as cleanup, contextlib.redirect_stdout(output):
             try:
@@ -82,6 +83,34 @@ class CacheGateTests(unittest.TestCase):
         for index in range(3):
             self.assertEqual((self.directory / f"{index}.log").read_text(), "synthetic success\n")
         self.assertNotIn("cache-gate | ", output.getvalue())
+
+    def test_preloaded_gate_cannot_pull_at_fixture_creation(self):
+        from derived_cache import Fixture
+        from integration import S3_IMAGE
+
+        # Model a daemon where a pinned image can only be started locally;
+        # creating it with a pull-capable policy is forbidden in measurement.
+        calls = []
+
+        def local_only(argv):
+            self.assertEqual(argv[-1], S3_IMAGE)
+            self.assertIn("--pull=never", argv)
+            calls.append(argv)
+            return SimpleNamespace(stdout=b"fixture-id\n")
+
+        with patch.object(Fixture, "__init__", return_value=None), \
+                patch("derived_cache.run", side_effect=local_only), \
+                patch.dict(os.environ, {"GIT_RS_TEST_CACHE_PRELOADED_IMAGES": "1"}):
+            fixture = Fixture(None)
+            fixture.identity, fixture.cpus, fixture.containers = "synthetic", "0,1", []
+            self.assertEqual(fixture.container("256m", .25, 32, [S3_IMAGE]), "fixture-id")
+            self.assertEqual(fixture.containers, ["fixture-id"])
+        self.assertEqual(len(calls), 1)
+        suite = self.root / "tests" / "derived_cache.py"
+        suite.write_text("import os\n"
+                         "assert os.environ['GIT_RS_TEST_CACHE_PRELOADED_IMAGES'] == '1'\n"
+                         "assert os.environ['DOCKER_HOST'] == 'unix:///var/run/docker.sock'\n")
+        self.invoke(io.StringIO(), "--preloaded-images")
 
 
 if __name__ == "__main__":
