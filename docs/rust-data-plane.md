@@ -218,12 +218,13 @@ explicit owned fixtures. The split job wires `tests/blame_artifacts.py` for
 contracts/faults/migration; its legacy phase requires real old binaries and their
 verified hashes. An ordinary green workspace test is not migration evidence.
 
-CI now separates `blame-images` from `blame`: each job retains a 20-minute ceiling.
-The former uses bounded Docker workers for four commit-bound image roles, then
-saves their immutable IDs in one uncompressed layer-deduplicated archive.
-The same workflow/run/attempt artifact contains its SHA256 and current commit;
-the latter job verifies archive descriptor/config image IDs and checkout before
-loading, then retains separate 900-second preparation and measurement units.
+CI separates `blame-image-inputs`, `blame-images` and `blame`; each job has a
+20-minute ceiling. The input job acquires the OS, Rust and locked Cargo inputs.
+The next runner verifies their image IDs and resumes the same Dockerfile stages
+from those exact local images. It saves the four final roles in one uncompressed
+layer-deduplicated archive. Both workflow/run/attempt artifacts bind the archive
+SHA256, Dockerfile and checkout. The `blame` job verifies the final image IDs
+before loading and retains separate 900-second preparation and measurement units.
 Image-build/Cargo downloads and existing runtime fixtures use host networking; image
 inspection remains offline. Exact-HEAD qualification must retain real artifact
 transport, inventory, outcomes and cleanup evidence. Historical success is not a

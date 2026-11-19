@@ -14,7 +14,8 @@ import blame_gate as gate
 
 ROOT = gate.ROOT
 TARGETS = ("test-fixture-build", "test", "release", "test-server")
-BUILD_TARGETS = ("build-inputs", *TARGETS)
+INPUT_TARGETS = ("codec-base", "toolchain", "build-inputs")
+BUILD_TARGETS = (*INPUT_TARGETS, *TARGETS)
 ENV = dict(os.environ, DOCKER_BUILDKIT="0", DOCKER_HOST="unix:///var/run/docker.sock")
 ENV.pop("DOCKER_CONTEXT", None)
 
@@ -88,6 +89,42 @@ def image_id(value):
     return value
 
 
+def manifest_ids(directory, revision, targets):
+    manifest_file = directory / "manifest.json"
+    gate.require(manifest_file.stat().st_size <= 64 * 1024, "image bundle manifest too large")
+    manifest = json.loads(manifest_file.read_text())
+    gate.require(manifest["format"] == 2 and manifest["commit"] == revision, "wrong image bundle commit")
+    gate.require(manifest["dockerfile_sha256"] == gate.digest(ROOT / "Dockerfile"), "wrong Dockerfile")
+    gate.require(set(manifest["images"]) == set(targets), "wrong image targets")
+    ids = {target: image_id(manifest["images"][target]) for target in targets}
+    gate.require(len(set(ids.values())) == len(targets), "image targets must be distinct")
+    return manifest, ids
+
+
+def build_recipe(directory, revision):
+    _, ids = manifest_ids(directory, revision, INPUT_TARGETS)
+    runtime = b"FROM codec-base AS runtime-base\n"
+    toolchain = b"FROM codec-base AS toolchain\n"
+    build_stage = b"FROM build-inputs AS build\n"
+    data = (ROOT / "Dockerfile").read_bytes()
+    boundaries = (runtime, toolchain, build_stage)
+    gate.require(all(data.count(line) == 1 for line in boundaries), "image phase boundary changed")
+    a, b, c = (data.index(line) for line in boundaries)
+    gate.require(a < b < c, "image phase boundaries are out of order")
+    tags = {}
+    for target, identity in ids.items():
+        # Use local content-specific names for the legacy Dockerfile parser.
+        # The imported identity must still exist, including after `load`.
+        tag = f"git-rs-verified-input:{target}-{identity.removeprefix('sha256:')}"
+        run(["docker", "image", "tag", identity, tag], check=True)
+        gate.require(output(["docker", "image", "inspect", "--format", "{{.Id}}", tag]) == identity,
+                     "prepared image identity mismatch")
+        tags[target] = tag
+    return (f"FROM {tags['codec-base']} AS codec-base\n".encode() + data[a:b]
+            + f"FROM {tags['toolchain']} AS toolchain\n".encode()
+            + f"FROM {tags['build-inputs']} AS build-inputs\n\n".encode() + data[c:])
+
+
 def build(args):
     gate.verify_unit(args.unit, slice_name(args.slice),
                      cleanup_command="blame_images.py cleanup --slice " + args.slice)
@@ -101,13 +138,19 @@ def build(args):
     gate.require(not iid.exists(), "image identity already exists")
     cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
     mirror = ["--build-arg", "GIT_RS_CI_AZURE_ARCHIVE=1"] if args.azure_archive else []
+    recipe = None
+    if args.prepared is not None:
+        gate.require(args.target in TARGETS and not args.azure_archive, "prepared input builds require a final image role")
+        gate.require("--file" in help_text, "legacy Docker build does not support --file")
+        recipe = build_recipe(args.prepared, revision)
+    dockerfile = ["--file", "-"] if recipe is not None else []
     try:
-        run(["docker", "build", "--target", args.target, "--tag", args.tag,
+        run(["docker", "build", *dockerfile, "--target", args.target, "--tag", args.tag,
              "--build-arg", "VCS_REF=" + revision, *mirror,
              "--network", "host", "--cgroup-parent", args.slice, "--cpuset-cpus", cpus,
              "--cpu-period", "100000", "--cpu-quota", "180000", "--memory", "3712m",
              "--memory-swap", "3712m", "--force-rm", "--iidfile", iid, ROOT],
-            timeout=840, check=True)
+            timeout=840, check=True, input=recipe)
         image_id(iid.read_text().strip())
     finally:
         cleanup(args.slice)
@@ -115,8 +158,9 @@ def build(args):
 
 def export(args):
     revision = commit(args.commit)
+    targets = INPUT_TARGETS if args.inputs else TARGETS
     ids = {target: image_id((args.directory / (target + ".iid")).read_text().strip())
-           for target in TARGETS}
+           for target in targets}
     archive = args.directory / "images.tar"
     gate.require(not archive.exists(), "image archive already exists")
     run(["docker", "image", "save", "--output", archive, *ids.values()], timeout=180, check=True)
@@ -129,14 +173,9 @@ def export(args):
 
 def load(args):
     revision = commit(args.commit)
-    manifest_file = args.directory / "manifest.json"
-    gate.require(manifest_file.stat().st_size <= 64 * 1024, "image bundle manifest too large")
-    manifest = json.loads(manifest_file.read_text())
-    gate.require(manifest["format"] == 2 and manifest["commit"] == revision, "wrong image bundle commit")
-    gate.require(manifest["dockerfile_sha256"] == gate.digest(ROOT / "Dockerfile"), "wrong Dockerfile")
-    gate.require(set(manifest["images"]) == set(TARGETS), "wrong image targets")
-    ids = {target: image_id(manifest["images"][target]) for target in TARGETS}
-    gate.require(len(set(ids.values())) == len(TARGETS), "image targets must be distinct")
+    targets = INPUT_TARGETS if args.inputs else TARGETS
+    gate.require(args.inputs == (args.env_file is None), "only final image loads export an environment")
+    manifest, ids = manifest_ids(args.directory, revision, targets)
     archive = args.directory / "images.tar"
     gate.require(archive.stat().st_size == manifest["archive_bytes"]
                  and gate.digest(archive) == manifest["archive_sha256"], "image archive checksum mismatch")
@@ -148,18 +187,19 @@ def load(args):
             gate.require(member.isfile() and 0 <= member.size <= limit, "invalid archive metadata")
             return stream.extractfile(member).read()
         records = json.loads(metadata("manifest.json", 64 * 1024))
-        gate.require(len(records) == len(TARGETS) and all(not row.get("RepoTags") for row in records),
+        gate.require(len(records) == len(targets) and all(not row.get("RepoTags") for row in records),
                      "archive must contain exactly the declared untagged image IDs")
         actual = {"sha256:" + hashlib.sha256(metadata(row["Config"], 1024 * 1024)).hexdigest()
                   for row in records}
         identities = [actual]
         if "index.json" in stream.getnames():
             # Docker's containerd image store exposes the OCI manifest digest
-            # as .Id; the classic store uses the config digest. Validate both
-            # archive representations, then require the daemon's exact ID below.
+            # as .Id. Classic save-by-ID can include a partial OCI index, but
+            # still lists every config in manifest.json. A partial index cannot
+            # authorize any OCI-manifest-addressed inventory.
             index = json.loads(metadata("index.json", 64 * 1024))
             descriptors = index["manifests"]
-            gate.require(len(descriptors) == len(TARGETS), "wrong OCI image inventory")
+            gate.require(len(descriptors) <= len(targets), "wrong OCI image inventory")
             configs, manifests = set(), set()
             for descriptor in descriptors:
                 identity = image_id(descriptor["digest"])
@@ -168,19 +208,21 @@ def load(args):
                              "OCI manifest digest mismatch")
                 configs.add(json.loads(data)["config"]["digest"])
                 manifests.add(identity)
-            gate.require(configs == actual, "OCI configs differ from archive inventory")
-            identities.append(manifests)
+            gate.require(configs <= actual, "OCI configs differ from archive inventory")
+            if configs == actual and len(manifests) == len(targets):
+                identities.append(manifests)
     gate.require(set(ids.values()) in identities, "archive image IDs differ from declaration")
     run(["docker", "image", "load", "--input", archive], timeout=180, check=True)
     for identity in ids.values():
         gate.require(output(["docker", "image", "inspect", "--format", "{{.Id}}", identity]) == identity,
                      "loaded image identity mismatch")
-    with args.env_file.open("a") as stream:
-        stream.write("BLAME_GATE_BUILDER_IMAGE=" + ids["test-fixture-build"] + "\n")
-        stream.write("BLAME_GATE_IMAGE=" + ids["test"] + "\n")
-        stream.write("GIT_RS_TEST_RUNTIME_IMAGE=" + ids["release"] + "\n")
-        stream.write("GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE=" + ids["test-server"] + "\n")
-        stream.write("GIT_RS_TEST_REVISION=" + revision + "\n")
+    if args.env_file is not None:
+        with args.env_file.open("a") as stream:
+            stream.write("BLAME_GATE_BUILDER_IMAGE=" + ids["test-fixture-build"] + "\n")
+            stream.write("BLAME_GATE_IMAGE=" + ids["test"] + "\n")
+            stream.write("GIT_RS_TEST_RUNTIME_IMAGE=" + ids["release"] + "\n")
+            stream.write("GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE=" + ids["test-server"] + "\n")
+            stream.write("GIT_RS_TEST_REVISION=" + revision + "\n")
     print(json.dumps({"verified_commit": revision, "images": ids}))
 
 
@@ -194,12 +236,14 @@ def main():
     builder.add_argument("--slice", required=True)
     builder.add_argument("--directory", type=Path, required=True)
     builder.add_argument("--azure-archive", action="store_true")
+    builder.add_argument("--prepared", type=Path)
     for action in ("export", "load"):
         command = sub.add_parser(action)
         command.add_argument("--directory", type=Path, required=True)
         command.add_argument("--commit", required=True)
+        command.add_argument("--inputs", action="store_true")
         if action == "load":
-            command.add_argument("--env-file", type=Path, required=True)
+            command.add_argument("--env-file", type=Path)
     cleaner = sub.add_parser("cleanup")
     cleaner.add_argument("--slice", required=True)
     args = parser.parse_args()

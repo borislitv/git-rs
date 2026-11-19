@@ -23,11 +23,11 @@ class ImageTests(unittest.TestCase):
         self.commit = "a" * 40
         self.slice = "git-rs-blame-images-fixture1234.slice"
 
-    def bundle(self, oci=False):
+    def bundle(self, oci=False, targets=images.TARGETS, *, partial_index=False):
         ids = {}
         with tarfile.open(self.directory / "images.tar", "w") as stream:
             rows = []
-            for target in images.TARGETS:
+            for target in targets:
                 data = json.dumps({"fixture": target}).encode()
                 digest = hashlib.sha256(data).hexdigest()
                 name = "blobs/sha256/" + digest
@@ -42,15 +42,16 @@ class ImageTests(unittest.TestCase):
             stream.addfile(header, io.BytesIO(data))
             if oci:
                 descriptors = []
-                for target in images.TARGETS:
+                for target in (targets[-1:] if partial_index else targets):
                     data = json.dumps({"schemaVersion": 2, "config": {"digest": ids[target]},
                                        "layers": []}).encode()
                     digest = hashlib.sha256(data).hexdigest()
                     header = tarfile.TarInfo("blobs/sha256/" + digest)
                     header.size = len(data)
                     stream.addfile(header, io.BytesIO(data))
-                    ids[target] = "sha256:" + digest
-                    descriptors.append({"digest": ids[target]})
+                    if not partial_index:
+                        ids[target] = "sha256:" + digest
+                    descriptors.append({"digest": "sha256:" + digest})
                 data = json.dumps({"schemaVersion": 2, "manifests": descriptors}).encode()
                 header = tarfile.TarInfo("index.json")
                 header.size = len(data)
@@ -73,7 +74,7 @@ class ImageTests(unittest.TestCase):
         with patch.object(images, "output", side_effect=output), \
                 patch.object(images, "run", side_effect=lambda argv, **kw: calls.append(argv)), \
                 patch("sys.stdout", new=io.StringIO()):
-            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file))
+            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, inputs=False))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][:3], ["docker", "image", "load"])
         self.assertEqual(env_file.read_text(), "BLAME_GATE_BUILDER_IMAGE=" + manifest["images"]["test-fixture-build"]
@@ -88,8 +89,25 @@ class ImageTests(unittest.TestCase):
         with patch.object(images, "output", side_effect=lambda argv, **kw:
                           self.commit if argv[0] == "git" else argv[-1]), \
                 patch.object(images, "run"), patch("sys.stdout", new=io.StringIO()):
-            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file))
+            images.load(SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, inputs=False))
         self.assertIn(manifest["images"]["test"], env_file.read_text())
+
+    def test_classic_save_by_id_keeps_every_config_even_with_partial_oci_index(self):
+        manifest = self.bundle(oci=True, partial_index=True)
+        env_file = self.directory / "environment"
+        args = SimpleNamespace(directory=self.directory, commit=self.commit, env_file=env_file, inputs=False)
+        with patch.object(images, "output", side_effect=lambda argv, **kw:
+                          self.commit if argv[0] == "git" else argv[-1]), \
+                patch.object(images, "run") as run, patch("sys.stdout", new=io.StringIO()):
+            images.load(args)
+            self.assertIn(manifest["images"]["test"], env_file.read_text())
+            self.assertEqual(run.call_count, 1)
+            # A missing OCI descriptor cannot be interpreted as an OCI ID.
+            manifest["images"]["test"] = "sha256:" + "f" * 64
+            (self.directory / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "archive image IDs differ"):
+                images.load(args)
+            self.assertEqual(run.call_count, 1)
 
     def test_corrupt_archive_foreign_commit_or_declared_id_never_loads_or_exports(self):
         for fault in ("checksum", "commit", "image", "dockerfile"):
@@ -110,7 +128,7 @@ class ImageTests(unittest.TestCase):
                         patch.object(images, "run") as run:
                     with self.assertRaises(ValueError):
                         images.load(SimpleNamespace(directory=self.directory, commit=self.commit,
-                                                    env_file=env_file))
+                                                    env_file=env_file, inputs=False))
                 run.assert_not_called()
                 self.assertFalse(env_file.exists())
 
@@ -203,7 +221,7 @@ class ImageTests(unittest.TestCase):
 
     def test_build_uses_supported_legacy_limits_and_refuses_missing_backend_flags(self):
         args = SimpleNamespace(unit="unit", slice=self.slice, directory=self.directory,
-                               target="test", tag="local/fixture:test", azure_archive=True)
+                               target="test", tag="local/fixture:test", azure_archive=True, prepared=None)
         argv_seen = []
 
         def run(argv, **kwargs):
@@ -227,6 +245,61 @@ class ImageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not support"):
                 images.build(args)
             run.assert_not_called()
+
+    def test_prepared_input_inventory_is_not_accepted_as_the_final_bundle(self):
+        self.bundle(oci=True, targets=images.INPUT_TARGETS)
+        input_args = SimpleNamespace(directory=self.directory, commit=self.commit, env_file=None, inputs=True)
+        final_env = self.directory / "environment"
+        with patch.object(images, "output", side_effect=lambda argv, **kw:
+                          self.commit if argv[0] == "git" else argv[-1]), \
+                patch.object(images, "run") as run, patch("sys.stdout", new=io.StringIO()):
+            images.load(input_args)
+            with self.assertRaisesRegex(ValueError, "wrong image targets"):
+                images.load(SimpleNamespace(directory=self.directory, commit=self.commit,
+                                             env_file=final_env, inputs=False))
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(final_env.exists())
+
+    def test_resumed_builder_uses_exact_local_inputs_and_refuses_wrong_image(self):
+        manifest = self.bundle(targets=images.INPUT_TARGETS)
+        args = SimpleNamespace(unit="unit", slice=self.slice, directory=self.directory,
+                               prepared=self.directory, target="test", tag="local/fixture:test", azure_archive=False)
+        help_text = "--file --cgroup-parent --cpu-period --cpu-quota --cpuset-cpus --memory-swap --force-rm --iidfile --network --target"
+        tags, builds = {}, []
+
+        def run(argv, **kw):
+            if argv[:3] == ["docker", "image", "tag"]:
+                tags[argv[4]] = argv[3]
+            elif argv[:2] == ["docker", "build"]:
+                builds.append((argv, kw["input"]))
+                Path(argv[argv.index("--iidfile") + 1]).write_text("sha256:" + "e" * 64)
+            else:
+                self.fail(f"unexpected command {argv}")
+
+        def output(argv, **kw):
+            return help_text if argv[-1] == "--help" else tags[argv[-1]]
+
+        with patch.object(images.gate, "verify_unit"), \
+                patch.object(images.gate, "checkout_identity", return_value=self.commit), \
+                patch.object(images, "output", side_effect=output), patch.object(images, "run", side_effect=run), \
+                patch.object(images, "cleanup"):
+            images.build(args)
+            # A consumer on a different daemon must fail before attempting a build.
+            args.target = "release"
+            with patch.object(images, "output", side_effect=lambda argv, **kw:
+                              help_text if argv[-1] == "--help" else "sha256:" + "0" * 64):
+                with self.assertRaisesRegex(ValueError, "prepared image identity mismatch"):
+                    images.build(args)
+        [(argv, recipe)] = builds
+        self.assertEqual(argv[argv.index("--file") + 1], "-")
+        self.assertNotIn(b"apt-get update", recipe)
+        self.assertNotIn(b"cargo fetch", recipe)
+        self.assertIn(b"apt-get --no-download autoremove", recipe)
+        self.assertIn(b"FROM client-oracle AS test", recipe)
+        self.assertIn(b"FROM runtime AS release", recipe)
+        for target, identity in manifest["images"].items():
+            [tag] = [tag for tag, value in tags.items() if value == identity]
+            self.assertIn(f"FROM {tag} AS {target}\n".encode(), recipe)
 
 
 if __name__ == "__main__":

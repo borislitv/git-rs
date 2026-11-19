@@ -59,59 +59,52 @@ jobs:
             .local/derived-cache-*/report.json
             .local/derived-cache-*/*.log
             .local/derived-cache-*/*.stderr
-  # Images have their own 20-minute job; preparation and measurement keep their
-  # independent 900-second bounds. Cold hosted-image timing remains observable.
-  blame-images:
+  # Keep network acquisition and native compilation in separate bounded jobs.
+  # The next runner resumes from the exact checked-out build input images.
+  blame-image-inputs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check bounded image handoff and ownership guards
         run: python3 -B tests/blame_images_test.py
+      - name: Acquire the exact OS packages, Rust toolchain and locked Cargo inputs
+        run: bash tests/blame_image_workers.sh inputs build
+      - name: Stop only owned build input workers
+        if: always()
+        run: bash tests/blame_image_workers.sh inputs cleanup
+      - name: Export the three immutable input images with commit and archive identity
+        run: python3 -B tests/blame_images.py export --inputs --directory .local/blame-image-inputs --commit "$GITHUB_SHA"
+      - name: Upload this run and attempt's exact input archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blame-image-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            .local/blame-image-inputs/images.tar
+            .local/blame-image-inputs/manifest.json
+  blame-images:
+    needs: blame-image-inputs
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: blame-image-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/blame-image-inputs
+      - name: Verify and load exact OS, Rust and Cargo input images
+        run: python3 -B tests/blame_images.py load --inputs --directory .local/blame-image-inputs --commit "$GITHUB_SHA"
       - name: Build exact builder, oracle and Git-free server targets with bounded workers
-        run: |
-          tag="${{ github.run_id }}-${{ github.run_attempt }}"
-          slice="git-rs-blame-images-$tag.slice"
-          printf 'BLAME_IMAGE_SLICE=%s\n' "$slice" >> "$GITHUB_ENV"
-          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
-          sudo tee "/run/systemd/system/$slice" > /dev/null <<EOF
-          [Unit]
-          Description=Owned prebuilt image workers
-          [Slice]
-          CPUQuota=200%
-          AllowedCPUs=$cpus
-          MemoryMax=4G
-          MemorySwapMax=0
-          TasksMax=256
-          EOF
-          sudo systemctl daemon-reload
-          for target in build-inputs test-fixture-build test release test-server; do
-            unit="git-rs-blame-images-$target-$tag.service"
-            printf 'BLAME_IMAGE_UNIT=%s\n' "$unit" >> "$GITHUB_ENV"
-            sudo systemd-run --wait --pipe --unit="$unit" --slice="$slice" \
-              --working-directory="$GITHUB_WORKSPACE" \
-              --property="User=$(id -un)" --property="Group=$(id -gn)" \
-              --property=RuntimeMaxSec=900 --property=TimeoutStopSec=40 \
-              --property=KillMode=control-group --property="AllowedCPUs=$cpus" \
-              --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_images.py cleanup --slice $slice" \
-              /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/blame_images.py" build \
-                --target "$target" --tag "git-rs:blame-$target" --unit "$unit" --slice "$slice" \
-                --directory "$GITHUB_WORKSPACE/.local/blame-images" --azure-archive
-          done
-      - name: Export four immutable images once with commit and archive identity
-        run: python3 -B tests/blame_images.py export --directory .local/blame-images --commit "$GITHUB_SHA"
+        run: bash tests/blame_image_workers.sh final build
       - name: Stop only owned legacy image workers
         if: always()
-        run: |
-          if [ -n "${BLAME_IMAGE_SLICE:-}" ]; then
-            if [ -n "${BLAME_IMAGE_UNIT:-}" ] && [ "$(systemctl show "$BLAME_IMAGE_UNIT" --property=LoadState --value)" != not-found ]; then
-              sudo systemctl stop "$BLAME_IMAGE_UNIT" || [ "$(systemctl show "$BLAME_IMAGE_UNIT" --property=LoadState --value)" = not-found ]
-            fi
-            python3 -B tests/blame_images.py cleanup --slice "$BLAME_IMAGE_SLICE"
-            sudo systemctl stop "$BLAME_IMAGE_SLICE"
-            sudo rm -f -- "/run/systemd/system/$BLAME_IMAGE_SLICE"
-            sudo systemctl daemon-reload
-          fi
+        run: bash tests/blame_image_workers.sh final cleanup
+      - name: Export four immutable images once with commit and archive identity
+        run: python3 -B tests/blame_images.py export --directory .local/blame-images --commit "$GITHUB_SHA"
       - name: Upload this run and attempt's exact image archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
