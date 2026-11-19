@@ -539,7 +539,11 @@ impl<S: PackSource> RangePackSet<S> {
         capacity.resize(blocks.capacity() * std::mem::size_of::<[u8; 32]>())?;
         let started = self.verification.as_ref().map(|_| Instant::now());
         let mut full = Sha256::new();
-        let mut bytes = self.budget.buffer(0)?;
+        // Controlled resize changes length only. Admit one reusable block,
+        // charging only the actual pack size when it is smaller than a block.
+        let mut bytes = self
+            .budget
+            .buffer(usize::try_from(size.min(PROOF_BLOCK))?)?;
         for offset in (0..size).step_by(PROOF_BLOCK as usize) {
             control.check()?;
             let length = usize::try_from((size - offset).min(PROOF_BLOCK))?;
