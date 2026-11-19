@@ -192,7 +192,7 @@ mod native {
         self, CCtx, CParameter, DCtx, DParameter, FrameHeaderStatus, FrameType, InBuffer, OutBuffer,
     };
 
-    const LEVEL: i32 = 3;
+    const LEVEL: i32 = 2;
     const WINDOW_LOG: u32 = 20;
     const WINDOW_BYTES: usize = 1 << WINDOW_LOG;
     // A fresh single-threaded context has a small number of native allocations
@@ -255,12 +255,10 @@ mod native {
         budget: &Arc<Budget>,
     ) -> Result<Option<OwnedBytes>> {
         process::check_operation()?;
-        // The pinned native level-3 large-source preset is dfast with window 21.
-        // We only cap that window at 20, leaving match tables/strategy/LDM at
-        // their defaults. Its small-source presets have no larger match tables
-        // and the same sequence-space divisor. The documented unknown-source
-        // stream estimate is therefore the conservative upper budget for this
-        // specific profile, not permission for arbitrary parameter overrides.
+        // The pinned large-source level-2 preset already uses window log 20.
+        // Smaller presets have smaller match tables and the same sequence-space
+        // divisor. With no workers, dictionary or LDM, the documented stream
+        // estimate bounds this profile, not arbitrary parameter overrides.
         // Requalify this relation if the native preset table or profile changes.
         let estimate = native_result(zstd_safe::estimate_cstream_size(LEVEL))?;
         let _native = budget.reserve(charge(estimate)?)?;

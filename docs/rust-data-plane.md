@@ -136,7 +136,7 @@ documented in [operations](../OPERATIONS.md#cache-schema-upgrade-and-rollback).
 The metadata text-row limit remains 8,192 bytes; artifacts use parameterized binary
 transport. Keys include repository, security scope, object format, ordered inputs,
 options, representation and producer version. Logical payload identity is independent
-of physical raw-v1/zstd-v1 encoding. Beneficial payloads use level 3, a 1 MiB window
+of physical raw-v1/zstd-v1 encoding. Beneficial payloads use level 2, a 1 MiB window
 and a single checksummed frame; logical and stored lengths each retain the 8 MiB
 limit. Frame metadata, complete consumption and both digests are checked before
 logical bytes escape. Decoder/context/output reservations survive actual cleanup.

@@ -76,6 +76,9 @@ For the synthetic runtime contract use a fresh fixture below and substitute
 `tests/warm_initial_runtime.py` in the same guarded command. It requires multiple committed
 hold releases, tests ACL revoke and process termination between quanta, checks memory and
 segment-count exhaustion, and only accepts a restarted foreground exact hit with native bytes.
+Add `--cache-placement all-pg` to use a compressible multipart fixture. It omits cache S3
+configuration, checks PostgreSQL placement and the stored and logical hashes of each data
+chunk, then compares the fresh HTTP hit through socket EOF. The default tests S3-backed chunks.
 The serial window size and budget must still be qualified on the 160k-edge target. If a segment,
 or the final metadata/encoding/publication quantum, cannot fit, the job fails rather than
 extending time or signing incomplete work.

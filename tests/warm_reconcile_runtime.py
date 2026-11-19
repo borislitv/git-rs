@@ -3,13 +3,14 @@
 import argparse
 from contextlib import contextmanager
 import hashlib
-from http.client import HTTPConnection
+from http.client import HTTPConnection, parse_headers
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -122,6 +123,20 @@ def http(port, path, maximum=256 * 1024):
         connection.close()
 
 
+def complete_http(port, path, maximum):
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as connection:
+        connection.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode("ascii"))
+        with connection.makefile("rb") as stream:
+            require(stream.readline(1024) == b"HTTP/1.1 200 OK\r\n", "exact cache read must return HTTP 200")
+            headers = parse_headers(stream)
+            require("Transfer-Encoding" not in headers and "Content-Encoding" not in headers,
+                    "exact cache read must be length-framed and unencoded")
+            body = stream.read(maximum + 1)  # Read through the peer's actual EOF, not just Content-Length.
+            require(len(body) <= maximum and headers.get_all("Content-Length") == [str(len(body))],
+                    "fixture response length differs from its single Content-Length")
+            return body
+
+
 class Fixture:
     def __init__(self, args):
         cfg = private_config(args.config)
@@ -168,9 +183,13 @@ class Fixture:
         self.writer = dict(self.source, **s3("GIT_RS_S3_", cfg["source_s3"], source_bucket))
         derived = {"GIT_RS_CACHE_" + k: self.cache[k] for k in pg if k != "PGCONNECT_TIMEOUT"}
         derived.update({"GIT_RS_CACHE_" + k: self.cache[k] for k in ("PGDATABASE", "PGUSER", "PGPASSWORD")})
-        derived.update(s3("GIT_RS_CACHE_S3_", cfg["cache_s3"], cfg["cache_s3"]["bucket"]))
+        self.all_pg = getattr(args, "cache_placement", "pg-s3") == "all-pg"
+        if not self.all_pg:
+            derived.update(s3("GIT_RS_CACHE_S3_", cfg["cache_s3"], cfg["cache_s3"]["bucket"]))
         derived.update(GIT_RS_CACHE_NAMESPACE=self.namespace, GIT_RS_CACHE_OWNER=self.owner,
-                       GIT_RS_CACHE_INLINE_BYTES="0", GIT_RS_BLAME_CHECKPOINT_KEY_FILE=str(key))
+                        GIT_RS_CACHE_INLINE_BYTES=str(8 * 1024**2 if self.all_pg else 0),
+                       GIT_RS_CACHE_MAX_PAYLOAD_BYTES=str(8 * 1024**2),
+                        GIT_RS_BLAME_CHECKPOINT_KEY_FILE=str(key))
         self.warmer = dict(self.reader, **s3("GIT_RS_S3_", cfg["warm_source_s3"], source_bucket), **derived,
                            GIT_RS_WARM_JOB_SECONDS="30")
         self.foreground = dict(self.writer, **derived)
@@ -305,10 +324,11 @@ class Fixture:
             if parsed is None:
                 continue
             hashed, fields, inputs = parsed
-            require(hashed == digest and s3_child == "t" and fields[0] == self.repo.encode()
+            require(hashed == digest and s3_child == ("f" if self.all_pg else "t")
+                    and fields[0] == self.repo.encode()
                     and fields[2:5] == [b"sha1", b"complete-blame-v2", b"native-root-line-porcelain-v1"]
                     and len(inputs[0]) == 8 and len(inputs[1]) == 20 and inputs[2] == PATH,
-                    "unexpected durable body key or missing live S3 body chunk")
+                    "unexpected durable body key or storage placement")
             scope = fields[1].decode(), inputs[1].hex()
             require(scope not in result, "multiple complete bodies for one scope")
             result[scope] = (uuid(payload), digest, fields[5])
@@ -361,7 +381,14 @@ class Fixture:
                            "DROP SEQUENCE git_rs_cache.fixture_body_attempt;")
         self.evict()
 
-    def verify(self, label, principal, tip, hit, map_hit=False, maximum=256 * 1024):
+    def oracle(self, tip):
+        return self.native("-c", "core.deltaBaseCacheLimit=512m", "--literal-pathspecs", "blame",
+                           "--root", "--line-porcelain", "--no-textconv", "--no-progress",
+                           "--diff-algorithm=myers", tip, "--", os.fsdecode(PATH))
+
+    def verify(self, label, principal, tip, hit, map_hit=False, maximum=256 * 1024, expected=None):
+        if expected is None:
+            expected = self.oracle(tip) if hit or map_hit else b""
         before = self.bodies()
         env = self.foreground
         args = [self.observer, "--socket", self.directory / "observer.sock", "--principal", principal,
@@ -382,9 +409,8 @@ class Fixture:
                         "foreground did not take the expected exact cache path")
 
             check_counts(0)
-            status, body = http(listener, f"/{SLUG}.git/blame/{tip}?path={quote_from_bytes(PATH, safe='')}", maximum)
-            expected = self.native("--literal-pathspecs", "blame", "--root", "--line-porcelain", "--no-textconv",
-                                   "--no-progress", tip, "--", os.fsdecode(PATH)) if hit or map_hit else b""
+            path = f"/{SLUG}.git/blame/{tip}?path={quote_from_bytes(PATH, safe='')}"
+            status, body = (200, complete_http(listener, path, maximum)) if self.all_pg and hit else http(listener, path, maximum)
             require((status, body) == (200 if hit or map_hit else 500, expected),
                     f"{label}: unexpected status/native bytes ({status})")
             if map_hit:

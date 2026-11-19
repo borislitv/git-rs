@@ -62,7 +62,7 @@ image. They are neither a server dependency nor an acceptable fallback. The
 production filesystem inventory, actual runtime lifecycle and independent native
 client results are separate evidence; no one of them establishes the others.
 
-Production cache compression stays single-threaded API level `3` (`zstd -3`), with
+Production cache compression uses single-threaded API level `2` (`zstd -2`), with
 its declared window/size/checksum/dictionary constraints. Keep
 `ZSTD_SYS_USE_PKG_CONFIG` absent, including an empty or `0` value; it must not select
 an unrecorded system codec. Source records and qualification remain revision-bound.

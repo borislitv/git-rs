@@ -2,6 +2,7 @@
 """Opt-in multi-quantum loopback contract using the real scoped warm CLI."""
 import argparse
 from contextlib import contextmanager
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -10,6 +11,8 @@ import sys
 import time
 
 from warm_reconcile_runtime import Fixture, eventually, http, require, stop
+
+CHUNK_BYTES = 4 * 1024**2
 
 
 class Initial(Fixture):
@@ -47,6 +50,33 @@ class Initial(Fixture):
                 "worker retained a source hold between quanta")
         require(not self.bodies(), "a partial quantum published a body")
 
+    def compressed_parts(self, body, expected):
+        root = self.cache_sql("SELECT (p.state='live' AND p.object_key IS NULL AND p.body IS NOT NULL "
+                              "AND octet_length(p.body)=COALESCE(p.stored_size,p.size) "
+                              "AND sha256(p.body)=COALESCE(p.stored_digest,p.digest)) IS TRUE "
+                              "FROM git_rs_cache.payloads p "
+                              f"WHERE p.namespace='{self.namespace}' AND p.id='{body}';")
+        require(root == "t", "signed body descriptor must be stored inline with its stored digest")
+        rows = self.cache_sql("SELECT c.ordinal,c.size,encode(c.digest,'hex'),p.stored_size, "
+                              "(p.state='live' AND p.object_key IS NULL AND p.body IS NOT NULL "
+                              "AND p.encoding='zstd-v1' AND p.stored_size<p.size "
+                              "AND octet_length(p.body)=p.stored_size AND sha256(p.body)=p.stored_digest "
+                              "AND p.size=c.size AND p.digest=c.digest) IS TRUE "
+                              "FROM git_rs_cache.manifest_children c LEFT JOIN git_rs_cache.payloads p "
+                              "ON p.namespace=c.namespace AND p.id=c.child "
+                              f"WHERE c.namespace='{self.namespace}' AND c.parent='{body}' ORDER BY c.ordinal;").splitlines()
+        require(2 <= len(rows) == (len(expected) + CHUNK_BYTES - 1) // CHUNK_BYTES,
+                "expected multipart body with the same logical length as Git")
+        stored_bytes = 0
+        for index, row in enumerate(rows):
+            ordinal, size, digest, stored, valid = row.split("|")
+            part = expected[index * CHUNK_BYTES:(index + 1) * CHUNK_BYTES]
+            require(valid == "t" and int(ordinal) == index and int(size) == len(part)
+                    and digest == hashlib.sha256(part).hexdigest(),
+                    f"body part {index} must be smaller zstd inline with exact logical and stored digests")
+            stored_bytes += int(stored)
+        print(f"PostgreSQL cached {len(rows)} compressed body parts: {len(expected)} logical, {stored_bytes} stored bytes")
+
     def exercise(self):
         self.setup()
         self.grant("alice", "reader")
@@ -58,7 +88,11 @@ class Initial(Fixture):
             eventually(lambda: http(health, "/readyz")[0] == 200, "receive metadata not ready")
             for index in range(7):
                 # A changed line at each edge, plus one stable since root.
-                tip = self.push(listener, f"stable\nline {index}\nlast\n".encode(), f"change {index}")
+                contents = f"stable\nline {index}\nlast\n".encode()
+                if self.all_pg:
+                    # Repeated porcelain metadata makes this a multipart body.
+                    contents += b"stable synthetic PostgreSQL cache line\n" * 32_768
+                tip = self.push(listener, contents, f"change {index}")
             self.drain()
 
         self.audit()
@@ -101,9 +135,14 @@ class Initial(Fixture):
         # exceeds the original piece's deadline and owns no source lease.
         require(self.count() == 7 and time.monotonic() - started >= 15,
                 "worker did not finish in independent renewed quanta")
-        require(set(self.bodies()) == {("alice", tip)}, "local run did not confirm the ordinary body")
+        bodies = self.bodies()
+        require(set(bodies) == {("alice", tip)}, "local run did not confirm the ordinary body")
         require(not self.maps(), "initial worker issued unrelated cache material")
-        self.verify("initial-exact-hit", "alice", tip, True)
+        expected = self.oracle(tip)
+        if self.all_pg:
+            self.compressed_parts(bodies[("alice", tip)][0], expected)
+        self.verify("initial-exact-hit", "alice", tip, True,
+                    maximum=16 * 1024**2 if self.all_pg else 256 * 1024, expected=expected)
 
 
 def main():
@@ -111,11 +150,12 @@ def main():
     for name in ("config", "workdir", "git", "binary", "observer"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--owned-loopback", required=True, choices=["synthetic-only"])
+    parser.add_argument("--cache-placement", choices=["pg-s3", "all-pg"], default="pg-s3")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, stop)
     Initial(args).exercise()
-    print("initial warm contract passed: scoped renewal, cancellation, admission, exact native hit")
+    print(f"initial warm contract passed ({args.cache_placement}): scoped renewal, cancellation, admission, exact native hit")
 
 
 if __name__ == "__main__":

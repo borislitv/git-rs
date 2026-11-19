@@ -156,13 +156,23 @@ fn cancelled_operation_does_not_allocate_decoded_output() {
     assert_eq!(budget.used(), 0);
 }
 
-// A separate one-shot producer supplies valid/adversarial frames to the streaming
-// decoder. Expected logical bytes come from the fixture input, not its decoder.
+// A separate one-shot producer supplies legacy level-3 and adversarial frames.
+// Expected logical bytes come from the fixture input, not its decoder.
 fn frame(bytes: &[u8], checksum: bool, content_size: bool, window_log: u32) -> Vec<u8> {
+    frame_at_level(bytes, checksum, content_size, window_log, 3)
+}
+
+fn frame_at_level(
+    bytes: &[u8],
+    checksum: bool,
+    content_size: bool,
+    window_log: u32,
+    level: i32,
+) -> Vec<u8> {
     use zstd::zstd_safe::{self, CCtx, CParameter};
     let mut context = CCtx::try_create().unwrap();
     for parameter in [
-        CParameter::CompressionLevel(3),
+        CParameter::CompressionLevel(level),
         CParameter::WindowLog(window_log),
         CParameter::ChecksumFlag(checksum),
         CParameter::ContentSizeFlag(content_size),
@@ -173,6 +183,27 @@ fn frame(bytes: &[u8], checksum: bool, content_size: bool, window_log: u32) -> V
     let size = context.compress2(&mut encoded[..], bytes).unwrap();
     encoded.truncate(size);
     encoded
+}
+
+#[test]
+fn writer_uses_level_two_with_the_bounded_frame_profile() {
+    Operation::new(5).enter(|| {
+        let mut bytes = Vec::new();
+        for line in 0u32..8192 {
+            bytes.extend_from_slice(b"author Synthetic\nsummary change ");
+            bytes.extend_from_slice(&line.to_le_bytes());
+            bytes.extend_from_slice(b"\nfilename synthetic-cache-fixture\n");
+            bytes.extend_from_slice(&(line % 97).to_le_bytes());
+            bytes.push(b'\n');
+        }
+        let level_two = frame_at_level(&bytes, true, true, 20, 2);
+        let legacy = frame(&bytes, true, true, 20);
+        assert!(level_two != legacy, "fixture must distinguish the presets");
+        let budget = Budget::new(64 * 1024 * 1024);
+        let encoded = encode(&bytes, &budget, MAX_BYTES).unwrap();
+        assert_eq!(encoded.metadata.encoding, Encoding::Zstd);
+        assert!(encoded.bytes() == level_two, "writer must use level 2");
+    });
 }
 
 fn compressed_metadata(stored: &[u8], logical: &[u8]) -> Metadata {
@@ -361,6 +392,12 @@ fn frame_completion_checksum_trailing_and_logical_digest_are_all_required() {
         }
         let budget = Budget::new(64 * 1024 * 1024);
         let mut metadata = compressed_metadata(&valid, &bytes);
+        let decoded = decode(&valid, &metadata, &budget).unwrap();
+        assert_eq!(
+            decoded.bytes, bytes,
+            "existing level-3 frames stay readable"
+        );
+        drop(decoded);
         metadata.logical_digest = [0xff; 32];
         let error = decode(&valid, &metadata, &budget).err().unwrap();
         assert!(error.to_string().contains("logical payload integrity"));

@@ -166,7 +166,7 @@ cache data is never source authority. Run `git-rs cache-migrate` independently o
 source `migrate`. Both schemas use logged tables; no transaction spans their databases.
 
 Bodies use bounded chunk/manifest storage. Payloads of at least 4 KiB are considered
-for single-threaded zstd level 3 with a 1 MiB window. Compression is retained only
+for single-threaded zstd level 2 with a 1 MiB window. Compression is retained only
 when it saves at least 128 bytes and 1/16 of the logical length; otherwise storage
 remains raw. The stored size selects inline PostgreSQL versus separately configured
 cache S3. This is optional reuse, not a claim that the maximum body fits default
@@ -212,6 +212,12 @@ access to authoritative `repos/` objects. With no cache S3 configuration, oversi
 inline artifacts bypass publication. The coordinator keeps a bounded local result
 or reports overload; cache failure does not authorize changing source commit status.
 Separate schema/database/pool does not isolate shared-cluster CPU, I/O or WAL.
+
+For PostgreSQL-only complete blame storage, set `GIT_RS_CACHE_INLINE_BYTES=8388608`
+and `GIT_RS_CACHE_MAX_PAYLOAD_BYTES=8388608`, and leave cache S3 settings unset.
+The signed body descriptor and its individually encoded chunks (up to 4 MiB
+logical bytes each) are stored in the cache database. Source packs still use
+the authoritative storage configuration.
 
 No serving path calls cache deletion. Maintenance closes admission by irreversible
 retirement, then waits for valid read holds and grace. Object deletion requires a
