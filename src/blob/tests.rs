@@ -76,13 +76,17 @@ impl Server {
                     let socket = stream.get_mut();
                     match reply {
                         Reply::Complete(body) => {
+                            // These fixtures exercise response validation, not
+                            // pooling. An idle peer must not keep another queued
+                            // connection from reaching the next reply.
                             write!(
                                 socket,
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                 body.len()
                             )
                             .unwrap();
                             socket.write_all(&body).unwrap();
+                            connection = None;
                         }
                         Reply::Redirect(address) => {
                             write!(socket, "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/test-bucket/?versioning\r\nContent-Length: 0\r\n\r\n").unwrap();
@@ -280,12 +284,15 @@ fn failed_response_integrity_does_not_poison_a_later_complete_fill() {
     let hash = crate::protocol::hex(&openssl::sha::sha256(b"complete"));
     let budget = git_rs_core::CapacityBudget::new(1024 * 1024);
     let control = git_rs_core::Control::new(std::time::Instant::now() + Duration::from_secs(5));
-    for _ in 0..3 {
-        assert!(
-            store
-                .source_bytes("object.pack", 8, &hash, &control, &budget)
-                .is_err()
-        );
+    for expected in [
+        "S3 response length limit exceeded",
+        "immutable source object was truncated",
+        "immutable source object digest mismatch",
+    ] {
+        let error = store
+            .source_bytes("object.pack", 8, &hash, &control, &budget)
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected);
         assert_eq!(budget.used(), 0);
     }
     let entry = store
