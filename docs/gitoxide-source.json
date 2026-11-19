@@ -17,19 +17,22 @@
     "FORK_PROVENANCE.md"
   ],
   "pull_request": "https://github.com/borislitv/gitoxide/pull/2",
-  "source_scope": "Controlled mapping/blame and authenticated completed-attribution reuse, bounded lazy preparation and weighted pruning, admitted raw backing reuse and verified-owner input, capacity-admitted token registries, single-pack ingestion, borrowed tree and submodule validation, caller-owned range delta/index primitives, original-budget ownership transfer and admitted physical topological traversal; this source record is not a runtime, native-oracle, resource or performance qualification verdict",
+  "source_scope": "Controlled mapping/blame, admitted linear blame segments and authenticated completed-attribution reuse, bounded lazy preparation and weighted pruning, admitted raw backing reuse and verified-owner input, capacity-admitted token registries, single-pack ingestion, borrowed tree and submodule validation, caller-owned range delta/index primitives, original-budget ownership transfer and admitted physical topological traversal; this source record is not a runtime, native-oracle, resource or performance qualification verdict",
   "resolved_package_count": 49,
   "resolved_packages_sha256": "5de07bc366f57b97c05b0de77092abfc1a6ee3d449de733e2cfdcfbe86ce319d",
   "controlled_source_sha256": {
-    "gix-blame/src/file/function.rs": "4e677cd173aedebefa08c4923a28e059235b7a6b0e69d034354789b808d08cfc",
+    "gix-blame/src/file/function.rs": "cea7bae22e023c8036716a804fb3c65a6676dbad26e75dc447c5e926c32f3e60",
     "gix-blame/src/file/prepared.rs": "4083f40c337ae09c03ec298013add9e119286cf8ac62bf2fd02fb2671ce4ad10",
-    "gix-blame/src/lib.rs": "8e2ccd9a74f5808cde5045c5d4086d338368d731b73cd6a4a0a219a7919c237a",
+    "gix-blame/src/file/segments.rs": "1029742a3eaa9d3c24c6c000a48862320d7ee14ab81df70e986c8bcfbf06e199",
+    "gix-blame/src/lib.rs": "a88c03a59acf08b7c0f8bcc38799d282da6428ccd5b7b18bc2ef8809fdac31ba",
     "gix-blame/src/native.rs": "2a1fd9d57a9dfefabae0a9472d50ebeb198c9dd7c916896aaebefc75528a44c4",
     "gix-diff/src/blob/mod.rs": "0cb3574c764f20cb96436de71b08d8d81cffca2b14754618c7ec4466a06d24e3",
     "gix-diff/src/blob/platform.rs": "9f72451f6c7216501260755ae3c58c6817d12678e3e539541f89410953502012",
     "gix-diff/src/blob/raw.rs": "795cb54984ea474a7a3c47999bdb0c1c7e0aab61c4baca74379a800f6aa53e87",
     "gix-imara-diff/src/control.rs": "340f7699eded4bc43b71f51df76b2aac9637d7fc9fe97ed9bb2319e8a6421d53",
+    "gix-imara-diff/src/lib.rs": "55e4ca48e73bde512fafb00d5539ca1e79963fdf08edec6ebadda021e083434a",
     "gix-imara-diff/src/myers/preprocess.rs": "01221d8c4e6fdbfcadbff8d9ba4f18817dd5df0e7d9d31fdb4cf72abdb2b4b70",
+    "gix-imara-diff/src/slider_heuristic.rs": "687697e87d8448f1fe1cb4359aaa444688d367047361e06097c412476aad4682",
     "gix-object/src/tree/ref_iter.rs": "43273bf5a09c3d55e0d37d17217a6032943bf19ad83628c1f9a806e6928b135b",
     "gix-pack/src/bundle/write/admitted.rs": "d1871f3adc9d8815b0046a6daaeb6aa66134e08396c9f46e589e6225cbf064a6",
     "gix-pack/src/bundle/write/controlled.rs": "9ad179d504b10f6bff1972e2f55fb80d6d54817cd04e3fd9d869578462441286",
@@ -56,7 +59,7 @@
   },
   "source": {
     "git": "https://github.com/borislitv/gitoxide",
-    "rev": "d80e8c8f13952fef55fb8a387e64c9436537cecf"
+    "rev": "aa333d0e87718828d801071e8545fcc2298e5ed3"
   },
   "upstream": {
     "base": "dd39fb66e3b1551c9fe849043e39b357a9799ca1",

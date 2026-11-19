@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
+#[path = "metadata_warm.rs"]
+pub(crate) mod warm;
+
 #[derive(Clone, Debug)]
 pub struct Pack {
     pub hash: String,
@@ -81,6 +84,7 @@ fn lease_seconds(remaining: Duration) -> Result<u64> {
 pub struct Barrier {
     pub(crate) id: String,
     repo: String,
+    scoped_warm: bool,
 }
 
 impl Barrier {
@@ -104,6 +108,7 @@ impl Barrier {
                 return Ok(Self {
                     id: lease,
                     repo: id.into(),
+                    scoped_warm: false,
                 });
             }
             if Instant::now() >= deadline {
@@ -116,6 +121,9 @@ impl Barrier {
     }
 
     pub fn check(&self) -> Result<()> {
+        if self.scoped_warm {
+            return Err(invalid("warm hold requires scoped source check"));
+        }
         if sql(&format!("SELECT 1 FROM repository_leases WHERE id={}::uuid AND repo_id={}::uuid AND expires_at > clock_timestamp();",text(&self.id),text(&self.repo)))?.trim() != "1" {
             return Err(invalid("repository lease expired"));
         }
@@ -125,10 +133,16 @@ impl Barrier {
 
 impl Drop for Barrier {
     fn drop(&mut self) {
+        if self.id.is_empty() {
+            return;
+        }
         // Releasing a hold must still work after request cancellation. This is a
         // separate, bounded metadata-only cleanup; failure leaves a safe expiry.
         let released = process::Operation::new(5).enter(|| {
             metrics::measure(Metric::Stage(Stage::LeaseRelease), || {
+                if self.scoped_warm {
+                    return warm::release(&self.id);
+                }
                 sql(&format!(
                     "DELETE FROM repository_leases WHERE id={}::uuid AND repo_id={}::uuid;",
                     text(&self.id),
@@ -144,10 +158,11 @@ impl Drop for Barrier {
 
 pub fn migrate() -> Result<()> {
     sql(&format!(
-        "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('git-rs-schema',0)); {} {} {} COMMIT;",
+        "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('git-rs-schema',0)); {} {} {} {} COMMIT;",
         include_str!("../migrations/001.sql"),
         include_str!("../migrations/002_maintenance.sql"),
-        include_str!("../migrations/current_functions.sql")
+        include_str!("../migrations/current_functions.sql"),
+        include_str!("../migrations/003_warm_reconcile.sql")
     ))?;
     Ok(())
 }
@@ -247,6 +262,7 @@ fn read_snapshot(
             *lease = Some(Barrier {
                 id: id.into(),
                 repo: repo.into(),
+                scoped_warm: false,
             });
             return Ok(());
         }

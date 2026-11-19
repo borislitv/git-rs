@@ -1,6 +1,8 @@
 //! Job-owned physical ranges and optional authenticated object reuse for blame.
 
-use crate::{Result, blob::Store, cache::Cache, invalid, object_source::RangeStore};
+use crate::{
+    Result, blame::Observer, blob::Store, cache::Cache, invalid, object_source::RangeStore,
+};
 use git_rs_core::{
     CapacityBudget, Control, Object, ReadLimits, SnapshotIdentity, VerifiedObjectProvider,
     objects::VerifiedObject,
@@ -13,9 +15,11 @@ pub(crate) use crate::object_source::Source;
 pub(crate) struct LazySnapshot {
     packs: RangePackSet<RangeStore>,
     work: Option<crate::blame::memo::WorkSet>,
+    observer: Option<Arc<dyn Observer>>,
     budget: CapacityBudget,
     limits: ReadLimits,
     resources: crate::blame::ResourceProfile,
+    operation: Arc<crate::process::Operation>,
 }
 
 impl LazySnapshot {
@@ -48,20 +52,30 @@ impl LazySnapshot {
         resources: crate::blame::ResourceProfile,
         control: &Control,
     ) -> Result<Self> {
+        let operation = source.operation.clone();
+        let packs = RangeStore::open_with_decoder_options(
+            source,
+            store,
+            cache,
+            budget.clone(),
+            limits,
+            resources.decoder_options(),
+            control,
+        )?
+        .with_prepared_reads();
+        let packs = if resources == crate::blame::ResourceProfile::LargeV1 {
+            packs.with_verification_journal(control)?
+        } else {
+            packs
+        };
         Ok(Self {
-            packs: RangeStore::open_with_decoder_options(
-                source,
-                store,
-                cache,
-                budget.clone(),
-                limits,
-                resources.decoder_options(),
-                control,
-            )?,
+            packs,
             work: None,
+            observer: None,
             budget,
             limits,
             resources,
+            operation,
         })
     }
 
@@ -71,6 +85,42 @@ impl LazySnapshot {
             .transpose()?;
         Ok(self)
     }
+
+    pub(crate) fn with_observer(mut self, observer: Option<Arc<dyn Observer>>) -> Self {
+        if observer
+            .as_ref()
+            .is_some_and(|o| o.wants_attribution_progress())
+        {
+            self.packs.enable_verification_stats();
+        }
+        self.observer = observer;
+        self
+    }
+
+    fn observe_read(
+        &self,
+        id: &gix::hash::oid,
+        header_only: bool,
+        control: &Control,
+    ) -> Result<()> {
+        if let Some(observer) = &self.observer {
+            control.check()?;
+            observer.source_read(id, header_only, control);
+            control.check()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LazySnapshot {
+    fn drop(&mut self) {
+        if !std::thread::panicking()
+            && let Some(observer) = &self.observer
+            && observer.wants_attribution_progress()
+        {
+            observer.range_verification_closed(self.packs.verification_stats());
+        }
+    }
 }
 
 impl VerifiedObjectProvider for LazySnapshot {
@@ -78,6 +128,9 @@ impl VerifiedObjectProvider for LazySnapshot {
         self.packs.identity()
     }
     fn header(&self, id: &gix::hash::oid, control: &Control) -> Result<Option<gix::objs::Header>> {
+        self.observe_read(id, true, control)?;
+        // A prepared header need not enter RangeStore::read_exact.
+        self.operation.check()?;
         self.packs.header(id, control)
     }
     fn object(
@@ -102,6 +155,8 @@ impl VerifiedObjectProvider for LazySnapshot {
         if !budget.shares_with(&self.budget) {
             return Err(invalid("source budget identity mismatch"));
         }
+        self.observe_read(id, false, control)?;
+        self.operation.check()?;
         let Some(header) = self.packs.header(id, control)? else {
             return Ok(None);
         };

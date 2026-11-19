@@ -36,6 +36,7 @@ EXCLUDE = {"blame_artifacts": {"artifact_process"},
            "blame_reuse": {"checkpoint_reuse_child", "warm_cache_outage_child"},
            "blame_core": {"runtime_support::runtime_child"}}
 ROOT_RUNTIME = "runtime_support::owned_source_runtime_fences_ready_cache_http_response_staging_and_publication"
+GENERAL_MAP = "completed_transport::signed_general_map_survives_native_fast_forwards_and_serving_restarts"
 HARNESS_FILES = ("tests/blame_gate.py", "tests/blame_artifacts.py", "tests/derived_cache.py",
                   "tests/integration.py", "tests/blame_concurrency.py",
                   "tests/runtime_process.py", "tests/maintenance_fixture.py",
@@ -159,6 +160,7 @@ def load_manifest(bundle):
         require(names and names == sorted(set(names))
                 and not (set(names) & EXCLUDE.get(suite, set())), "invalid exact inventory")
     require(ROOT_RUNTIME in manifest["inventory"]["blame_core"], "root-runtime contract omitted")
+    require(GENERAL_MAP in manifest["inventory"]["blame_reuse"], "general map contract omitted")
     return manifest
 
 
@@ -326,6 +328,7 @@ def prepare_bundle(args):
                                 ["--volume", f"{bundle}:/gate:ro"])
             names[name] = inventory(text, name)
     require(ROOT_RUNTIME in names["blame_core"], "isolated root-runtime contract missing")
+    require(GENERAL_MAP in names["blame_reuse"], "general map contract missing")
     manifest = {"format": 1, "current_commit": revision,
                 "legacy": {"repository": LEGACY_REPOSITORY, "commit": LEGACY_COMMIT,
                            "cargo_manifest_sha256": digest(legacy / "Cargo.toml"),

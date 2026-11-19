@@ -79,7 +79,8 @@ def serving_text(success=0, count=0, version=VERSION, start=START):
         ("stage", "stage", ("sql_init", "sql_acquire", "sql_query", "sql_reset", "lease_commit", "catalog_read",
                             "lease_release", "cache_fill", "cache_link", "object_hash", "restore_refs", "restore_head",
                             "hook_setup", "git_input", "git_output", "git_wait", "ref_validate", "tip_validate",
-                            "fast_forward", "scratch_cleanup", "process_spawn")),
+                            "fast_forward", "scratch_cleanup", "process_spawn", "blame_preflight",
+                            "blame_attribution", "blame_encode", "blame_send")),
         ("dependency", "operation", ("sql", "s3_get", "s3_put", "s3_delete", "s3_versioning")),
         ("subprocess", "program", ("git", "curl", "sha256sum", "other")),
     ]:

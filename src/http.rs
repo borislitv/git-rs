@@ -3,7 +3,7 @@ use crate::{
     auth::{HttpCredentials, Service},
     engine::{Cgi, Engine},
     invalid,
-    metrics::{Outcome, RequestTimer, Transport},
+    metrics::{self, Metric, Outcome, RequestTimer, Stage, Transport},
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -42,6 +42,13 @@ fn line(input: &mut impl BufRead, max: usize) -> Result<String> {
 
 impl Request {
     pub fn parse(input: &mut impl BufRead) -> Result<Self> {
+        Self::parse_with_receive_profile(input, Default::default())
+    }
+
+    pub fn parse_with_receive_profile(
+        input: &mut impl BufRead,
+        profile: crate::receive::ResourceProfile,
+    ) -> Result<Self> {
         let request_line = line(input, 4096)?;
         let parts: Vec<_> = request_line.split(' ').collect();
         let [method, uri, version] = parts.as_slice() else {
@@ -107,7 +114,12 @@ impl Request {
                     return Err(invalid("invalid Content-Length"));
                 }
                 let length = value.parse()?;
-                if length > MAX_BODY {
+                let limit = if service == Service::Receive && *method == "POST" {
+                    profile.body_bytes()
+                } else {
+                    MAX_BODY
+                };
+                if length > limit {
                     return Err(invalid("HTTP body too large"));
                 }
                 Ok(length)
@@ -159,6 +171,14 @@ impl Request {
     }
 
     pub fn body<'a, R: BufRead>(&self, input: &'a mut R) -> Body<'a, R> {
+        self.body_with_limit(input, MAX_BODY)
+    }
+
+    pub(crate) fn body_with_limit<'a, R: BufRead>(
+        &self,
+        input: &'a mut R,
+        limit: u64,
+    ) -> Body<'a, R> {
         Body {
             input,
             chunked: self.chunked,
@@ -171,6 +191,7 @@ impl Request {
                 }
             },
             total: 0,
+            limit,
             done: false,
         }
     }
@@ -181,6 +202,7 @@ pub struct Body<'a, R> {
     chunked: bool,
     remaining: u64,
     total: u64,
+    limit: u64,
     done: bool,
 }
 
@@ -208,9 +230,9 @@ impl<R: BufRead> Read for Body<'_, R> {
                 self.done = true;
                 return Ok(0);
             }
-            if self.remaining > MAX_BODY.saturating_sub(self.total) {
-                return Err(bad());
-            }
+        }
+        if self.remaining > self.limit.saturating_sub(self.total) {
+            return Err(bad());
         }
         if self.remaining == 0 {
             self.done = true;
@@ -288,16 +310,18 @@ fn handle_bounded(
     stream.set_read_timeout(Some(remaining))?;
     stream.set_write_timeout(Some(remaining))?;
     let mut input = BufReader::new(stream.try_clone()?);
-    let request = match Request::parse(&mut input) {
-        Ok(request) => request,
-        Err(_) => {
-            timer.outcome(Outcome::BadRequest);
-            stream.write_all(
-                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-            )?;
-            return Ok(());
-        }
-    };
+    let request =
+        match Request::parse_with_receive_profile(&mut input, engine.blame.cpu().receive_profile())
+        {
+            Ok(request) => request,
+            Err(_) => {
+                timer.outcome(Outcome::BadRequest);
+                stream.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )?;
+                return Ok(());
+            }
+        };
     let principal = match authentication {
         Authentication::Development(principal) => principal,
         Authentication::Basic(credentials) => match request.authenticate(credentials) {
@@ -377,7 +401,7 @@ fn handle_blame(
                 || {
                     let _ = interrupt.shutdown(std::net::Shutdown::Both);
                 },
-                || {
+                || metrics::measure(Metric::Stage(Stage::BlameSend), || {
                     body.check()?;
                     write!(
                         stream,
@@ -385,7 +409,7 @@ fn handle_blame(
                         body.len()
                     )?;
                     body.write_to(stream)
-                },
+                }),
             )?;
             timer.outcome(Outcome::Success);
             return Ok(());

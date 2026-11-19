@@ -11,6 +11,7 @@ use git_rs_core::{
     blame::{BlameError, BlameRequest},
 };
 use std::sync::Arc;
+use std::time::Instant;
 
 pub(super) fn reachable(
     session: &SnapshotSession<LazySnapshot>,
@@ -38,42 +39,69 @@ pub(super) fn reachable(
     Ok(reachable.iter().any(|id| id == commit))
 }
 
-pub(super) fn body(
+pub(super) fn exact_body(
+    env: &Environment,
+    source: &Arc<Source>,
+    key: &ArtifactKey,
+    control: &Control,
+) -> Result<Option<CompleteArtifact>> {
+    read_body(env, source, key, control, true)
+}
+
+fn read_body(
+    env: &Environment,
+    source: &Arc<Source>,
+    key: &ArtifactKey,
+    control: &Control,
+    exact: bool,
+) -> Result<Option<CompleteArtifact>> {
+    let Some(cache) = env.derived.as_ref().filter(|_| env.body_lookup) else {
+        return Ok(None);
+    };
+    let artifacts = BlameArtifacts::new(cache);
+    let read = || {
+        let access = Arc::new(SourceAccess {
+            source: source.clone(),
+            key: key.clone(),
+        });
+        if let Some(writer) = &env.writer {
+            artifacts.get_body_authenticated(key, access, |manifest, tag| {
+                writer.verify_body(key, manifest, tag, control)
+            })
+        } else {
+            artifacts.get_verified(key, ArtifactKind::CompleteBody, access)
+        }
+    };
+    let body = if exact && env.writer.is_some() && env.resources == super::ResourceProfile::LargeV1
+    {
+        let start = Instant::now();
+        // No large window for absent, pending or unavailable keys. The hint
+        // grants no source, cache or signing authority; normal authenticated
+        // acquisition still verifies the root and every child under holds.
+        let ready = super::optional_body_io(control, start + super::BODY_PROBE_TIME, |_| {
+            Ok(cache.first_ready_hint(&[key])?.is_some())
+        })?;
+        if ready == Some(true) {
+            super::optional_body_io(control, start + super::LARGE_BODY_READ_TIME, |_| read())?
+        } else {
+            None
+        }
+    } else {
+        super::optional_cache(control, read)?
+    };
+    source.check()?;
+    Ok(body.flatten())
+}
+
+pub(super) fn parent_body(
     env: &Environment,
     source: &Arc<Source>,
     session: &SnapshotSession<LazySnapshot>,
     principal: &str,
     request: BlameRequest<'_>,
-    exact_key: &ArtifactKey,
     control: &Control,
-) -> Result<Option<(CompleteArtifact, Phase)>> {
-    let Some(cache) = env.derived.as_ref().filter(|_| env.body_lookup) else {
-        return Ok(None);
-    };
-    let artifacts = BlameArtifacts::new(cache);
-    let read = |key: &ArtifactKey| -> Result<_> {
-        let body = super::optional_cache(control, || {
-            let access = Arc::new(SourceAccess {
-                source: source.clone(),
-                key: key.clone(),
-            });
-            if let Some(writer) = &env.writer {
-                artifacts.get_body_authenticated(key, access, |manifest, tag| {
-                    writer.verify_body(key, manifest, tag, control)
-                })
-            } else {
-                // This is the explicit trusted-writer cache mode, for exact lookup only.
-                artifacts.get_verified(key, ArtifactKind::CompleteBody, access)
-            }
-        })?;
-        // A cache-side failure can be optional; loss of the source is not.
-        source.check()?;
-        Ok(body.flatten())
-    };
-    if let Some(body) = read(exact_key)? {
-        return Ok(Some((body, Phase::CacheHit)));
-    }
-    if env.writer.is_none() {
+) -> Result<Option<CompleteArtifact>> {
+    if env.writer.is_none() || env.derived.is_none() || !env.body_lookup {
         return Ok(None);
     }
     // The physical proof is not an optional cache operation. The immediate
@@ -99,5 +127,5 @@ pub(super) fn body(
         env.resources,
     )?;
     // Retain the original signed artifact and its holds, not a child publication.
-    Ok(read(&parent_key)?.map(|body| (body, Phase::ParentBodyHit)))
+    read_body(env, source, &parent_key, control, false)
 }

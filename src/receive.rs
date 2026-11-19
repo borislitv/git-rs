@@ -27,8 +27,11 @@ use std::{
     sync::Arc,
 };
 
+mod bootstrap;
 mod budget;
 mod pack;
+mod profile;
+pub use profile::ResourceProfile;
 pub(crate) mod transport;
 pub mod wire;
 
@@ -122,6 +125,15 @@ impl<'cpu> ReceiveSession<'cpu> {
         request: &http::Request,
         input: &mut impl BufRead,
     ) -> Result<Option<Completed<Prepared>>> {
+        self.run_http_profile(request, input, ResourceProfile::BaselineV1)
+    }
+
+    pub(crate) fn run_http_profile(
+        self,
+        request: &http::Request,
+        input: &mut impl BufRead,
+        profile: ResourceProfile,
+    ) -> Result<Option<Completed<Prepared>>> {
         let http::Action::Git(cgi) = &request.action else {
             return Err(invalid("receive requires a Git HTTP action"));
         };
@@ -134,6 +146,9 @@ impl<'cpu> ReceiveSession<'cpu> {
             return Err(invalid("unsupported direct receive HTTP request"));
         }
         let encoding = transport::Encoding::parse(&cgi.encoding)?;
+        if profile == ResourceProfile::LargeBootstrapV1 {
+            return bootstrap::run_http(self, request, input, encoding, profile);
+        }
         let io = self.admitted.io_control();
         let mut body = self.admitted.budget().buffer(32 * 1024)?;
         let mut output = transport::MemoryOutput {
@@ -279,8 +294,22 @@ struct ValidatedPack {
 
 struct PackBytes {
     hash: String,
-    pack: gix::odb::pack::memory::OwnedBuffer<u8>,
-    index: gix::odb::pack::memory::OwnedBuffer<u8>,
+    pack: PackBacking,
+    index: PackBacking,
+}
+
+enum PackBacking {
+    Normalized(gix::odb::pack::memory::OwnedBuffer<u8>),
+    Packed(CapacityBuffer),
+}
+
+impl PackBacking {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Normalized(bytes) => bytes,
+            Self::Packed(bytes) => bytes.as_slice(),
+        }
+    }
 }
 
 impl CpuJob for HttpJob {
@@ -550,8 +579,8 @@ fn validate(
             outcome.ok_or_else(|| invalid("validated incoming objects have no structural pack"))?;
         Some(PackBytes {
             hash: outcome.outcome.data_hash.to_string(),
-            pack: outcome.pack.into_owned(budget.clone())?,
-            index: outcome.index.into_owned(budget.clone())?,
+            pack: PackBacking::Normalized(outcome.pack.into_owned(budget.clone())?),
+            index: PackBacking::Normalized(outcome.index.into_owned(budget.clone())?),
         })
     };
     control.check()?;
@@ -600,20 +629,38 @@ pub fn publish(prepared: Completed<Prepared>, store: &Store) -> Receipt {
         session.operation.check()?;
         session.lease().check()?;
         let mut packs = Vec::new();
+        let bootstrap = files
+            .pack
+            .as_ref()
+            .is_some_and(|pack| matches!(&pack.pack, PackBacking::Packed(_)));
         if let Some(pack) = &files.pack {
+            let stage = metrics::BootstrapStage::Upload.start(bootstrap);
             packs.push(metrics::measure(Metric::Phase(Phase::Upload), || {
-                store.upload_bytes(
+                if !bootstrap {
+                    return store.upload_bytes(
+                        &session.snapshot.id,
+                        &session.operation_id,
+                        &pack.hash,
+                        pack.pack.bytes(),
+                        pack.index.bytes(),
+                    );
+                }
+                store.upload_bootstrap_bytes(
                     &session.snapshot.id,
                     &session.operation_id,
                     &pack.hash,
-                    &pack.pack,
-                    &pack.index,
+                    pack.pack.bytes(),
+                    pack.index.bytes(),
+                    &prepared.control,
+                    &prepared.capacity,
                 )
             })?);
+            stage.complete();
         }
+        let stage = metrics::BootstrapStage::Publish.start(bootstrap);
         session.operation.check()?;
         prepared.control.check()?;
-        metrics::measure(Metric::Phase(Phase::Publish), || {
+        let generation = metrics::measure(Metric::Phase(Phase::Publish), || {
             metadata::publish(
                 &session.snapshot,
                 session.lease(),
@@ -623,8 +670,9 @@ pub fn publish(prepared: Completed<Prepared>, store: &Store) -> Receipt {
                 &files.fast_forward,
                 &packs,
             )
-        })
-        .map(|generation| Publication::Published { generation })
+        })?;
+        stage.complete();
+        Ok(Publication::Published { generation })
     });
     Receipt {
         prepared,

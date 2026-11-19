@@ -124,9 +124,12 @@ fn run() -> Result<()> {
     if !(1..=3600).contains(&seconds) {
         return Err(invalid("invalid fixture operation seconds"));
     }
-    let mut blame = Blame::new(
+    let resources = std::env::var_os("GIT_RS_BLAME_RESOURCE_PROFILE");
+    let resources = git_rs::blame::ResourceProfile::from_os_value(resources.as_deref())?;
+    let mut blame = Blame::new_with_resource_profile(
         option(&args, "--concurrency")?.parse()?,
         option(&args, "--waiters")?.parse()?,
+        resources,
     )?;
     let options = fixture_options(&args)?;
     if args
@@ -172,7 +175,10 @@ fn run() -> Result<()> {
             sequence: AtomicU64::new(0),
         }));
     }
-    let work = Arc::new(work_observer::WorkObserver::new(gate_observer));
+    let work = Arc::new(work_observer::WorkObserver::new(
+        gate_observer,
+        args.iter().any(|arg| arg == "--attribution-progress"),
+    ));
     blame = blame.with_observer(work.clone());
     let _serving = ServingSocket::bind(&PathBuf::from(option(&args, "--socket")?))?;
     let object_cache_bytes = match option(&args, "--object-cache-bytes") {

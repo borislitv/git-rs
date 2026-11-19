@@ -185,8 +185,26 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         map: Option<&CompletedBlameMap<'_>>,
         memo: Option<memo::MemoryMappingRequest<'_>>,
     ) -> Result<CompleteBlame, BlameError> {
-        let mut result =
-            self.blame_complete_inner(request, options, memo, map.map(|map| (namespace, map)))?;
+        self.blame_complete_with_completed_observed(request, options, namespace, map, memo, None)
+    }
+
+    /// The same completed-map attribution with optional job-local observation.
+    pub fn blame_complete_with_completed_observed(
+        &self,
+        request: BlameRequest<'_>,
+        options: &BlameOptions,
+        namespace: [u8; 32],
+        map: Option<&CompletedBlameMap<'_>>,
+        memo: Option<memo::MemoryMappingRequest<'_>>,
+        progress: Option<&super::BlameProgress>,
+    ) -> Result<CompleteBlame, BlameError> {
+        let mut result = self.blame_complete_inner(
+            request,
+            options,
+            memo,
+            map.map(|map| (namespace, map)),
+            progress,
+        )?;
         if map.is_none() {
             result.completed_use = super::CompletedUse::Miss;
         }

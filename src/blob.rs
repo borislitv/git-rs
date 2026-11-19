@@ -205,11 +205,50 @@ impl Store {
         pack_bytes: &[u8],
         index_bytes: &[u8],
     ) -> Result<Pack> {
+        self.upload_bytes_inner(repo, operation, native_hash, pack_bytes, index_bytes, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upload_bootstrap_bytes(
+        &self,
+        repo: &str,
+        operation: &str,
+        native_hash: &str,
+        pack_bytes: &[u8],
+        index_bytes: &[u8],
+        control: &git_rs_core::Control,
+        capacity: &git_rs_core::CapacityBudget,
+    ) -> Result<Pack> {
+        // Sender, single-slot channel and transport-owned chunks are bounded;
+        // this guard covers application/SDK buffering, not the kernel or RSS.
+        let _io = capacity.reservation(2 * 1024 * 1024)?;
+        self.upload_bytes_inner(
+            repo,
+            operation,
+            native_hash,
+            pack_bytes,
+            index_bytes,
+            Some((control, process::MAX_OPERATION_SECONDS)),
+        )
+    }
+
+    fn upload_bytes_inner(
+        &self,
+        repo: &str,
+        operation: &str,
+        native_hash: &str,
+        pack_bytes: &[u8],
+        index_bytes: &[u8],
+        controlled: Option<(&git_rs_core::Control, u64)>,
+    ) -> Result<Pack> {
         crate::protocol::Oid::parse(native_hash.as_bytes())?;
         let digest = |bytes: &[u8]| -> Result<String> {
             let mut hash = Sha256::new();
             for chunk in bytes.chunks(32 * 1024) {
                 process::check_operation()?;
+                if let Some((control, _)) = controlled {
+                    control.check()?;
+                }
                 hash.update(chunk);
             }
             Ok(crate::protocol::hex(&hash.finish()))
@@ -240,9 +279,23 @@ impl Store {
             (&pack.idx_key, index_bytes, &pack.idx_digest),
         ] {
             metrics::measure(Metric::Dependency(Dependency::S3Put), || {
+                let url = format!("{}/{}/{}", self.endpoint, self.bucket, key);
+                if let Some((control, seconds)) = controlled {
+                    return self.request_memory_controlled(
+                        reqwest::Method::PUT,
+                        &url,
+                        Some(hash),
+                        Some(bytes),
+                        None,
+                        &mut std::io::sink(),
+                        4096,
+                        seconds,
+                        control,
+                    );
+                }
                 self.request_memory(
                     reqwest::Method::PUT,
-                    &format!("{}/{}/{}", self.endpoint, self.bucket, key),
+                    &url,
                     Some(hash),
                     Some(bytes),
                     None,

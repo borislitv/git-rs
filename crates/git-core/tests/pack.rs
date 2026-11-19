@@ -280,6 +280,699 @@ fn range_reconstruction_reuses_prepared_headers_and_keeps_strict_limits() {
     assert_eq!(held_base.as_slice(), b"hello");
     drop(held_base);
     assert_eq!(budget.used(), 0);
+
+    // Two deltas, with both base lookup forms exercised. Keep the index warm
+    // but disable the verified object/header caches to isolate cold planning.
+    let middle = target;
+    let target = blob(b"hello!!");
+    let full = full_hello();
+    let middle_offset = 12 + full.len() as u64;
+    let ref_entry = ref_delta(base);
+    let target_offset = middle_offset + ref_entry.len() as u64;
+    let ofs_entry = ofs_delta(ref_entry.len(), 6, 7);
+    let idx = root.write(
+        "prepared-chain",
+        &[(base, full), (middle, ref_entry), (target, ofs_entry)],
+    );
+    let open = |control: &Control, reuse: bool, fault_offset| {
+        let packs = RangePackSet::new(
+            Source {
+                pack: std::fs::read(idx.with_extension("pack")).unwrap(),
+                index: std::fs::read(&idx).unwrap(),
+                reads: &reads,
+                target_offset: fault_offset,
+                target_fault: &target_fault,
+            },
+            SnapshotIdentity {
+                source: b"counted-synthetic-range".to_vec(),
+                generation: b"two".to_vec(),
+                object_hash: gix_hash::Kind::Sha1,
+            },
+            budget.clone(),
+            limits,
+            DecoderOptions {
+                cache_slots: 0,
+                cache_bytes: 0,
+                max_cache_entry_bytes: 0,
+                header_slots: 0,
+                ..acceleration()
+            },
+            control,
+        )
+        .unwrap();
+        let packs = if reuse {
+            packs.with_prepared_reads()
+        } else {
+            packs
+        };
+        assert!(packs.locate(&target, control).unwrap().is_some());
+        reads.borrow_mut().clear();
+        packs
+    };
+    let control = Control::new(Instant::now() + Duration::from_secs(10));
+    for (reuse, expected_reads) in [(false, [5, 5, 8]), (true, [5, 0, 3])] {
+        let packs = open(&control, reuse, target_offset);
+        let base_charge = budget.used();
+        let mut elapsed = [Duration::ZERO; 3];
+        let mut pending_bytes = 0;
+        for (attempt, expected) in expected_reads.into_iter().enumerate() {
+            reads.borrow_mut().clear();
+            let started = Instant::now();
+            if attempt < 2 {
+                let header = packs.header(&target, &control).unwrap().unwrap();
+                elapsed[attempt] = started.elapsed();
+                assert_eq!(header.kind, gix_object::Kind::Blob);
+                assert_eq!(header.size, 7);
+                let charged = budget.used() - base_charge;
+                if attempt == 0 {
+                    pending_bytes = charged;
+                    assert_eq!(pending_bytes > 0, reuse);
+                } else {
+                    assert_eq!(charged, pending_bytes, "no second plan allocation retained");
+                }
+            } else {
+                let value = packs
+                    .verified_object(&target, &control, &budget, limits)
+                    .unwrap()
+                    .unwrap();
+                elapsed[attempt] = started.elapsed();
+                assert_eq!(value.id(), target.as_ref());
+                assert_eq!(value.as_slice(), b"hello!!");
+            }
+            assert_eq!(
+                reads.borrow().len(),
+                expected,
+                "reuse={reuse}, attempt={attempt}"
+            );
+        }
+        eprintln!(
+            "prepared={reuse}: range reads={expected_reads:?}, elapsed={elapsed:?}, pending backing bytes={pending_bytes}"
+        );
+        assert_eq!(
+            budget.used(),
+            base_charge,
+            "consumed witness must release its charge"
+        );
+    }
+
+    for (limit, message) in [
+        (
+            ReadLimits {
+                max_delta_depth: 1,
+                ..limits
+            },
+            "delta depth limit exceeded",
+        ),
+        (
+            ReadLimits {
+                max_decode_bytes: 29,
+                ..limits
+            },
+            "delta decoded-byte budget exceeded",
+        ),
+    ] {
+        let packs = open(&control, true, target_offset);
+        let base_charge = budget.used();
+        packs.header(&target, &control).unwrap().unwrap();
+        reads.borrow_mut().clear();
+        assert!(
+            matches!(packs.verified_object(&target, &control, &budget, limit),
+            Err(err) if err.to_string().contains(message))
+        );
+        assert!(
+            reads.borrow().is_empty(),
+            "reject the complete plan before decode"
+        );
+        assert_eq!(budget.used(), base_charge);
+    }
+
+    // Fault either the target or an intermediate frame after preparation.
+    for (fault_offset, fault, message) in [
+        (
+            target_offset,
+            PayloadFault::ReadError,
+            "synthetic source read failed",
+        ),
+        (
+            target_offset,
+            PayloadFault::ChangedHeader,
+            "immutable range-backed entry header changed",
+        ),
+        (
+            middle_offset,
+            PayloadFault::ChangedHeader,
+            "immutable range-backed entry header changed",
+        ),
+    ] {
+        let packs = open(&control, true, fault_offset);
+        let base_charge = budget.used();
+        packs.header(&target, &control).unwrap().unwrap();
+        target_fault.set(fault);
+        assert!(
+            matches!(packs.verified_object(&target, &control, &budget, limits),
+            Err(err) if err.to_string() == message)
+        );
+        assert_eq!(budget.used(), base_charge);
+        target_fault.set(PayloadFault::None);
+    }
+
+    {
+        let packs = open(&control, true, target_offset);
+        packs.header(&target, &control).unwrap().unwrap();
+        packs.header(&middle, &control).unwrap().unwrap();
+        reads.borrow_mut().clear();
+        packs.header(&target, &control).unwrap().unwrap();
+        assert_eq!(reads.borrow().len(), 5, "only one chain is retained");
+        reads.borrow_mut().clear();
+        let other_request = Control::new(control.deadline());
+        packs.header(&target, &other_request).unwrap().unwrap();
+        assert_eq!(
+            reads.borrow().len(),
+            5,
+            "different control cannot reuse a plan"
+        );
+    }
+
+    let packs = open(&control, true, target_offset);
+    let base_charge = budget.used();
+    packs.header(&target, &control).unwrap().unwrap();
+    reads.borrow_mut().clear();
+    control.cancel();
+    assert!(
+        matches!(packs.verified_object(&target, &control, &budget, limits),
+        Err(err) if err.downcast_ref::<git_rs_core::StopReason>() == Some(&git_rs_core::StopReason::Cancelled))
+    );
+    assert!(reads.borrow().is_empty());
+    assert_eq!(budget.used(), base_charge);
+    drop(packs);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn range_cache_transfers_adjacent_deltas_and_preserves_copy_contract() {
+    use git_rs_core::objects::Result;
+    use git_rs_core::pack::ranges::{PackSource, RangePackSet};
+    use git_rs_core::{CapacityBuffer, SnapshotIdentity, VerifiedObjectProvider};
+    use gix_hash::ObjectId;
+    use std::cell::Cell;
+
+    struct Source<'a> {
+        pack: &'a [u8],
+        index: &'a [u8],
+        reads: &'a Cell<usize>,
+        stop_next_read: &'a Cell<bool>,
+    }
+    impl PackSource for Source<'_> {
+        fn pack_count(&self) -> usize {
+            1
+        }
+        fn pack_size(&self, _: usize) -> Result<u64> {
+            Ok(self.pack.len() as u64)
+        }
+        fn pack_hash(&self, _: usize) -> Result<ObjectId> {
+            Ok(ObjectId::from_bytes_or_panic(
+                &self.pack[self.pack.len() - 20..],
+            ))
+        }
+        fn pack_digest(&self, _: usize) -> Result<[u8; 32]> {
+            use sha2::{Digest, Sha256};
+            Ok(Sha256::digest(self.pack).into())
+        }
+        fn index(
+            &self,
+            _: usize,
+            control: &Control,
+            budget: &CapacityBudget,
+        ) -> Result<CapacityBuffer> {
+            let mut bytes = budget.buffer(self.index.len())?;
+            bytes.resize_controlled(self.index.len(), 0, control)?;
+            bytes.as_mut_slice().copy_from_slice(self.index);
+            Ok(bytes)
+        }
+        fn read_exact(
+            &self,
+            _: usize,
+            offset: u64,
+            output: &mut [u8],
+            control: &Control,
+            _: &CapacityBudget,
+        ) -> Result<()> {
+            control.check()?;
+            self.reads.set(self.reads.get() + 1);
+            let start = usize::try_from(offset)?;
+            output.copy_from_slice(&self.pack[start..start + output.len()]);
+            if self.stop_next_read.replace(false) {
+                control.cancel();
+            }
+            Ok(())
+        }
+    }
+
+    fn varint(mut size: usize, out: &mut Vec<u8>) {
+        while size >= 128 {
+            out.push((size as u8 & 127) | 128);
+            size >>= 7;
+        }
+        out.push(size as u8);
+    }
+
+    // A small stored full entry followed by six REF deltas doubling its bytes
+    // via two identical COPY commands. The last adjacent pair is 1 and 2 MiB.
+    let mut body = vec![b'a'; 32 * 1024];
+    let mut full = vec![0xb0]; // blob type, continuation, low size nibble zero
+    varint(body.len() >> 4, &mut full);
+    full.extend_from_slice(&compressed(&body));
+    let mut entries = vec![(blob(&body), full)];
+    for _ in 0..6 {
+        let size = body.len();
+        let mut instructions = Vec::new();
+        varint(size, &mut instructions);
+        varint(size * 2, &mut instructions);
+        // COPY from offset zero, with the upper two size bytes present.
+        for _ in 0..2 {
+            instructions.extend_from_slice(&[0xe0, (size >> 8) as u8, (size >> 16) as u8]);
+        }
+        assert!(instructions.len() < 16);
+        let mut entry = vec![0x70 | instructions.len() as u8];
+        entry.extend_from_slice(entries.last().unwrap().0.as_slice());
+        entry.extend_from_slice(&compressed(&instructions));
+        body.resize(size * 2, b'a');
+        entries.push((blob(&body), entry));
+    }
+    let root = Directory::new();
+    let idx = root.write("range-transfer", &entries);
+    let pack = std::fs::read(idx.with_extension("pack")).unwrap();
+    let index = std::fs::read(idx).unwrap();
+    let reads = Cell::new(0);
+    let stop_next_read = Cell::new(false);
+    let control = Control::new(Instant::now() + Duration::from_secs(15));
+    const BUDGET: usize = 16 * 1024 * 1024;
+    let budget = CapacityBudget::new(BUDGET);
+    let limits = ReadLimits::default();
+    let open = |cache_bytes| {
+        RangePackSet::new(
+            Source {
+                pack: &pack,
+                index: &index,
+                reads: &reads,
+                stop_next_read: &stop_next_read,
+            },
+            SnapshotIdentity {
+                source: b"range-transfer".to_vec(),
+                generation: b"one".to_vec(),
+                object_hash: gix_hash::Kind::Sha1,
+            },
+            budget.clone(),
+            limits,
+            DecoderOptions {
+                cache_slots: 1,
+                cache_bytes,
+                max_cache_entry_bytes: cache_bytes,
+                ..Default::default()
+            },
+            &control,
+        )
+        .unwrap()
+        .with_prepared_reads()
+    };
+    let parent = entries[5].0;
+    let target = entries[6].0;
+    let packs = open(body.len());
+    let started = Instant::now();
+    let parent_pin = packs
+        .verified_object(&parent, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_pin.as_slice(), &body[..body.len() / 2]);
+    let parent_stats = packs.cache_stats(&control).unwrap();
+    assert_eq!((parent_stats.decodes, parent_stats.pinned_entries), (6, 1));
+
+    packs.header(&target, &control).unwrap().unwrap();
+    let before = reads.get();
+    let refused = packs
+        .verified_object(&target, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(refused.as_slice(), body.as_slice());
+    let refusal_reads = reads.get() - before;
+    assert_eq!(refusal_reads, 1, "only the target payload needs reading");
+    assert_eq!(packs.cache_stats(&control).unwrap().decodes, 7);
+    assert_eq!(
+        packs.cache_stats(&control).unwrap().entry_bytes,
+        parent_pin.capacity()
+    );
+    let original = refused.as_slice().as_ptr();
+    let pressure = budget.reservation(BUDGET - budget.used()).unwrap();
+    let owned = refused.into_object(&control, &budget).unwrap();
+    assert_eq!(
+        owned.data.as_slice().as_ptr(),
+        original,
+        "admission loss preserves owned backing"
+    );
+    drop((owned, pressure, parent_pin));
+
+    let cold = packs
+        .verified_object(&target, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    let cold_ptr = cold.as_slice().as_ptr();
+    let cold_stats = packs.cache_stats(&control).unwrap();
+    assert_eq!(
+        (
+            cold_stats.decodes,
+            cold_stats.pinned_entries,
+            cold_stats.entry_bytes
+        ),
+        (8, 1, cold.capacity())
+    );
+    let before = reads.get();
+    let hit = packs
+        .verified_object(&target, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        hit.as_slice().as_ptr(),
+        cold_ptr,
+        "cold result is the indexed allocation"
+    );
+    let strict = ReadLimits {
+        max_delta_depth: 5,
+        ..limits
+    };
+    assert!(
+        packs
+            .verified_object(&target, &control, &budget, strict)
+            .is_err()
+    );
+    assert_eq!(
+        reads.get(),
+        before,
+        "warm hit and strict rejection do not read payload"
+    );
+    let copy = hit.into_object(&control, &budget).unwrap();
+    assert_ne!(copy.data.as_slice().as_ptr(), cold_ptr);
+    assert_eq!(copy.data.as_slice(), body.as_slice());
+    drop(copy);
+
+    let pressure = budget.reservation(BUDGET - budget.used()).unwrap();
+    let recovered = cold.into_object(&control, &budget).unwrap();
+    assert_eq!(recovered.data.as_slice().as_ptr(), cold_ptr);
+    assert_eq!(packs.cache_stats(&control).unwrap().entry_bytes, 0);
+    drop((recovered, pressure));
+
+    let stop = Control::new(control.deadline());
+    packs.header(&target, &stop).unwrap().unwrap();
+    let before = packs.cache_stats(&control).unwrap();
+    stop_next_read.set(true);
+    assert!(
+        packs
+            .verified_object(&target, &stop, &budget, limits)
+            .is_err()
+    );
+    let after = packs.cache_stats(&control).unwrap();
+    assert_eq!((after.decodes, after.entries), (before.decodes, 0));
+
+    let final_pin = packs
+        .verified_object(&target, &control, &budget, limits)
+        .unwrap()
+        .unwrap();
+    let final_stats = packs.cache_stats(&control).unwrap();
+    eprintln!(
+        "range transfer: {final_stats:?}, physical reads={}, refusal payload reads={refusal_reads}, elapsed={:?}",
+        reads.get(),
+        started.elapsed()
+    );
+    drop(packs);
+    assert_eq!(final_pin.as_slice(), body.as_slice());
+    assert!(budget.used() >= final_pin.capacity());
+    drop(final_pin);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn range_verification_journal_only_reuses_exact_physical_inputs() {
+    use git_rs_core::objects::Result;
+    use git_rs_core::pack::ranges::{PackSource, RangePackSet};
+    use git_rs_core::{CapacityBuffer, SnapshotIdentity, VerifiedObjectProvider};
+    use gix_hash::ObjectId;
+    use std::cell::Cell;
+
+    struct Source<'a> {
+        pack: &'a [u8],
+        index: &'a [u8],
+        substitute: &'a [u8],
+        mutated: &'a Cell<bool>,
+    }
+    impl PackSource for Source<'_> {
+        fn pack_count(&self) -> usize {
+            1
+        }
+        fn pack_size(&self, _: usize) -> Result<u64> {
+            Ok(self.pack.len() as u64)
+        }
+        fn pack_hash(&self, _: usize) -> Result<ObjectId> {
+            Ok(ObjectId::from_bytes_or_panic(
+                &self.pack[self.pack.len() - 20..],
+            ))
+        }
+        fn pack_digest(&self, _: usize) -> Result<[u8; 32]> {
+            use sha2::{Digest, Sha256};
+            Ok(Sha256::digest(self.pack).into())
+        }
+        fn index(
+            &self,
+            _: usize,
+            control: &Control,
+            budget: &CapacityBudget,
+        ) -> Result<CapacityBuffer> {
+            let mut bytes = budget.buffer(self.index.len())?;
+            bytes.resize_controlled(self.index.len(), 0, control)?;
+            bytes.as_mut_slice().copy_from_slice(self.index);
+            Ok(bytes)
+        }
+        fn read_exact(
+            &self,
+            _: usize,
+            offset: u64,
+            output: &mut [u8],
+            control: &Control,
+            _: &CapacityBudget,
+        ) -> Result<()> {
+            control.check()?;
+            let start = usize::try_from(offset)?;
+            if self.mutated.get() && start == 12 && output.len() == self.substitute.len() {
+                output.copy_from_slice(self.substitute);
+            } else {
+                output.copy_from_slice(&self.pack[start..start + output.len()]);
+            }
+            Ok(())
+        }
+    }
+
+    // Distinct blob contents, same exact entry length and index CRC, both
+    // with valid zlib framing. The substitute is not the original Git OID.
+    let original = [0x31, 0x19, 0x9e, 0x95, 0x20, 0xaf, 0x12, 0xb6];
+    let alternate = [0x23, 0x98, 0x13, 0x94, 0x85, 0x35, 0x8b, 0xdb];
+    let full = |bytes: &[u8]| [vec![0x38], compressed(bytes)].concat();
+    let original_entry = full(&original);
+    let alternate_entry = full(&alternate);
+    assert_eq!(original_entry.len(), alternate_entry.len());
+    assert_eq!(
+        crc32fast::hash(&original_entry),
+        crc32fast::hash(&alternate_entry)
+    );
+    let base = blob(&original);
+    let other_base = blob(&alternate);
+    let child_bytes = [original.as_slice(), b"!"].concat();
+    let child = blob(&child_bytes);
+    let sibling_bytes = [original.as_slice(), b"."].concat();
+    let sibling = blob(&sibling_bytes);
+    let wrong_child = blob(&[original.as_slice(), b"?"].concat());
+    let delta = |base: ObjectId, suffix| {
+        [
+            vec![0x76],
+            base.as_slice().to_vec(),
+            compressed(&[8, 9, 0x90, 8, 1, suffix]),
+        ]
+        .concat()
+    };
+    let entries = [
+        (base, original_entry),
+        (child, delta(base, b'!')),
+        (sibling, delta(base, b'.')),
+        (other_base, alternate_entry.clone()),
+        (wrong_child, delta(other_base, b'?')),
+    ];
+    let dir = Directory::new();
+    let path = dir.write("journal", &entries);
+    let pack = std::fs::read(path.with_extension("pack")).unwrap();
+    let v1 = std::fs::read(path).unwrap();
+    let mut index = b"\xfftOc\x00\x00\x00\x02".to_vec();
+    index.extend_from_slice(&v1[..1024]);
+    let mut sorted = Vec::new();
+    let mut offset = 12u32;
+    for (oid, entry) in &entries {
+        sorted.push((*oid, crc32fast::hash(entry), offset));
+        offset += entry.len() as u32;
+    }
+    sorted.sort_unstable_by_key(|row| row.0);
+    for (oid, _, _) in &sorted {
+        index.extend_from_slice(oid.as_slice());
+    }
+    for (_, crc, _) in &sorted {
+        index.extend_from_slice(&crc.to_be_bytes());
+    }
+    for (_, _, offset) in &sorted {
+        index.extend_from_slice(&offset.to_be_bytes());
+    }
+    index.extend_from_slice(&pack[pack.len() - 20..]);
+    index.extend_from_slice(checksum(&index).as_slice());
+
+    let mutated = Cell::new(false);
+    let control = Control::new(Instant::now() + Duration::from_secs(20));
+    let budget = CapacityBudget::new(96 * 1024 * 1024);
+    let limits = ReadLimits::default();
+    let open = || {
+        RangePackSet::new(
+            Source {
+                pack: &pack,
+                index: &index,
+                substitute: &alternate_entry,
+                mutated: &mutated,
+            },
+            SnapshotIdentity {
+                source: b"journal-fixture".to_vec(),
+                generation: b"one".to_vec(),
+                object_hash: gix_hash::Kind::Sha1,
+            },
+            budget.clone(),
+            limits,
+            DecoderOptions {
+                cache_slots: 1,
+                cache_bytes: 64,
+                max_cache_entry_bytes: 64,
+                ..Default::default()
+            },
+            &control,
+        )
+        .unwrap()
+        .with_verification_journal(&control)
+        .unwrap()
+    };
+    // Two requested leaf blobs share one base but there is just one cache slot.
+    // The streaming producer should read both exact bodies with only one
+    // decode of their common base, and a direct read should still hit that base.
+    for (streamed, want) in [(false, 4), (true, 3)] {
+        let packs = if streamed {
+            open().with_streamed_blobs()
+        } else {
+            open()
+        };
+        for (oid, bytes) in [(child, &child_bytes), (sibling, &sibling_bytes)] {
+            let value = packs
+                .verified_object(&oid, &control, &budget, limits)
+                .unwrap()
+                .unwrap();
+            assert_eq!(value.id(), oid.as_ref());
+            assert_eq!(value.as_slice(), bytes.as_slice());
+        }
+        let before = packs.cache_stats(&control).unwrap().decodes;
+        assert_eq!(
+            before, want,
+            "streamed={streamed}: shared-base decode count"
+        );
+        if streamed {
+            let value = packs
+                .object(&base, &control, &budget, limits)
+                .unwrap()
+                .unwrap();
+            assert_eq!(value.data.as_slice(), original);
+            assert_eq!(packs.cache_stats(&control).unwrap().decodes, before);
+        }
+    }
+    assert_eq!(budget.used(), 0);
+    let packs = open();
+    let read = |id: &ObjectId| {
+        packs
+            .verified_object(id, &control, &budget, limits)
+            .map(|v| v.unwrap())
+    };
+    assert_eq!(read(&child).unwrap().as_slice(), child_bytes);
+    let first = packs.verification_stats();
+    assert_eq!(
+        (first.sha1_calls, first.journal_records, first.journal_hits),
+        (2, 2, 0)
+    );
+    drop(read(&other_base).unwrap()); // evicts the child; its base was already evicted
+    assert_eq!(read(&child).unwrap().as_slice(), child_bytes);
+    let replay = packs.verification_stats();
+    assert_eq!(
+        (
+            replay.sha1_calls,
+            replay.journal_records,
+            replay.journal_hits
+        ),
+        (3, 3, 2)
+    );
+    assert_eq!(replay.avoided_sha1_bytes, first.sha1_bytes);
+    let strict = ReadLimits {
+        max_decode_bytes: 22,
+        ..limits
+    }; // 8 + 6 + 9 = 23
+    assert!(
+        packs
+            .verified_object(&child, &control, &budget, strict)
+            .is_err()
+    );
+    assert_eq!(packs.verification_stats().sha1_calls, replay.sha1_calls);
+    assert!(
+        read(&wrong_child)
+            .unwrap_err()
+            .to_string()
+            .contains("physical pack object hash mismatch")
+    );
+    drop(read(&other_base).unwrap());
+    mutated.set(true);
+    let before_mutation = packs.verification_stats();
+    assert!(
+        read(&child)
+            .unwrap_err()
+            .to_string()
+            .contains("physical pack object hash mismatch")
+    );
+    let rejected = packs.verification_stats();
+    assert_eq!(
+        rejected.journal_mismatches,
+        before_mutation.journal_mismatches + 1
+    );
+    assert_eq!(rejected.sha1_calls, before_mutation.sha1_calls + 1);
+    assert_eq!(rejected.journal_hits, before_mutation.journal_hits);
+    assert_eq!(rejected.journal_records, before_mutation.journal_records);
+    drop(packs);
+    let first_corrupt = open();
+    assert!(
+        first_corrupt
+            .verified_object(&child, &control, &budget, limits)
+            .is_err()
+    );
+    let stats = first_corrupt.verification_stats();
+    assert_eq!(
+        (stats.sha1_calls, stats.journal_records, stats.journal_hits),
+        (1, 0, 0)
+    );
+    control.cancel();
+    assert!(
+        first_corrupt
+            .verified_object(&child, &control, &budget, limits)
+            .is_err()
+    );
+    assert_eq!(
+        first_corrupt.verification_stats().sha1_calls,
+        stats.sha1_calls
+    );
+    eprintln!("journal first={first:?} replay={replay:?} rejected={rejected:?}");
+    drop(first_corrupt);
+    assert_eq!(budget.used(), 0);
 }
 
 #[test]

@@ -70,6 +70,408 @@ fn seal(mut pack: Vec<u8>) -> Vec<u8> {
     pack.extend_from_slice(hash.try_finalize().unwrap().as_slice());
     pack
 }
+
+#[test]
+fn packed_bootstrap_bounds_workspace_not_sum_of_intermediate_results() -> Result<()> {
+    use git_rs_core::receive::packed::{Packed, Progress};
+    const SIZE: usize = 22 * 1024;
+    const COUNT: usize = 13;
+    const LIMIT: usize = 256 * 1024;
+    const { assert!(COUNT * SIZE > LIMIT) };
+    let mut bytes = vendor::data::header::encode(vendor::data::Version::V2, COUNT as u32).to_vec();
+    let mut base = bytes.len();
+    append(
+        &mut bytes,
+        vendor::data::entry::Header::Blob,
+        &vec![b'a'; SIZE],
+    );
+    let mut last = vec![b'a'; SIZE];
+    for suffix in 1..COUNT as u8 {
+        let offset = bytes.len();
+        // 22 KiB as Git's delta varint: 0x80, 0xb0, 0x01. Then copy
+        // SIZE-1 bytes at offset zero, and append one unique literal byte.
+        let delta = [
+            0x80, 0xb0, 0x01, 0x80, 0xb0, 0x01, 0xb0, 0xff, 0x57, 1, suffix,
+        ];
+        append(
+            &mut bytes,
+            vendor::data::entry::Header::OfsDelta {
+                base_distance: (offset - base) as u64,
+            },
+            &delta,
+        );
+        base = offset;
+        last[SIZE - 1] = suffix;
+    }
+    let bytes = seal(bytes);
+    let control = control();
+    let capacity = CapacityBudget::new(8 * 1024 * 1024);
+    let decoder_budget = budget::Budget::new(capacity.clone())?;
+    let identity = identity();
+    let read = ReadLimits {
+        max_decode_bytes: LIMIT,
+        ..limits()
+    };
+    let mut reported = 0;
+    let pack = Packed::open(
+        &bytes,
+        &identity,
+        &control,
+        &capacity,
+        &decoder_budget,
+        read,
+        ReceiveLimits::default(),
+        |event| {
+            if let Progress::EntryBatch { objects, .. } = event {
+                reported += objects;
+            }
+        },
+    )?;
+    assert_eq!(reported, COUNT as u64);
+    assert_eq!(pack.statistics().1, (COUNT * SIZE) as u64);
+    let tip = object_id(gix::objs::Kind::Blob, &last);
+    assert_eq!(
+        (&pack)
+            .object(&tip, &control, &capacity, read)?
+            .unwrap()
+            .data
+            .as_slice(),
+        last
+    );
+    drop(pack);
+    let tighter = ReadLimits {
+        max_decode_bytes: 40 * 1024,
+        ..read
+    };
+    assert!(
+        Packed::open(
+            &bytes,
+            &identity,
+            &control,
+            &capacity,
+            &decoder_budget,
+            tighter,
+            ReceiveLimits::default(),
+            |_| {}
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "native Git pack-objects/index-pack A/B sensitivity"]
+fn native_packed_bootstrap_verified_base_reuse() -> Result<()> {
+    use git_rs_core::receive::packed::{InventoryFailure, Packed, Progress};
+    use std::process::{Command, Stdio};
+    let files = Files::new();
+    let run = |args: &[&str], input: &[u8]| -> Result<Vec<u8>> {
+        let binary =
+            std::env::var_os("GIT_RS_NATIVE_TEST_GIT").unwrap_or_else(|| "/usr/bin/git".into());
+        let mut command = Command::new(binary);
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &files.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(&files.root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(helpers) = std::env::var_os("GIT_RS_NATIVE_TEST_EXEC_PATH") {
+            command.env("GIT_EXEC_PATH", helpers);
+        }
+        let mut child = command.spawn()?;
+        child.stdin.take().unwrap().write_all(input)?;
+        let out = child.wait_with_output()?;
+        assert!(
+            out.status.success(),
+            "native {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(out.stdout)
+    };
+    run(&["init", "--bare", "--quiet"], b"")?;
+    let mut state = 33u32;
+    let mut text: Vec<_> = (0..512 * 1024)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for i in 0..96 {
+        // Most content is identical, with cumulative small revisions and a
+        // distinct tail. Git itself chooses the physical bases and depth.
+        text[4096 * i..4096 * i + 32].fill(i as u8);
+        ids.extend(run(&["hash-object", "-w", "--stdin"], &text)?);
+    }
+    let bytes = run(
+        &[
+            "-c",
+            "pack.threads=1",
+            "pack-objects",
+            "--stdout",
+            "--window=32",
+            "--depth=20",
+            "--delta-base-offset",
+        ],
+        &ids,
+    )?;
+    fs::write(files.root.join("native.pack"), &bytes)?;
+    run(&["index-pack", "--strict", "native.pack"], b"")?;
+    let native = fs::read(files.root.join("native.idx"))?;
+    eprintln!(
+        "OFS fixture pack_sha256={:02x?} strict_index_sha256={:02x?}",
+        openssl::sha::sha256(&bytes),
+        openssl::sha::sha256(&native)
+    );
+    let capacity = CapacityBudget::new(512 * 1024 * 1024);
+    let decoder = budget::Budget::new(capacity.clone())?;
+    let identity = identity();
+    let limits = limits();
+    let cpu_ns = || -> Result<u64> {
+        Ok(fs::read_to_string("/proc/thread-self/schedstat")?
+            .split_whitespace()
+            .next()
+            .expect("thread CPU runtime")
+            .parse()?)
+    };
+    let run_inventory = |reuse| -> Result<_> {
+        let control = Control::new(Instant::now() + Duration::from_secs(30));
+        let start_cpu = cpu_ns()?;
+        let now = Instant::now();
+        let pack = Packed::open_with_reuse(
+            &bytes,
+            &identity,
+            &control,
+            &capacity,
+            &decoder,
+            limits,
+            ReceiveLimits::default(),
+            reuse,
+            |_| {},
+        )?;
+        let wall = now.elapsed();
+        let cpu = cpu_ns()? - start_cpu;
+        let mut idx = Vec::new();
+        pack.write_index(&mut idx, &control)?;
+        assert_eq!(
+            idx, native,
+            "every CRC and physical offset must match native strict index-pack"
+        );
+        let count = pack.statistics().0;
+        eprintln!(
+            "OFS reuse={reuse} entries={count} wall_ns_per_entry={} cpu_ns_per_entry={}",
+            wall.as_nanos() / count as u128,
+            cpu / count as u64
+        );
+        Ok((pack.statistics(), pack.reuse_statistics(), wall, cpu))
+    };
+    let old = run_inventory(false)?;
+    let new = run_inventory(true)?;
+    let forest_control = Control::new(Instant::now() + Duration::from_secs(30));
+    let forest = Packed::open_forest(
+        &bytes,
+        &identity,
+        &forest_control,
+        &capacity,
+        &decoder,
+        limits,
+        ReceiveLimits::default(),
+        |_| {},
+    )?;
+    let mut forest_index = Vec::new();
+    forest.write_index(&mut forest_index, &forest_control)?;
+    assert_eq!(forest_index, native);
+    assert_eq!(forest.statistics().0, old.0.0);
+    assert_eq!(forest.statistics().1, old.0.1);
+    assert!(forest.statistics().2 < old.0.2);
+    eprintln!(
+        "forest inventory work={:?} reuse={:?} lane_frontier_bytes={}",
+        forest.statistics(),
+        forest.reuse_statistics(),
+        forest.frontier_peak()
+    );
+    drop(forest);
+    eprintln!("synthetic OFS inventory: old={old:?}, new={new:?}");
+    assert_eq!((old.0.0, old.0.1), (96, 96 * 512 * 1024));
+    assert_eq!((old.0.0, old.0.1), (new.0.0, new.0.1));
+    assert!(new.1.hits > 32 && new.1.avoided_ancestor_bytes > 0);
+    assert!(
+        new.0.2 < old.0.2,
+        "reuse must measurably reduce controlled decoder work"
+    );
+    for reuse in [false, true] {
+        let error = Packed::open_with_reuse(
+            &bytes,
+            &identity,
+            &control(),
+            &capacity,
+            &decoder,
+            ReadLimits {
+                max_decode_bytes: 1024 * 1024,
+                ..limits
+            },
+            ReceiveLimits::default(),
+            reuse,
+            |_| {},
+        )
+        .err()
+        .expect("a 512 KiB delta cannot fit two results plus instructions in 1 MiB");
+        assert_eq!(
+            error.downcast_ref(),
+            Some(&InventoryFailure::ChainWorkspace)
+        );
+    }
+    let cancelled = control();
+    let mut partial_hits = 0;
+    let result = Packed::open_with_reuse(
+        &bytes,
+        &identity,
+        &cancelled,
+        &capacity,
+        &decoder,
+        limits,
+        ReceiveLimits::default(),
+        true,
+        |event| {
+            if let Progress::Reuse(delta) = event {
+                partial_hits += delta.hits;
+                cancelled.cancel();
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(partial_hits, 1, "report verified work before cancellation");
+    Ok(())
+}
+
+#[test]
+fn packed_forest_visits_far_siblings_and_preserves_ordinal_and_bounds() -> Result<()> {
+    use git_rs_core::receive::packed::{InventoryFailure, Packed, Progress};
+    const SIZE: usize = 512 * 1024;
+    const ROOTS: usize = 36;
+    let mut bytes =
+        vendor::data::header::encode(vendor::data::Version::V2, (3 * ROOTS) as u32).to_vec();
+    let mut offsets = Vec::new();
+    let mut ids = Vec::new();
+    for fill in 0..ROOTS as u8 {
+        offsets.push(bytes.len());
+        let body = vec![fill; SIZE];
+        append(&mut bytes, vendor::data::entry::Header::Blob, &body);
+        ids.push(object_id(gix::objs::Kind::Blob, &body));
+    }
+    for suffix in [0xfe, 0xff] {
+        for (fill, &offset) in offsets.iter().enumerate() {
+            let mut delta = vec![0x80, 0x80, 0x20, 0x80, 0x80, 0x20];
+            // Seven 64 KiB copies, then 65,535 bytes and one distinct literal.
+            delta.extend([0x80; 7]);
+            delta.extend([0xb0, 0xff, 0xff, 1, suffix]);
+            let distance = (bytes.len() - offset) as u64;
+            append(
+                &mut bytes,
+                vendor::data::entry::Header::OfsDelta {
+                    base_distance: distance,
+                },
+                &delta,
+            );
+            let mut body = vec![fill as u8; SIZE];
+            body[SIZE - 1] = suffix;
+            ids.push(object_id(gix::objs::Kind::Blob, &body));
+        }
+    }
+    let bytes = seal(bytes);
+    let identity = identity();
+    let receive = ReceiveLimits::default();
+    let budget = CapacityBudget::new(64 * 1024 * 1024);
+    let vendor = budget::Budget::new(budget.clone())?;
+    let read = limits();
+    let control = control();
+    let old = Packed::open_with_reuse(
+        &bytes,
+        &identity,
+        &control,
+        &budget,
+        &vendor,
+        read,
+        receive,
+        true,
+        |_| {},
+    )?;
+    let new = Packed::open_forest(
+        &bytes,
+        &identity,
+        &control,
+        &budget,
+        &vendor,
+        read,
+        receive,
+        |_| {},
+    )?;
+    assert_eq!(new.physical_ids().collect::<Vec<_>>(), ids);
+    assert_eq!(new.reuse_statistics().hits, (2 * ROOTS) as u64);
+    assert_eq!(
+        new.reuse_statistics().avoided_ancestor_bytes,
+        (2 * ROOTS * SIZE) as u64
+    );
+    assert!(old.reuse_statistics().hits < new.reuse_statistics().hits);
+    assert!(new.statistics().2 < old.statistics().2);
+    assert_eq!(
+        new.frontier_peak(),
+        SIZE,
+        "keep only the branch parent, not the physically distant siblings"
+    );
+    let mut idx = Vec::new();
+    let mut serial = Vec::new();
+    new.write_index(&mut idx, &control)?;
+    old.write_index(&mut serial, &control)?;
+    assert_eq!(idx, serial);
+    drop((old, new));
+    let cap = ReadLimits {
+        max_decode_bytes: 2 * SIZE,
+        ..read
+    };
+    let err = Packed::open_forest(
+        &bytes,
+        &identity,
+        &control,
+        &budget,
+        &vendor,
+        cap,
+        receive,
+        |_| {},
+    )
+    .err()
+    .expect("two full buffers plus instructions exceed the old chain workspace contract");
+    assert_eq!(err.downcast_ref(), Some(&InventoryFailure::ChainWorkspace));
+    let before = budget.used();
+    let stopped = Control::new(Instant::now() + Duration::from_secs(10));
+    let err = Packed::open_forest(
+        &bytes,
+        &identity,
+        &stopped,
+        &budget,
+        &vendor,
+        read,
+        receive,
+        |event| {
+            if matches!(event, Progress::EntryBatch { .. }) {
+                stopped.cancel();
+            }
+        },
+    );
+    assert!(err.is_err());
+    assert_eq!(
+        budget.used(),
+        before,
+        "cancelled forest must drop all admitted backing"
+    );
+    Ok(())
+}
 fn commands(rows: &[(gix::ObjectId, &[u8])], caps: &[u8], budget: &CapacityBudget) -> CommandBatch {
     let mut input = Vec::new();
     for (index, (id, name)) in rows.iter().enumerate() {

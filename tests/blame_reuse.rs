@@ -29,6 +29,12 @@ mod source_support;
 #[path = "support/blame_immutable_body.rs"]
 mod immutable_body;
 
+#[path = "support/blame_cache_support.rs"]
+mod cache_support;
+
+#[path = "support/blame_completed_transport.rs"]
+mod completed_transport;
+
 fn native_output(root: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
     native_output_with_deadline(root, args, input, "20s")
 }
@@ -141,6 +147,213 @@ fn publish_history(fixture: &source_support::Fixture, tip: &str) {
     publish_history_from(fixture, &fixture.commit, tip);
 }
 
+#[derive(Default)]
+struct SegmentProbe {
+    planning: AtomicBool,
+    reject: std::sync::Mutex<Option<SegmentReject>>,
+    reads: std::sync::Mutex<Vec<Oid>>,
+}
+
+enum SegmentReject {
+    Cancel,
+    Revoke(String),
+}
+
+impl Observer for SegmentProbe {
+    fn observe(&self, phase: Phase, control: &Control) -> Result<()> {
+        if phase == Phase::SegmentPlanning {
+            self.reads.lock().unwrap().clear();
+            self.planning.store(true, Ordering::Release);
+        } else if phase == Phase::SegmentPlanned {
+            self.planning.store(false, Ordering::Release);
+            match self.reject.lock().unwrap().take() {
+                Some(SegmentReject::Cancel) => control.cancel(),
+                Some(SegmentReject::Revoke(slug)) => {
+                    metadata::grant(&slug, "alice", "bob", "none", b"refs/")?;
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn source_read(&self, id: &gix::hash::oid, _: bool, _: &Control) {
+        if self.planning.load(Ordering::Acquire) {
+            self.reads
+                .lock()
+                .unwrap()
+                .push(Oid(id.as_bytes().try_into().unwrap()));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires exclusively owned loopback PostgreSQL/S3 and private tmpfs"]
+fn cold_large_v1_uses_segments_and_matches_native() {
+    use git_rs::blame::ResourceProfile;
+
+    assert!(std::thread::available_parallelism().unwrap().get() >= 2);
+    let git = std::env::var_os("GIT_RS_TEST_ORACLE_GIT").expect("qualified native Git 2.56");
+    let mut oracle = Command::new(git);
+    oracle
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("LC_ALL", "C");
+    let version = oracle.arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(version.stdout, b"git version 2.56.0\n");
+
+    let probe = Arc::new(SegmentProbe::default());
+    let stage_count = |stage: &str, outcome: &str| -> u64 {
+        let metrics = git_rs::metrics::global().render(0, 0);
+        let prefix =
+            format!("git_rs_blame_segment_stage_total{{stage=\"{stage}\",outcome=\"{outcome}\"}} ");
+        metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let blame = Blame::new_with_resource_profile(1, 0, ResourceProfile::LargeV1)
+        .unwrap()
+        .with_observer(probe.clone());
+    let fixture = source_support::Fixture::new(blame, 10);
+    let native_root = fixture.root.join("native");
+    let tip = history(&native_root, 40, &fixture.commit);
+    publish_history(&fixture, &tip);
+    let request = Request::parse(&tip, "path=file").unwrap();
+    let response = Operation::new(30)
+        .enter(|| fixture.engine.blame(&fixture.slug, "alice", &request))
+        .unwrap();
+    let Response::Complete(body) = response else {
+        panic!("cold large-v1 blame did not complete");
+    };
+    let stats = body.work_statistics().unwrap().segments;
+    assert!(
+        stats.used && stats.lanes >= 2,
+        "ordinary fallback: {stats:?}"
+    );
+    assert_eq!(stats.scanned_edges, 40);
+    assert!(stats.sampled_capacity_bytes <= ResourceProfile::LargeV1.job_bytes());
+    let objects = text(native(&native_root, &["rev-list", "--objects", &tip], b""));
+    let blobs: Vec<_> = objects
+        .lines()
+        .filter_map(|line| line.strip_suffix(" file"))
+        .map(|id| Oid::parse(id.as_bytes()).unwrap())
+        .collect();
+    assert!(blobs.len() >= 40);
+    let reads = probe.reads.lock().unwrap();
+    assert!(!reads.is_empty());
+    assert!(
+        !reads.iter().any(|id| blobs.contains(id)),
+        "planner touched physical blob"
+    );
+    drop(reads);
+    eprintln!("cold large-v1 segments: {stats:?}");
+    let mut bytes = Vec::new();
+    Operation::new(10)
+        .enter(|| body.write_to(&mut bytes))
+        .unwrap();
+    let output = Command::new("timeout")
+        .args(["--kill-after=2s", "20s"])
+        .arg(oracle.get_program())
+        .env_clear()
+        .envs(
+            oracle
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .arg("-C")
+        .arg(&native_root)
+        .args([
+            "--literal-pathspecs",
+            "blame",
+            "--root",
+            "--line-porcelain",
+            "--no-textconv",
+            "--no-progress",
+            "--diff-algorithm=myers",
+            &tip,
+            "--",
+            "file",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(bytes, output.stdout);
+    drop(body);
+    wait_for(|| fixture.leases() == 0);
+
+    let stopped = stage_count("planning", "stopped");
+    *probe.reject.lock().unwrap() = Some(SegmentReject::Cancel);
+    let cancelled =
+        Operation::new(30).enter(|| fixture.engine.blame(&fixture.slug, "alice", &request));
+    assert!(cancelled.is_err());
+    // Shared errors retain their CPU ownership until the caller drops them.
+    drop(cancelled);
+    wait_for(|| fixture.leases() == 0 && fixture.engine.blame.admitted() == 0);
+    assert!(stage_count("planning", "stopped") > stopped);
+
+    fixture.restored_reader();
+    *probe.reject.lock().unwrap() = Some(SegmentReject::Revoke(fixture.slug.clone()));
+    let revoked = Operation::new(30).enter(|| fixture.engine.blame(&fixture.slug, "bob", &request));
+    assert!(
+        probe.reject.lock().unwrap().is_none(),
+        "revocation hook not reached"
+    );
+    assert!(revoked.is_err());
+    assert!(matches!(
+        Operation::new(30)
+            .enter(|| fixture.engine.blame(&fixture.slug, "alice", &request))
+            .unwrap(),
+        Response::Busy
+    ));
+    drop(revoked);
+    wait_for(|| fixture.leases() == 0 && fixture.engine.blame.admitted() == 0);
+
+    // Delete the path, then re-add it and create a long linear suffix. A
+    // present-path prefix is not proof that the deletion is a root.
+    let mut deletion = format!(
+        "commit refs/heads/history\ncommitter Synthetic <synthetic@example.invalid> 1000000050 +0000\ndata 6\ndelete\nfrom {tip}\nD file\n\n"
+    );
+    native(
+        &native_root,
+        &["fast-import", "--quiet", "--force"],
+        deletion.as_bytes(),
+    );
+    deletion = text(native(
+        &native_root,
+        &["rev-parse", "refs/heads/history"],
+        b"",
+    ));
+    let readded = history(&native_root, 40, &deletion);
+    publish_history_from(&fixture, &tip, &readded);
+    let request = Request::parse(&readded, "path=file").unwrap();
+    let fell_back = stage_count("fallback", "completed");
+    let response = Operation::new(30)
+        .enter(|| fixture.engine.blame(&fixture.slug, "alice", &request))
+        .unwrap();
+    let body = match response {
+        Response::Complete(body) => body,
+        Response::Busy => panic!("fallback unexpectedly busy"),
+        Response::NotFound => panic!("re-added path not found"),
+        Response::TooLarge => panic!("fallback exceeded output limit"),
+    };
+    let stats = body.work_statistics().unwrap().segments;
+    assert!(stats.attempted && !stats.used && stats.lanes == 0 && stats.scanned_edges >= 40);
+    assert!(stage_count("fallback", "completed") > fell_back);
+    let mut bytes = Vec::new();
+    Operation::new(10)
+        .enter(|| body.write_to(&mut bytes))
+        .unwrap();
+    assert_eq!(bytes, native_porcelain(&native_root, &readded));
+    drop(body);
+    wait_for(|| fixture.leases() == 0);
+}
+
 fn publish_history_from(fixture: &source_support::Fixture, previous: &str, tip: &str) {
     Operation::new(30).enter(|| {
         let native_root = fixture.root.join("native");
@@ -233,6 +446,10 @@ fn checkpoint_reuse_child() {
     let root = std::path::PathBuf::from(std::env::var_os("GIT_RS_REUSE_ROOT").unwrap());
     let slug = std::env::var("GIT_RS_REUSE_SLUG").unwrap();
     let tip = std::env::var("GIT_RS_REUSE_TIP").unwrap();
+    if let Some(mode) = mode.strip_prefix("completed-") {
+        completed_transport::serve(mode, &root, &slug, &tip);
+        return;
+    }
     if let Some(mode) = mode.strip_prefix("immutable-") {
         immutable_body::serve(mode, &root, &slug, &tip);
         return;

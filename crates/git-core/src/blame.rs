@@ -23,6 +23,8 @@ mod replacement;
 pub use replacement::{ReplacementBlame, ReplacementSeed};
 #[path = "blame_completed.rs"]
 mod completed;
+#[path = "blame_segments.rs"]
+pub mod segments;
 pub use completed::{CompletedBlameMap, MAX_COMPLETED_MAP_BYTES};
 pub use gix_blame::native::CompletedUse;
 
@@ -36,6 +38,32 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_COMMITS: usize = 1_000_000;
 // Match the pinned vendor's total-object bound, not its per-name metadata bound.
 const MAX_TREE_BYTES: usize = 128 * 1024 * 1024;
+
+fn blame_cpu_poll(control: &Control) -> impl FnMut(Stage) -> Result<(), StopReason> + '_ {
+    let mut cpu = control.cpu_poller();
+    let mut previous = None;
+    move |stage| {
+        // Audited pure-CPU quanta only: <=4096-byte chunks, <=1024 offset
+        // copies or Common tokens, and bounded attribution metadata. Stage
+        // transitions, allocations, source I/O and hooks remain strict.
+        let bounded = matches!(
+            stage,
+            Stage::Attribution
+                | Stage::Tokenize
+                | Stage::Hash
+                | Stage::Equal
+                | Stage::Copy
+                | Stage::Common
+        );
+        let result = if bounded && previous == Some(stage) {
+            cpu.checkpoint()
+        } else {
+            cpu.boundary()
+        };
+        previous = bounded.then_some(stage);
+        result
+    }
+}
 // Fixed attribute/filter-selection metadata constructed by the pinned Platform
 // constructor, never populated from repository configuration in the raw path.
 // This conservative bootstrap charge is separate from dependency-owned data leases;
@@ -223,6 +251,7 @@ impl ProducerVersion {
                 include_bytes!("lib.rs").as_slice(), include_bytes!("blame.rs").as_slice(),
                 include_bytes!("blame_replacement.rs").as_slice(),
                 include_bytes!("blame_completed.rs").as_slice(),
+                include_bytes!("blame_segments.rs").as_slice(),
                 include_bytes!("porcelain.rs").as_slice(), include_bytes!("objects.rs").as_slice(),
                 include_bytes!("graph.rs").as_slice(), include_bytes!("pack.rs").as_slice(),
                 include_bytes!("pack_cache.rs").as_slice(), include_bytes!("control.rs").as_slice(),
@@ -329,6 +358,46 @@ struct CallbackBridge<'a, T: ?Sized> {
     control: &'a Control,
     cause: &'a Cause,
 }
+
+/// Closed counters for one synchronous attribution attempt, including errors.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlameProgressSnapshot {
+    /// Latest `Stage::Commit` processed value, before the next visit starts.
+    pub commit_watermark: usize,
+    /// Completed raw mapping boundaries, not all DAG edges or equal-blob edges.
+    pub mapping_boundaries: u64,
+    pub mapping: memo::MappingStatistics,
+    pub last_mapping_elapsed: std::time::Duration,
+    pub raw_blob_calls: u64,
+    /// Inclusive verified-object acquisition wall, including failed calls.
+    pub raw_blob_elapsed: std::time::Duration,
+    pub raw_blob_elapsed_at_last_mapping: std::time::Duration,
+}
+
+/// Job-local observation only. No callbacks, I/O, allocations or locks.
+pub struct BlameProgress {
+    started: std::time::Instant,
+    counters: std::cell::Cell<BlameProgressSnapshot>,
+}
+
+impl BlameProgress {
+    pub fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            counters: std::cell::Cell::new(BlameProgressSnapshot::default()),
+        }
+    }
+
+    pub fn snapshot(&self) -> BlameProgressSnapshot {
+        self.counters.get()
+    }
+}
+
+impl Default for BlameProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl<T: ?Sized> CallbackBridge<'_, T> {
     fn invoke<R>(
         &mut self,
@@ -359,9 +428,23 @@ impl gix_blame::memo::MappingMemo for CallbackBridge<'_, dyn memo::MappingMemo +
         self.invoke(|callback| callback.completed(key, encoded))
     }
 }
-impl gix_blame::memo::MappingBoundary for CallbackBridge<'_, dyn memo::MappingBoundary + '_> {
+struct BoundaryBridge<'a> {
+    callback: CallbackBridge<'a, dyn memo::MappingBoundary + 'a>,
+    progress: Option<&'a BlameProgress>,
+}
+
+impl gix_blame::memo::MappingBoundary for BoundaryBridge<'_> {
     fn completed(&mut self, statistics: memo::MappingStatistics) -> Result<(), Cancelled> {
-        self.invoke(|callback| callback.completed(statistics))
+        if let Some(progress) = self.progress {
+            let mut counters = progress.snapshot();
+            counters.mapping_boundaries += 1;
+            counters.mapping = statistics;
+            counters.last_mapping_elapsed = progress.started.elapsed();
+            counters.raw_blob_elapsed_at_last_mapping = counters.raw_blob_elapsed;
+            progress.counters.set(counters);
+        }
+        self.callback
+            .invoke(|callback| callback.completed(statistics))
     }
 }
 
@@ -415,6 +498,7 @@ impl Allocation for BlameAllocation {
 struct FindBridge<'a, P> {
     session: &'a SnapshotSession<P>,
     cause: Arc<Cause>,
+    progress: Option<&'a BlameProgress>,
 }
 
 /// No mutable bytes or weak handles escape this private raw input owner.
@@ -468,11 +552,15 @@ impl<P: VerifiedObjectProvider> FindBridge<'_, P> {
             // hash/collision witness, original decode plan and budget identity.
             // Moving the witness retains either owned bytes or the cache pin;
             // object()/into_object() would copy pinned bytes here.
-            let Some(object) = self
-                .session
-                .verified_object(id)
-                .map_err(|error| source_error(error.as_ref()))?
-            else {
+            let started = self.progress.map(|_| std::time::Instant::now());
+            let object = self.session.verified_object(id);
+            if let Some((progress, started)) = self.progress.zip(started) {
+                let mut counters = progress.snapshot();
+                counters.raw_blob_calls += 1;
+                counters.raw_blob_elapsed += started.elapsed();
+                progress.counters.set(counters);
+            }
+            let Some(object) = object.map_err(|error| source_error(error.as_ref()))? else {
                 return Ok(None);
             };
             if object.header().kind != Kind::Blob {
@@ -772,7 +860,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         request: BlameRequest<'_>,
         options: &BlameOptions,
     ) -> Result<CompleteBlame, BlameError> {
-        self.blame_complete_inner(request, options, None, None)
+        self.blame_complete_observed(request, options, None, None)
     }
 
     pub fn blame_complete_with_memo(
@@ -781,7 +869,19 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         options: &BlameOptions,
         memo: memo::MemoryMappingRequest<'_>,
     ) -> Result<CompleteBlame, BlameError> {
-        self.blame_complete_inner(request, options, Some(memo), None)
+        self.blame_complete_observed(request, options, Some(memo), None)
+    }
+
+    /// Run ordinary attribution with optional closed progress counters.
+    /// Mapping counts require a reuse-enabled memo request with an existing boundary.
+    pub fn blame_complete_observed(
+        &self,
+        request: BlameRequest<'_>,
+        options: &BlameOptions,
+        memo: Option<memo::MemoryMappingRequest<'_>>,
+        progress: Option<&BlameProgress>,
+    ) -> Result<CompleteBlame, BlameError> {
+        self.blame_complete_inner(request, options, memo, None, progress)
     }
 
     fn blame_complete_inner(
@@ -790,6 +890,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         options: &BlameOptions,
         memo: Option<memo::MemoryMappingRequest<'_>>,
         completed: Option<([u8; 32], &CompletedBlameMap<'_>)>,
+        progress: Option<&BlameProgress>,
     ) -> Result<CompleteBlame, BlameError> {
         self.validate_blame_request(request)?;
         let scopes = completed::scopes(self, options)?;
@@ -830,33 +931,16 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
             .validate_controlled_raw()
             .map_err(|_| BlameError::UnsupportedContract)?;
         let max_commits = self.limits.max_graph_objects.min(MAX_COMMITS);
-        let mut cpu = self.control.cpu_poller();
-        let mut previous_cpu_stage = None;
+        let mut poll = blame_cpu_poll(&self.control);
         let mut check = |event: gix_diff::blob::control::Checkpoint| {
-            // Only the audited pure CPU loops are sampled: byte operations use
-            // <=4096-byte chunks (offset copies <=1024 items), Common <=1024
-            // tokens, Attribution bounded hunk metadata (<=128 suspects plus a
-            // logarithmic prefix query) or <=4096 bytes of fixed-width origin
-            // IDs. Explicit origin paths retain byte-comparison checks. Any
-            // stage transition is strict. All
-            // allocation, graph/source, output, trace, census, cleanup and
-            // other/unknown stages remain strict; user hooks have their own
-            // strict pre/post checks. No provider/I/O check is amortized.
-            let bounded_cpu = matches!(
-                event.stage,
-                Stage::Attribution
-                    | Stage::Tokenize
-                    | Stage::Hash
-                    | Stage::Equal
-                    | Stage::Copy
-                    | Stage::Common
-            );
-            let checked = if bounded_cpu && previous_cpu_stage == Some(event.stage) {
-                cpu.checkpoint()
-            } else {
-                cpu.boundary()
-            };
-            previous_cpu_stage = bounded_cpu.then_some(event.stage);
+            let checked = poll(event.stage);
+            if event.stage == Stage::Commit
+                && let Some(progress) = progress
+            {
+                let mut counters = progress.snapshot();
+                counters.commit_watermark = event.processed;
+                progress.counters.set(counters);
+            }
             let result = checked.map_err(BlameError::from).and_then(|()| {
                 if event.stage == Stage::Commit && event.processed >= max_commits {
                     Err(BlameError::WorkLimit)
@@ -872,6 +956,7 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
         let source = FindBridge {
             session: self,
             cause: cause.clone(),
+            progress,
         };
         let mut raw_blobs = |id: &oid| source.raw_blob(id, &mut raw_metadata);
         let result = if let Some(memo) = memo {
@@ -881,10 +966,13 @@ impl<P: VerifiedObjectProvider> SnapshotSession<P> {
                 control: &self.control,
                 cause: &cause,
             };
-            let mut boundary = memo.boundary.map(|callback| CallbackBridge {
-                callback,
-                control: &self.control,
-                cause: &cause,
+            let mut boundary = memo.boundary.map(|callback| BoundaryBridge {
+                callback: CallbackBridge {
+                    callback,
+                    control: &self.control,
+                    cause: &cause,
+                },
+                progress,
             });
             gix_blame::file_with_allocations_and_completed_attribution(
                 &source,

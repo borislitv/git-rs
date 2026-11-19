@@ -1,5 +1,5 @@
 use super::semantics::Edge;
-use super::storage::{ChargedVec, Set};
+use super::storage::{ChargedVec, Map, Set};
 use super::{ReceiveLimits, Warning, nonnull, semantics};
 use crate::objects::{Result, VerifiedObject, invalid};
 use crate::{SnapshotSession, VerifiedObjectProvider};
@@ -9,7 +9,7 @@ use gix_object::Kind;
 #[derive(Clone, Copy)]
 enum Frame {
     Enter(Edge),
-    Leave(ObjectId),
+    Leave(ObjectId, Kind),
 }
 
 pub(super) struct Work<'a, P> {
@@ -19,13 +19,18 @@ pub(super) struct Work<'a, P> {
     reads: usize,
     edges: usize,
     complete: Set<ObjectId>,
+    packed_complete: Option<Map<ObjectId, Kind>>,
     gitmodules_done: Set<ObjectId>,
     warnings_seen: Set<(ObjectId, semantics::WarningKind)>,
     warnings: ChargedVec<Warning>,
 }
 
 impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
-    pub fn new(snapshot: &'a SnapshotSession<P>, limits: ReceiveLimits) -> Result<Self> {
+    pub fn new(
+        snapshot: &'a SnapshotSession<P>,
+        limits: ReceiveLimits,
+        packed: bool,
+    ) -> Result<Self> {
         Ok(Self {
             snapshot,
             limits,
@@ -33,6 +38,9 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
             reads: 0,
             edges: 0,
             complete: Set::new(snapshot.capacity.clone(), snapshot.limits.max_graph_objects)?,
+            packed_complete: packed
+                .then(|| Map::new(snapshot.capacity.clone(), snapshot.limits.max_graph_objects))
+                .transpose()?,
             gitmodules_done: Set::new(
                 snapshot.capacity.clone(),
                 snapshot.limits.max_graph_objects,
@@ -40,6 +48,15 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
             warnings_seen: Set::new(snapshot.capacity.clone(), limits.max_warnings)?,
             warnings: ChargedVec::new(snapshot.capacity.clone(), limits.max_warnings)?,
         })
+    }
+
+    pub fn complete_packed_leaf(&mut self, id: ObjectId, kind: Kind) -> Result<()> {
+        if kind == Kind::Blob
+            && let Some(complete) = &mut self.packed_complete
+        {
+            complete.insert(id, kind, &self.snapshot.control)?;
+        }
+        Ok(())
     }
 
     pub fn charge(&mut self, size: usize) -> Result<()> {
@@ -107,12 +124,24 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
     }
 
     pub fn closure(&mut self, root: ObjectId, expected: Option<Kind>) -> Result<()> {
-        let root_object = self.read(&root)?;
-        let kind = root_object.header().kind;
+        if let Some(kind) = self.packed_complete.as_ref().and_then(|map| map.get(&root)) {
+            self.snapshot.control.check()?;
+            if expected.is_some_and(|expected| expected != *kind) {
+                return Err(invalid("unexpected receive root object type"));
+            }
+            return Ok(());
+        }
+        let kind = if self.packed_complete.is_some() {
+            self.snapshot
+                .header(&root)?
+                .ok_or_else(|| invalid("missing packed receive root"))?
+                .kind
+        } else {
+            self.read(&root)?.header().kind
+        };
         if expected.is_some_and(|expected| expected != kind) {
             return Err(invalid("unexpected receive root object type"));
         }
-        drop(root_object);
         let snapshot = self.snapshot;
         let mut stack = ChargedVec::new(
             snapshot.capacity.clone(),
@@ -135,11 +164,27 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
         while let Some(frame) = stack.pop() {
             snapshot.control.check()?;
             match frame {
-                Frame::Leave(id) => {
+                Frame::Leave(id, kind) => {
                     active.remove(&id);
-                    self.complete.insert(id, &snapshot.control)?;
+                    if let Some(complete) = &mut self.packed_complete {
+                        complete.insert(id, kind, &snapshot.control)?;
+                    } else {
+                        self.complete.insert(id, &snapshot.control)?;
+                    }
                 }
                 Frame::Enter(edge) => {
+                    if let Some(kind) = self
+                        .packed_complete
+                        .as_ref()
+                        .and_then(|map| map.get(&edge.id))
+                    {
+                        if *kind != edge.kind {
+                            return Err(invalid("receive graph edge type mismatch"));
+                        }
+                        if !edge.gitmodules || self.gitmodules_done.contains(&edge.id) {
+                            continue;
+                        }
+                    }
                     // Check type even if a different typed edge visited this ID.
                     // An OID-only visited fast path before this check is unsound.
                     let object = self.read(&edge.id)?;
@@ -171,11 +216,16 @@ impl<'a, P: VerifiedObjectProvider> Work<'a, P> {
                     if active.contains(&edge.id) {
                         return Err(invalid("receive object graph cycle"));
                     }
-                    if self.complete.contains(&edge.id) {
+                    if self.complete.contains(&edge.id)
+                        || self
+                            .packed_complete
+                            .as_ref()
+                            .is_some_and(|map| map.get(&edge.id).is_some())
+                    {
                         continue;
                     }
                     active.insert(edge.id, &snapshot.control)?;
-                    stack.push(Frame::Leave(edge.id), &snapshot.control)?;
+                    stack.push(Frame::Leave(edge.id, edge.kind), &snapshot.control)?;
                     self.inspect(&edge.id, edge.kind, object.as_slice(), |child| {
                         stack.push(Frame::Enter(child), &snapshot.control)
                     })?;

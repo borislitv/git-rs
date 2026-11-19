@@ -82,3 +82,14 @@
   controls. Mixed-parent ambiguity falls back to ordinary attribution. The fork
   blame suite passed 91 tests and the focused application core suites passed 42.
   This qualifies the core API, not a first, uncached request on a long history.
+- Cold slider qualification: the current owned pin is [Gitoxide `7c9e8fb`](https://github.com/borislitv/gitoxide/commit/7c9e8fbecae9b475ac51c80db8be2261f3f00f82).
+  On a synthetic repeated-line edge, the slider scanned 4 tokens instead of
+  100,004 and matched Git 2.56 hunk coordinates and changed bytes. The full
+  91-test fork blame suite and 10 imara-diff unit tests passed. This is not a
+  corpus timing result.
+- The bounded cold segment producer now streams newly requested blob bodies
+  without evicting resident delta bases on their behalf. The one-slot shared-base
+  test checks exact output and one materialization of the common base. The owned
+  loopback cancellation, revocation, and delete/re-add fallback checks passed.
+  Independent initial warming also passed the synthetic quantum/restart gate;
+  full-history blame and Kubernetes warm-worker takeover are separate open gates.

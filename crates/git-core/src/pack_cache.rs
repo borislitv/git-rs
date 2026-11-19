@@ -113,6 +113,37 @@ pub(super) struct Entry {
     _metadata: CapacityReservation,
 }
 
+// Only this wrapper owns the Arc; no Weak can escape. On the final strong
+// release, into_inner frees the control block before dropping Entry's charge.
+#[derive(Clone)]
+struct SharedEntry(Option<Arc<Entry>>);
+
+impl SharedEntry {
+    fn into_inner(mut self) -> Option<Entry> {
+        Arc::into_inner(self.0.take().expect("live cache entry"))
+    }
+
+    fn strong_count(&self) -> usize {
+        Arc::strong_count(self.0.as_ref().expect("live cache entry"))
+    }
+}
+
+impl std::ops::Deref for SharedEntry {
+    type Target = Entry;
+
+    fn deref(&self) -> &Entry {
+        self.0.as_deref().expect("live cache entry")
+    }
+}
+
+impl Drop for SharedEntry {
+    fn drop(&mut self) {
+        if let Some(entry) = self.0.take() {
+            drop(Arc::into_inner(entry));
+        }
+    }
+}
+
 struct EntryAdmission {
     quota: QuotaPermit,
     metadata: CapacityReservation,
@@ -131,7 +162,7 @@ struct Memo {
     plan: DecodePlan,
 }
 struct Tables {
-    entries: Vec<Option<Arc<Entry>>>,
+    entries: Vec<Option<SharedEntry>>,
     headers: Vec<Option<Memo>>,
     // Sorted slot metadata only, not additional object/header ownership. Header
     // duplicates retain their individual slots; lowest slot wins as in the scan.
@@ -159,8 +190,9 @@ pub(super) struct Runtime {
 /// entry and its snapshot-cache metadata. It never exposes mutable bytes.
 #[derive(Clone)]
 pub struct CachedObject {
-    entry: Arc<Entry>,
+    entry: SharedEntry,
     _owner: Arc<Runtime>,
+    freshly_transferred: bool,
 }
 impl CachedObject {
     pub(crate) fn shares_budget(&self, budget: &CapacityBudget) -> bool {
@@ -180,6 +212,30 @@ impl CachedObject {
     }
     pub fn capacity(&self) -> usize {
         self.entry.data.capacity()
+    }
+
+    /// A fresh transfer must not make formerly owned mutable results fail just
+    /// because optional caching holds the only otherwise available backing.
+    pub(crate) fn recover_fresh_backing(self) -> Option<CapacityBuffer> {
+        if !self.freshly_transferred {
+            return None;
+        }
+        let slot_pin = {
+            let mut tables = self._owner.lock();
+            let position = tables
+                .entry_index
+                .binary_search_by_key(&self.entry.key, |&(key, _)| key)
+                .ok()?;
+            let slot = tables.entry_index[position].1;
+            let indexed = tables.entries[slot].as_ref()?;
+            if !std::ptr::eq::<Entry>(&**indexed, &*self.entry) || indexed.strong_count() != 2 {
+                return None;
+            }
+            tables.entry_index.remove(position);
+            tables.entries[slot].take()
+        };
+        drop(slot_pin);
+        self.entry.into_inner().map(|entry| entry.data)
     }
 }
 
@@ -204,7 +260,7 @@ impl Runtime {
         }
         let metadata_bytes = |entries, headers, entry_index, header_index| {
             [
-                (entries, std::mem::size_of::<Option<Arc<Entry>>>()),
+                (entries, std::mem::size_of::<Option<SharedEntry>>()),
                 (headers, std::mem::size_of::<Option<Memo>>()),
                 (entry_index, std::mem::size_of::<(Key, usize)>()),
                 (header_index, std::mem::size_of::<(Key, ObjectId, usize)>()),
@@ -288,11 +344,11 @@ impl Runtime {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    pub fn lookup(
+    fn lookup(
         &self,
         key: Key,
         check: &dyn Fn() -> gix_error::Result,
-    ) -> gix_error::Result<Option<Arc<Entry>>> {
+    ) -> gix_error::Result<Option<SharedEntry>> {
         check()?;
         let found = {
             let tables = self.lock();
@@ -382,7 +438,7 @@ impl Runtime {
                 tables.entry_cursor = (index + 1) % tables.entries.len();
                 if tables.entries[index]
                     .as_ref()
-                    .is_some_and(|entry| Arc::strong_count(entry) == 1)
+                    .is_some_and(|entry| entry.strong_count() == 1)
                 {
                     let key = tables.entries[index].as_ref().expect("occupied victim").key;
                     let position = tables
@@ -527,8 +583,8 @@ impl Runtime {
         plan: DecodePlan,
         compressed: usize,
         storage: EntryStorage,
-    ) -> Arc<Entry> {
-        Arc::new(Entry {
+    ) -> SharedEntry {
+        SharedEntry(Some(Arc::new(Entry {
             key,
             id,
             plan,
@@ -536,12 +592,12 @@ impl Runtime {
             data: storage.data,
             _quota: storage.admission.quota,
             _metadata: storage.admission.metadata,
-        })
+        })))
     }
 
     fn publish(
         &self,
-        candidate: &Arc<Entry>,
+        candidate: &SharedEntry,
         check: &dyn Fn() -> gix_error::Result,
     ) -> gix_error::Result<bool> {
         let key = candidate.key;
@@ -551,11 +607,19 @@ impl Runtime {
             check()?;
             {
                 let mut tables = self.lock();
-                if tables
+                if let Ok(position) = tables
                     .entry_index
                     .binary_search_by_key(&key, |&(key, _)| key)
-                    .is_ok()
                 {
+                    let existing = tables.entries[tables.entry_index[position].1]
+                        .as_ref()
+                        .expect("indexed cache entry");
+                    if existing.id != candidate.id {
+                        return Err(gix_error::corruption(
+                            "decoder cache object identity mismatch",
+                        )
+                        .into());
+                    }
                     return Ok(false);
                 }
                 if let Some(slot) = tables.entries.iter().position(|slot| slot.is_none()) {
@@ -598,6 +662,51 @@ impl Runtime {
         ))
     }
 
+    /// Transfer the original already-verified decode allocation to the cache.
+    /// Only optional cache quota/metadata is new; losing admission preserves the
+    /// original allocation and plan, without reading or hashing it again.
+    pub fn transfer_verified(
+        self: &Arc<Self>,
+        key: Key,
+        id: ObjectId,
+        plan: DecodePlan,
+        compressed: usize,
+        data: CapacityBuffer,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<VerifiedObject> {
+        check()?;
+        debug_assert!(data.shares_budget(&self.budget));
+        let data = if let Some(existing) = self.lookup(key, check)? {
+            if existing.id != id {
+                return Err(gix_error::corruption("decoder cache object identity mismatch").into());
+            }
+            data
+        } else if let Some(admission) = self.entry_admission(data.capacity(), check)? {
+            let candidate =
+                Self::entry(key, id, plan, compressed, EntryStorage { data, admission });
+            if self.publish(&candidate, check)? {
+                return Ok(VerifiedObject::from_cached(CachedObject {
+                    entry: candidate,
+                    _owner: self.clone(),
+                    freshly_transferred: true,
+                }));
+            }
+            candidate
+                .into_inner()
+                .expect("unpublished entry was never shared")
+                .data
+        } else {
+            data
+        };
+        check()?;
+        Ok(VerifiedObject::from_pack_verified(
+            id.as_ref(),
+            plan.header.kind,
+            data,
+            plan,
+        ))
+    }
+
     /// A bounded, advisory eligibility check before optional intermediate hashing.
     /// Publication still admits actual backing and rechecks races in store_verified.
     fn may_store_intermediate(
@@ -628,7 +737,7 @@ impl Runtime {
                 for entry in &tables.entries {
                     match entry {
                         None => slot_available = true,
-                        Some(entry) if Arc::strong_count(entry) == 1 => {
+                        Some(entry) if entry.strong_count() == 1 => {
                             slot_available = true;
                             available = available.saturating_add(entry.data.capacity());
                         }
@@ -664,13 +773,14 @@ impl Runtime {
         if entry.id != id {
             return Err(gix_error::corruption("decoder cache object identity mismatch").into());
         }
-        // Only store_verified can create an Entry; no mutable storage escapes
+        // Only verified publication can create an Entry; no mutable storage escapes
         // publication. Keep the identity and stop checks, not a redundant hash.
         check()?;
         self.note_hit();
         Ok(Some(CachedObject {
             entry,
             _owner: self.clone(),
+            freshly_transferred: false,
         }))
     }
 
@@ -685,7 +795,7 @@ impl Runtime {
                 .entries
                 .iter()
                 .flatten()
-                .filter(|entry| Arc::strong_count(entry) > 1)
+                .filter(|entry| entry.strong_count() > 1)
                 .count(),
             entry_bytes: self.quota.used.load(Ordering::Acquire),
             header_entries: tables.headers.iter().flatten().count(),
@@ -868,8 +978,13 @@ impl gix_pack::cache::DecodeEntry for EntryCache<'_> {
                 let Some(mut storage) = runtime.entry_storage(data.len(), check)? else {
                     return Ok(());
                 };
-                let id =
-                    super::hash_object_with(self.bundle.index.object_hash(), kind, data, check)?;
+                let id = super::hash_object_with(
+                    self.bundle.index.object_hash(),
+                    kind,
+                    data,
+                    check,
+                    |_| {},
+                )?;
                 // No reverse index or caller-provided proof is needed: only a
                 // digest indexed at this exact physical location may be sealed.
                 let Some(position) = self.bundle.index.lookup(id.as_ref()) else {

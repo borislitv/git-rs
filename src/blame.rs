@@ -19,6 +19,8 @@ use std::{
 
 #[path = "blame_batch.rs"]
 pub(crate) mod batch;
+#[path = "blame_completed.rs"]
+mod completed;
 #[path = "blame_derive.rs"]
 mod derive;
 #[path = "blame_jobs.rs"]
@@ -27,6 +29,8 @@ mod jobs;
 mod lookup;
 #[path = "blame_memo.rs"]
 pub(crate) mod memo;
+#[path = "blame_reconcile.rs"]
+pub mod reconcile;
 #[path = "blame_replacement.rs"]
 mod replacement;
 #[path = "blame_resources.rs"]
@@ -74,6 +78,10 @@ impl Request {
             }
         }
         let path = percent_encoding::percent_decode_str(encoded).collect::<Vec<_>>();
+        Self::from_raw(commit, path)
+    }
+
+    fn from_raw(commit: Oid, path: Vec<u8>) -> Result<Self> {
         if commit == Oid::ZERO
             || path.is_empty()
             || path.len() > 4096
@@ -115,9 +123,13 @@ pub enum Phase {
     BodyBuildUnavailable,
     PreflightTip,
     PreflightWalk,
+    SegmentPlanning,
+    SegmentPlanned,
     WorkSetPrepared,
     ParentBodyHit,
     ReplacementSeedHit,
+    CompletedMapHit,
+    CompletedMapPublished,
 }
 /// In-process observation outside source/cache/workset/scheduler locks. Callbacks
 /// must honor the original control/deadline, including the statistics callback.
@@ -125,6 +137,25 @@ pub trait Observer: Send + Sync {
     fn observe(&self, phase: Phase, control: &Control) -> Result<()>;
     /// Actual completed core work, including independent warm jobs. Not progress.
     fn work_completed(&self, _warm: bool, _statistics: WorkStatistics, _control: &Control) {}
+    /// Opt in to a numeric summary after each core attribution attempt.
+    fn wants_attribution_progress(&self) -> bool {
+        false
+    }
+    /// Called once after the core returns, even after a stop. Do not perform I/O.
+    fn attribution_progress(
+        &self,
+        _snapshot: git_rs_core::blame::BlameProgressSnapshot,
+        _elapsed: Duration,
+        _completed: bool,
+    ) {
+    }
+    /// A source-provider lookup attempt, before any cache access. `header_only`
+    /// distinguishes a header lookup from a verified-object lookup. This is
+    /// not a count of pack ranges or underlying delta reads. Keep callbacks
+    /// bounded and in-process; do not perform I/O or log object IDs.
+    fn source_read(&self, _id: &gix::hash::oid, _header_only: bool, _control: &Control) {}
+    /// Closed per-provider counters, including cancelled attempts. No I/O.
+    fn range_verification_closed(&self, _stats: git_rs_core::pack::ranges::VerificationStats) {}
 }
 fn observe(observer: &Option<Arc<dyn Observer>>, phase: Phase, control: &Control) -> Result<()> {
     control.check()?;
@@ -165,10 +196,25 @@ impl Blame {
         waiters: usize,
         resources: ResourceProfile,
     ) -> Result<Self> {
+        Self::new_with_resource_profiles(concurrency, waiters, resources, Default::default())
+    }
+
+    /// Both policies share one actual work/result pool; their byte caps are independent.
+    pub fn new_with_resource_profiles(
+        concurrency: usize,
+        waiters: usize,
+        resources: ResourceProfile,
+        receive: crate::receive::ResourceProfile,
+    ) -> Result<Self> {
         resources.validate_capacity(concurrency, waiters)?;
         ProducerVersion::verified()?;
         Ok(Self {
-            jobs: Jobs::new_with_resource_profile(concurrency, waiters, resources)?,
+            jobs: Jobs::with_cpu(Arc::new(crate::cpu_jobs::CpuJobs::with_receive_profile(
+                concurrency,
+                waiters,
+                resources.job_bytes(),
+                receive,
+            )?)),
             cache: None,
             observer: None,
             writer: None,
@@ -183,7 +229,12 @@ impl Blame {
         self.resources.validate_capacity(concurrency, waiters)?;
         ProducerVersion::verified()?;
         Ok(Self {
-            jobs: Jobs::new_with_resource_profile(concurrency, waiters, self.resources)?,
+            jobs: Jobs::with_cpu(Arc::new(crate::cpu_jobs::CpuJobs::with_receive_profile(
+                concurrency,
+                waiters,
+                self.resources.job_bytes(),
+                self.jobs.cpu().receive_profile(),
+            )?)),
             cache: self.cache,
             observer: self.observer,
             writer: self.writer,
@@ -472,6 +523,86 @@ fn optional_cache_for<T>(
         Err(_) => Ok(None),
     }
 }
+
+// The independent signed-body lane must not borrow time from its source/CPU
+// owner, or from a narrower operation already entered by the caller.
+fn optional_body_io<T>(
+    control: &Control,
+    deadline: Instant,
+    work: impl FnOnce(&Arc<process::Operation>) -> Result<T>,
+) -> Result<Option<T>> {
+    control.check()?;
+    process::check_operation()?;
+    let parent = process::Operation::current()
+        .ok_or_else(|| invalid("body cache requires an operation owner"))?;
+    let operation =
+        process::Operation::until(deadline.min(control.deadline()).min(parent.deadline()));
+    let result = operation.enter(|| {
+        operation.check()?;
+        work(&operation)
+    });
+    control.check()?;
+    parent.check()?;
+    match result {
+        Err(error) if codec_runtime_failure(error.as_ref()) => Err(error),
+        Ok(value) if operation.check().is_ok() => Ok(Some(value)),
+        _ => Ok(None),
+    }
+}
+
+const BODY_PROBE_TIME: Duration = Duration::from_secs(2);
+// A ready hint is not authenticated evidence. This cap includes the probe,
+// root verification and children, and fits inside the default 30s read hold.
+const LARGE_BODY_READ_TIME: Duration = Duration::from_secs(24);
+
+fn body_stage_time(bytes: u64) -> Duration {
+    // 4 MiB units; budget serial PUT + verified GET + PG pin round trips.
+    // The 64-chunk wire format is unchanged: no more than 34 seconds.
+    BODY_PROBE_TIME + Duration::from_millis(500 * bytes.div_ceil(MAX_CHUNK_BYTES as u64).min(64))
+}
+
+/// Renew the *same* build through staging, root CAS and unknown-commit
+/// confirmation. Neither renewal nor join can inherit a longer CPU deadline.
+fn with_body_renewal<T>(
+    build: &crate::derived_cache::BuildLease,
+    operation: &Arc<process::Operation>,
+    stage: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    build.check_authority()?;
+    if !build.renew()? {
+        return Ok(None);
+    }
+    struct Stop<'a>(&'a std::sync::mpsc::Sender<()>);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    std::thread::scope(|scope| {
+        let (done, finished) = std::sync::mpsc::channel();
+        let stop = Stop(&done);
+        scope.spawn(move || {
+            let interval = Duration::from_secs(2);
+            while finished.recv_timeout(interval) == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                if operation.check().is_err() {
+                    break;
+                }
+                let rpc = process::Operation::until(
+                    operation
+                        .deadline()
+                        .min(Instant::now() + Duration::from_secs(1)),
+                );
+                if !rpc.enter(|| build.renew()).unwrap_or(false) {
+                    break; // per-chunk and root CAS still fence lost authority
+                }
+            }
+        });
+        let result = stage();
+        drop(stop);
+        result.map(Some)
+    })
+}
 fn codec_runtime_failure(mut error: &(dyn std::error::Error + 'static)) -> bool {
     loop {
         if matches!(
@@ -495,7 +626,7 @@ fn publish_body(
     control: &Control,
     budget: &CapacityBudget,
     observer: &Option<Arc<dyn Observer>>,
-) -> Result<()> {
+) -> Result<bool> {
     observe(observer, Phase::Staging, control)?;
     ProducerVersion::verified()?;
     let artifacts = BlameArtifacts::new(cache);
@@ -504,6 +635,7 @@ fn publish_body(
     for mut bytes in body.chunks() {
         while !bytes.is_empty() {
             control.check()?;
+            process::check_operation()?;
             let start = buffer.as_slice().len();
             let length = bytes.len().min(MAX_CHUNK_BYTES - start).min(32 * 1024);
             let (part, rest) = bytes.split_at(length);
@@ -512,7 +644,7 @@ fn publish_body(
             bytes = rest;
             if buffer.as_slice().len() == MAX_CHUNK_BYTES {
                 let Some(chunk) = artifacts.stage_chunk(build, buffer.as_slice())? else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 chunks.push(chunk);
                 buffer.resize(0, 0)?;
@@ -521,20 +653,19 @@ fn publish_body(
     }
     if !buffer.as_slice().is_empty() {
         let Some(chunk) = artifacts.stage_chunk(build, buffer.as_slice())? else {
-            return Ok(());
+            return Ok(false);
         };
         chunks.push(chunk);
     }
     observe(observer, Phase::Publishing, control)?;
     ProducerVersion::verified()?;
     if let Some(writer) = writer {
-        let _ = artifacts.publish_body_authenticated(build, &chunks, |key, manifest| {
+        artifacts.publish_body_authenticated(build, &chunks, |key, manifest| {
             writer.body_tag(key, manifest, control)
-        })?;
+        })
     } else {
-        let _ = artifacts.publish(build, ArtifactKind::CompleteBody, &chunks)?;
+        artifacts.publish(build, ArtifactKind::CompleteBody, &chunks)
     }
-    Ok(())
 }
 
 #[cfg(test)]

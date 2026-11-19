@@ -1,6 +1,7 @@
 """Real explicit Rust receive fixture. Native Git is an external client only."""
 import gzip
 import concurrent.futures
+from contextlib import closing
 import hashlib
 import http.client
 import json
@@ -603,6 +604,88 @@ def fault_cases(f, port, tip, tree, commands, gateway, commit_gateway):
     f.results["publication_old_oid_acl_epoch_live_lease_fences"] = True
 
 
+def large_bootstrap(f, helper):
+    """Real upload of a native repack above the baseline object-count limit."""
+    f.cli("create", "team/bootstrap", "alice")
+    server = f.server / "bootstrap"
+    server.mkdir()
+    log_path = f.base / "receive-bootstrap.log"
+    log = log_path.open("xb")
+    f.logs.append(log)
+    env = {key: value for key, value in f.env.items() if not key.startswith("GIT_RS_CACHE_")}
+    env.update(GIT_RS_RECEIVE_FIXTURE=str(server),
+               GIT_RS_RECEIVE_RESOURCE_PROFILE="large-bootstrap-v1")
+    program = "/usr/local/bin/tests/receive-fixture" if f.runtime else helper
+    child = f.spawn(["--ignored", "--exact", "receive_fixture_process", "--nocapture"],
+                    env=env, log=log, fixture_program=program)
+    def ready():
+        assert child.poll() is None, log_path.read_text()
+        return re.search(r"development HTTP 127.0.0.1:(\d+)", log_path.read_text())
+    wait_for(ready, "large bootstrap receive fixture")
+    port = int(ready().group(1))
+    url = f"http://127.0.0.1:{port}/team/bootstrap.git"
+    repo = "(SELECT id FROM git_rs.repositories WHERE slug='team/bootstrap')"
+    blob = b"synthetic blob for pack-only bootstrap tests\n"
+    blob_id = hashlib.sha1(b"blob " + str(len(blob)).encode() + b"\0" + blob).hexdigest().encode()
+    first = pkt(b"0" * 40 + b" " + blob_id + b" refs/tags/good\0report-status")
+    second = pkt(b"0" * 40 + b" " + b"1" * 40 + b" refs/tags/absent")
+    one_blob = pack_objects([(3, blob)])
+    for request in [first + b"0000" + pack_objects([(3, blob), (3, blob)]),
+                    first + second + b"0000" + one_blob,
+                    first + b"0000" + one_blob + b"trailer"]:
+        with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=20)) as conn:
+            conn.request("POST", "/team/bootstrap.git/git-receive-pack", request,
+                         {"Content-Type": "application/x-git-receive-pack-request"})
+            response = conn.getresponse()
+            assert response.status == 200 and b"ng refs/tags/good" in response.read()
+        assert f.sql(f"SELECT count(*) FROM git_rs.refs WHERE repo_id={repo}") == "0"
+        assert f.sql(f"SELECT count(*) FROM git_rs.staged_objects WHERE repo_id={repo}") == "0"
+    source = f.base / "bootstrap-source"
+    f.git(f.base, "init", "-b", "main", source)
+    # Distinct commits, trees, and similar but unique blobs make ordinary Git
+    # deltas useful; the uploaded pack is required to actually contain deltas.
+    count = 34_000
+    stream = bytearray()
+    stable = b"large bootstrap fixture\n" * 12
+    for i in range(count):
+        blob = f"synthetic {i:06d}\n".encode() + stable
+        stream.extend(b"commit refs/heads/main\n"
+                      b"committer Fixture <fixture@example.invalid> 1577836800 +0000\n"
+                      b"data 7\nfixture\nM 100644 inline file\n")
+        stream.extend(f"data {len(blob)}\n".encode() + blob + b"\n\n")
+    command(["git", "-C", source, "fast-import", "--quiet"], env=f.env, data=bytes(stream))
+    f.git(source, "-c", "pack.threads=1", "repack", "-adf")
+    tip = f.git(source, "rev-parse", "HEAD").stdout.strip()
+    expected = sorted(line.split()[0] for line in f.git(source, "rev-list", "--objects", "HEAD").stdout.splitlines())
+    assert len(expected) == 3 * count and len(expected) > 100_000
+    f.git(source, "-c", "http.postBuffer=65536", "push", url, "HEAD:refs/heads/main")
+    refs = f.git(source, "ls-remote", "--refs", url).stdout.splitlines()
+    assert refs == [tip + b"\trefs/heads/main"], refs
+    assert f.sql(f"SELECT count(*) FROM git_rs.operations WHERE repo_id={repo}") == "1"
+    pack_key, idx_key = f.sql(f"SELECT pack_key,idx_key FROM git_rs.packs WHERE repo_id={repo}").split("|")
+    received_pack = f.base / "bootstrap-received.pack"
+    received_idx = f.base / "bootstrap-received.idx"
+    received_pack.write_bytes(f.s3("GET", pack_key).stdout)
+    received_idx.write_bytes(f.s3("GET", idx_key).stdout)
+    canonical_idx = f.base / "bootstrap-native.idx"
+    f.git(source, "index-pack", "--strict", "-o", canonical_idx, received_pack)
+    assert canonical_idx.read_bytes() == received_idx.read_bytes()
+    rows = f.git(source, "verify-pack", "-v", received_idx).stdout.splitlines()
+    entries = [line.split() for line in rows if re.match(rb"^[0-9a-f]{40} ", line)]
+    assert any(len(entry) == 7 for entry in entries), "native client sent no delta entries"
+    assert sorted(entry[0] for entry in entries) == expected
+    health_port = int(re.search(r"health 127.0.0.1:(\d+)", log_path.read_text()).group(1))
+    with closing(http.client.HTTPConnection("127.0.0.1", health_port, timeout=5)) as conn:
+        conn.request("GET", "/metrics")
+        response = conn.getresponse()
+        assert response.status == 200
+        telemetry = response.read().decode().splitlines()
+    assert 'git_rs_receive_bootstrap_stage_total{stage="publish",outcome="completed"} 1' in telemetry
+    assert 'git_rs_receive_bootstrap_stage_total{stage="inventory",outcome="failed"} 2' in telemetry
+    assert 'git_rs_receive_bootstrap_stage_total{stage="graph",outcome="failed"} 1' in telemetry
+    f.results["native_large_bootstrap_exact_inventory"] = len(entries)
+
+
 def run(args):
     assert args.provision and args.fixture_dir
     assert args.receive_fixture_binary or args.runtime_fixture_image, "a prebuilt receive fixture is required"
@@ -636,6 +719,8 @@ def run(args):
                          GIT_RS_CACHE_PGPORT=str(cache_outage.server_address[1]))
             helper = str(args.receive_fixture_binary.resolve()) if args.receive_fixture_binary else None
             exercise(f, helper, gateway, commit_gateway, cache_outage)
+            if os.environ.get("GIT_RS_TEST_LARGE_RECEIVE") == "1":
+                large_bootstrap(f, helper)
             f.results["status"] = "passed"
         finally:
             close_gateways(cache_outage, commit_gateway, gateway)

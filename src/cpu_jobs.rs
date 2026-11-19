@@ -161,6 +161,7 @@ pub struct CpuJobs {
     pub(crate) executor: CpuExecutor,
     pub(crate) admission: Arc<process::Admission>,
     blame_job_bytes: usize,
+    receive_profile: crate::receive::ResourceProfile,
 }
 
 impl CpuJobs {
@@ -173,6 +174,16 @@ impl CpuJobs {
         queued: usize,
         bytes: usize,
     ) -> Result<Self> {
+        Self::with_receive_profile(workers, queued, bytes, Default::default())
+    }
+
+    pub(crate) fn with_receive_profile(
+        workers: usize,
+        queued: usize,
+        bytes: usize,
+        receive_profile: crate::receive::ResourceProfile,
+    ) -> Result<Self> {
+        receive_profile.validate_capacity(workers, queued)?;
         if !(1..=4).contains(&workers) || queued > 3 || workers + queued > 4 {
             return Err(invalid(
                 "CPU capacity requires concurrency in 1..=4, waiters in 0..=3 and total <=4",
@@ -188,7 +199,12 @@ impl CpuJobs {
             })?,
             admission: process::Admission::new(total),
             blame_job_bytes: bytes,
+            receive_profile,
         })
+    }
+
+    pub fn receive_profile(&self) -> crate::receive::ResourceProfile {
+        self.receive_profile
     }
 
     pub(crate) fn blame_budget(&self) -> CapacityBudget {
@@ -229,6 +245,21 @@ impl CpuJobs {
         &self,
         operation: Arc<process::Operation>,
     ) -> Result<Option<CpuAdmission<'_>>> {
+        self.try_admit_bytes(operation, JOB_BYTES)
+    }
+
+    pub(crate) fn try_admit_receive_http(
+        &self,
+        operation: Arc<process::Operation>,
+    ) -> Result<Option<CpuAdmission<'_>>> {
+        self.try_admit_bytes(operation, self.receive_profile.job_bytes())
+    }
+
+    fn try_admit_bytes(
+        &self,
+        operation: Arc<process::Operation>,
+        bytes: usize,
+    ) -> Result<Option<CpuAdmission<'_>>> {
         let io = IoControl::new(operation)?;
         let Some(permit) = self.admission.try_admit() else {
             return Ok(None);
@@ -236,7 +267,7 @@ impl CpuJobs {
         Ok(Some(CpuAdmission {
             cpu: self,
             io,
-            budget: CapacityBudget::new(JOB_BYTES),
+            budget: CapacityBudget::new(bytes),
             permit: Arc::new(permit),
         }))
     }

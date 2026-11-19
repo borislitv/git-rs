@@ -9,6 +9,7 @@ use gix_hash::{ObjectId, oid};
 
 mod commands;
 mod gitmodules;
+pub mod packed;
 mod semantics;
 use crate::storage;
 mod walk;
@@ -142,7 +143,7 @@ impl<P: VerifiedObjectProvider> ReceiveSession<P> {
         if count > self.limits.max_incoming_objects {
             return Err(invalid("incoming object count limit exceeded"));
         }
-        let mut work = walk::Work::new(snapshot, self.limits)?;
+        let mut work = walk::Work::new(snapshot, self.limits, false)?;
         let mut roots = ChargedVec::new(snapshot.capacity.clone(), count)?;
         for _ in 0..count {
             snapshot.control.check()?;
@@ -200,6 +201,68 @@ impl<P: VerifiedObjectProvider> ReceiveSession<P> {
                 command.old() == command.new()
             };
             fast_forward.push(ff, &snapshot.control)?;
+        }
+        snapshot.control.check()?;
+        Ok(ValidatedReceive {
+            commands,
+            fast_forward,
+            warnings: work.finish(),
+            incoming_objects: count,
+            _snapshot: self.snapshot,
+        })
+    }
+}
+
+impl<'a, 'bytes> ReceiveSession<&'a packed::Packed<'bytes>> {
+    /// Run over the exact inventory of the same immutable packed provider.
+    /// No caller-supplied membership token, second source, or entry iterator.
+    pub fn run_packed(
+        self,
+        commands: CommandBatch,
+        refs: &impl RefSnapshot,
+    ) -> Result<ValidatedReceive<&'a packed::Packed<'bytes>>> {
+        let snapshot = &self.snapshot;
+        let packed = snapshot.provider;
+        if !commands.budget.shares_with(&snapshot.capacity) {
+            return Err(invalid("receive commands require session capacity budget"));
+        }
+        for command in commands.commands() {
+            snapshot.control.check()?;
+            if !command.old().is_null()
+                || command.new().is_null()
+                || refs.ref_oid(command.name()).is_some()
+            {
+                return Err(invalid("packed bootstrap commands must create refs"));
+            }
+        }
+        let (count, logical_bytes, _) = packed.statistics();
+        if count > self.limits.max_incoming_objects
+            || count > snapshot.limits.max_graph_objects
+            || count > self.limits.max_object_reads
+            || logical_bytes > self.limits.max_decoded_bytes
+        {
+            return Err(invalid("packed receive inventory exceeds semantic limits"));
+        }
+        let mut work = walk::Work::new(snapshot, self.limits, true)?;
+        for (id, kind) in packed.entries() {
+            nonnull(&id)?;
+            // The packed inventory collision-checked each physical object and
+            // bound it to one exact index offset. No blob parser is required
+            // except for filename-derived gitmodules edges in the typed walk.
+            work.complete_packed_leaf(id, kind)?;
+        }
+        for (id, kind) in packed.entries() {
+            work.closure(id, Some(kind))?;
+        }
+        let mut fast_forward =
+            ChargedVec::new(snapshot.capacity.clone(), commands.commands().len())?;
+        for command in commands.commands() {
+            let kind = command
+                .name()
+                .starts_with(b"refs/heads/")
+                .then_some(gix_object::Kind::Commit);
+            work.closure(command.new(), kind)?;
+            fast_forward.push(true, &snapshot.control)?;
         }
         snapshot.control.check()?;
         Ok(ValidatedReceive {

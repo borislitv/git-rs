@@ -15,7 +15,19 @@ use std::{
 fn receive_fixture_process() -> Result<()> {
     let base = PathBuf::from(std::env::var("GIT_RS_RECEIVE_FIXTURE")?);
     let _logs = metrics::init_service_logs()?;
-    let mut blame = git_rs::blame::Blame::new(2, 0)?;
+    let receive = git_rs::receive::ResourceProfile::from_os_value(
+        std::env::var_os("GIT_RS_RECEIVE_RESOURCE_PROFILE").as_deref(),
+    )?;
+    let mut blame = git_rs::blame::Blame::new_with_resource_profiles(
+        if receive == git_rs::receive::ResourceProfile::LargeBootstrapV1 {
+            1
+        } else {
+            2
+        },
+        0,
+        Default::default(),
+        receive,
+    )?;
     if std::env::var_os("GIT_RS_CACHE_NAMESPACE").is_some() {
         let cache = git_rs::derived_cache::DerivedCache::from_env()?;
         assert!(
@@ -29,7 +41,11 @@ fn receive_fixture_process() -> Result<()> {
         blame,
         store: Store::from_env()?,
         cache: Arc::new(Cache::new(1024 * 1024, 8 * 1024 * 1024)),
-        operation_seconds: 15,
+        operation_seconds: if receive == git_rs::receive::ResourceProfile::LargeBootstrapV1 {
+            300
+        } else {
+            15
+        },
     });
     let ssh = UnixListener::bind(base.join("receive.sock"))?;
     let ssh_engine = engine.clone();

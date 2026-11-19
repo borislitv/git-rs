@@ -7,13 +7,20 @@ other callers still require independent qualification.
 
 Use maintained upstream libraries through supported public APIs by default.
 Maintain one explicit exception for `NativeRootV1`: the owned Gitoxide fork,
-currently pinned at `d80e8c8f13952fef55fb8a387e64c9436537cecf`. The production
+currently pinned at `aa333d0e87718828d801071e8545fcc2298e5ed3`. The production
 path at that pin matches full Git 2.56 porcelain on both independent-root and
 same-path-before-rename merges. The tested upstream candidates each fail one
 of those cases. Keep the existing implementation and qualify focused changes
 there; do not create a second attribution engine in the application. Record
 the exact pin, its upstream base and patch scope, and rerun native, resource
 and performance gates on every changed producer.
+
+Linear segment attribution is built from the same immutable pin, without a
+Cargo feature or alternate renderer. Cold `large-v1` jobs may plan independent
+segments over a held, physically verified snapshot. Reduction composes source
+coordinates and origin groups before the ordinary porcelain encoder runs.
+Unsupported history or mismatched endpoints use the ordinary blame path;
+cancellation, deadline and source failures do not yield partial attribution.
 
 A missing hook is first evidence that the application boundary or an internal
 requirement needs reconsideration. Prefer, in order:

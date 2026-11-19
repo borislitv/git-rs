@@ -2,12 +2,19 @@
 //! are authenticated by the source adapter; every returned object is rehashed.
 //! Only a requested entry and its bounded delta dependencies are reconstructed.
 
-use std::{cell::RefCell, ops::Deref, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Deref,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gix_hash::{ObjectId, oid};
 use sha2::{Digest, Sha256};
 
-use super::{DecodePlan, DecoderOptions, PackLocation, Runtime, acceleration::Key};
+use super::{
+    DecodePlan, DecoderCacheStats, DecoderOptions, PackLocation, Runtime, acceleration::Key,
+};
 use crate::{
     CapacityBudget, CapacityBuffer, CapacityReservation, Control, Object, ReadLimits,
     SnapshotIdentity, VerifiedObjectProvider,
@@ -78,9 +85,12 @@ impl Deref for SharedRange {
 }
 
 const PROOF_BLOCK: u64 = 4 * 1024 * 1024;
+const VERIFIED_BLOCK_SLOTS: usize = 4;
 const MAX_SOURCE_PACK: u64 = 12 * 1024 * 1024 * 1024;
 
 struct PackProof {
+    size: u64,
+    digest: [u8; 32],
     blocks: Vec<[u8; 32]>,
     _capacity: CapacityReservation,
 }
@@ -89,7 +99,7 @@ struct PackProof {
 struct VerifiedBlock {
     pack: usize,
     offset: u64,
-    bytes: SharedRange,
+    bytes: Arc<CapacityBuffer>,
 }
 
 /// Exact encoded bytes from a catalog-SHA-256-verified pack and independently
@@ -116,18 +126,102 @@ struct Index {
     _capacity: CapacityReservation,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Frame {
     location: PackLocation,
     id: ObjectId,
     end: u64,
 }
 
-// A per-read witness, never reused by a different lookup or with different limits.
+const JOURNAL_SLOTS: usize = 1 << 18;
+const JOURNAL_PROBES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VerificationStats {
+    pub sha1_calls: u64,
+    pub sha1_bytes: u64,
+    pub sha1_time: Duration,
+    pub sha256_bytes: u64,
+    pub sha256_time: Duration,
+    pub journal_records: u64,
+    pub recorded_sha1_bytes: u64,
+    pub journal_hits: u64,
+    pub avoided_sha1_bytes: u64,
+    /// Successful full verifications that did not produce a reusable record;
+    /// these can include repeat visits if admission is exhausted.
+    pub unrecorded_sha1_calls: u64,
+    pub journal_mismatches: u64,
+    pub journal_capacity_bytes: usize,
+    pub authenticated_scan_bytes: u64,
+    pub authenticated_scan_time: Duration,
+    pub authenticated_block_bytes: u64,
+    pub authenticated_block_time: Duration,
+    pub authenticated_span_bytes: u64,
+}
+
+impl<S: PackSource> crate::objects::SnapshotSession<RangePackSet<S>> {
+    /// Snapshot of verification work performed by this range provider only.
+    pub fn range_verification_stats(&self) -> VerificationStats {
+        self.provider.verification_stats()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VerificationRecord {
+    frame: Frame,
+    base: Option<Frame>,
+    plan: DecodePlan,
+    encoded: [u8; 32],
+}
+
+// The provider owns the held catalog and authenticated indexes. No entries
+// cross providers or controls. Slots never evict or replace a successful proof.
+struct VerificationJournal {
+    slots: Vec<Option<VerificationRecord>>,
+    _capacity: CapacityReservation,
+    control: Control,
+}
+
+impl VerificationJournal {
+    fn probe(&self, location: PackLocation) -> Option<(usize, Option<VerificationRecord>)> {
+        let hash = location.offset.wrapping_mul(0x9e3779b97f4a7c15)
+            ^ (location.pack as u64).wrapping_mul(0xbf58476d1ce4e5b9);
+        let start = (hash >> (64 - JOURNAL_SLOTS.ilog2())) as usize;
+        for offset in 0..JOURNAL_PROBES {
+            let slot = (start + offset) & (JOURNAL_SLOTS - 1);
+            let record = self.slots[slot];
+            if record.is_none_or(|r| r.frame.location == location) {
+                return Some((slot, record));
+            }
+        }
+        None
+    }
+}
+
 // The complete entry is still read and compared against `entry` by `inflate`.
 struct PreparedEntry {
     frame: Frame,
     entry: gix_pack::data::Entry,
+    plan: DecodePlan,
+}
+
+struct PendingRead {
+    entries: Vec<Option<PreparedEntry>>,
+    _capacity: CapacityReservation,
+    control: Control,
+}
+
+impl PendingRead {
+    fn matches(&self, id: &oid, location: PackLocation, control: &Control) -> bool {
+        let root = self.entries[0].as_ref().expect("prepared root");
+        root.frame.id.as_ref() == id
+            && root.frame.location == location
+            && self.control.deadline() == control.deadline()
+            && std::ptr::eq(
+                self.control.cancellation_flag(),
+                control.cancellation_flag(),
+            )
+    }
 }
 
 /// One admitted job's range-backed physical provider. All indexes, decoder
@@ -136,7 +230,12 @@ struct PreparedEntry {
 pub struct RangePackSet<S> {
     indexes: RefCell<Vec<Option<Index>>>,
     proofs: RefCell<Vec<Option<PackProof>>>,
-    verified_block: RefCell<Option<VerifiedBlock>>,
+    verified_blocks: RefCell<[Option<VerifiedBlock>; VERIFIED_BLOCK_SLOTS]>,
+    prepare_next_read: bool,
+    stream_requested_blobs: bool,
+    pending_read: RefCell<Option<PendingRead>>,
+    journal: RefCell<Option<VerificationJournal>>,
+    verification: Option<Cell<VerificationStats>>,
     runtime: Arc<Runtime>,
     identity: SnapshotIdentity,
     budget: CapacityBudget,
@@ -177,7 +276,12 @@ impl<S: PackSource> RangePackSet<S> {
         Ok(Self {
             indexes: RefCell::new(indexes),
             proofs: RefCell::new(proofs),
-            verified_block: RefCell::new(None),
+            verified_blocks: RefCell::new(std::array::from_fn(|_| None)),
+            prepare_next_read: false,
+            stream_requested_blobs: false,
+            pending_read: RefCell::new(None),
+            journal: RefCell::new(None),
+            verification: None,
             runtime: Runtime::new(options, budget.clone(), control)?,
             identity,
             budget,
@@ -185,6 +289,108 @@ impl<S: PackSource> RangePackSet<S> {
             _capacity: capacity,
             source,
         })
+    }
+
+    /// Retain at most one chain from a cold header lookup for the next matching
+    /// header or object lookup. The caller must perform its source authorization
+    /// and operation checks even if a header no longer has to read a range.
+    pub fn with_prepared_reads(mut self) -> Self {
+        self.prepare_next_read = true;
+        self
+    }
+
+    /// For a caller streaming distinct blobs, keep new requested blob bodies
+    /// from displacing shared delta bases. Previously cached bases still hit
+    /// when requested directly; lookup and verification are unchanged.
+    pub fn with_streamed_blobs(mut self) -> Self {
+        self.stream_requested_blobs = true;
+        self
+    }
+
+    pub fn with_verification_stats(mut self) -> Self {
+        self.enable_verification_stats();
+        self
+    }
+
+    pub fn enable_verification_stats(&mut self) {
+        self.verification.get_or_insert_with(Default::default);
+    }
+
+    /// Enable request-local reuse of successful physical SHA1DC proofs. A
+    /// denied allocation or full probe window falls back to the original verifier.
+    pub fn with_verification_journal(mut self, control: &Control) -> Result<Self> {
+        self = self.with_verification_stats();
+        control.check()?;
+        if self.identity.object_hash != gix_hash::Kind::Sha1 {
+            return Ok(self);
+        }
+        let width = std::mem::size_of::<Option<VerificationRecord>>();
+        let Ok(mut capacity) = self.budget.reservation(JOURNAL_SLOTS * width) else {
+            return Ok(self);
+        };
+        let mut slots = Vec::new();
+        if slots.try_reserve_exact(JOURNAL_SLOTS).is_err()
+            || capacity.resize(slots.capacity() * width).is_err()
+        {
+            return Ok(self);
+        }
+        for len in (1024..=JOURNAL_SLOTS).step_by(1024) {
+            control.check()?;
+            slots.resize(len, None);
+        }
+        control.check()?;
+        self.update_verification(|s| s.journal_capacity_bytes = slots.capacity() * width);
+        *self.journal.get_mut() = Some(VerificationJournal {
+            slots,
+            _capacity: capacity,
+            control: control.clone(),
+        });
+        Ok(self)
+    }
+
+    /// Closed numeric counters also readable after cancellation.
+    pub fn verification_stats(&self) -> VerificationStats {
+        self.verification
+            .as_ref()
+            .map_or_else(Default::default, Cell::get)
+    }
+
+    fn update_verification(&self, update: impl FnOnce(&mut VerificationStats)) {
+        if let Some(stats) = &self.verification {
+            let mut value = stats.get();
+            update(&mut value);
+            stats.set(value);
+        }
+    }
+
+    fn journal_probe(&self, location: PackLocation) -> Option<(usize, Option<VerificationRecord>)> {
+        self.journal.borrow().as_ref()?.probe(location)
+    }
+
+    fn retain_prepared(
+        &self,
+        entries: impl Iterator<Item = Option<PreparedEntry>>,
+        len: usize,
+        control: &Control,
+    ) -> Result<()> {
+        let entry_bytes = std::mem::size_of::<Option<PreparedEntry>>();
+        let Ok(mut capacity) = self.budget.reservation(len * entry_bytes) else {
+            return Ok(control.check()?);
+        };
+        let mut owned = Vec::new();
+        if owned.try_reserve_exact(len).is_err()
+            || capacity.resize(owned.capacity() * entry_bytes).is_err()
+        {
+            return Ok(control.check()?);
+        }
+        owned.extend(entries.take(len));
+        control.check()?;
+        *self.pending_read.borrow_mut() = Some(PendingRead {
+            entries: owned,
+            _capacity: capacity,
+            control: control.clone(),
+        });
+        Ok(())
     }
 
     fn index(&self, pack: usize, control: &Control) -> Result<()> {
@@ -311,10 +517,16 @@ impl<S: PackSource> RangePackSet<S> {
 
     fn authenticate_source(&self, pack: usize, control: &Control) -> Result<()> {
         control.check()?;
-        if self.proofs.borrow()[pack].is_some() {
+        let size = self.source.pack_size(pack)?;
+        let digest = self.source.pack_digest(pack)?;
+        if let Some(proof) = self.proofs.borrow()[pack].as_ref() {
+            if proof.size != size || proof.digest != digest {
+                return Err(invalid(
+                    "immutable source pack identity changed after authentication",
+                ));
+            }
             return Ok(());
         }
-        let size = self.source.pack_size(pack)?;
         if size > MAX_SOURCE_PACK {
             return Err(invalid("source pack exceeds authenticated range profile"));
         }
@@ -325,18 +537,17 @@ impl<S: PackSource> RangePackSet<S> {
         let mut blocks = Vec::new();
         blocks.try_reserve_exact(count)?;
         capacity.resize(blocks.capacity() * std::mem::size_of::<[u8; 32]>())?;
+        let started = self.verification.as_ref().map(|_| Instant::now());
         let mut full = Sha256::new();
+        let mut bytes = self.budget.buffer(0)?;
         for offset in (0..size).step_by(PROOF_BLOCK as usize) {
             control.check()?;
             let length = usize::try_from((size - offset).min(PROOF_BLOCK))?;
-            let bytes = self
-                .source
-                .read_shared(pack, offset, length, control, &self.budget)?;
-            if bytes.len() != length {
-                return Err(invalid("shared source range size mismatch"));
-            }
+            bytes.resize_controlled(length, 0, control)?;
+            self.source
+                .read_exact(pack, offset, bytes.as_mut_slice(), control, &self.budget)?;
             let mut block = Sha256::new();
-            for chunk in bytes.chunks(32 * 1024) {
+            for chunk in bytes.as_slice().chunks(32 * 1024) {
                 control.check()?;
                 full.update(chunk);
                 block.update(chunk);
@@ -344,14 +555,26 @@ impl<S: PackSource> RangePackSet<S> {
             blocks.push(block.finalize().into());
         }
         let actual: [u8; 32] = full.finalize().into();
-        if actual != self.source.pack_digest(pack)? {
+        if actual != digest
+            || digest != self.source.pack_digest(pack)?
+            || size != self.source.pack_size(pack)?
+        {
             return Err(invalid("complete immutable source pack digest mismatch"));
         }
         control.check()?;
         self.proofs.borrow_mut()[pack] = Some(PackProof {
+            size,
+            digest,
             blocks,
             _capacity: capacity,
         });
+        if let Some(started) = started {
+            self.update_verification(|s| {
+                s.authenticated_scan_bytes = s.authenticated_scan_bytes.saturating_add(size);
+                s.authenticated_scan_time =
+                    s.authenticated_scan_time.saturating_add(started.elapsed());
+            });
+        }
         Ok(())
     }
 
@@ -362,7 +585,16 @@ impl<S: PackSource> RangePackSet<S> {
 
     fn read_authenticated_bytes(&self, frame: Frame, control: &Control) -> Result<CapacityBuffer> {
         self.authenticate_pack(frame.location.pack, control)?;
-        let length = usize::try_from(frame.end - frame.location.offset)?;
+        let size = self.proofs.borrow()[frame.location.pack]
+            .as_ref()
+            .expect("authenticated pack")
+            .size;
+        let length = frame
+            .end
+            .checked_sub(frame.location.offset)
+            .filter(|_| frame.end <= size)
+            .ok_or_else(|| invalid("authenticated range lies outside pack"))?;
+        let length = usize::try_from(length)?;
         let max = self
             .limits
             .max_decode_bytes
@@ -379,34 +611,41 @@ impl<S: PackSource> RangePackSet<S> {
         while offset < frame.end {
             control.check()?;
             let start = offset / PROOF_BLOCK * PROOF_BLOCK;
-            let existing = self
-                .verified_block
-                .borrow()
-                .as_ref()
-                .filter(|block| block.pack == frame.location.pack && block.offset == start)
-                .cloned();
+            let existing = {
+                let mut slots = self.verified_blocks.borrow_mut();
+                let hit = slots.iter().position(|slot| {
+                    slot.as_ref().is_some_and(|block| {
+                        block.pack == frame.location.pack && block.offset == start
+                    })
+                });
+                hit.and_then(|index| {
+                    slots[..=index].rotate_right(1);
+                    slots[0].clone()
+                })
+            };
             let block = if let Some(block) = existing {
                 block
             } else {
-                let length = usize::try_from(
-                    (self.source.pack_size(frame.location.pack)? - start).min(PROOF_BLOCK),
-                )?;
-                let bytes = self.source.read_shared(
+                let started = self.verification.as_ref().map(|_| Instant::now());
+                let length = usize::try_from((size - start).min(PROOF_BLOCK))?;
+                // Drop the LRU before admitting another block. The bytes we
+                // hash are provider-owned and have no external mutable owner.
+                self.verified_blocks.borrow_mut()[VERIFIED_BLOCK_SLOTS - 1] = None;
+                let mut bytes = self.budget.buffer(length)?;
+                bytes.resize_controlled(length, 0, control)?;
+                self.source.read_exact(
                     frame.location.pack,
                     start,
-                    length,
+                    bytes.as_mut_slice(),
                     control,
                     &self.budget,
                 )?;
-                if bytes.len() != length {
-                    return Err(invalid("shared source range size mismatch"));
-                }
                 let expected = self.proofs.borrow()[frame.location.pack]
                     .as_ref()
                     .expect("complete pack digest was verified")
                     .blocks[usize::try_from(start / PROOF_BLOCK)?];
                 let mut hash = Sha256::new();
-                for chunk in bytes.chunks(32 * 1024) {
+                for chunk in bytes.as_slice().chunks(32 * 1024) {
                     control.check()?;
                     hash.update(chunk);
                 }
@@ -419,14 +658,25 @@ impl<S: PackSource> RangePackSet<S> {
                 let block = VerifiedBlock {
                     pack: frame.location.pack,
                     offset: start,
-                    bytes,
+                    bytes: Arc::new(bytes),
                 };
-                *self.verified_block.borrow_mut() = Some(block.clone());
+                let mut slots = self.verified_blocks.borrow_mut();
+                slots.rotate_right(1);
+                slots[0] = Some(block.clone());
+                if let Some(started) = started {
+                    self.update_verification(|s| {
+                        s.authenticated_block_bytes =
+                            s.authenticated_block_bytes.saturating_add(length as u64);
+                        s.authenticated_block_time =
+                            s.authenticated_block_time.saturating_add(started.elapsed());
+                    });
+                }
                 block
             };
             let within = usize::try_from(offset - start)?;
-            let count = usize::try_from(frame.end - offset)?.min(block.bytes.len() - within);
-            for (source, destination) in block.bytes[within..within + count]
+            let bytes = block.bytes.as_slice();
+            let count = usize::try_from(frame.end - offset)?.min(bytes.len() - within);
+            for (source, destination) in bytes[within..within + count]
                 .chunks(32 * 1024)
                 .zip(output.as_mut_slice()[written..written + count].chunks_mut(32 * 1024))
             {
@@ -440,6 +690,7 @@ impl<S: PackSource> RangePackSet<S> {
     }
 
     pub fn packed_object(&self, id: &oid, control: &Control) -> Result<Option<PackedObject>> {
+        drop(self.pending_read.take());
         let Some(location) = self.locate(id, control)? else {
             return Ok(None);
         };
@@ -739,7 +990,7 @@ impl<S: PackSource> RangePackSet<S> {
         plan.validate(limits)?;
         control.check()?;
         if let Some(slot) = prepared.get_mut(depth) {
-            *slot = Some(PreparedEntry { frame, entry });
+            *slot = Some(PreparedEntry { frame, entry, plan });
         }
         Ok(plan)
     }
@@ -776,7 +1027,8 @@ impl<S: PackSource> RangePackSet<S> {
         entry: &gix_pack::data::Entry,
         control: &Control,
         limits: ReadLimits,
-    ) -> Result<CapacityBuffer> {
+        fingerprint: bool,
+    ) -> Result<(CapacityBuffer, Option<[u8; 32]>)> {
         let size = usize::try_from(entry.decompressed_size)?;
         if size > limits.max_decode_bytes {
             return Err(invalid("range-backed inflate byte limit exceeded"));
@@ -822,6 +1074,26 @@ impl<S: PackSource> RangePackSet<S> {
                 return Err(invalid("range-backed entry CRC mismatch"));
             }
         }
+        let encoded = if fingerprint {
+            let started = Instant::now();
+            let mut hashed = 0;
+            let result = (|| -> Result<_> {
+                let mut hash = Sha256::new();
+                for chunk in input.as_slice().chunks(32 * 1024) {
+                    control.check()?;
+                    hash.update(chunk);
+                    hashed += chunk.len() as u64;
+                }
+                Ok(hash.finalize().into())
+            })();
+            self.update_verification(|s| {
+                s.sha256_bytes = s.sha256_bytes.saturating_add(hashed);
+                s.sha256_time = s.sha256_time.saturating_add(started.elapsed());
+            });
+            Some(result?)
+        } else {
+            None
+        };
         let actual = gix_pack::data::Entry::from_bytes(
             input.as_slice(),
             frame.location.offset,
@@ -846,7 +1118,7 @@ impl<S: PackSource> RangePackSet<S> {
             return Err(invalid("range-backed physical entry framing mismatch"));
         }
         control.check()?;
-        Ok(output)
+        Ok((output, encoded))
     }
 
     fn decode_at(
@@ -855,13 +1127,14 @@ impl<S: PackSource> RangePackSet<S> {
         limits: ReadLimits,
         prepared: &[Option<PreparedEntry>],
         depth: usize,
-    ) -> Result<(VerifiedObject, DecodePlan)> {
+        pin_result: bool,
+    ) -> Result<(VerifiedObject, DecodePlan, bool)> {
         control.check()?;
         let step = prepared
             .get(depth)
             .and_then(Option::as_ref)
             .ok_or_else(|| invalid("missing prepared range-backed delta entry"))?;
-        let result = self.decode_source(step, control, limits, prepared, depth);
+        let result = self.decode_source(step, control, limits, prepared, depth, pin_result);
         self.source_result(step.frame.location.pack, control, result)
     }
 
@@ -872,8 +1145,13 @@ impl<S: PackSource> RangePackSet<S> {
         limits: ReadLimits,
         prepared: &[Option<PreparedEntry>],
         depth: usize,
-    ) -> Result<(VerifiedObject, DecodePlan)> {
-        let PreparedEntry { frame, entry } = step;
+        pin_result: bool,
+    ) -> Result<(VerifiedObject, DecodePlan, bool)> {
+        let PreparedEntry {
+            frame,
+            entry,
+            plan: expected,
+        } = step;
         let frame = *frame;
         let location = frame.location;
         let key = Key {
@@ -883,10 +1161,24 @@ impl<S: PackSource> RangePackSet<S> {
         if let Some(pin) = self.runtime.pin(key, frame.id, &|| check(control))? {
             pin.plan().validate(limits)?;
             let plan = pin.plan();
+            Self::check_prepared_plan(*expected, plan)?;
             control.check()?;
-            return Ok((VerifiedObject::from_cached(pin), plan));
+            let recorded = self.journal_probe(location).and_then(|(_, record)| record);
+            if let Some(record) = recorded {
+                if record.frame != frame {
+                    return Err(invalid("immutable range-backed verification frame changed"));
+                }
+                Self::check_prepared_plan(record.plan, plan)?;
+            }
+            return Ok((VerifiedObject::from_cached(pin), plan, recorded.is_some()));
         }
-        let bytes = self.inflate(frame, entry, control, limits)?;
+        let probe = self.journal_probe(location);
+        let base_frame = prepared
+            .get(depth + 1)
+            .and_then(Option::as_ref)
+            .map(|step| step.frame);
+        let (bytes, encoded) = self.inflate(frame, entry, control, limits, probe.is_some())?;
+        let mut exact_base = true;
         let (object, plan) = if let Some(kind) = entry.header.as_kind() {
             let size = bytes.as_slice().len();
             (
@@ -917,7 +1209,9 @@ impl<S: PackSource> RangePackSet<S> {
             // The prepared child location came from the same physical header
             // that `inflate` just rechecked. Keep a cached base pinned rather
             // than allocating and copying its verified bytes into a second buffer.
-            let (base, base_plan) = self.decode_at(control, limits, prepared, depth + 1)?;
+            let (base, base_plan, proved) =
+                self.decode_at(control, limits, prepared, depth + 1, true)?;
+            exact_base = proved;
             if base.as_slice().len() as u64 != base_size {
                 return Err(invalid("range-backed delta base size mismatch"));
             }
@@ -956,24 +1250,141 @@ impl<S: PackSource> RangePackSet<S> {
             (Object { kind, data }, plan)
         };
         plan.validate(limits)?;
-        super::verify_hash_with(&frame.id, object.kind, object.data.as_slice(), &|| {
-            check(control)
-        })?;
-        self.runtime.note_decode();
-        self.runtime.store_verified(
-            key,
-            frame.id,
-            plan,
-            usize::try_from(frame.end - entry.data_offset)?,
-            object.data.as_slice(),
-            &|| check(control),
+        Self::check_prepared_plan(*expected, plan)?;
+        let recorded = self.verify_decoded(
+            frame, base_frame, plan, &object, probe, encoded, exact_base, control,
         )?;
+        self.runtime.note_decode();
+        let compressed = usize::try_from(frame.end - entry.data_offset)?;
+        let object = if self.stream_requested_blobs
+            && depth == 0
+            && object.kind == gix_object::Kind::Blob
+        {
+            VerifiedObject::from_pack_verified(&frame.id, object.kind, object.data, plan)
+        } else if pin_result {
+            self.runtime
+                .transfer_verified(key, frame.id, plan, compressed, object.data, &|| {
+                    check(control)
+                })?
+        } else {
+            self.runtime
+                .returned_verified(key, frame.id, plan, compressed, object.data, &|| {
+                    check(control)
+                })?
+        };
         self.runtime.remember(key, frame.id, plan, control)?;
         control.check()?;
-        Ok((
-            VerifiedObject::from_pack_verified(frame.id.as_ref(), object.kind, object.data, plan),
-            plan,
-        ))
+        Ok((object, plan, recorded))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_decoded(
+        &self,
+        frame: Frame,
+        base: Option<Frame>,
+        plan: DecodePlan,
+        object: &Object,
+        probe: Option<(usize, Option<VerificationRecord>)>,
+        encoded: Option<[u8; 32]>,
+        exact_base: bool,
+        control: &Control,
+    ) -> Result<bool> {
+        control.check()?;
+        let previous = probe.and_then(|(_, record)| record);
+        let bytes = object.data.as_slice();
+        if let Some(record) = previous
+            && record.frame == frame
+            && record.base == base
+            && exact_base
+            && encoded == Some(record.encoded)
+            && Self::check_prepared_plan(record.plan, plan).is_ok()
+        {
+            let header = gix_object::encode::loose_header(object.kind, bytes.len() as u64);
+            self.update_verification(|s| {
+                s.journal_hits = s.journal_hits.saturating_add(1);
+                s.avoided_sha1_bytes = s
+                    .avoided_sha1_bytes
+                    .saturating_add((header.len() + bytes.len()) as u64);
+            });
+            return Ok(true);
+        }
+        if previous.is_some() {
+            self.update_verification(|s| {
+                s.journal_mismatches = s.journal_mismatches.saturating_add(1)
+            });
+        }
+        if self.verification.is_some() && frame.id.kind() == gix_hash::Kind::Sha1 {
+            let started = Instant::now();
+            let mut hashed = 0u64;
+            let result = super::verify_hash_observed(
+                &frame.id,
+                object.kind,
+                bytes,
+                &|| check(control),
+                |len| hashed += len as u64,
+            );
+            self.update_verification(|s| {
+                if hashed != 0 {
+                    s.sha1_calls = s.sha1_calls.saturating_add(1);
+                    s.sha1_bytes = s.sha1_bytes.saturating_add(hashed);
+                }
+                s.sha1_time = s.sha1_time.saturating_add(started.elapsed());
+            });
+            result?;
+        } else {
+            super::verify_hash_with(&frame.id, object.kind, bytes, &|| check(control))?;
+        }
+        if previous.is_some() {
+            // Preserve the original verifier's collision/OID/stop errors. Even
+            // a different encoding of the same OID violates this held source.
+            return Err(invalid(
+                "immutable range-backed verification inputs changed",
+            ));
+        }
+        if exact_base
+            && let Some(encoded) = encoded
+            && let Some(journal) = self.journal.borrow_mut().as_mut()
+            && let Some((slot, None)) = journal.probe(frame.location)
+        {
+            journal.slots[slot] = Some(VerificationRecord {
+                frame,
+                base,
+                plan,
+                encoded,
+            });
+            let header = gix_object::encode::loose_header(object.kind, bytes.len() as u64);
+            self.update_verification(|s| {
+                s.journal_records = s.journal_records.saturating_add(1);
+                s.recorded_sha1_bytes = s
+                    .recorded_sha1_bytes
+                    .saturating_add((header.len() + bytes.len()) as u64);
+            });
+            return Ok(true);
+        }
+        if frame.id.kind() == gix_hash::Kind::Sha1 {
+            self.update_verification(|s| {
+                s.unrecorded_sha1_calls = s.unrecorded_sha1_calls.saturating_add(1)
+            });
+        }
+        Ok(false)
+    }
+
+    fn check_prepared_plan(expected: DecodePlan, actual: DecodePlan) -> Result<()> {
+        if expected.header.kind != actual.header.kind
+            || expected.header.size != actual.header.size
+            || expected.max_object != actual.max_object
+            || expected.expanded != actual.expanded
+            || expected.depth != actual.depth
+            || expected.instructions != actual.instructions
+            || expected.workspace != actual.workspace
+        {
+            return Err(invalid("immutable range-backed decode plan changed"));
+        }
+        Ok(())
+    }
+
+    pub fn cache_stats(&self, control: &Control) -> Result<DecoderCacheStats> {
+        self.runtime.stats(control)
     }
 
     /// Enumerate every catalog index entry, including unreachable objects. The
@@ -1012,6 +1423,7 @@ impl<S: PackSource> VerifiedObjectProvider for RangePackSet<S> {
         &self.identity
     }
     fn header(&self, id: &oid, control: &Control) -> Result<Option<gix_object::Header>> {
+        let pending = self.pending_read.take();
         let Some(location) = self.locate(id, control)? else {
             return Ok(None);
         };
@@ -1023,16 +1435,41 @@ impl<S: PackSource> VerifiedObjectProvider for RangePackSet<S> {
             plan.validate(self.limits)?;
             return Ok(Some(plan.header));
         }
-        self.prepare(
+        if let Some(pending) = pending.filter(|pending| pending.matches(id, location, control)) {
+            let header = pending.entries[0]
+                .as_ref()
+                .expect("prepared root")
+                .plan
+                .header;
+            control.check()?;
+            *self.pending_read.borrow_mut() = Some(pending);
+            return Ok(Some(header));
+        }
+        if !self.prepare_next_read {
+            return self
+                .prepare(
+                    location,
+                    control,
+                    self.limits,
+                    &mut [None; 65],
+                    0,
+                    false,
+                    &mut [],
+                )
+                .map(|plan| Some(plan.header));
+        }
+        let mut prepared = [const { None }; 65];
+        let plan = self.prepare(
             location,
             control,
             self.limits,
             &mut [None; 65],
             0,
             false,
-            &mut [],
-        )
-        .map(|plan| Some(plan.header))
+            &mut prepared,
+        )?;
+        self.retain_prepared(prepared.into_iter(), plan.depth + 1, control)?;
+        Ok(Some(plan.header))
     }
     fn object(
         &self,
@@ -1041,7 +1478,7 @@ impl<S: PackSource> VerifiedObjectProvider for RangePackSet<S> {
         budget: &CapacityBudget,
         limits: ReadLimits,
     ) -> Result<Option<Object>> {
-        self.verified_object(id, control, budget, limits)?
+        self.read_verified(id, control, budget, limits, false)?
             .map(|object| object.into_object(control, budget))
             .transpose()
     }
@@ -1052,7 +1489,35 @@ impl<S: PackSource> VerifiedObjectProvider for RangePackSet<S> {
         budget: &CapacityBudget,
         limits: ReadLimits,
     ) -> Result<Option<VerifiedObject>> {
+        self.read_verified(id, control, budget, limits, true)
+    }
+    fn pack_location(&self, id: &oid, control: &Control) -> Result<Option<PackLocation>> {
+        self.locate(id, control)
+    }
+    fn packed_object(&self, id: &oid, control: &Control) -> Result<Option<PackedObject>> {
+        self.packed_object(id, control)
+    }
+}
+
+impl<S: PackSource> RangePackSet<S> {
+    fn read_verified(
+        &self,
+        id: &oid,
+        control: &Control,
+        budget: &CapacityBudget,
+        limits: ReadLimits,
+        pin_result: bool,
+    ) -> Result<Option<VerifiedObject>> {
+        let pending = self.pending_read.take();
         control.check()?;
+        if self.journal.borrow().as_ref().is_some_and(|j| {
+            j.control.deadline() != control.deadline()
+                || !std::ptr::eq(j.control.cancellation_flag(), control.cancellation_flag())
+        }) {
+            // A foreign control may continue via the original verifier, but
+            // its cache writes cannot later satisfy this request's proofs.
+            drop(self.journal.take());
+        }
         limits.validate()?;
         if !budget.shares_with(&self.budget)
             || limits.max_decode_bytes > self.limits.max_decode_bytes
@@ -1072,26 +1537,34 @@ impl<S: PackSource> VerifiedObjectProvider for RangePackSet<S> {
             pin.plan().validate(limits)?;
             return Ok(Some(VerifiedObject::from_cached(pin)));
         }
-        // Bound by ReadLimits' maximum physical delta depth. Keep the walk's
-        // frames on the stack only for this read; no unverified cache is added.
         let mut prepared = [const { None }; 65];
-        self.prepare(
-            location,
-            control,
-            limits,
-            &mut [None; 65],
-            0,
-            false,
-            &mut prepared,
-        )?;
-        let (object, _) = self.decode_at(control, limits, &prepared, 0)?;
+        if let Some(mut pending) = pending.filter(|pending| pending.matches(id, location, control))
+        {
+            // Check every frame's original physical plan, not just the returned
+            // size. The chain comes from this provider's authenticated indexes,
+            // with the original OFS and first-match REF base resolutions.
+            for (dst, step) in prepared.iter_mut().zip(pending.entries.drain(..)) {
+                control.check()?;
+                step.as_ref()
+                    .expect("prepared chain")
+                    .plan
+                    .validate(limits)?;
+                *dst = step;
+            }
+            // Drop the optional heap owner before admitting required decode buffers.
+        } else {
+            self.prepare(
+                location,
+                control,
+                limits,
+                &mut [None; 65],
+                0,
+                false,
+                &mut prepared,
+            )?;
+        }
+        let (object, _, _) = self.decode_at(control, limits, &prepared, 0, pin_result)?;
         Ok(Some(object))
-    }
-    fn pack_location(&self, id: &oid, control: &Control) -> Result<Option<PackLocation>> {
-        self.locate(id, control)
-    }
-    fn packed_object(&self, id: &oid, control: &Control) -> Result<Option<PackedObject>> {
-        self.packed_object(id, control)
     }
 }
 

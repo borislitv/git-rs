@@ -15,6 +15,75 @@ The runtime uses Tini as PID 1 to forward termination signals and reap descendan
 does not implement application-level graceful signal draining: termination is a crash-safe stop,
 and active clients can receive an unknown outcome. Durable leases expire independently of the pod.
 
+### Current-tip blame warming
+
+`git-rs warm-reconcile` is an optional worker, not a serving mode. It immediately scans its
+configured targets, then waits `GIT_RS_WARM_INTERVAL_SECONDS` (default 60, range 1–3600) after
+each full pass. `GIT_RS_WARM_JOB_SECONDS` bounds each slot (default 120, range 1–300). Each replica
+has one serial worker, no queue, a 32 MiB source RAM cache, its own per-job capacity budget and
+its own bounded PG/S3 clients. Long targets can delay later slots in a pass; these settings are
+not a freshness SLA. `--once` runs one pass for diagnostics; success does not mean every slot
+published a body. Absent/unauthorized targets, contended leases, claimed builds and compatible
+cache hits are skips. Stop the deployment to roll back; a killed worker's shared source hold
+expires on the database clock (remaining job time plus up to 30 seconds). Graceful completion
+releases it even if the target or ACL was revoked. A later pass also repairs an evicted body.
+
+1. Run `git-rs migrate` as the metadata schema owner and `git-rs cache-migrate` separately using
+   cache administration credentials. The warm source API migration is additive; leave its
+   tables in place on rollback. Do not run either migration with the worker login.
+2. Provision a dedicated real PostgreSQL login for each worker scope (replicas of one scope
+   share that login). Do not use a login that owns objects, is a member of serving/admin roles,
+   or has inherited or `PUBLIC` grants to metadata tables or publication/maintenance APIs.
+   Bind the login directly; `SET ROLE` does not change `session_user`. For example, after
+   securely provisioning `git_rs_warm_example` with `LOGIN NOINHERIT`, grant only:
+
+   ```sql
+   GRANT USAGE ON SCHEMA git_rs TO git_rs_warm_example;
+   GRANT EXECUTE ON FUNCTION git_rs.warm_slots(),
+       git_rs.warm_acquire(integer,uuid,integer), git_rs.warm_identity(uuid),
+       git_rs.warm_snapshot(uuid), git_rs.warm_check(uuid,uuid,bigint,bigint,bytea),
+       git_rs.warm_release(uuid) TO git_rs_warm_example;
+   ```
+
+3. As metadata administrator, register each exact `(repository UUID, authorized Git principal,
+   full branch ref, raw path)` in a slot numbered 1–64. Only the administrator can edit targets.
+   A target does not grant the Git principal read permission. The live ACL, ref tip, generation
+   and storage epoch are still checked. The following synthetic example uses `dir/` followed
+   by byte `ff`. Unregister by deleting the row, or revoke the principal's read permission;
+   neither action releases an in-flight storage hold prematurely.
+
+   ```sql
+   INSERT INTO git_rs.warm_targets(worker,slot,repo_id,principal,branch,path)
+   VALUES ('git_rs_warm_example',1,'ac000000-0000-0000-0000-000000000001',
+           'warm-reader',convert_to('refs/heads/main','UTF8'),decode('6469722fff','hex'));
+   ```
+
+4. Set source `PG*` to that login with TLS verification. Give source `GIT_RS_S3_*` credentials
+   **only** `GetObject` (including range reads) on `repos/<configured UUID>/operations/*` for
+   each configured UUID. No listing, upload or delete. Git packs contain repository-wide
+   object bytes, so the object-store authorization scope is repository-level; the worker's
+   SQL and derivation scope is the exact target. Rotate IAM scope on target changes.
+   Give `GIT_RS_CACHE_PG*`/`GIT_RS_CACHE_DSN` separate cache runtime credentials and give
+   `GIT_RS_CACHE_S3_*` read/write, not delete, on only the configured derived namespace prefix.
+   Do not mount maintenance credentials. Match the serving producer, resource profile,
+   cache namespace, owner, signing key and codec configuration. For a direct invocation,
+   `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` must name a protected absolute 32-byte regular file.
+5. To validate the worker, run one operator-controlled `warm-reconcile --once` in an owned
+   fixture with independent credentials and resource limits. See the
+   [loopback runtime contract](docs/warm-reconcile-runtime.md). Run the SQL contract against a
+   disposable migrated database (`psql -X -v ON_ERROR_STOP=1 -f tests/warm_reconcile.sql`); add
+   `-v warm_cache_fixture=1` if that database also has the independently migrated cache schema.
+   Kubernetes rollout requires a qualified named Lease and a separate PG mutation fence for
+   takeover safety. The worker is not wired into the Helm chart.
+
+The reconciler never schedules from receive. The older `GIT_RS_BLAME_WARM_PATH` hint remains
+available for compatibility; leave it unset when deploying the separate worker. A confirmed
+push and a successful reconciliation are independent. An authenticated unchanged-parent body
+can satisfy a scan; no child alias is published. A cold miss takes the existing complete-body
+build lease and follows the normal core and codec path, not the foreground-only composed
+response shortcut. The metadata and artifact databases are not a single transaction: a ref or
+ACL change racing a cache commit cannot make the artifact a source authorization grant.
+
 | Environment | Meaning |
 | --- | --- |
 | `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | Tokio PostgreSQL primary metadata connection |
@@ -29,6 +98,7 @@ and active clients can receive an unknown outcome. Durable leases expire indepen
 | `GIT_RS_OPERATION_SECONDS` | operation deadline, integer `1..3600`, default 120 |
 | `GIT_RS_BLAME_CONCURRENCY`, `GIT_RS_BLAME_WAITERS` | shared receive/upload/blame/history CPU runtime: 1 / 0; concurrency 1–4, waiters 0–3, total at most 4 |
 | `GIT_RS_BLAME_RESOURCE_PROFILE` | startup-only blame policy: `baseline-v1` (default) or explicit `large-v1`; large requires concurrency 1 / queued waiters 0; see [blame resource policy](docs/blame.md#explicit-blame-resource-policy) |
+| `GIT_RS_RECEIVE_RESOURCE_PROFILE` | `serve` only: `baseline-v1` by default, or `large-bootstrap-v1` for a single admitted Smart HTTP job to an empty repository; see [bootstrap limits and telemetry](docs/large-receive.md) |
 | `GIT_RS_BLAME_CHECKPOINT_KEY_FILE` | optional protected absolute 32-byte signing-key file; requires explicit cache configuration |
 | `GIT_RS_BLAME_WARM_PATH` | optional single literal percent-encoded path; requires authenticated checkpoint cache; disabled by default |
 | `GIT_RS_DEBUG_TIMINGS=1` | opt-in fixed-field timing logs; initialized once at process entry, off by default |

@@ -269,10 +269,13 @@ fn serve(args: &[String]) -> Result<()> {
     }
     let selected_resources = std::env::var_os("GIT_RS_BLAME_RESOURCE_PROFILE");
     let resources = git_rs::blame::ResourceProfile::from_os_value(selected_resources.as_deref())?;
-    let mut blame = git_rs::blame::Blame::new_with_resource_profile(
+    let selected_receive = std::env::var_os("GIT_RS_RECEIVE_RESOURCE_PROFILE");
+    let receive = git_rs::receive::ResourceProfile::from_os_value(selected_receive.as_deref())?;
+    let mut blame = git_rs::blame::Blame::new_with_resource_profiles(
         blame_capacity("GIT_RS_BLAME_CONCURRENCY", 1)?,
         blame_capacity("GIT_RS_BLAME_WAITERS", 0)?,
         resources,
+        receive,
     )?;
     if let Some(key_file) = std::env::var_os("GIT_RS_BLAME_CHECKPOINT_KEY_FILE") {
         let config = git_rs::derived_cache::CacheConfig::from_env()?;
@@ -327,10 +330,20 @@ fn serve(args: &[String]) -> Result<()> {
     } else {
         None
     };
+    if receive == git_rs::receive::ResourceProfile::LargeBootstrapV1 && http.is_none() {
+        return Err(invalid("large-bootstrap-v1 requires a Smart HTTP listener"));
+    }
     let socket = PathBuf::from(option(args, "--socket")?);
     let cache_bytes = std::env::var("GIT_RS_CACHE_BYTES")
         .unwrap_or_else(|_| "67108864".into())
         .parse()?;
+    if receive == git_rs::receive::ResourceProfile::LargeBootstrapV1
+        && cache_bytes > 64 * 1024 * 1024
+    {
+        return Err(invalid(
+            "large-bootstrap-v1 requires GIT_RS_CACHE_BYTES <= 67108864",
+        ));
+    }
     let engine = Arc::new(Engine {
         blame,
         store: Store::from_env()?,
@@ -535,6 +548,9 @@ fn run() -> Result<()> {
         Some("ssh") => bridge(&args),
         Some("authorized-keys") => authorized_keys(&args),
         Some("migrate") => metadata::migrate(),
+        Some("warm-reconcile") if args.len() == 2 || (args.len() == 3 && args[2] == "--once") => {
+            git_rs::blame::reconcile::run(args.len() == 3)
+        }
         Some("cache-migrate") if args.len() == 2 => git_rs::process::Operation::new(30)
             .enter(|| git_rs::derived_cache::DerivedCache::from_env()?.migrate()),
         Some("create") if args.len() == 4 => metadata::create(&args[2], &args[3]),
@@ -609,7 +625,7 @@ fn run() -> Result<()> {
             })
         }
         _ => Err(invalid(
-            "usage: git-rs serve --socket PATH [--http ADDRESS --http-credentials FILE | --dev-http 127.0.0.1:PORT --dev-principal NAME] | maintenance --scratch PATH --health ADDRESS [--once --wait SECONDS] | ssh --socket PATH --principal NAME | migrate | cache-migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX | history REPO PRINCIPAL [--ref refs/heads/NAME --max-commits COUNT] | backup REPO PRINCIPAL --output PATH | truncate REPO PRINCIPAL --keep COUNT --backup PATH [--drop-other-refs] | cleanup REPO PRINCIPAL [--wait SECONDS]",
+            "usage: git-rs serve --socket PATH [--http ADDRESS --http-credentials FILE | --dev-http 127.0.0.1:PORT --dev-principal NAME] | warm-reconcile [--once] | maintenance --scratch PATH --health ADDRESS [--once --wait SECONDS] | ssh --socket PATH --principal NAME | migrate | cache-migrate | create REPO OWNER | grant REPO ACTOR SUBJECT ROLE PREFIX | history REPO PRINCIPAL [--ref refs/heads/NAME --max-commits COUNT] | backup REPO PRINCIPAL --output PATH | truncate REPO PRINCIPAL --keep COUNT --backup PATH [--drop-other-refs] | cleanup REPO PRINCIPAL [--wait SECONDS]",
         )),
     }
 }

@@ -74,6 +74,21 @@ impl Observer for Trace {
 }
 
 fn get(engine: &Engine, slug: &str, commit: &str) -> Vec<u8> {
+    get_path(engine, slug, commit, "file")
+}
+
+pub(super) fn get_path(engine: &Engine, slug: &str, commit: &str, path: &str) -> Vec<u8> {
+    let (wire, result) = get_path_result(engine, slug, commit, path);
+    result.unwrap();
+    wire
+}
+
+pub(super) fn get_path_result(
+    engine: &Engine,
+    slug: &str,
+    commit: &str,
+    path: &str,
+) -> (Vec<u8>, git_rs::Result<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     client
@@ -85,17 +100,16 @@ fn get(engine: &Engine, slug: &str, commit: &str) -> Vec<u8> {
     std::thread::scope(|scope| {
         let server = scope.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            http::handle(stream, engine, "bob").unwrap();
+            http::handle(stream, engine, "bob")
         });
         write!(
             client,
-            "GET /{slug}.git/blame/{commit}?path=file HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            "GET /{slug}.git/blame/{commit}?path={path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
         )
         .unwrap();
         let mut bytes = Vec::new();
         client.read_to_end(&mut bytes).unwrap();
-        server.join().unwrap(); // includes body write/flush and drop of serving holds
-        bytes
+        (bytes, server.join().unwrap()) // includes body write/flush and drop of serving holds
     })
 }
 

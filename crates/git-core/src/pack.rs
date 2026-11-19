@@ -703,7 +703,17 @@ fn verify_hash_with(
     bytes: &[u8],
     check: &dyn Fn() -> gix_error::Result,
 ) -> gix_error::Result {
-    if hash_object_with(id.kind(), kind, bytes, check)?.as_ref() != id {
+    verify_hash_observed(id, kind, bytes, check, |_| {})
+}
+
+fn verify_hash_observed(
+    id: &oid,
+    kind: gix_object::Kind,
+    bytes: &[u8],
+    check: &dyn Fn() -> gix_error::Result,
+    hashed: impl FnMut(usize),
+) -> gix_error::Result<()> {
+    if hash_object_with(id.kind(), kind, bytes, check, hashed)?.as_ref() != id {
         return Err(gix_error::corruption("physical pack object hash mismatch").into());
     }
     check()?;
@@ -715,13 +725,17 @@ fn hash_object_with(
     kind: gix_object::Kind,
     bytes: &[u8],
     check: &dyn Fn() -> gix_error::Result,
+    mut hashed: impl FnMut(usize),
 ) -> gix_error::Result<gix_hash::ObjectId> {
     check()?;
     let mut hash = gix_hash::hasher(hash_kind);
-    hash.update(&gix_object::encode::loose_header(kind, bytes.len() as u64));
+    let header = gix_object::encode::loose_header(kind, bytes.len() as u64);
+    hash.update(&header);
+    hashed(header.len());
     for chunk in bytes.chunks(32 * 1024) {
         check()?;
         hash.update(chunk);
+        hashed(chunk.len());
     }
     let id = hash.try_finalize()?;
     check()?;

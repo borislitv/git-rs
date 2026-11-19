@@ -27,7 +27,49 @@ pub(crate) struct Source {
     _metadata: CapacityReservation,
 }
 
+pub(crate) struct WarmSource {
+    pub source: Arc<Source>,
+    pub principal: String,
+    pub path: Vec<u8>,
+}
+
 impl Source {
+    pub(crate) fn acquire_warm(
+        slot: u8,
+        operation: Arc<process::Operation>,
+        budget: &CapacityBudget,
+    ) -> Result<Option<WarmSource>> {
+        let capacity = budget.reservation(SOURCE_METADATA_BYTES)?;
+        let Some(target) = metadata::warm::acquire(slot)? else {
+            return Ok(None);
+        };
+        // The read-only IAM policy is the outer boundary. Also reject a catalog
+        // that would make this process read an object from another repository.
+        let prefix = format!("repos/{}/operations/", target.snapshot.id);
+        if target
+            .snapshot
+            .packs
+            .iter()
+            .any(|pack| !pack.pack_key.starts_with(&prefix) || !pack.idx_key.starts_with(&prefix))
+        {
+            return Err(invalid("warm source pack is outside the repository"));
+        }
+        let source = Self::held(
+            target.snapshot,
+            target.lease,
+            &target.principal,
+            true,
+            operation,
+            capacity,
+        )?;
+        source.check()?;
+        Ok(Some(WarmSource {
+            source,
+            principal: target.principal,
+            path: target.path,
+        }))
+    }
+
     pub fn acquire(
         slug: &str,
         principal: &str,
@@ -144,6 +186,11 @@ impl Source {
             .filter(|operation| operation.deadline() <= self.operation.deadline())
             .unwrap_or_else(|| self.operation.clone());
         operation.enter(|| {
+            if let Some(check) = metadata::warm::check(&self.lease, &self.snapshot) {
+                check?;
+                self.operation.check()?;
+                return process::check_operation();
+            }
             self.lease.check()?;
             if let Some(job) = &self.job { job.check()?; }
             let s = &self.snapshot;

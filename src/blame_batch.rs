@@ -50,79 +50,90 @@ impl WriterProof {
         })
     }
     pub fn load(config: &CacheConfig, path: &Path) -> Result<Self> {
-        if !path.is_absolute() {
-            return Err(invalid("checkpoint key path must be absolute"));
-        }
-        let uid = fs::metadata("/proc/self")?.uid();
-        for ancestor in path.ancestors().skip(1) {
-            let m = fs::symlink_metadata(ancestor)?;
-            if !m.is_dir() || (m.uid() != 0 && m.uid() != uid) || m.mode() & 0o022 != 0 {
-                return Err(invalid(
-                    "checkpoint key ancestors must be protected real directories",
-                ));
-            }
-        }
-        let before = fs::symlink_metadata(path)?;
-        if !before.is_file()
-            || (before.uid() != 0 && before.uid() != uid)
-            || before.mode() & 0o077 != 0
-            || before.len() != 32
-        {
+        with_protected_seed(path, |key| Self::from_key(config, key))
+    }
+}
+
+/// Shared file validation only; the consuming signers have separate keys and domains.
+pub(crate) fn with_protected_seed<T>(
+    path: &Path,
+    consume: impl FnOnce(&[u8; 32]) -> Result<T>,
+) -> Result<T> {
+    if !path.is_absolute() {
+        return Err(invalid("checkpoint key path must be absolute"));
+    }
+    let uid = fs::metadata("/proc/self")?.uid();
+    for ancestor in path.ancestors().skip(1) {
+        let m = fs::symlink_metadata(ancestor)?;
+        if !m.is_dir() || (m.uid() != 0 && m.uid() != uid) || m.mode() & 0o022 != 0 {
             return Err(invalid(
-                "checkpoint key must be a private owner-readable regular 32-byte file",
+                "checkpoint key ancestors must be protected real directories",
             ));
         }
-        let mut file = fs::File::open(path)?;
-        let opened = file.metadata()?;
-        if (
-            before.dev(),
-            before.ino(),
-            before.len(),
-            before.mode(),
-            before.uid(),
-            before.ctime(),
-            before.ctime_nsec(),
-        ) != (
-            opened.dev(),
-            opened.ino(),
-            opened.len(),
-            opened.mode(),
-            opened.uid(),
-            opened.ctime(),
-            opened.ctime_nsec(),
-        ) {
-            return Err(invalid("checkpoint key changed while opening"));
-        }
-        let mut key = [0; 32];
-        if let Err(error) = file.read_exact(&mut key) {
-            key.fill(0);
-            return Err(error.into());
-        }
-        let after = file.metadata()?;
-        if (
-            opened.len(),
-            opened.mtime(),
-            opened.mtime_nsec(),
-            opened.ctime(),
-            opened.ctime_nsec(),
-            opened.mode(),
-            opened.uid(),
-        ) != (
-            after.len(),
-            after.mtime(),
-            after.mtime_nsec(),
-            after.ctime(),
-            after.ctime_nsec(),
-            after.mode(),
-            after.uid(),
-        ) {
-            key.fill(0);
-            return Err(invalid("checkpoint key changed while reading"));
-        }
-        let proof = Self::from_key(config, &key);
-        key.fill(0); // best effort only; not a claim of allocator/native zeroization
-        proof
     }
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file()
+        || (before.uid() != 0 && before.uid() != uid)
+        || before.mode() & 0o077 != 0
+        || before.len() != 32
+    {
+        return Err(invalid(
+            "checkpoint key must be a private owner-readable regular 32-byte file",
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if (
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mode(),
+        before.uid(),
+        before.ctime(),
+        before.ctime_nsec(),
+    ) != (
+        opened.dev(),
+        opened.ino(),
+        opened.len(),
+        opened.mode(),
+        opened.uid(),
+        opened.ctime(),
+        opened.ctime_nsec(),
+    ) {
+        return Err(invalid("checkpoint key changed while opening"));
+    }
+    let mut key = [0; 32];
+    if let Err(error) = file.read_exact(&mut key) {
+        key.fill(0);
+        return Err(error.into());
+    }
+    let after = file.metadata()?;
+    if (
+        opened.len(),
+        opened.mtime(),
+        opened.mtime_nsec(),
+        opened.ctime(),
+        opened.ctime_nsec(),
+        opened.mode(),
+        opened.uid(),
+    ) != (
+        after.len(),
+        after.mtime(),
+        after.mtime_nsec(),
+        after.ctime(),
+        after.ctime_nsec(),
+        after.mode(),
+        after.uid(),
+    ) {
+        key.fill(0);
+        return Err(invalid("checkpoint key changed while reading"));
+    }
+    let proof = consume(&key);
+    key.fill(0); // best effort only; not a claim of allocator/native zeroization
+    proof
+}
+
+impl WriterProof {
     /// Compute the MAC for a complete-body descriptor; publication signs only
     /// locally derived porcelain. The MAC binds namespace, writer, the full
     /// canonical key (including storage epoch, not ref generation in v2), and

@@ -141,6 +141,17 @@ pub fn init_timing_logs() -> Option<TimingGuard> {
     guard
 }
 
+pub(crate) fn timing_details_enabled() -> bool {
+    matches!(TIMING_LOGS.get(), Some(Some(_)))
+}
+
+pub(crate) fn timing_details(record: std::fmt::Arguments<'_>) {
+    if let Some(Some(logs)) = TIMING_LOGS.get() {
+        let line = format!("{record}\n");
+        let _ = logs.writer.clone().write_all(line.as_bytes());
+    }
+}
+
 const BUCKETS: [(u64, &str); 15] = [
     (1_000_000, "0.001"),
     (5_000_000, "0.005"),
@@ -204,6 +215,377 @@ const PHASES: [&str; 11] = [
 ];
 
 #[derive(Clone, Copy)]
+pub(crate) enum BootstrapStage {
+    Admission,
+    Source,
+    Body,
+    Inventory,
+    InventoryChecksum,
+    InventoryEntries,
+    InventorySort,
+    Graph,
+    Index,
+    Upload,
+    Publish,
+    Status,
+}
+
+const BOOTSTRAP_STAGES: [&str; 12] = [
+    "admission",
+    "source",
+    "body",
+    "inventory",
+    "inventory_checksum",
+    "inventory_entries",
+    "inventory_sort",
+    "graph",
+    "index",
+    "upload",
+    "publish",
+    "status",
+];
+
+static BOOTSTRAP_RESULTS: [[AtomicU64; 2]; BOOTSTRAP_STAGES.len()] =
+    [const { [const { AtomicU64::new(0) }; 2] }; BOOTSTRAP_STAGES.len()];
+static BOOTSTRAP_NS: [AtomicU64; BOOTSTRAP_STAGES.len()] =
+    [const { AtomicU64::new(0) }; BOOTSTRAP_STAGES.len()];
+static BOOTSTRAP_ACTIVE: [AtomicU64; BOOTSTRAP_STAGES.len()] =
+    [const { AtomicU64::new(0) }; BOOTSTRAP_STAGES.len()];
+static BOOTSTRAP_WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static BOOTSTRAP_INVENTORY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static BOOTSTRAP_REUSE: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }; 3];
+static BOOTSTRAP_REJECTIONS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+pub(crate) fn bootstrap_reuse(
+    done: Option<bool>,
+    delta: git_rs_core::receive::packed::ReuseStatistics,
+) {
+    let counters = &BOOTSTRAP_REUSE[done.map_or(0, |ok| 1 + usize::from(ok))];
+    counters[0].fetch_add(delta.hits, Ordering::Relaxed);
+    counters[1].fetch_add(delta.avoided_ancestor_bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn bootstrap_inventory_failure(reason: git_rs_core::receive::packed::InventoryFailure) {
+    use git_rs_core::receive::packed::InventoryFailure::*;
+    let index = match reason {
+        DecoderCheckpoints => 0,
+        LogicalBytes => 1,
+        ChainDepth => 2,
+        ChainWorkspace => 3,
+        ObjectBytes => 4,
+    };
+    BOOTSTRAP_REJECTIONS[index].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn bootstrap_inventory(objects: u64, logical: u64, polls: u64) {
+    for (counter, n) in BOOTSTRAP_INVENTORY.iter().zip([objects, logical, polls]) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+impl BootstrapStage {
+    pub(crate) fn start(self, enabled: bool) -> BootstrapStageGuard {
+        BootstrapStageGuard {
+            stage: enabled.then(|| {
+                BOOTSTRAP_ACTIVE[self as usize].fetch_add(1, Ordering::Relaxed);
+                (self, Instant::now())
+            }),
+            ok: false,
+        }
+    }
+}
+
+pub(crate) struct BootstrapStageGuard {
+    stage: Option<(BootstrapStage, Instant)>,
+    ok: bool,
+}
+
+impl BootstrapStageGuard {
+    pub(crate) fn complete(mut self) {
+        self.ok = true;
+    }
+}
+
+impl Drop for BootstrapStageGuard {
+    fn drop(&mut self) {
+        if let Some((stage, start)) = self.stage {
+            BOOTSTRAP_RESULTS[stage as usize][usize::from(self.ok)].fetch_add(1, Ordering::Relaxed);
+            let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            BOOTSTRAP_NS[stage as usize].fetch_add(nanos, Ordering::Relaxed);
+            BOOTSTRAP_ACTIVE[stage as usize].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn bootstrap_work(bytes: u64, objects: u64, logical: u64, polls: u64) {
+    for (counter, n) in BOOTSTRAP_WORK.iter().zip([bytes, objects, logical, polls]) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BlameSegmentStage {
+    Planning,
+    Execute,
+    Reduce,
+    Encode,
+    Fallback,
+}
+
+const SEGMENT_STAGES: [&str; 5] = ["planning", "execute", "reduce", "encode", "fallback"];
+const SEGMENT_OUTCOMES: [&str; 4] = ["completed", "declined", "failed", "stopped"];
+static SEGMENT_STAGES_TOTAL: [[AtomicU64; 4]; SEGMENT_STAGES.len()] =
+    [const { [const { AtomicU64::new(0) }; 4] }; SEGMENT_STAGES.len()];
+static SEGMENT_STAGES_NS: [[AtomicU64; 4]; SEGMENT_STAGES.len()] =
+    [const { [const { AtomicU64::new(0) }; 4] }; SEGMENT_STAGES.len()];
+static SEGMENT_ACTIVE: [AtomicU64; SEGMENT_STAGES.len()] =
+    [const { AtomicU64::new(0) }; SEGMENT_STAGES.len()];
+static SEGMENT_WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static SEGMENT_CAPACITY_MAX: AtomicU64 = AtomicU64::new(0);
+
+impl BlameSegmentStage {
+    pub(crate) fn start(self, control: &git_rs_core::Control) -> BlameSegmentTimer<'_> {
+        SEGMENT_ACTIVE[self as usize].fetch_add(1, Ordering::Relaxed);
+        BlameSegmentTimer {
+            stage: self as usize,
+            started: Instant::now(),
+            control,
+            outcome: 2,
+        }
+    }
+}
+
+pub(crate) struct BlameSegmentTimer<'a> {
+    stage: usize,
+    started: Instant,
+    control: &'a git_rs_core::Control,
+    outcome: usize,
+}
+
+impl BlameSegmentTimer<'_> {
+    pub(crate) fn completed(&mut self) {
+        self.outcome = 0;
+    }
+    pub(crate) fn declined(&mut self) {
+        self.outcome = 1;
+    }
+}
+
+impl Drop for BlameSegmentTimer<'_> {
+    fn drop(&mut self) {
+        let outcome = if self.control.check().is_err() || crate::process::check_operation().is_err()
+        {
+            3
+        } else {
+            self.outcome
+        };
+        let ns = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        SEGMENT_STAGES_TOTAL[self.stage][outcome].fetch_add(1, Ordering::Relaxed);
+        SEGMENT_STAGES_NS[self.stage][outcome].fetch_add(ns, Ordering::Relaxed);
+        SEGMENT_ACTIVE[self.stage].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn blame_segment_work([edges, lanes, cpu_ns, cpu_samples, capacity]: [u64; 5]) {
+    for (counter, value) in SEGMENT_WORK.iter().zip([edges, lanes, cpu_ns, cpu_samples]) {
+        counter.fetch_add(value, Ordering::Relaxed);
+    }
+    SEGMENT_CAPACITY_MAX.fetch_max(capacity, Ordering::Relaxed);
+}
+
+fn render_blame_segments(output: &mut String) {
+    let total = "git_rs_blame_segment_stage_total";
+    let seconds = "git_rs_blame_segment_stage_seconds_sum";
+    let active = "git_rs_blame_segment_stage_active";
+    let work = "git_rs_blame_segment_work_total";
+    let capacity = "git_rs_blame_segment_sampled_capacity_bytes_max";
+    header(
+        output,
+        total,
+        "Terminal cold blame stage outcomes, including stop and fallback.",
+        "counter",
+    );
+    header(
+        output,
+        seconds,
+        "Wall time by terminal cold blame stage outcome.",
+        "counter",
+    );
+    header(
+        output,
+        active,
+        "Cold blame stages in progress, including scoped cleanup.",
+        "gauge",
+    );
+    header(
+        output,
+        work,
+        "Cold blame work, including declined and failed attempts.",
+        "counter",
+    );
+    header(
+        output,
+        capacity,
+        "Maximum sampled charged job bytes, not an RSS or allocator peak.",
+        "gauge",
+    );
+    for (i, stage) in SEGMENT_STAGES.iter().enumerate() {
+        for (j, outcome) in SEGMENT_OUTCOMES.iter().enumerate() {
+            writeln!(
+                output,
+                "{total}{{stage=\"{stage}\",outcome=\"{outcome}\"}} {}",
+                SEGMENT_STAGES_TOTAL[i][j].load(Ordering::Relaxed)
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "{seconds}{{stage=\"{stage}\",outcome=\"{outcome}\"}} {:.9}",
+                SEGMENT_STAGES_NS[i][j].load(Ordering::Relaxed) as f64 / 1e9
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "{active}{{stage=\"{stage}\"}} {}",
+            SEGMENT_ACTIVE[i].load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    for (unit, value) in ["scanned_edges", "lanes", "lane_cpu_ns", "lane_cpu_samples"]
+        .into_iter()
+        .zip(&SEGMENT_WORK)
+    {
+        writeln!(
+            output,
+            "{work}{{unit=\"{unit}\"}} {}",
+            value.load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "{capacity} {}",
+        SEGMENT_CAPACITY_MAX.load(Ordering::Relaxed)
+    )
+    .unwrap();
+}
+
+fn render_bootstrap(output: &mut String) {
+    let reuse = "git_rs_receive_bootstrap_verified_base_reuse_total";
+    header(
+        output,
+        reuse,
+        "Verified base reuse during inventory and by terminal inventory outcome.",
+        "counter",
+    );
+    for (outcome, counters) in ["progress", "failed", "completed"]
+        .into_iter()
+        .zip(&BOOTSTRAP_REUSE)
+    {
+        for (unit, counter) in ["hits", "avoided_ancestor_bytes"].into_iter().zip(counters) {
+            writeln!(
+                output,
+                "{reuse}{{outcome=\"{outcome}\",unit=\"{unit}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            )
+            .unwrap();
+        }
+    }
+    let failures = "git_rs_receive_bootstrap_inventory_admission_failures_total";
+    header(
+        output,
+        failures,
+        "Typed physical inventory admission failures.",
+        "counter",
+    );
+    for (reason, counter) in [
+        "decoder_checkpoints",
+        "logical_bytes",
+        "chain_depth",
+        "chain_workspace",
+        "object_bytes",
+    ]
+    .into_iter()
+    .zip(&BOOTSTRAP_REJECTIONS)
+    {
+        writeln!(
+            output,
+            "{failures}{{reason=\"{reason}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    header(
+        output,
+        "git_rs_receive_bootstrap_inventory_progress_total",
+        "Verified physical-entry work, sampled in bounded batches.",
+        "counter",
+    );
+    for (metric, counter) in ["objects", "logical_bytes", "decoder_checkpoints"]
+        .into_iter()
+        .zip(BOOTSTRAP_INVENTORY.iter())
+    {
+        writeln!(
+            output,
+            "git_rs_receive_bootstrap_inventory_progress_total{{unit=\"{metric}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    header(
+        output,
+        "git_rs_receive_bootstrap_stage_active",
+        "Bootstrap attempts in each closed stage.",
+        "gauge",
+    );
+    header(
+        output,
+        "git_rs_receive_bootstrap_stage_total",
+        "Closed bootstrap stage outcomes.",
+        "counter",
+    );
+    header(
+        output,
+        "git_rs_receive_bootstrap_stage_seconds_sum",
+        "Wall time elapsed across bootstrap stage attempts.",
+        "counter",
+    );
+    for (index, stage) in BOOTSTRAP_STAGES.iter().enumerate() {
+        let active = BOOTSTRAP_ACTIVE[index].load(Ordering::Relaxed);
+        writeln!(
+            output,
+            "git_rs_receive_bootstrap_stage_active{{stage=\"{stage}\"}} {active}"
+        )
+        .unwrap();
+        for (index_outcome, outcome) in ["failed", "completed"].iter().enumerate() {
+            let count = BOOTSTRAP_RESULTS[index][index_outcome].load(Ordering::Relaxed);
+            writeln!(output, "git_rs_receive_bootstrap_stage_total{{stage=\"{stage}\",outcome=\"{outcome}\"}} {count}").unwrap();
+        }
+        let seconds = BOOTSTRAP_NS[index].load(Ordering::Relaxed) as f64 / 1e9;
+        writeln!(
+            output,
+            "git_rs_receive_bootstrap_stage_seconds_sum{{stage=\"{stage}\"}} {seconds:.9}"
+        )
+        .unwrap();
+    }
+    for (counter, name) in BOOTSTRAP_WORK.iter().zip([
+        "pack_bytes",
+        "objects",
+        "logical_bytes",
+        "decoder_checkpoints",
+    ]) {
+        let metric = format!("git_rs_receive_bootstrap_{name}_total");
+        header(
+            output,
+            &metric,
+            "Work for bootstrap requests that completed physical inventory.",
+            "counter",
+        );
+        writeln!(output, "{metric} {}", counter.load(Ordering::Relaxed)).unwrap();
+    }
+}
+
+#[derive(Clone, Copy)]
 pub enum Stage {
     SqlInit,
     SqlAcquire,
@@ -226,8 +608,12 @@ pub enum Stage {
     FastForward,
     ScratchCleanup,
     ProcessSpawn,
+    BlamePreflight,
+    BlameAttribution,
+    BlameEncode,
+    BlameSend,
 }
-const STAGES: [&str; 21] = [
+const STAGES: [&str; 25] = [
     "sql_init",
     "sql_acquire",
     "sql_query",
@@ -249,6 +635,10 @@ const STAGES: [&str; 21] = [
     "fast_forward",
     "scratch_cleanup",
     "process_spawn",
+    "blame_preflight",
+    "blame_attribution",
+    "blame_encode",
+    "blame_send",
 ];
 
 #[derive(Clone, Copy)]
@@ -429,6 +819,8 @@ impl Registry {
 
     pub fn render(&self, active: usize, cache_allocated: usize) -> String {
         let mut output = String::with_capacity(96 * 1024);
+        render_bootstrap(&mut output);
+        render_blame_segments(&mut output);
         header(
             &mut output,
             "git_rs_build_info",

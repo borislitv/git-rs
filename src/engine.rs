@@ -65,13 +65,13 @@ impl Engine {
         let operation = process::Operation::current()
             .ok_or_else(|| invalid("receive requires a bounded transport operation"))?;
         let cpu = self.blame.cpu();
-        let admission = cpu
-            .try_admit(operation)?
-            .ok_or_else(|| invalid("receive CPU admission busy"))?;
         let http::Action::Git(cgi) = &request.action else {
             return Err(invalid("receive requires a Git HTTP action"));
         };
         if cgi.method == "GET" {
+            let admission = cpu
+                .try_admit(operation)?
+                .ok_or_else(|| invalid("receive CPU admission busy"))?;
             let discovery =
                 crate::receive::ReceiveDiscovery::acquire_http(admission, request, principal)?;
             output.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-advertisement\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
@@ -79,16 +79,26 @@ impl Engine {
             output.flush()?;
             return Ok(());
         }
+        let bootstrap = cpu.receive_profile() == crate::receive::ResourceProfile::LargeBootstrapV1;
+        let admission_stage = crate::metrics::BootstrapStage::Admission.start(bootstrap);
+        let admission = cpu
+            .try_admit_receive_http(operation)?
+            .ok_or_else(|| invalid("receive CPU admission busy"))?;
+        admission_stage.complete();
+        let source_stage = crate::metrics::BootstrapStage::Source.start(bootstrap);
         let session =
             crate::receive::ReceiveSession::acquire(admission, self, &request.slug, principal)?;
+        source_stage.complete();
         let prepared = session
-            .run_http(request, input)?
+            .run_http_profile(request, input, cpu.receive_profile())?
             .ok_or_else(|| invalid("receive interrupted before completion"))?;
         let receipt = crate::receive::publish(prepared, &self.store);
         let result = (|| {
+            let status = crate::metrics::BootstrapStage::Status.start(bootstrap);
             output.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
             receipt.write_status(output)?;
             output.flush()?;
+            status.complete();
             receipt
                 .publication()
                 .map(|_| ())

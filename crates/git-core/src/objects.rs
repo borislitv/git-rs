@@ -310,7 +310,8 @@ impl VerifiedObject {
     }
 
     /// Consume/discard the witness. Mutable returned bytes carry no reusable
-    /// attestation; converting an immutable cache pin necessarily copies it.
+    /// attestation. A shared cache pin is copied unless optional admission of
+    /// this fresh decode can be rolled back to recover its exclusive backing.
     pub fn into_object(self, control: &Control, budget: &CapacityBudget) -> Result<Object> {
         control.check()?;
         let kind = self.kind;
@@ -325,14 +326,21 @@ impl VerifiedObject {
                 if !pin.shares_budget(budget) {
                     return Err(invalid("verified object budget identity mismatch"));
                 }
-                let mut data = budget.buffer(pin.as_slice().len())?;
-                for chunk in pin.as_slice().chunks(32 * 1024) {
-                    control.check()?;
-                    let start = data.as_slice().len();
-                    data.resize(start + chunk.len(), 0)?;
-                    data.as_mut_slice()[start..].copy_from_slice(chunk);
+                match budget.buffer(pin.as_slice().len()) {
+                    Ok(mut data) => {
+                        for chunk in pin.as_slice().chunks(32 * 1024) {
+                            control.check()?;
+                            let start = data.as_slice().len();
+                            data.resize(start + chunk.len(), 0)?;
+                            data.as_mut_slice()[start..].copy_from_slice(chunk);
+                        }
+                        data
+                    }
+                    Err(error) => {
+                        control.check()?;
+                        pin.recover_fresh_backing().ok_or(error)?
+                    }
                 }
-                data
             }
         };
         control.check()?;

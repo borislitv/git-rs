@@ -439,17 +439,19 @@ fn callback_admission_and_boundary_cancellation_preserve_typed_causes_and_cleanu
             last: MappingStatistics::default(),
             cancel: !fail_store,
         };
-        let result = session.blame_complete_with_memo(
+        let progress = git_rs_core::blame::BlameProgress::new();
+        let result = session.blame_complete_observed(
             BlameRequest {
                 commit: &tip,
                 path: b"file",
             },
             &options,
-            MemoryMappingRequest {
+            Some(MemoryMappingRequest {
                 reuse: true,
                 memo: &mut memory,
                 boundary: Some(&mut boundary),
-            },
+            }),
+            Some(&progress),
         );
         assert_eq!(
             result.err(),
@@ -462,6 +464,11 @@ fn callback_admission_and_boundary_cancellation_preserve_typed_causes_and_cleanu
         assert_eq!(memory.loads, 1, "must reach the actual mapping callback");
         assert_eq!(memory.stores, usize::from(!stop_load));
         assert_eq!(boundary.calls, usize::from(!fail_store && !stop_load));
+        let sample = progress.snapshot();
+        assert!(sample.raw_blob_calls >= 2);
+        assert_eq!(sample.mapping_boundaries, boundary.calls as u64);
+        assert_eq!(sample.mapping, boundary.last);
+        assert!(sample.raw_blob_elapsed_at_last_mapping <= sample.raw_blob_elapsed);
         drop(memory);
         drop(session);
         assert_eq!(budget.used(), 0);
