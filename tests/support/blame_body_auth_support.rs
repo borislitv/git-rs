@@ -174,8 +174,39 @@ impl CacheWriter {
                 .unwrap()
         })
     }
-    fn root(&self, namespace: &str, except: Option<&str>) -> StoredRoot {
-        let rows = self.query("SELECT p.id::text,p.body,p.encoding FROM git_rs_cache.payloads p JOIN git_rs_cache.manifest_roots m ON m.namespace=p.namespace AND m.payload=p.id JOIN git_rs_cache.directory d ON d.namespace=p.namespace AND d.payload=p.id WHERE p.namespace=$1::text::uuid AND m.kind=1 AND d.state='ready' AND ($2::text IS NULL OR p.id<>$2::text::uuid)", &[&namespace, &except]);
+    fn root(&self, namespace: &str, repository: &str, principal: &str) -> StoredRoot {
+        // The independently signed attribution map is also a kind=1 manifest.
+        // Select the scoped porcelain key, not the shared manifest shape.
+        let mut rows = self.query(
+            "SELECT p.id::text,p.body,p.encoding,j.canonical FROM git_rs_cache.payloads p
+             JOIN git_rs_cache.manifest_roots m ON m.namespace=p.namespace AND m.payload=p.id
+             JOIN git_rs_cache.directory d ON d.namespace=p.namespace AND d.payload=p.id
+             JOIN git_rs_cache.jobs j ON j.namespace=d.namespace AND j.key_hash=d.key_hash
+             WHERE p.namespace=$1::text::uuid AND m.kind=1 AND d.state='ready'",
+            &[&namespace],
+        );
+        rows.retain(|row| {
+            let canonical: &[u8] = row.get(3);
+            let mut fields = canonical
+                .strip_prefix(b"git-rs-artifact-key\0\x01")
+                .unwrap();
+            [
+                repository.as_bytes(),
+                principal.as_bytes(),
+                b"sha1",
+                b"complete-blame-v2",
+                b"native-root-line-porcelain-v1",
+            ]
+            .into_iter()
+            .all(|expected| {
+                let (size, rest) = fields.split_first_chunk::<4>().unwrap();
+                let (field, remaining) = rest
+                    .split_at_checked(u32::from_be_bytes(*size) as usize)
+                    .unwrap();
+                fields = remaining;
+                field == expected
+            })
+        });
         assert_eq!(rows.len(), 1, "exact complete-body root, not a checkpoint");
         assert_eq!(
             rows[0].get::<_, String>(2),
@@ -282,7 +313,7 @@ fn authenticated_body_rejects_cache_role_forgery_after_all_ordinary_digests_are_
         "must exercise a real signed ready-body hit before attack"
     );
     let attacker = CacheWriter::new();
-    let root = attacker.root(&config.namespace, None);
+    let root = attacker.root(&config.namespace, &fixture.repo, "bob");
     let forged = attacker.forge_inline(&config.namespace, &root);
     assert_ne!(forged, fixture.expected);
     // Prove this is a semantic-authentication attack, not a broken checksum or
@@ -341,9 +372,10 @@ fn authenticated_body_rejects_same_payload_replay_under_another_authorized_sourc
     );
     assert_eq!(read(&fixture, "bob"), fixture.expected);
     let attacker = CacheWriter::new();
-    let bob = attacker.root(&config.namespace, None);
+    let bob = attacker.root(&config.namespace, &fixture.repo, "bob");
     assert_eq!(read(&fixture, "alice"), fixture.expected);
-    let alice = attacker.root(&config.namespace, Some(&bob.id));
+    let alice = attacker.root(&config.namespace, &fixture.repo, "alice");
+    assert_ne!(bob.id, alice.id);
     // Both authorized requests derive identical bytes; only their full keys
     // differ. Copy a valid tag as well as the manifest, and repair its root SHA.
     attacker.replace_root(&config.namespace, &alice, &bob.body);
@@ -404,7 +436,7 @@ fn signing_mode_rejects_stripped_and_incompatible_body_authentication_envelopes(
         );
         assert_eq!(read(&fixture, "bob"), fixture.expected);
         let attacker = CacheWriter::new();
-        let root = attacker.root(&config.namespace, None);
+        let root = attacker.root(&config.namespace, &fixture.repo, "bob");
         let manifest_length = b"git-rs-complete-artifact\0\x01".len() + 5 + 36;
         assert!(
             root.body.len() > manifest_length,
