@@ -96,7 +96,7 @@ jobs:
               --property="ExecStopPost=/usr/bin/python3 -B $GITHUB_WORKSPACE/tests/blame_images.py cleanup --slice $slice" \
               /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/blame_images.py" build \
                 --target "$target" --tag "git-rs:blame-$target" --unit "$unit" --slice "$slice" \
-                --directory "$GITHUB_WORKSPACE/.local/blame-images"
+                --directory "$GITHUB_WORKSPACE/.local/blame-images" --azure-archive
           done
       - name: Export four immutable images once with commit and archive identity
         run: python3 -B tests/blame_images.py export --directory .local/blame-images --commit "$GITHUB_SHA"

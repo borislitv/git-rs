@@ -1,4 +1,15 @@
 FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS codec-base
+# Hosted image qualification can use the Ubuntu archive mirror already used
+# by the Azure runner. Suite, signing keys and the security stanza stay intact.
+ARG GIT_RS_CI_AZURE_ARCHIVE=0
+RUN case "$GIT_RS_CI_AZURE_ARCHIVE" in \
+      0) ;; \
+      1) sources=/etc/apt/sources.list.d/ubuntu.sources; \
+         grep -qx 'URIs: http://archive\.ubuntu\.com/ubuntu/\?' "$sources" \
+         && sed -i 's|^URIs: http://archive\.ubuntu\.com/ubuntu/\?$|URIs: http://azure.archive.ubuntu.com/ubuntu/|' "$sources" \
+         && grep -Fxq 'URIs: http://azure.archive.ubuntu.com/ubuntu/' "$sources" ;; \
+      *) exit 2 ;; \
+    esac
 # One OS package transaction supplies the ABI used by compilation and serving.
 # Runtime pruning below does not upgrade or copy libc/gconv files piecemeal.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \

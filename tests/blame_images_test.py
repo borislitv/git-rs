@@ -203,7 +203,7 @@ class ImageTests(unittest.TestCase):
 
     def test_build_uses_supported_legacy_limits_and_refuses_missing_backend_flags(self):
         args = SimpleNamespace(unit="unit", slice=self.slice, directory=self.directory,
-                               target="test", tag="local/fixture:test")
+                               target="test", tag="local/fixture:test", azure_archive=True)
         argv_seen = []
 
         def run(argv, **kwargs):
@@ -217,10 +217,11 @@ class ImageTests(unittest.TestCase):
             images.build(args)
         argv = argv_seen[0]
         for flag, value in [("--cgroup-parent", self.slice), ("--network", "host"),
-                             ("--build-arg", "VCS_REF=" + self.commit),
-                            ("--cpu-quota", "180000"), ("--memory", "3712m"),
-                            ("--memory-swap", "3712m"), ("--cpuset-cpus", "2,3")]:
+                             ("--cpu-quota", "180000"), ("--memory", "3712m"),
+                             ("--memory-swap", "3712m"), ("--cpuset-cpus", "2,3")]:
             self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertEqual([value for flag, value in zip(argv, argv[1:]) if flag == "--build-arg"],
+                         ["VCS_REF=" + self.commit, "GIT_RS_CI_AZURE_ARCHIVE=1"])
         with patch.object(images.gate, "verify_unit"), patch.object(images.gate, "checkout_identity"), \
                 patch.object(images, "output", return_value="unsupported"), patch.object(images, "run") as run:
             with self.assertRaisesRegex(ValueError, "does not support"):

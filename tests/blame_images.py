@@ -100,9 +100,10 @@ def build(args):
     iid = args.directory / (args.target + ".iid")
     gate.require(not iid.exists(), "image identity already exists")
     cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
+    mirror = ["--build-arg", "GIT_RS_CI_AZURE_ARCHIVE=1"] if args.azure_archive else []
     try:
         run(["docker", "build", "--target", args.target, "--tag", args.tag,
-             "--build-arg", "VCS_REF=" + revision,
+             "--build-arg", "VCS_REF=" + revision, *mirror,
              "--network", "host", "--cgroup-parent", args.slice, "--cpuset-cpus", cpus,
              "--cpu-period", "100000", "--cpu-quota", "180000", "--memory", "3712m",
              "--memory-swap", "3712m", "--force-rm", "--iidfile", iid, ROOT],
@@ -192,6 +193,7 @@ def main():
     builder.add_argument("--unit", required=True)
     builder.add_argument("--slice", required=True)
     builder.add_argument("--directory", type=Path, required=True)
+    builder.add_argument("--azure-archive", action="store_true")
     for action in ("export", "load"):
         command = sub.add_parser(action)
         command.add_argument("--directory", type=Path, required=True)
