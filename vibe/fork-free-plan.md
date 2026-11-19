@@ -250,6 +250,39 @@ worker chart/values, `OPERATIONS.md`, `docs/blame.md`.
 
 ### Stage 8: Verify usefulness and recovery end to end
 
+**Short performance loop, before full-history acceptance:**
+
+- Recover the previous benchmark receipt: record binary, repository and pack,
+  commit and path, range or full history, output format, process count, CPU and
+  memory limits, storage tier, cache state, exit status and output size. Compare
+  elapsed time only between equivalent requests. Keep unmatched runs as diagnostics.
+- Freeze a smaller real file with its history and an independent native full
+  porcelain oracle. Calibrate the harness with a short prefix, then use a full
+  20,000-commit prefix from the real root, preserving the original objects and
+  parent links. Keep the serving deadline fixed; identify any longer native
+  oracle budget separately. Record exact bytes through EOF and measure CPU
+  (user/system, across workers), wall time, RSS, faults, read volume and I/O
+  stall on the owned process or cgroup.
+- Run the same pack on owned disk and tmpfs with the same application cache
+  policy and CPU/memory envelope. Report OS page residency separately from
+  application cache state. Measure local core and HTTP separately. For HTTP
+  record authorization/catalog, range fetch, pack decode and verification,
+  attribution/diff, encode and send; for native use an owned-process CPU profile
+  and measured I/O. Do not add nested wall times or equate samples with seconds.
+- Treat every failed test, deadline, resource exhaustion or byte mismatch as an
+  open investigation. Record the exact run, terminal condition, last completed
+  phase, actual work and resource usage, and the first differing byte where
+  applicable. Identify the cause and confirm it with a discriminating control.
+  If the evidence is insufficient, add phase timing, progress counters or a
+  bounded trace of the missing boundary; reproduce on the smallest relevant
+  input. Do not repeat an unchanged opaque run, increase its timeout, enlarge
+  the fixture or mark the failure resolved without that evidence.
+- Change one factor at a time: backing for I/O, admitted workers for CPU, decoder
+  budget for memory/reconstruction pressure. Repeat the matched baseline and
+  candidate, report work counts and exact output, and commit only demonstrated
+  improvements. Increase the fixture size only after the smaller case explains
+  the cost. Use the sealed corpus and existing oracle for final acceptance.
+
 **Implement tests/measurements:**
 
 - Stop the warmer, advance refs, restart and obtain the latest authorized native-
