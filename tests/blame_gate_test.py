@@ -1001,5 +1001,52 @@ class RuntimeHandoffTests(unittest.TestCase):
                 self.assertEqual(daemon.containers, expected)
 
 
+class ColdSegmentsContracts(unittest.TestCase):
+    def test_two_lane_case_gets_two_cpus_and_restores_quota_even_on_ambiguous_update(self):
+        class SegmentDaemon(RuntimeDaemon):
+            def check_allowance(self):
+                assert self.containers[self.outer]["HostConfig"]["NanoCpus"] <= 2 * 10**9
+                assert self.containers[self.sentinel] == self.preserved
+
+        arguments = ["/gate/bin/blame_reuse", "--ignored", "--exact", gate.COLD_SEGMENTS,
+                     "--test-threads=1", "--nocapture"]
+        for fault in (None, "work", "update-reply-lost"):
+            with self.subTest(fault=fault):
+                daemon = SegmentDaemon()
+                outer = daemon.containers[daemon.outer]
+                runs = []
+
+                def command(argv, **options):
+                    if argv[:2] == ["docker", "update"]:
+                        self.assertEqual(argv[-1], daemon.outer)
+                        self.assertEqual(argv[2], "--cpus")
+                        outer["HostConfig"]["NanoCpus"] = int(argv[3]) * 10**9
+                        if argv[3] == "2" and fault == "update-reply-lost":
+                            raise subprocess.TimeoutExpired(argv, 10)
+                        return SimpleNamespace(returncode=0)
+                    if argv == arguments:
+                        runs.append(argv)
+                        self.assertEqual(outer["HostConfig"]["NanoCpus"], 2 * 10**9)
+                        self.assertEqual(options["env"]["GIT_RS_TEST_ORACLE_GIT"], "/usr/bin/git")
+                        self.assertEqual(options["timeout"], 300)
+                        if fault == "work":
+                            raise subprocess.CalledProcessError(101, argv)
+                        return SimpleNamespace(returncode=0)
+                    return daemon.command(argv, **options)
+
+                env = {"INVOCATION_ID": daemon.token, "GIT_RS_GATE_SLICE": daemon.slice}
+                with patch.dict(os.environ, env), patch.object(gate, "command", side_effect=command), \
+                        patch.object(gate.os, "sched_getaffinity", return_value={24, 25}):
+                    if fault is None:
+                        self.assertEqual(gate.run_cold_segments(arguments, {}, None).returncode, 0)
+                    else:
+                        error = subprocess.CalledProcessError if fault == "work" else subprocess.TimeoutExpired
+                        with self.assertRaises(error):
+                            gate.run_cold_segments(arguments, {}, None)
+                self.assertEqual(len(runs), int(fault != "update-reply-lost"))
+                self.assertEqual(outer["HostConfig"]["NanoCpus"], 10**9)
+                self.assertEqual(daemon.containers[daemon.sentinel], daemon.preserved)
+
+
 if __name__ == "__main__":
     unittest.main()

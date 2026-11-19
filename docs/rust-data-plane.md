@@ -226,6 +226,10 @@ the fixtures, oracle and Git-free images. Each workflow/run/attempt artifact
 binds the archive SHA256, Dockerfile and checkout. The four final roles share one
 uncompressed, layer-deduplicated archive. The `blame` job verifies the final image
 IDs before loading and retains separate 900-second preparation and measurement units.
+During the exact `cold_large_v1_uses_segments_and_matches_native` contract, the
+owned controller can use both CPUs of the existing aggregate slice and passes the
+attested image's Git executable to the case. The controller restores its one-CPU
+quota afterwards; the aggregate still bounds the controller and its PG/S3 fixtures.
 Image-build/Cargo downloads and existing runtime fixtures use host networking; image
 inspection remains offline. Exact-HEAD qualification must retain real artifact
 transport, inventory, outcomes and cleanup evidence. Historical success is not a

@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LEGACY_REPOSITORY = "https://github.com/borislitv/git-rs"
 LEGACY_COMMIT = "43d79301993c88cdde044c5dead260a4b0424079"
 GIT_VERSION = "git version 2.56.0"
+ORACLE_GIT = "/usr/bin/git"
 GIT_SOURCE = ("git 2.56.0\n"
               "source https://www.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz\n"
               "sha256 26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3\n")
@@ -37,6 +38,7 @@ EXCLUDE = {"blame_artifacts": {"artifact_process"},
            "blame_core": {"runtime_support::runtime_child"}}
 ROOT_RUNTIME = "runtime_support::owned_source_runtime_fences_ready_cache_http_response_staging_and_publication"
 GENERAL_MAP = "completed_transport::signed_general_map_survives_native_fast_forwards_and_serving_restarts"
+COLD_SEGMENTS = "cold_large_v1_uses_segments_and_matches_native"
 HARNESS_FILES = ("tests/blame_gate.py", "tests/blame_artifacts.py", "tests/derived_cache.py",
                   "tests/integration.py", "tests/blame_concurrency.py",
                   "tests/runtime_process.py", "tests/maintenance_fixture.py",
@@ -292,7 +294,7 @@ def prepare_bundle(args):
     packages = [image_output(image, ["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"])
                 for image in (builder, runtime)]
     require(packages[0] == packages[1], "build/runtime OS packages differ")
-    require(image_output(runtime, ["/usr/bin/git", "--version"]) == GIT_VERSION,
+    require(image_output(runtime, [ORACLE_GIT, "--version"]) == GIT_VERSION,
             "runtime Git version mismatch")
     provenance = image_output(runtime, ["/usr/bin/cat", "/usr/share/git-rs/git-source.txt"]) + "\n"
     require(provenance == GIT_SOURCE, "runtime Git provenance mismatch")
@@ -670,6 +672,37 @@ def remove_runtime_child(name, identity, token, outer_id, slice_name):
     require(not runtime_children(name, identity), "runtime child removal was not acknowledged")
 
 
+def run_cold_segments(arguments, env, stream):
+    """Allow the exact two-lane case to use the existing aggregate CPU ceiling."""
+    token = invocation()
+    slice_name = os.environ.get("GIT_RS_GATE_SLICE", "")
+    require(re.fullmatch(SLICE_PATTERN, slice_name), "invalid runtime aggregate slice")
+    require(len(os.sched_getaffinity(0)) == 2, "cold segments require two CPUs in the aggregate affinity")
+    outer_id = runtime_outer(token, slice_name)["Id"]
+    one_cpu, two_cpus = 1_000_000_000, 2_000_000_000
+    work_error = None
+    try:
+        command(["docker", "update", "--cpus", "2", outer_id], timeout=10)
+        runtime_outer(token, slice_name, outer_id, (two_cpus,))
+        return command(arguments, env=dict(env, GIT_RS_TEST_ORACLE_GIT=ORACLE_GIT),
+                       timeout=300, stdout=stream, stderr=subprocess.STDOUT)
+    except BaseException as error:
+        work_error = error
+        raise
+    finally:
+        try:
+            # An interrupted update may already have applied. Inspect the same
+            # owned container before restoring its usual quota.
+            current = runtime_outer(token, slice_name, outer_id, (one_cpu, two_cpus))
+            if current["HostConfig"]["NanoCpus"] == two_cpus:
+                command(["docker", "update", "--cpus", "1", outer_id], timeout=10)
+                runtime_outer(token, slice_name, outer_id)
+        except BaseException as restore_error:
+            if work_error is not None:
+                raise BaseExceptionGroup("cold segments and CPU restoration failed", [work_error, restore_error])
+            raise
+
+
 def run_root_runtime(manifest, executable, env, stream):
     """Transfer an idle dispatcher's CPU, retaining its 1.25 combined allowance.
 
@@ -739,7 +772,7 @@ def inside():
     manifest = load_manifest(bundle)
     for name, expected in manifest["harness_sources"].items():
         require(digest(ROOT / name) == expected, "execution harness source mismatch")
-    require(output(["/usr/bin/git", "--version"]) == GIT_VERSION, "wrong execution Git")
+    require(output([ORACLE_GIT, "--version"]) == GIT_VERSION, "wrong execution Git")
     require(Path("/usr/share/git-rs/git-source.txt").read_text() == manifest["git_source"],
             "wrong execution Git source")
     packages = output(["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"])
@@ -796,6 +829,8 @@ def inside():
                     environment = env
                     if suite == "blame_core" and case == ROOT_RUNTIME:
                         completed = run_root_runtime(manifest, paths[suite], env, stream)
+                    elif suite == "blame_reuse" and case == COLD_SEGMENTS:
+                        completed = run_cold_segments(arguments, env, stream)
                     else:
                         completed = command(arguments, env=environment,
                                             timeout=300, stdout=stream, stderr=subprocess.STDOUT)
