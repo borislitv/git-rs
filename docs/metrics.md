@@ -13,6 +13,10 @@ never become labels. Counters and histogram accumulators start at zero and reset
 on process restart; gauges report current state or static metadata. Scrapes do
 not perform SQL or S3 requests.
 
+The serving exposition has 1,048 fixed series, including the bootstrap receive
+and segmented blame telemetry. Its 96 KiB byte budget includes full-width counter
+and duration values and retains all legacy buckets and labels.
+
 ## Metric families
 
 | Family | Type | Labels / meaning |

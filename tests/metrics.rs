@@ -52,7 +52,6 @@ fn histograms_preserve_boundaries_overflow_errors_and_prometheus_framing() {
         assert!(text.contains(expected), "missing sample: {expected}");
     }
     assert!(text.ends_with('\n'));
-    assert!(text.len() < 64 * 1024, "exposition must remain bounded");
 }
 
 #[test]
@@ -557,7 +556,36 @@ fn exposition_retains_legacy_contract_and_adds_rust_phases() {
             "missing exposition contract: {expected}"
         );
     }
-    assert!(text.len() < 64 * 1024);
+}
+
+#[test]
+fn serving_exposition_has_fixed_cardinality_and_fits_with_full_width_samples() {
+    // All values except the wall-clock start time are integers (up to 20
+    // digits), or u64 nanoseconds printed as seconds (11 digits + '.' + 9).
+    // Reserve extra width for the finite, variable-precision start time.
+    let text = Registry::new().render(usize::MAX, usize::MAX);
+    let mut series = std::collections::HashSet::new();
+    let mut max_bytes = 0;
+    for line in text.lines() {
+        if line.starts_with('#') {
+            max_bytes += line.len() + 1;
+        } else {
+            let (identity, value) = line.rsplit_once(' ').expect("sample value");
+            assert!(series.insert(identity), "duplicate series: {identity}");
+            let width = if identity == "git_rs_process_start_time_seconds" {
+                32
+            } else {
+                21
+            };
+            assert!(value.len() <= width, "sample wider than budget: {identity}");
+            max_bytes += identity.len() + width + 2; // separating space and newline
+        }
+    }
+    assert_eq!(series.len(), 1048, "serving metric series changed");
+    assert!(
+        max_bytes <= 96 * 1024,
+        "maximum exposition size is {max_bytes} bytes"
+    );
 }
 
 #[test]
