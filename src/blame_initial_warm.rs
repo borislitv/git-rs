@@ -20,6 +20,7 @@ use git_rs_core::{
 };
 use std::{
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -29,7 +30,9 @@ pub(super) struct Limits {
     quantum: Duration,
     slices: u64,
     edges: usize,
+    lanes: usize,
     bytes: usize,
+    pub range_bytes: usize,
     pause: Duration,
 }
 
@@ -46,7 +49,10 @@ impl Limits {
             quantum: Duration::from_secs(seconds),
             slices: setting("GIT_RS_WARM_INITIAL_SEGMENTS", 2048, 4096)?,
             edges: setting("GIT_RS_WARM_SEGMENT_EDGES", 256, 16384)? as usize,
-            bytes: (setting("GIT_RS_WARM_INITIAL_MIB", 4096, 4096)? as usize) << 20,
+            lanes: (setting("GIT_RS_WARM_INITIAL_LANES", 1, 16)? as usize)
+                .min(thread::available_parallelism().map_or(1, |n| n.get())),
+            bytes: (setting("GIT_RS_WARM_INITIAL_MIB", 4096, 32768)? as usize) << 20,
+            range_bytes: (setting("GIT_RS_WARM_INITIAL_RANGE_MIB", 32, 1024)? as usize) << 20,
             pause: Duration::from_millis(pause),
         })
     }
@@ -111,7 +117,12 @@ pub(super) fn run(env: &Environment, slot: u8, limits: Limits, end: Instant) -> 
     let mut target: Option<Target> = None;
     let mut cursor = None;
     let mut traversed = 0usize;
+    let mut segments = 0u64;
     for index in 0..limits.slices {
+        if segments == limits.slices {
+            break;
+        }
+        let width = limits.lanes.min((limits.slices - segments) as usize);
         let started = Instant::now();
         let before = traversed;
         let operation = limits.operation(end);
@@ -147,35 +158,76 @@ pub(super) fn run(env: &Environment, slot: u8, limits: Limits, end: Instant) -> 
                 .max_graph_edges
                 .min(read.max_graph_objects.saturating_sub(1))
                 .saturating_sub(traversed);
-            let Some((endpoint, edges)) = derive::segments::warm_window(
+            let Some((windows, edges)) = plan_quantum(
                 &session,
                 request,
                 &control,
                 read.max_metadata_bytes,
-                limits.edges.min(remaining),
+                limits.edges,
+                remaining,
+                width,
             )?
             else {
                 return Ok(Slice::Ordinary);
             };
-            if endpoint.is_some() && edges == 0 {
-                return Err(invalid("initial warm graph bound exceeded"));
-            }
-            let next = endpoint.as_ref().map(|end| end.commit);
+            let next = windows
+                .last()
+                .expect("nonempty plan")
+                .end
+                .map(|end| end.commit);
             derive::segments::report_verification(
                 "warm_planner",
                 session.range_verification_stats(),
             );
-            let result = receipt.append(&session, request, endpoint, &env.options);
+            let result = if windows.len() == 1 {
+                receipt.append(&session, request, windows[0].end, &env.options)?
+            } else {
+                let mut stats = derive::segments::SegmentStatistics::default();
+                let Some(pieces) = derive::segments::execute(
+                    &windows,
+                    &control,
+                    &budget,
+                    |window| {
+                        operation.enter(|| {
+                            let producer = self::session(env, &held.source, &budget, &control)?;
+                            let result = producer.summarize_blame_segment(
+                                BlameRequest {
+                                    commit: &window.start,
+                                    path: request.path,
+                                },
+                                window.end,
+                                &env.options,
+                            );
+                            derive::segments::report_verification(
+                                "warm_producer",
+                                producer.range_verification_stats(),
+                            );
+                            Ok(result?)
+                        })
+                    },
+                    &mut stats,
+                )?
+                else {
+                    return Ok(Slice::Ordinary);
+                };
+                for piece in pieces {
+                    if !receipt.append_segment(&session, piece, &env.options)? {
+                        return Ok(Slice::Ordinary);
+                    }
+                }
+                true
+            };
             derive::segments::report_verification(
                 "warm_planner_and_producer",
                 session.range_verification_stats(),
             );
-            if !result? {
+            if !result {
                 return Ok(Slice::Ordinary);
             }
             scope.check(&held)?;
             control.check()?;
             traversed += edges;
+            segments += windows.len() as u64;
             Ok(Slice::More(next))
         });
         if std::env::var_os("GIT_RS_DEBUG_TIMINGS").as_deref() == Some(std::ffi::OsStr::new("1")) {
@@ -186,10 +238,11 @@ pub(super) fn run(env: &Environment, slot: u8, limits: Limits, end: Instant) -> 
                 Err(_) => "failed",
             };
             eprintln!(
-                "initial_warm_quantum index={} edges={} total_edges={traversed} elapsed_ms={} outcome={outcome}",
+                "initial_warm_quantum index={} edges={} total_edges={traversed} elapsed_ms={} outcome={outcome} segments={segments} capacity_bytes={}",
                 index + 1,
                 traversed - before,
-                started.elapsed().as_millis()
+                started.elapsed().as_millis(),
+                budget.used(),
             );
         }
         let result = result?;
@@ -230,6 +283,45 @@ pub(super) fn run(env: &Environment, slot: u8, limits: Limits, end: Instant) -> 
         }
     }
     Err(invalid("initial warm segment count exhausted"))
+}
+
+fn plan_quantum<P: git_rs_core::VerifiedObjectProvider>(
+    session: &SnapshotSession<P>,
+    request: BlameRequest<'_>,
+    control: &Control,
+    metadata_limit: usize,
+    edges_per_window: usize,
+    remaining: usize,
+    width: usize,
+) -> Result<Option<(Vec<derive::segments::Endpoint>, usize)>> {
+    let mut windows = Vec::with_capacity(width);
+    let mut start = request.commit.to_owned();
+    let mut traversed = 0;
+    for _ in 0..width {
+        let Some((end, edges)) = derive::segments::warm_window(
+            session,
+            BlameRequest {
+                commit: &start,
+                path: request.path,
+            },
+            control,
+            metadata_limit,
+            edges_per_window.min(remaining - traversed),
+        )?
+        else {
+            return Ok(None);
+        };
+        if end.is_some() && edges == 0 {
+            return Err(invalid("initial warm graph bound exceeded"));
+        }
+        windows.push(derive::segments::Endpoint { start, end });
+        traversed += edges;
+        match end {
+            Some(endpoint) => start = endpoint.commit,
+            None => break,
+        }
+    }
+    Ok(Some((windows, traversed)))
 }
 
 fn session(

@@ -193,9 +193,9 @@ struct Point {
 }
 
 #[derive(Clone, Copy)]
-struct Endpoint {
-    start: gix::ObjectId,
-    end: Option<CoreEndpoint>,
+pub(in crate::blame) struct Endpoint {
+    pub start: gix::ObjectId,
+    pub end: Option<CoreEndpoint>,
 }
 
 /// Balanced by estimated changed-blob work, not just by commit count. The
@@ -355,7 +355,7 @@ struct Lane<T> {
     capacity: usize,
 }
 
-fn execute<T: Send>(
+pub(in crate::blame) fn execute<T: Send>(
     endpoints: &[Endpoint],
     control: &Control,
     budget: &CapacityBudget,
@@ -375,7 +375,7 @@ fn execute<T: Send>(
         }
     };
     thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(LANES - 1);
+        let mut handles = Vec::with_capacity(endpoints.len() - 1);
         let mut spawn_failed = false;
         for &endpoint in &endpoints[1..] {
             match thread::Builder::new()
@@ -391,7 +391,7 @@ fn execute<T: Send>(
                 }
             }
         }
-        let mut results = Vec::with_capacity(LANES);
+        let mut results = Vec::with_capacity(endpoints.len());
         if !spawn_failed {
             results.push(run(endpoints[0]));
         }

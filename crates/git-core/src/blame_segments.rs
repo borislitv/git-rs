@@ -12,7 +12,8 @@ pub struct BlameSegment {
 }
 
 /// Completed local prefix for a warm run. It has no wire format, no import or
-/// public summary constructor. Accepts only segments freshly computed by append.
+/// public summary constructor. Only locally computed, currently admitted
+/// segments can extend it.
 #[derive(Default)]
 pub struct LocalSegmentRun {
     prefix: Option<BlameSegment>,
@@ -37,6 +38,38 @@ impl LocalSegmentRun {
         let Some(piece) = session.summarize_blame_segment(request, endpoint, options)? else {
             return Ok(false);
         };
+        self.append_local(session, prefix, piece, scopes)
+    }
+
+    /// Fold a worker's complete segment from this quantum into the local prefix.
+    /// Only the prefix may come from a previous deadline; the new segment must
+    /// belong to the current source, budget and cancellation owner.
+    pub fn append_segment<P: VerifiedObjectProvider>(
+        &mut self,
+        session: &SnapshotSession<P>,
+        piece: BlameSegment,
+        options: &BlameOptions,
+    ) -> Result<bool, BlameError> {
+        let prefix = self.prefix.take();
+        let scopes = completed::scopes(session, options)?;
+        session.control.check()?;
+        if !session.accepts_segment(&piece, &scopes)
+            || prefix
+                .as_ref()
+                .is_some_and(|prefix| !session.accepts_local_prefix(prefix, &scopes))
+        {
+            return Ok(false);
+        }
+        self.append_local(session, prefix, piece, scopes)
+    }
+
+    fn append_local<P: VerifiedObjectProvider>(
+        &mut self,
+        session: &SnapshotSession<P>,
+        prefix: Option<BlameSegment>,
+        piece: BlameSegment,
+        scopes: completed::Scopes,
+    ) -> Result<bool, BlameError> {
         self.prefix = match prefix {
             Some(prefix) => session.compose_segments(&prefix, &piece, scopes)?,
             None => Some(piece),

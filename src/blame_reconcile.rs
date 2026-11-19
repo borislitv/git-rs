@@ -34,7 +34,7 @@ fn setting(name: &str, default: u64, max: u64) -> Result<u64> {
     Ok(value)
 }
 
-/// One serial worker with no queue and its own per-job budget and process.
+/// One worker with no target queue and its own per-job budget and process.
 /// Only slot IDs survive a scan; every job acquires the live branch and ACL.
 pub fn run(once: bool) -> Result<()> {
     let seconds = setting("GIT_RS_WARM_JOB_SECONDS", 120, 300)?;
@@ -59,7 +59,10 @@ pub fn run(once: bool) -> Result<()> {
     let writer = WriterProof::load(&config, Path::new(&key_file))?;
     let env = derive::Environment {
         store: Store::from_env()?,
-        files: Arc::new(Cache::new(32 * 1024 * 1024, 8 * 1024 * 1024)),
+        files: Arc::new(Cache::new(
+            initial.map_or(32 * 1024 * 1024, |limits| limits.range_bytes),
+            8 * 1024 * 1024,
+        )),
         derived: Some(DerivedCache::open(config)?),
         writer: Some(writer),
         observer: None,

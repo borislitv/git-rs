@@ -77,7 +77,7 @@ class Initial(Fixture):
             stored_bytes += int(stored)
         print(f"PostgreSQL cached {len(rows)} compressed body parts: {len(expected)} logical, {stored_bytes} stored bytes")
 
-    def exercise(self):
+    def exercise(self, lanes):
         self.setup()
         self.grant("alice", "reader")
         self.checkout.mkdir()
@@ -96,9 +96,12 @@ class Initial(Fixture):
             self.drain()
 
         self.audit()
+        require(len(os.sched_getaffinity(0)) >= lanes, "initial runtime fixture lacks its allotted CPUs")
         self.warmer.update(GIT_RS_BLAME_RESOURCE_PROFILE="large-v1", GIT_RS_WARM_JOB_SECONDS="4",
                            GIT_RS_WARM_INITIAL_SECONDS="60", GIT_RS_WARM_SEGMENT_EDGES="2",
                            GIT_RS_WARM_INITIAL_SEGMENTS="8", GIT_RS_WARM_QUANTUM_PAUSE_MS="5000")
+        if lanes != 1:
+            self.warmer["GIT_RS_WARM_INITIAL_LANES"] = str(lanes)
         self.foreground.update(GIT_RS_BLAME_RESOURCE_PROFILE="large-v1")
 
         with self.child() as child:
@@ -131,9 +134,10 @@ class Initial(Fixture):
 
         started = time.monotonic()
         self.once()
-        # Three 2-edge windows (the last reaches root), then finalization; each pause
-        # exceeds the original piece's deadline and owns no source lease.
-        require(self.count() == 7 and time.monotonic() - started >= 15,
+        # Three 2-edge windows (the last reaches root), then finalization.
+        # Each gap exceeds the producer deadline and owns no source lease.
+        quanta = (3 + lanes - 1) // lanes
+        require(self.count() == 3 + quanta + 1 and time.monotonic() - started >= 5 * quanta,
                 "worker did not finish in independent renewed quanta")
         bodies = self.bodies()
         require(set(bodies) == {("alice", tip)}, "local run did not confirm the ordinary body")
@@ -151,10 +155,11 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--owned-loopback", required=True, choices=["synthetic-only"])
     parser.add_argument("--cache-placement", choices=["pg-s3", "all-pg"], default="pg-s3")
+    parser.add_argument("--initial-lanes", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, stop)
-    Initial(args).exercise()
+    Initial(args).exercise(args.initial_lanes)
     print(f"initial warm contract passed ({args.cache_placement}): scoped renewal, cancellation, admission, exact native hit")
 
 

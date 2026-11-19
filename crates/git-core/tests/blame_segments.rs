@@ -2,8 +2,11 @@
 mod fixture;
 
 use fixture::{Fixture, control, render};
-use git_rs_core::blame::{BlameError, CompletedUse, MAX_BODY_BYTES, segments::Endpoint};
-use git_rs_core::{BlameOptions, BlameRequest, CapacityBudget, Porcelain, StopReason};
+use git_rs_core::blame::{
+    BlameError, CompletedUse, MAX_BODY_BYTES,
+    segments::{Endpoint, LocalSegmentRun},
+};
+use git_rs_core::{BlameOptions, BlameRequest, CapacityBudget, Control, Porcelain, StopReason};
 use gix_object::Kind;
 
 #[test]
@@ -130,7 +133,39 @@ fn independent_segments_match_flat_and_native_porcelain() {
         "segment porcelain differs from native"
     );
     assert_eq!(actual, expected);
-    drop((body, result, front, young, middle, tail, session));
+    drop((body, result, front, tail));
+    let mut local = LocalSegmentRun::default();
+    assert!(local.append_segment(&session, young, &options).unwrap());
+    assert!(local.append_segment(&session, middle, &options).unwrap());
+    drop(session);
+
+    let renewed = Control::new(control.deadline());
+    let session = repo.session(budget.clone(), renewed.clone());
+    let tail_request = BlameRequest {
+        commit: &points[1].commit,
+        path,
+    };
+    let piece = session
+        .summarize_blame_segment(tail_request, None, &options)
+        .unwrap()
+        .unwrap();
+    assert!(local.append_segment(&session, piece, &options).unwrap());
+    let result = local.finish(&session, request, &options).unwrap().unwrap();
+    let body = Porcelain::encode_complete(&result, &renewed, &budget, MAX_BODY_BYTES).unwrap();
+    assert!(body.chunks().flatten().eq(expected.iter()));
+    drop((body, result));
+
+    let foreign = repo.session(budget.clone(), control);
+    let piece = foreign
+        .summarize_blame_segment(request, None, &options)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !LocalSegmentRun::default()
+            .append_segment(&session, piece, &options)
+            .unwrap()
+    );
+    drop((foreign, session));
     assert_eq!(budget.used(), 0);
 }
 

@@ -51,11 +51,16 @@ job path is unchanged. Do not set it on the periodic worker or the serving deplo
 | `GIT_RS_WARM_JOB_SECONDS` (each quantum, including finalization) | 120 | 300 s |
 | `GIT_RS_WARM_SEGMENT_EDGES` (all parent edges per segment, including unchanged edges) | 256 | 16,384 |
 | `GIT_RS_WARM_INITIAL_SEGMENTS` (computed segments per target, plus one finalization) | 2,048 | 4,096 |
-| `GIT_RS_WARM_INITIAL_MIB` (shared per-target admission for retained summary and active work) | 4,096 | 4,096 MiB |
+| `GIT_RS_WARM_INITIAL_LANES` (adjacent segments per quantum, capped by available CPUs) | 1 | 16 |
+| `GIT_RS_WARM_INITIAL_MIB` (shared per-target admission for retained summary and active work) | 4,096 | 32,768 MiB |
+| `GIT_RS_WARM_INITIAL_RANGE_MIB` (separate immutable source range cache) | 32 | 1,024 MiB |
 | `GIT_RS_WARM_QUANTUM_PAUSE_MS` (no source hold during pause; optional pacing) | 0 | 5,000 ms |
 
-The worker reduces each freshly completed segment into a single in-memory prefix using the
-ordinary producer. The prefix has no serialization/import route; original allocation tokens
+The worker plans adjacent bounded windows under one scoped hold per quantum. Independent
+producers run against that same hold, deadline and capacity budget. The worker folds the
+completed segments in newest-to-oldest order into a single in-memory prefix before dropping
+the hold. The segment limit counts all folded windows, including parallel ones. The prefix
+has no serialization/import route; original allocation tokens
 retain their capacity and controls. A new quantum uses a fresh session and deadline but must
 match repository, principal, branch, tip, path, generation, epoch, and the core producer and
 options scope. No warm source, cache or build hold crosses quanta. Revocation or a mismatch
@@ -79,7 +84,9 @@ segment-count exhaustion, and only accepts a restarted foreground exact hit with
 Add `--cache-placement all-pg` to use a compressible multipart fixture. It omits cache S3
 configuration, checks PostgreSQL placement and the stored and logical hashes of each data
 chunk, then compares the fresh HTTP hit through socket EOF. The default tests S3-backed chunks.
-The serial window size and budget must still be qualified on the 160k-edge target. If a segment,
+Use `--initial-lanes 2` with at least two fixture CPUs to exercise parallel production, expiry
+of the prior control, and ordered reduction before publication. The window size and resource
+budget must be qualified against the workload. If a segment,
 or the final metadata/encoding/publication quantum, cannot fit, the job fails rather than
 extending time or signing incomplete work.
 
