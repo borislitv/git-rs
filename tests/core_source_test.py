@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "https://github.com/borislitv/gitoxide"
-REV = "aa333d0e87718828d801071e8545fcc2298e5ed3"
+REV = "82ac9b97e4e91d3920f70527e6e40991f2ec579e"
 SOURCE = f"git+{REPO}?rev={REV}#{REV}"
 CODEC_REPO = "https://github.com/borislitv/iconv-native-rs"
 CODEC_REV = "f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"

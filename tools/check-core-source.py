@@ -12,7 +12,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/borislitv/gitoxide"
-GITOXIDE_REV = "aa333d0e87718828d801071e8545fcc2298e5ed3"
+GITOXIDE_REV = "82ac9b97e4e91d3920f70527e6e40991f2ec579e"
 GITOXIDE_CONTROLLED_SOURCES = {
     "gix-blame/src/file/function.rs",
     "gix-blame/src/file/segments.rs",

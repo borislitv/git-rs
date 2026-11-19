@@ -59,7 +59,7 @@
   },
   "source": {
     "git": "https://github.com/borislitv/gitoxide",
-    "rev": "aa333d0e87718828d801071e8545fcc2298e5ed3"
+    "rev": "82ac9b97e4e91d3920f70527e6e40991f2ec579e"
   },
   "upstream": {
     "base": "dd39fb66e3b1551c9fe849043e39b357a9799ca1",

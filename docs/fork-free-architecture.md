@@ -7,7 +7,7 @@ other callers still require independent qualification.
 
 Use maintained upstream libraries through supported public APIs by default.
 Maintain one explicit exception for `NativeRootV1`: the owned Gitoxide fork,
-currently pinned at `aa333d0e87718828d801071e8545fcc2298e5ed3`. The production
+currently pinned at `82ac9b97e4e91d3920f70527e6e40991f2ec579e`. The production
 path at that pin matches full Git 2.56 porcelain on both independent-root and
 same-path-before-rename merges. The tested upstream candidates each fail one
 of those cases. Keep the existing implementation and qualify focused changes
