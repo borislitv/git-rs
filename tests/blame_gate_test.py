@@ -205,8 +205,9 @@ class GateTests(unittest.TestCase):
                      "server_image": "sha256:" + "d" * 64, "server_fixture_image": "sha256:" + "f" * 64,
                     "builder_image": "sha256:" + "b" * 64, "binaries": binaries,
                     "harness_sources": {name: "c" * 64 for name in gate.HARNESS_FILES},
-                    "inventory": {suite: [gate.ROOT_RUNTIME] if suite == "blame_core"
-                                  else ["actual_fixture_case"] for suite in gate.SUITES}}
+                     "inventory": {suite: ["actual_fixture_case"] for suite in gate.SUITES}}
+        manifest["inventory"]["blame_core"] = [gate.ROOT_RUNTIME]
+        manifest["inventory"]["blame_reuse"].append(gate.GENERAL_MAP)
         self.seal_manifest(bundle, manifest)
         (bundle / "bin").chmod(0o555)
         bundle.chmod(0o555)
@@ -522,6 +523,13 @@ class GateTests(unittest.TestCase):
     def test_sealed_complete_bundle_is_accepted_without_running_binaries(self):
         bundle, expected = self.bundle()
         self.assertEqual(gate.load_manifest(bundle)["binaries"], expected["binaries"])
+
+    def test_sealed_bundle_without_general_map_contract_is_rejected(self):
+        bundle, manifest = self.bundle()
+        manifest["inventory"]["blame_reuse"].remove(gate.GENERAL_MAP)
+        self.seal_manifest(bundle, manifest)
+        with self.assertRaisesRegex(ValueError, "general map contract omitted"):
+            gate.load_manifest(bundle)
 
     def test_modified_binary_is_rejected_even_when_manifest_is_unchanged(self):
         bundle, _ = self.bundle()
