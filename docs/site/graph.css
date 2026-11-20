@@ -1,0 +1,107 @@
+/* Scoped, local-only graph styles. Geometry uses SVG attributes, never inline CSS. */
+.grg {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  color: #edf2f7;
+  background: #0f1926;
+  border: 1px solid #3a4d62;
+  border-radius: 16px;
+  padding: 18px;
+  overflow: hidden;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+.grg, .grg * { box-sizing: border-box; }
+.grg .grg-heading { margin: 0 0 8px; font-size: 1.2rem; }
+.grg .grg-note { margin: 8px 0; color: #acbbcc; font-size: .8rem; line-height: 1.6; }
+.grg .grg-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; margin-top: 18px; }
+.grg .grg-field { display: grid; flex: 1 1 220px; gap: 5px; min-width: 0; font-size: .78rem; color: #acbbcc; }
+.grg .grg-field select, .grg .grg-field input {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid #627b8d;
+  border-radius: 8px;
+  background: #111c2a;
+  color: #edf2f7;
+  padding: 10px;
+  font: inherit;
+}
+.grg .grg-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.grg .grg-button {
+  background: #172435;
+  border: 1px solid #627b8d;
+  border-radius: 7px;
+  color: #edf2f7;
+  min-height: 42px;
+  padding: 8px 12px;
+  font: inherit;
+  font-size: .8rem;
+  cursor: pointer;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.grg .grg-button:hover:enabled { border-color: #8bdaca; background: #163331; }
+.grg .grg-button:disabled { cursor: default; opacity: .5; }
+.grg .grg-zoom { min-width: 48px; text-align: center; font: .75rem ui-monospace, monospace; }
+.grg .grg-status { min-height: 1.6em; margin: 12px 0 4px; color: #8bdaca; font-size: .8rem; }
+.grg .grg-viewport {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 660px;
+  height: clamp(380px, 72vh, 760px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #3a4d62;
+  border-radius: 10px;
+  background-color: #0b1420;
+  background-image: radial-gradient(#314153 1px, transparent 1px);
+  background-size: 20px 20px;
+  cursor: grab;
+  touch-action: none;
+  scrollbar-width: thin;
+}
+.grg .grg-dragging { cursor: grabbing; user-select: none; }
+.grg .grg-svg { display: block; max-width: none; flex-shrink: 0; }
+.grg .grg-edge { fill: none; stroke: #71859c; stroke-width: 1.6; stroke-linejoin: round; }
+.grg .grg-arrow-normal { fill: #71859c; }
+.grg .grg-arrow-active { fill: #8bdaca; }
+.grg .grg-edge-inactive { opacity: .18; }
+.grg .grg-edge-active { stroke: #8bdaca; stroke-width: 3; }
+.grg .grg-node { cursor: pointer; }
+.grg .grg-node rect { fill: #172435; stroke: #71859c; stroke-width: 1.5; }
+.grg .grg-node text { pointer-events: none; }
+.grg .grg-node-id { fill: #9bbfff; font: 12px ui-monospace, monospace; }
+.grg .grg-node-title { fill: #edf2f7; font: 16px ui-sans-serif, system-ui, sans-serif; font-weight: 600; }
+.grg .grg-inactive rect { fill: #111c2a; stroke: #40536a; stroke-dasharray: 5 4; }
+.grg .grg-inactive .grg-node-title { fill: #acbbcc; }
+.grg .grg-participating rect { fill: #183b39; stroke: #8bdaca; stroke-width: 2.5; }
+.grg .grg-node:hover rect { stroke: #edf2f7; stroke-width: 3; }
+.grg .grg-match rect { stroke: #f7bf82; stroke-width: 3; stroke-dasharray: 7 3; }
+.grg .grg-node[aria-pressed="true"] rect { stroke: #f7bf82; stroke-width: 4; fill: #3c3023; }
+.grg .grg-node:focus { outline: none; }
+.grg .grg-node:focus-visible rect { stroke: #ffffff; stroke-width: 5; }
+.grg .grg-button:focus-visible, .grg input:focus-visible, .grg select:focus-visible,
+.grg summary:focus-visible, .grg-viewport:focus-visible { outline: 3px solid #f7bf82; outline-offset: 2px; }
+.grg .grg-route { border-top: 1px solid #3a4d62; margin-top: 18px; padding-top: 14px; overflow-wrap: anywhere; }
+.grg .grg-route h4 { margin: 0 0 8px; font-size: 1rem; }
+.grg .grg-route-summary { margin: 12px 0; font-size: .85rem; line-height: 1.8; color: #8bdaca; }
+.grg .grg-route-details { margin-top: 14px; }
+.grg summary { cursor: pointer; font-size: .83rem; padding: 8px 0; }
+.grg .grg-sequence { padding-left: 24px; margin: 12px 0; }
+.grg .grg-sequence > li { margin: 16px 0; padding-left: 4px; }
+.grg .grg-step { margin-top: 6px; }
+.grg .grg-step dl { margin: 0; padding: 10px 14px; border-left: 2px solid #3a4d62; }
+.grg .grg-step dt { font-size: .78rem; font-weight: 700; margin-top: 10px; }
+.grg .grg-step dd { margin: 3px 0 12px; color: #acbbcc; white-space: pre-line; font-size: .8rem; }
+@media (max-width: 680px) {
+  .grg { padding: 12px; }
+  .grg .grg-controls { width: 100%; }
+  .grg .grg-viewport { height: 500px; height: 65vh; min-height: 340px; }
+}
+@media print {
+  .grg .grg-toolbar, .grg .grg-status { display: none; }
+  .grg .grg-viewport { height: auto; overflow: visible; }
+  .grg .grg-svg { width: 100%; height: auto; }
+}

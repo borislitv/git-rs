@@ -1,0 +1,24 @@
+{{- if and .Values.cnpg.enabled .Values.cnpg.backup.enabled }}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ include "git-rs.pgName" . }}-backup
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  {{- toYaml (required "cnpg.backup.spec requires a Barman ObjectStore configuration" .Values.cnpg.backup.spec) | nindent 2 }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ include "git-rs.pgName" . }}-backup
+spec:
+  immediate: true
+  backupOwnerReference: self
+  schedule: {{ .Values.cnpg.backup.schedule | quote }}
+  cluster:
+    name: {{ include "git-rs.pgName" . }}
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+{{- end }}

@@ -1,0 +1,182 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "replicaCount": {"type": "integer", "minimum": 1, "maximum": 32},
+    "image": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$"},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array", "items": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}}, "additionalProperties": false}},
+    "service": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "type": {"enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+        "sshPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "serviceAccount": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"create": {"type": "boolean"}, "name": {"type": "string"}}
+    },
+    "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+    "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+    "tolerations": {"type": "array"},
+    "affinity": {"type": "object"},
+    "resources": {"type": "object"},
+    "cacheBytes": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+    "operationSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "cpu": {"type": "object", "additionalProperties": false, "properties": {
+      "concurrency": {"type": "integer", "minimum": 1, "maximum": 4},
+      "waiters": {"type": "integer", "minimum": 0, "maximum": 3}
+    }},
+    "debugTimings": {"type": "boolean"},
+    "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+    "maintenance": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "replicaCount": {"type": "integer", "minimum": 1, "maximum": 8},
+        "leaseName": {"type": "string", "maxLength": 253, "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"},
+        "serviceAccount": {"type": "object", "additionalProperties": false, "properties": {
+          "create": {"type": "boolean"}, "name": {"type": "string", "maxLength": 253, "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"}
+        }},
+        "tokenAudience": {"type": "string", "maxLength": 256},
+        "leaseSeconds": {"type": "integer", "minimum": 20, "maximum": 300},
+        "renewGraceSeconds": {"type": "integer", "minimum": 1, "maximum": 299},
+        "expirySafetySeconds": {"type": "integer", "minimum": 1, "maximum": 10},
+        "pgFenceLeaseSeconds": {"type": "integer", "minimum": 10, "maximum": 120},
+        "heartbeatSeconds": {"type": "integer", "minimum": 1, "maximum": 30},
+        "jobLeaseSeconds": {"type": "integer", "minimum": 10, "maximum": 120},
+        "jobSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "sourceConcurrency": {"const": 1},
+        "scanBatch": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "scanSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "scanBudgetMillis": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "deleteBatch": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "cacheBytes": {"type": "integer", "minimum": 0, "maximum": 536870912},
+        "shutdownSeconds": {"type": "integer", "minimum": 60, "maximum": 120},
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 70, "maximum": 180},
+        "scratch": {"type": "object", "additionalProperties": false, "properties": {
+          "medium": {"enum": ["Memory", ""]}, "sizeLimit": {"type": "string", "minLength": 1}
+        }},
+        "resources": {"type": "object"},
+        "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"}
+      }
+    },
+    "ssh": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "hostKeysSecret": {"type": "string", "minLength": 1},
+        "authorizedKeysSecret": {"type": "string", "minLength": 1},
+        "authorizedKeysKey": {"type": "string", "minLength": 1},
+        "resources": {"type": "object"}
+      }
+    },
+    "http": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "credentialsSecret": {"type": "string"},
+        "credentialsKey": {"type": "string", "minLength": 1},
+        "port": {"type": "integer", "minimum": 1024, "maximum": 65535}
+      }
+    },
+    "httpRoute": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "parentRefs": {"type": "array", "maxItems": 32, "items": {
+          "type": "object", "additionalProperties": false, "required": ["name", "sectionName"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "namespace": {"type": "string", "minLength": 1},
+            "sectionName": {"type": "string", "minLength": 1},
+            "group": {"enum": ["gateway.networking.k8s.io"]},
+            "kind": {"enum": ["Gateway"]}
+          }
+        }},
+        "hostnames": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1}},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "timeouts": {"type": "object", "additionalProperties": false, "properties": {
+          "request": {"type": "string", "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"},
+          "backendRequest": {"type": "string", "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"}
+        }}
+      }
+    },
+    "postgresql": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "host": {"type": "string"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "database": {"type": "string", "minLength": 1},
+        "username": {"type": "string", "minLength": 1},
+        "passwordSecret": {"type": "string"},
+        "passwordKey": {"type": "string", "minLength": 1},
+        "serverCASecret": {"type": "string"},
+        "serverCAKey": {"type": "string", "minLength": 1}
+      }
+    },
+    "cnpg": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "name": {"type": "string"},
+        "spec": {"type": "object"},
+        "backup": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1},
+            "spec": {"type": "object"}
+          }
+        }
+      }
+    },
+    "s3": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "endpoint": {"type": "string", "pattern": "^$|^https://[^\\s]+$"},
+        "region": {"type": "string", "minLength": 1},
+        "bucket": {"type": "string"},
+        "credentialsSecret": {"type": "string"},
+        "accessKeyKey": {"type": "string", "minLength": 1},
+        "secretKeyKey": {"type": "string", "minLength": 1},
+        "caSecret": {"type": "string"},
+        "caKey": {"type": "string", "minLength": 1}
+      }
+    },
+    "objectBucket": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "name": {"type": "string"},
+        "storageClassName": {"type": "string", "minLength": 1},
+        "bucketName": {"type": "string"},
+        "additionalConfig": {"type": "object", "additionalProperties": {"type": "string"}},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}, "propertyNames": {"not": {"const": "helm.sh/resource-policy"}}}
+      }
+    },
+    "migration": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "activeDeadlineSeconds": {"type": "integer", "minimum": 1},
+        "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    }
+  }
+}

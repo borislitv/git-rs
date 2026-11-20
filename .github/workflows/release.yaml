@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yaml
+    permissions:
+      contents: read
+  publish:
+    needs: verify
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+      - name: Validate version and unpublished release
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          python3 -c 'import os,tomllib; assert tomllib.load(open("Cargo.toml","rb"))["package"]["version"] == os.environ["GITHUB_REF_NAME"][1:]'
+          if draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null); then
+            test "$draft" = true || { printf '%s\n' 'Refusing to overwrite a published release'; exit 1; }
+          fi
+          printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'IMAGE=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          printf 'CHART_REGISTRY=oci://ghcr.io/%s/charts\n' "${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+          printf 'DOCKER_CONFIG=%s/git-rs-registry/docker\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'HELM_REGISTRY_CONFIG=%s/git-rs-registry/helm.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Authenticate to GHCR
+        run: |
+          umask 077
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish versioned runtime image
+        run: |
+          docker build --target release --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --tag "$IMAGE:$VERSION" .
+          test "$(docker run --rm "$IMAGE:$VERSION" --version)" = "git-rs $VERSION"
+          docker push "$IMAGE:$VERSION"
+          digest=$(docker inspect "$IMAGE:$VERSION" --format '{{index .RepoDigests 0}}')
+          printf 'IMAGE_DIGEST=%s\n' "${digest##*@}" >> "$GITHUB_ENV"
+      - name: Package and publish OCI chart
+        run: |
+          mkdir -p dist
+          helm package charts/git-rs --destination dist
+          if ! output=$(helm push "dist/git-rs-$VERSION.tgz" "$CHART_REGISTRY" 2>&1); then
+            printf '%s\n' "$output"; exit 1
+          fi
+          printf '%s\n' "$output"
+          [[ "$output" =~ Digest:\ (sha256:[a-f0-9]{64}) ]]
+          printf 'CHART_DIGEST=%s\n' "${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+      - name: Draft release with checksums and provenance
+        run: |
+          docker run --rm --entrypoint /bin/cat "$IMAGE:$VERSION" \
+            /usr/share/git-rs/git-source.txt > dist/runtime-git.txt
+          docker run --rm --entrypoint /bin/cat "$IMAGE:$VERSION" \
+            /usr/share/git-rs/packages.tsv > dist/runtime-packages.tsv
+          runtime_git=$(docker run --rm --entrypoint /usr/bin/git "$IMAGE:$VERSION" --version)
+          python3 scripts/release_metadata.py --directory dist --image-digest "$IMAGE_DIGEST" \
+            --chart-digest "$CHART_DIGEST" --repository "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" \
+            --runtime-git "${runtime_git#git version }"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            flags=()
+            if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft "${flags[@]}" \
+              --title "git-rs $VERSION" --notes-file dist/NOTES.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" "dist/git-rs-$VERSION.tgz" \
+            dist/release.json dist/SHA256SUMS dist/runtime-git.txt dist/runtime-packages.tsv --clobber
+      - name: Verify anonymous access and publish release
+        run: |
+          mkdir -p "$RUNNER_TEMP/anonymous-docker" "$RUNNER_TEMP/anonymous-chart"
+          if ! docker --config "$RUNNER_TEMP/anonymous-docker" pull "$IMAGE@$IMAGE_DIGEST"; then
+            printf '%s\n' 'Set the GHCR container package visibility to public, then rerun this job. The GitHub release remains a draft.'
+            exit 1
+          fi
+          if ! helm --registry-config "$RUNNER_TEMP/anonymous-helm.json" pull \
+            "$CHART_REGISTRY/git-rs" --version "$VERSION" --destination "$RUNNER_TEMP/anonymous-chart"; then
+            printf '%s\n' 'Set the GHCR charts/git-rs package visibility to public, then rerun this job. The GitHub release remains a draft.'
+            exit 1
+          fi
+          cmp "dist/git-rs-$VERSION.tgz" "$RUNNER_TEMP/anonymous-chart/git-rs-$VERSION.tgz"
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Remove registry credentials
+        if: always()
+        run: |
+          docker logout ghcr.io || true
+          helm registry logout ghcr.io || true

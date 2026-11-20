@@ -1,0 +1,24 @@
+# Preinstalled CNPG and bucket provisioner; platform owns storage and TLS RGW.
+# Replace reserved endpoints and precreate referenced Secrets before installing.
+replicaCount: 3
+s3:
+  endpoint: https://objects.example.invalid
+  caSecret: git-rs-s3-ca
+objectBucket:
+  enabled: true
+  storageClassName: ceph-bucket
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+http:
+  enabled: true
+  credentialsSecret: git-rs-http
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: public-gateway
+      namespace: ingress
+      sectionName: https
+  hostnames: [git.example.invalid]
+  timeouts:
+    request: 300s
+    backendRequest: 300s

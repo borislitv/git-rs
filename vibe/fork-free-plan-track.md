@@ -1,0 +1,95 @@
+# Progress tracker for the dependency migration and blame plan
+
+`[X]` means the changes and the stage's required checks have completed.
+
+- [X] Stage 1: Correct complete-body lookup
+- [X] Stage 2: Verify immutable-body behavior through real serving
+- [ ] Stage 3: Implement fork-free adapters in an isolated qualification workspace
+- [ ] Stage 4: Qualify the public-API replacements
+- [ ] Stage 5: Add one bounded executor and cut over qualified callers
+- [ ] Stage 6: Verify cutover, resources and dependency provenance
+- [ ] Stage 7: Reconcile warm targets with the selected producer
+- [ ] Stage 8: Verify usefulness and recovery end to end
+
+## Notes
+
+- Plan validation: retain live source fences and named-Lease behavior. Treat
+  changed-file cross-commit reuse and each upstream parity check as separate gates.
+- Stage 1 (2026-11-17): `cargo fmt --all -- --check` and locked workspace
+  `cargo check --workspace --all-targets` passed. Serving qualification is stage 2.
+- Stage 2: the [full owned blame gate](https://github.com/borislitv/git-rs/actions/runs/44171006222/job/134358219594)
+  passed on `5670ed2`, including real push/restart/force-push and ACL/epoch fences.
+  The [unchanged-edge control](https://github.com/borislitv/git-rs/actions/runs/44171006222/job/134349754710)
+  failed at its intended assertion with optimization disabled and passed on restoration.
+  Earlier head `23db2fb` masked a source digest error; the unchanged integrity contract
+  passed after `4a88308` propagated the original error from physical preflight.
+- Stages 3–4 (2026-11-18): [standalone candidates, commands and results](../tests/upstream_probe/README.md).
+  Final isolated run: 39 passed, 2 failed, none ignored. Strict upstream header
+  inspection and payload streaming preserve the tested legacy frame policy.
+  Physical origin-tree evidence recovers `previous` for the tested edited rename,
+  including after a later change removes its last unchanged line. The stored-entry,
+  encoding and codec suites passed; locked all-target check and Clippy passed.
+  Two native-oracle comparisons disqualify the upstream blame candidates:
+  incomplete coverage on an independent-root merge (Gitoxide, debug and release),
+  and incorrect commit/path for same-path versus rename (libgit2).
+- Blame backend selected: the existing owned Gitoxide pin `0354c999` passed both
+  merge reproductions through `SnapshotSession` against Git 2.56 full porcelain.
+  The full core blame test target passed 16/16. Keep the two upstream failures as
+  comparison evidence. Changed-file +1/+100 reuse is a separate open gate.
+- Changed-file prototype: the pinned core serializes a certified one-coordinate
+  base and composes a verified linear suffix. The 20,000-commit test reloads the
+  seed in a fresh session and matches Git 2.56 at +1/+100 with no older commit
+  reads. It declines +101; ordinary blame triggers the old-history read guard.
+  The [short owned HTTP gate](https://github.com/borislitv/git-rs/actions/runs/44246492811/job/134612013812)
+  passed on `2c50adb`: both restarted processes returned native bytes with exact
+  suffix counts and no attribution traversal. Observed response times were 463 ms
+  at +1 and 1,715 ms at +100, on an eight-commit base. The +1 advance was a real
+  HTTP push; +100 used the production catalog transaction after bulk HTTP receive
+  returned an empty reply in an earlier local run. Bulk receive remains open.
+  The 20,000-commit HTTP contract and wrong-signing-key control are part of the
+  default owned gate's ignored-test inventory; their execution is tracked separately.
+- On [`03a8d7a`](https://github.com/borislitv/git-rs/actions/runs/44250571496/job/134628008683),
+  the eight-commit case passed with the wrong-key control: the wire stayed
+  native-exact and the request used ordinary attribution. The 20,000-commit
+  case hit its 120-second deadline during the cold base request, before either
+  advance. That fixture used a 1 MiB source cache, below a single full 4 MiB
+  source range. The next run uses the serving default 64 MiB for the long case
+  and logs phase timings, retaining the deadline and output/reuse assertions.
+- On [`dd6aa93`](https://github.com/borislitv/git-rs/actions/runs/44255714735/job/134645051391),
+  the cold base still stopped after 120 seconds with 64 MiB. It acquired the
+  source, prepared the WorkSet and claimed the body in 3.5 seconds, but never
+  reported completed attribution. The gate previously built `blame_reuse` in
+  Cargo's debug profile; the optimized serving contract is built in the exact
+  oracle image with the unchanged 120-second deadline and reuse assertions.
+- [`2c5ca37`](https://github.com/borislitv/git-rs/actions/runs/44261018668/job/134660853089):
+  the optimized cold 20k base matched native bytes. Both runs stopped at the
+  following native +1 push before a changed-tip GET. The push helper still used
+  a debug binary and a 1 MiB source cache. See the [architecture review and
+  acceptance criteria](../docs/blame-reuse-architecture.md).
+- `2f46616`: the 20,000-commit changed-file HTTP contract passed in the
+  [push](https://github.com/borislitv/git-rs/actions/runs/44267373656/job/134683560495)
+  and [PR](https://github.com/borislitv/git-rs/actions/runs/44267385530/job/134683016859)
+  blame jobs with matched release builds and 64 MiB source caches. Both first
+  requests after restart had native-exact output and `ReplacementSeedHit`.
+  The +1 advance used native HTTP receive; cumulative +100 qualifies serving
+  after catalog publication only. No broader migration stage is marked complete.
+- Core completed maps: [owned Gitoxide revision `d80e8c8`](https://github.com/borislitv/gitoxide/commit/d80e8c8f13952fef55fb8a387e64c9436537cecf)
+  preserves origin ranges, byte paths, native grouping and previous metadata.
+  A new snapshot can reuse the immutable wire; its decoded map is specific to
+  the live job and target. The synthetic cross-generation edit/rename matched
+  Git 2.56 full porcelain with a guard against reads below the base. Rebinding
+  the wire to ref generation or forcing old metadata reads failed the respective
+  controls. Mixed-parent ambiguity falls back to ordinary attribution. The fork
+  blame suite passed 91 tests and the focused application core suites passed 42.
+  This qualifies the core API, not a first, uncached request on a long history.
+- Cold slider qualification: the current owned pin is [Gitoxide `7c9e8fb`](https://github.com/borislitv/gitoxide/commit/7c9e8fbecae9b475ac51c80db8be2261f3f00f82).
+  On a synthetic repeated-line edge, the slider scanned 4 tokens instead of
+  100,004 and matched Git 2.56 hunk coordinates and changed bytes. The full
+  91-test fork blame suite and 10 imara-diff unit tests passed. This is not a
+  corpus timing result.
+- The bounded cold segment producer now streams newly requested blob bodies
+  without evicting resident delta bases on their behalf. The one-slot shared-base
+  test checks exact output and one materialization of the common base. The owned
+  loopback cancellation, revocation, and delete/re-add fallback checks passed.
+  Independent initial warming also passed the synthetic quantum/restart gate;
+  full-history blame and Kubernetes warm-worker takeover are separate open gates.

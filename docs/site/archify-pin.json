@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/tt-a1i/archify",
+  "revision": "a7ed6fd6657da90414831d1d42cf95987188750c",
+  "packageVersion": "3.2.0",
+  "archiveUrl": "https://codeload.github.com/tt-a1i/archify/tar.gz/a7ed6fd6657da90414831d1d42cf95987188750c",
+  "archiveSha256": "dcc0e0ca1f1245d80cfcadb0f0e3275ba8a58a71bf8027c94f4c42a59aefa704",
+  "packageTreeSha256": "689f7c8834fc64354c0f70599c239111ce64a594a8637bcc3178defd1e7f716a",
+  "packageTreeAlgorithm": "SHA256 of sorted recursive relative POSIX filename + NUL + file SHA256 hex + LF, regular files only; extracted archify package plus root llms.txt and license notices",
+  "localeKeys": 486,
+  "localeSha256": "ad787e1674ed50793dc9b541d3b0195d3d1ad08fa5a063830cc31a83080735bd",
+  "licenses": [
+    "LICENSE",
+    "LICENSE-MIT",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+    "assets/JetBrainsMono-OFL.txt"
+  ],
+  "source": {
+    "url": "https://github.com/borislitv/git-rs.git",
+    "revision": "da6f02f1cba3852c899fc74e129fba20556e5cf8",
+    "extraCitedPaths": ["AGENTS.md", "crates/git-core/src/write_pack.rs"]
+  },
+  "updateCheckDisabled": true,
+  "browserAcceptance": "A successful finalize receipt must include passing validate, deliver, strict check and real browser-check gates; perceptual review is separate"
+}

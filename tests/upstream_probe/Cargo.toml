@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "git-rs-upstream-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gix-blame = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b", features = ["sha1"] }
+gix-hash = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b", features = ["sha1"] }
+gix-object = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b" }
+gix-error = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b" }
+gix-diff = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b", default-features = false, features = ["blob"] }
+gix-worktree = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b", default-features = false, features = ["attributes"] }
+gix-filter = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b" }
+gix-glob = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b" }
+gix-pack = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b", default-features = false, features = ["sha1"] }
+gix-zlib = { git = "https://github.com/GitoxideLabs/gitoxide", rev = "b8e1eb2a3deaf67d82bdfec0ddad43b693639d8b" }
+zstd = { git = "https://github.com/gyscos/zstd-rs", rev = "5c4970b9ca1735b1bb19008729d5f4538fbdbc23", default-features = false, features = ["vendored", "experimental"] }
+zstandard = { version = "=0.1.9", default-features = false }
+gio = "=0.21.2"
+crc32fast = "1.5"
+sha2 = "=0.11.1"
+
+[dev-dependencies]
+git2 = { version = "=0.21.0", default-features = false, features = ["vendored-libgit2"] }
+tempfile = "3"
+flate2 = "1"

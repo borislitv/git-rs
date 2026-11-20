@@ -1,0 +1,5 @@
+# Documented GitHub-hosted label missing from actionlint 1.7.12's built-in list:
+# https://github.com/actions/runner-images#available-images
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

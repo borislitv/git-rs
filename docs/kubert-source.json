@@ -1,0 +1,25 @@
+{
+  "format": 1,
+  "source": {
+    "git": "https://github.com/borislitv/kubert",
+    "rev": "5ebc70e236e14852c82ace1dc772e3c48c1839f7"
+  },
+  "upstream": {
+    "git": "https://github.com/olix0r/kubert",
+    "rev": "a2ff424f072a0de77d98ab97592d6f66ae1d9546"
+  },
+  "package": {
+    "name": "kubert",
+    "version": "0.25.0",
+    "license": "Apache-2.0"
+  },
+  "default_features": false,
+  "features": ["lease", "openssl-tls"],
+  "notices_in_source": ["LICENSE", "FORK_PROVENANCE.md"],
+  "controlled_source_sha256": {
+    "kubert/src/lease.rs": "a57780c50fe9831ee1bc89bcd35992b11eb4e868c167ce13c7fa3c3a23f9b009",
+    "kubert/src/admin/diagnostics/lease.rs": "ddc62f92fbccb938e4611fe8d26585988e876fbbc6b858bebb6e2a9986938535",
+    "kubert/Cargo.toml": "8d0247152cc92ff1a7d74e8ba90847911150bf8cdfff2525af696c633fecb7b1"
+  },
+  "qualification": "Source identity and feature policy only; real Kubernetes CAS/SSA, expiry, fault and resource qualification are separate revision-bound gates."
+}

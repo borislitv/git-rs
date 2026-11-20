@@ -1,0 +1,25 @@
+{{- if .Values.cnpg.enabled }}
+{{- $spec := deepCopy .Values.cnpg.spec }}
+{{- if not (hasKey $spec "bootstrap") }}
+{{- $_ := set $spec "bootstrap" (dict "initdb" (dict "database" .Values.postgresql.database "owner" .Values.postgresql.username)) }}
+{{- end }}
+{{- if .Values.cnpg.backup.enabled }}
+{{- range $spec.plugins | default list }}
+{{- if or (eq .name "barman-cloud.cloudnative-pg.io") .isWALArchiver }}
+{{- fail "cnpg.backup cannot be combined with another WAL archiver in cnpg.spec.plugins" }}
+{{- end }}
+{{- end }}
+{{- $archiver := dict "name" "barman-cloud.cloudnative-pg.io" "isWALArchiver" true "parameters" (dict "barmanObjectName" (printf "%s-backup" (include "git-rs.pgName" .))) }}
+{{- $_ := set $spec "plugins" (append ($spec.plugins | default list) $archiver) }}
+{{- end }}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "git-rs.pgName" . }}
+  labels:
+    {{- include "git-rs.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  {{- toYaml $spec | nindent 2 }}
+{{- end }}

@@ -1,0 +1,17 @@
+{
+  "source": {
+    "git": "https://github.com/borislitv/iconv-native-rs",
+    "rev": "f8022d89dfe9e9fd2a6e3ce0bac5a68a4c77e89f"
+  },
+  "upstream": {
+    "git": "https://github.com/bdbai/iconv-native-rs",
+    "rev": "d386e5223966bcde2654523e2b2135223a5c3602",
+    "version": "0.1.0"
+  },
+  "license": "MIT OR Apache-2.0",
+  "notices_in_source": ["LICENSE"],
+  "source_identity": "iconv_native::CODEC_SOURCE_ID",
+  "runtime_identity": "iconv_native::BUILD_CONTRACT",
+  "runtime_gate": "iconv_native::runtime::verify",
+  "native_profile": "x86_64-unknown-linux-gnu; libc-iconv; actual thread codeset ANSI_X3.4-1968; native Git oracle LC_ALL=C"
+}

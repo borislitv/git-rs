@@ -1,0 +1,136 @@
+{{- if .Values.maintenance.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "git-rs.fullname" . }}-maintenance
+  labels:
+    {{- include "git-rs.maintenanceLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.maintenance.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      {{- include "git-rs.maintenanceSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "git-rs.maintenanceSelectorLabels" . | nindent 8 }}
+      {{- with .Values.maintenance.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "git-rs.maintenanceServiceAccount" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.maintenance.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: maintenance
+          image: {{ include "git-rs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [maintenance, --scratch, /scratch/private, --health, "0.0.0.0:8081"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          env:
+            {{- include "git-rs.pgEnv" . | nindent 12 }}
+            {{- include "git-rs.s3Env" . | nindent 12 }}
+            - name: GIT_RS_POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: GIT_RS_LEADER_LEASE_NAME
+              value: {{ include "git-rs.maintenanceLease" . | quote }}
+            - name: GIT_RS_LEADER_LEASE_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: GIT_RS_LEADER_LEASE_SECONDS, value: {{ .Values.maintenance.leaseSeconds | quote }}}
+            - {name: GIT_RS_LEADER_RENEW_GRACE_SECONDS, value: {{ .Values.maintenance.renewGraceSeconds | quote }}}
+            - {name: GIT_RS_LEADER_EXPIRY_SAFETY_SECONDS, value: {{ .Values.maintenance.expirySafetySeconds | quote }}}
+            - {name: GIT_RS_LEADER_PG_FENCE_LEASE_SECONDS, value: {{ .Values.maintenance.pgFenceLeaseSeconds | quote }}}
+            - {name: GIT_RS_LEADER_PG_FENCE_HEARTBEAT_SECONDS, value: {{ .Values.maintenance.heartbeatSeconds | quote }}}
+            - {name: GIT_RS_MAINTENANCE_JOB_LEASE_SECONDS, value: {{ .Values.maintenance.jobLeaseSeconds | quote }}}
+            - {name: GIT_RS_MAINTENANCE_JOB_SECONDS, value: {{ .Values.maintenance.jobSeconds | quote }}}
+            - {name: GIT_RS_MAINTENANCE_CONCURRENCY, value: {{ .Values.maintenance.sourceConcurrency | quote }}}
+            - {name: GIT_RS_MAINTENANCE_SCAN_BATCH, value: {{ .Values.maintenance.scanBatch | quote }}}
+            - {name: GIT_RS_MAINTENANCE_SCAN_SECONDS, value: {{ .Values.maintenance.scanSeconds | quote }}}
+            - {name: GIT_RS_MAINTENANCE_SCAN_BUDGET_MILLIS, value: {{ .Values.maintenance.scanBudgetMillis | quote }}}
+            - {name: GIT_RS_MAINTENANCE_DELETE_BATCH, value: {{ .Values.maintenance.deleteBatch | quote }}}
+            - {name: GIT_RS_MAINTENANCE_SHUTDOWN_SECONDS, value: {{ .Values.maintenance.shutdownSeconds | quote }}}
+            - {name: GIT_RS_CACHE_BYTES, value: {{ .Values.maintenance.cacheBytes | int64 | quote }}}
+          ports: [{name: health, containerPort: 8081}]
+          startupProbe:
+            httpGet: {path: /livez, port: health}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /livez, port: health}
+          readinessProbe:
+            httpGet: {path: /readyz, port: health}
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.maintenance.resources | nindent 12 }}
+          volumeMounts:
+            - {name: identity, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
+            - {name: scratch, mountPath: /scratch}
+            - {name: temporary, mountPath: /tmp}
+            - {name: pg-ca, mountPath: /etc/git-rs/pg-ca, readOnly: true}
+            {{- if .Values.s3.caSecret }}
+            - {name: s3-ca, mountPath: /etc/git-rs/s3-ca, readOnly: true}
+            {{- end }}
+      volumes:
+        - name: identity
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+                  {{- if .Values.maintenance.tokenAudience }}
+                  audience: {{ .Values.maintenance.tokenAudience | quote }}
+                  {{- end }}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{key: ca.crt, path: ca.crt}]
+              - downwardAPI:
+                  items: [{path: namespace, fieldRef: {fieldPath: metadata.namespace}}]
+        - name: scratch
+          emptyDir:
+            {{- if .Values.maintenance.scratch.medium }}
+            medium: {{ .Values.maintenance.scratch.medium }}
+            {{- end }}
+            sizeLimit: {{ .Values.maintenance.scratch.sizeLimit }}
+        - name: temporary
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+        - name: pg-ca
+          secret:
+            secretName: {{ include "git-rs.pgCASecret" . }}
+            items: [{key: {{ .Values.postgresql.serverCAKey }}, path: ca.crt}]
+        {{- if .Values.s3.caSecret }}
+        - name: s3-ca
+          secret:
+            secretName: {{ .Values.s3.caSecret }}
+            items: [{key: {{ .Values.s3.caKey }}, path: ca.crt}]
+        {{- end }}
+      {{- with .Values.maintenance.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.maintenance.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.maintenance.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

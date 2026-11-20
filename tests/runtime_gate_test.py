@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""Supervisor cleanup and completion contracts without Docker or systemd."""
+import copy
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import runtime_gate as runtime
+
+
+class Daemon:
+    token = "a" * 32
+    cluster, controller, backend, foreign = (digit * 64 for digit in "1234")
+
+    def __init__(self):
+        self.containers = {}
+        for identity, name, owner in ((self.cluster, runtime.cluster_name(self.token), self.token),
+                                     (self.controller, "owned-controller", self.token),
+                                     (self.backend, "owned-backend", self.token),
+                                     (self.foreign, "unrelated", "b" * 32)):
+            self.containers[identity] = {"Id": identity, "Name": "/" + name,
+                                        "Config": {"Labels": {runtime.gate.LABEL[:-1]: owner}}}
+        self.preserved = copy.deepcopy(self.containers[self.foreign])
+        self.replaced = False
+
+    def output(self, argv, **_):
+        if argv[1] == "ps":
+            if argv[-1].startswith("id="):
+                identity = argv[-1].removeprefix("id=")
+                return identity if identity in self.containers else ""
+            return "\n".join(identity for identity, row in self.containers.items()
+                             if row["Config"]["Labels"].get(runtime.gate.LABEL[:-1]) == self.token)
+        assert argv[1] == "inspect"
+        rows = [copy.deepcopy(self.containers[identifier]) for identifier in argv[2:]]
+        if self.replaced:
+            for row in rows:
+                row["Config"]["Labels"][runtime.gate.LABEL[:-1]] = "b" * 32
+        return json.dumps(rows)
+
+    def command(self, argv, **_):
+        assert argv[:4] == ["docker", "rm", "-f", "-v"]
+        for identity in argv[4:]:
+            assert identity != self.foreign
+            del self.containers[identity]
+
+
+class ClusterStartupContracts(unittest.TestCase):
+    def start(self, config):
+        identity = "1" * 64
+
+        def output(argv, **_):
+            if argv[:2] == ["docker", "ps"]:
+                return ""
+            if argv[:2] == ["docker", "create"]:
+                return identity
+            if argv[3:5] == ["kubectl", "version"]:
+                return '{"serverVersion":{"gitVersion":"v1.37.2+k3s1"}}'
+            self.assertEqual(argv[3:], ["containerd", "--config",
+                "/var/lib/rancher/k3s/agent/etc/containerd/config.toml", "config", "dump"])
+            return config
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(runtime.gate, "output", side_effect=output), \
+                patch.object(runtime.gate, "command"), \
+                patch.object(runtime.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"True")), \
+                patch.object(runtime, "cluster_cgroups") as groups:
+            result = runtime.start_cluster("a" * 32, "owned.slice", "24,25", "/owned/pods",
+                time.monotonic() + 20, Path(directory))
+            groups.assert_called_once_with(identity, "/owned/pods")
+            return result
+
+    def test_node_readiness_does_not_accept_an_ignored_or_overridden_shim_setting(self):
+        for config in ("version = 3", '[plugins."io.containerd.shim.v1.manager"]\nenv = ["GOMAXPROCS=2"]'):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "shim launcher setting"):
+                self.start(config)
+
+    def test_effective_shim_setting_allows_the_bound_cluster_to_be_returned(self):
+        self.assertEqual(self.start('[plugins."io.containerd.shim.v1.manager"]\nenv = ["GOMAXPROCS=1"]'), "1" * 64)
+
+
+class ControllerClientContracts(unittest.TestCase):
+    def prepare(self, directory, *, copied=b"\x7fELFsynthetic pinned client", digest=None, size=None):
+        identity = "1" * 64
+        config = {"clusters": [{"cluster": {"server": "https://127.0.0.1:6443",
+                   "certificate-authority-data": "synthetic-ca"}}], "users": [{"name": "synthetic-client"}]}
+
+        def command(argv, **_):
+            self.assertEqual(argv[:4], ["docker", "cp", "--follow-link", identity + ":/bin/kubectl"])
+            Path(argv[4]).write_bytes(copied)
+            if size is not None:
+                with Path(argv[4]).open("r+b") as output:
+                    output.truncate(size)
+
+        def output(argv, **_):
+            if argv[:3] == ["docker", "exec", identity]:
+                if argv[3] == "sha256sum":
+                    expected = hashlib.sha256(copied)
+                    remaining = (size or len(copied)) - len(copied)
+                    while remaining:
+                        chunk = min(remaining, 65536)
+                        expected.update(b"\0" * chunk)
+                        remaining -= chunk
+                    return (digest or expected.hexdigest()) + "  /bin/kubectl\n"
+                self.assertEqual(argv[3:], ["kubectl", "config", "view", "--raw", "--flatten", "-o", "json"])
+                return json.dumps(config)
+            self.assertEqual(argv, ["docker", "inspect", identity])
+            return '[{"NetworkSettings":{"Ports":{"6443/tcp":[{"HostPort":"12345"}]}}}]'
+
+        with patch.object(runtime.gate, "command", side_effect=command), \
+                patch.object(runtime.gate, "output", side_effect=output):
+            return runtime.prepare_controller_client(identity, Path(directory), time.monotonic() + 30)
+
+    def test_pinned_client_uses_the_published_tls_endpoint_and_private_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.prepare(directory), hashlib.sha256(b"\x7fELFsynthetic pinned client").hexdigest())
+            config = Path(directory) / "controller-kubeconfig.json"
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            content = json.loads(config.read_text())
+            self.assertEqual(content["clusters"][0]["cluster"], {
+                "server": "https://127.0.0.1:12345", "certificate-authority-data": "synthetic-ca"})
+            self.assertEqual((Path(directory) / "kubectl").stat().st_mode & 0o777, 0o500)
+
+    def test_a_different_copy_or_non_executable_payload_cannot_receive_credentials(self):
+        for options in ({"digest": "f" * 64}, {"copied": b"not a client"}, {"size": 256 * 1024 * 1024 + 1}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "copy differs|Linux ELF|invalid pinned"):
+                    self.prepare(directory, **options)
+                self.assertFalse((Path(directory) / "controller-kubeconfig.json").exists())
+
+    def test_the_pinned_multicall_client_size_is_accepted_within_the_file_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.prepare(directory, size=242520984)
+            self.assertEqual((Path(directory) / "kubectl").stat().st_size, 242520984)
+            self.assertTrue((Path(directory) / "controller-kubeconfig.json").is_file())
+
+
+class SupervisorContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.daemon = Daemon()
+        for boundary in (patch.object(runtime, "DIRECTORIES", self.root),
+                         patch.dict(os.environ, {"INVOCATION_ID": self.daemon.token}),
+                         patch.object(runtime.gate, "output", side_effect=self.daemon.output),
+                         patch.object(runtime.gate, "command", side_effect=self.daemon.command)):
+            boundary.start()
+            self.addCleanup(boundary.stop)
+        self.local = self.root / self.daemon.token
+        self.local.mkdir(mode=0o700)
+        runtime.save_cluster(self.local, self.daemon.token, self.daemon.cluster)
+        fixture = self.local / "fixture"
+        fixture.mkdir(mode=0o700)
+        maintenance = fixture / "maintenance-fixture"
+        maintenance.mkdir(mode=0o700)
+        self.journal = maintenance / "maintenance-fixture.json"
+        self.journal.write_text("synthetic exact-owned journal")
+
+    def test_cleanup_reaps_servers_and_cluster_before_credentials_preserving_unrelated_state(self):
+        config = self.local / "controller-kubeconfig.json"
+        config.write_text("synthetic client credentials")
+        client = self.local / "kubectl"
+        client.write_bytes(b"\x7fELFsynthetic client")
+        def namespace(path, *, destroyed_cluster):
+            self.assertEqual(path, self.journal)
+            self.assertEqual(destroyed_cluster, self.daemon.cluster)
+            self.assertEqual(set(self.daemon.containers), {self.daemon.foreign})
+            path.unlink()
+
+        with patch.object(runtime, "confirm_drain"), patch.object(runtime, "cleanup_namespace", side_effect=namespace):
+            runtime.cleanup()
+        self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
+        self.assertFalse(self.journal.exists())
+        self.assertFalse(config.exists())
+        self.assertFalse(client.exists())
+
+    def test_interrupted_credential_cleanup_retries_from_the_durable_removed_cluster_identity(self):
+        with patch.object(runtime, "confirm_drain"), \
+                patch.object(runtime, "cleanup_namespace", side_effect=RuntimeError("credential cleanup interrupted")):
+            with self.assertRaisesRegex(RuntimeError, "credential cleanup interrupted"):
+                runtime.cleanup()
+        self.assertEqual(set(self.daemon.containers), {self.daemon.foreign})
+        self.assertTrue(self.journal.exists())
+        with patch.object(runtime, "confirm_drain"), \
+                patch.object(runtime, "cleanup_namespace", side_effect=lambda path, **_: path.unlink()):
+            runtime.cleanup()
+        self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
+
+    def test_default_cleanup_budget_accepts_a_fractional_monotonic_origin(self):
+        # Subtracting the sampled origin from its rounded sum can exceed 35s.
+        with patch.object(runtime.time, "monotonic", return_value=29.019), \
+                patch.object(runtime, "confirm_drain"), \
+                patch.object(runtime, "cleanup_namespace", side_effect=lambda path, **_: path.unlink()):
+            runtime.cleanup()
+        self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
+        self.assertFalse(self.journal.exists())
+
+    def test_changed_owner_is_not_removed_after_label_discovery(self):
+        before = copy.deepcopy(self.daemon.containers)
+        self.daemon.replaced = True
+        with self.assertRaisesRegex(ValueError, "ownership changed"):
+            runtime.cleanup()
+        self.assertEqual(self.daemon.containers, before)
+        self.assertTrue(self.journal.exists())
+
+    def test_expired_cleanup_budget_preserves_unremoved_resources_and_journals(self):
+        before = copy.deepcopy(self.daemon.containers)
+        with patch.object(runtime.time, "monotonic", side_effect=[0, runtime.CLEANUP_SECONDS]):
+            with self.assertRaisesRegex(ValueError, "cleanup absolute deadline expired"):
+                runtime.cleanup()
+        self.assertEqual(self.daemon.containers, before)
+        self.assertTrue(self.journal.exists())
+
+    def test_container_removal_alone_does_not_acknowledge_credential_cleanup(self):
+        runtime.cleanup(containers_only=True)
+        self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
+        self.assertTrue(self.journal.exists())
+        with self.assertRaises(FileNotFoundError):
+            runtime.cleanup()
+        self.assertTrue(self.journal.exists(), "actual-owner drain must precede credential cleanup")
+
+    def test_failed_actual_owner_drain_preserves_credentials_for_independent_retry(self):
+        with patch.object(runtime, "confirm_drain", side_effect=ValueError("actual owners still running")):
+            with self.assertRaisesRegex(ValueError, "still running"):
+                runtime.cleanup()
+        self.assertTrue(self.journal.exists())
+        self.assertEqual(self.daemon.containers, {self.daemon.foreign: self.daemon.preserved})
+
+    def test_an_existing_recorded_cluster_that_lost_its_label_is_not_removed_or_claimed_destroyed(self):
+        self.daemon.containers[self.daemon.cluster]["Config"]["Labels"] = {}
+        before = copy.deepcopy(self.daemon.containers[self.daemon.cluster])
+        with self.assertRaisesRegex(ValueError, "unconfirmed|owner changed"):
+            runtime.cleanup()
+        self.assertEqual(self.daemon.containers[self.daemon.cluster], before)
+        self.assertTrue(self.journal.exists())
+
+    @contextmanager
+    def phase(self, *, work_error=None, cleanup_error=None):
+        # A fresh invocation owns a fresh output directory.
+        token = "c" * 32
+        args = SimpleNamespace(phase="integration", unit="owned.service", slice="owned.slice",
+            revision="d" * 40, runtime_image="runtime", fixture_image="fixture", oracle_image="oracle",
+            traced=True, deadline=time.monotonic() + 600, profile=runtime.gate.DEFAULT_RUNTIME_PROFILE)
+        local = self.root / token
+        local.mkdir(mode=0o700)
+        ready = local / "trace-ready"
+        ready.touch(mode=0o644)
+        real_stat = Path.stat
+        real_lstat = Path.lstat
+
+        def stat(path, *a, **kw):
+            return SimpleNamespace(st_gid=123) if str(path) == "/var/run/docker.sock" else real_stat(path, *a, **kw)
+
+        def lstat(path, *a, **kw):
+            if path == ready:
+                return SimpleNamespace(st_mode=0o100644, st_uid=0)
+            return real_lstat(path, *a, **kw)
+
+        with patch.object(runtime, "observed_scope", return_value={"owner": token, "group": "/owned.slice",
+                    "envelope": {"profile": runtime.gate.DEFAULT_RUNTIME_PROFILE}}), \
+                patch.object(runtime, "inspect_image", side_effect=["sha256:" + digit * 64 for digit in "567"]), \
+                patch.object(runtime.gate, "output", return_value="/owned.slice"), \
+                patch.object(runtime.gate, "command", side_effect=work_error), patch.object(Path, "stat", stat), patch.object(Path, "lstat", lstat), \
+                patch.object(runtime, "cleanup", side_effect=cleanup_error) as cleanup:
+            yield args, local, cleanup
+
+    def test_successful_work_with_failed_cleanup_cannot_publish_completion(self):
+        with self.phase(cleanup_error=RuntimeError("cleanup unconfirmed")) as (args, local, _):
+            with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
+                runtime.run(args)
+        report = json.loads((local / "report.json").read_text())
+        self.assertTrue(report["work_completed"])
+        self.assertFalse(report["completed"])
+        self.assertNotIn("cleanup_completed", report)
+        self.assertEqual(report["cleanup_errors"], ["RuntimeError"])
+
+    def test_report_preserves_the_attested_envelope(self):
+        with self.phase() as (args, local, _):
+            runtime.run(args)
+        report = json.loads((local / "report.json").read_text())
+        self.assertEqual(report["envelope"], {"profile": runtime.gate.DEFAULT_RUNTIME_PROFILE})
+        self.assertTrue(report["work_completed"])
+        self.assertFalse(report["completed"], "only the outer observer may attest completion")
+
+    def test_cleanup_failure_preserves_the_foreground_error_and_private_report(self):
+        original = ValueError("runtime work failed")
+        with self.phase(work_error=original, cleanup_error=OSError("daemon unavailable")) as (args, local, cleanup):
+            with self.assertRaises(ValueError) as raised:
+                runtime.run(args)
+            self.assertIs(raised.exception, original)
+            cleanup.assert_called_once_with(containers_only=True)
+        report = json.loads((local / "report.json").read_text())
+        self.assertEqual(report["failure"], "ValueError")
+        self.assertEqual(report["cleanup_errors"], ["OSError"])
+        self.assertFalse(report["completed"])
+        self.assertNotIn("containers_stopped", report)
+        self.assertTrue(any("OSError" in note for note in original.__notes__))
+        self.assertEqual((local / "report.json").stat().st_mode & 0o777, 0o600)
+
+    def test_report_creation_failure_does_not_replace_the_work_error_or_skip_cleanup(self):
+        original = ValueError("runtime work failed")
+        with self.phase(work_error=original) as (args, local, cleanup), \
+                patch.object(runtime.tempfile, "mkstemp", side_effect=OSError("no space")):
+            with self.assertRaises(ValueError) as raised:
+                runtime.run(args)
+            self.assertIs(raised.exception, original)
+            cleanup.assert_called_once_with(containers_only=True)
+        self.assertTrue(any("OSError" in note for note in original.__notes__))
+        self.assertFalse((local / "report.json").exists())
+
+    def test_successful_work_is_not_successful_when_its_report_cannot_be_saved(self):
+        with self.phase() as (args, local, cleanup), \
+                patch.object(runtime.tempfile, "mkstemp", side_effect=OSError("no space")):
+            with self.assertRaisesRegex(OSError, "no space"):
+                runtime.run(args)
+            cleanup.assert_called_once_with(containers_only=True)
+        self.assertFalse((local / "report.json").exists())
+
+    def test_an_untraced_entrypoint_cannot_start_a_runtime_phase(self):
+        with self.assertRaisesRegex(ValueError, "successful-exec observer"):
+            runtime.run(SimpleNamespace(traced=False))
+
+    def test_kubernetes_controller_runs_in_the_pinned_oracle_with_the_prebuilt_helm(self):
+        commands = []
+        with self.phase() as (args, local, _):
+            args.phase = "kubernetes"
+            helm = local / "helm"
+            helm.write_bytes(b"\x7fELFsynthetic-prebuilt-helm")
+            helm.chmod(0o555)
+            args.helm = str(helm)
+            with patch.object(runtime, "start_cluster", return_value="owned-cluster"), \
+                    patch.object(runtime, "prepare_controller_client", return_value="c" * 64), \
+                    patch.object(runtime, "cluster_cgroups", return_value=["owned-pod"]), \
+                    patch.object(runtime.gate, "command", side_effect=lambda argv, **_: commands.append(argv)):
+                runtime.run(args)
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertEqual(command[:2], ["docker", "run"])
+        self.assertIn("sha256:" + "7" * 64, command)
+        self.assertIn(f"type=bind,src={helm},dst=/usr/local/bin/helm,readonly", command)
+        self.assertIn(f"type=bind,src={local / 'kubectl'},dst=/usr/local/bin/kubectl,readonly", command)
+        self.assertIn("GIT_RS_TEST_KUBECTL=/usr/local/bin/kubectl", command)
+        self.assertIn("GIT_RS_TEST_KUBECONFIG=/opt/git-rs/.local/controller-kubeconfig.json", command)
+        self.assertIn("GIT_RS_TEST_CLUSTER_CONTAINER=owned-cluster", command)
+        self.assertEqual(command[-4:], ["--phase", "kubernetes", "--cluster-container", "owned-cluster"])
+
+    def test_istio_dispatch_keeps_native_clients_in_the_oracle_and_consumes_prepared_inputs(self):
+        environment = {"INVOCATION_ID": self.daemon.token, "GIT_RS_TEST_RUNTIME_IMAGE": "sha256:" + "1" * 64,
+                       "GIT_RS_TEST_ORACLE_IMAGE": "sha256:" + "2" * 64, "GIT_RS_TEST_REVISION": "a" * 40}
+        (self.root / ".local").mkdir(mode=0o700)
+        with patch.dict(os.environ, environment), patch.object(runtime, "ROOT", self.root), \
+                patch.object(runtime.gate, "output", return_value="Docker version fixture"), \
+                patch.object(runtime.os, "execv", side_effect=RuntimeError("dispatch captured")) as dispatch:
+            with self.assertRaisesRegex(RuntimeError, "dispatch captured"):
+                runtime.inside(SimpleNamespace(phase="istio", cluster_container=self.daemon.cluster))
+        executable, argv = dispatch.call_args.args
+        self.assertEqual(executable, runtime.sys.executable)
+        self.assertEqual(argv[2], "/opt/git-rs/tests/istio.py")
+        for option, value in (("--cluster-container", self.daemon.cluster),
+                              ("--image", environment["GIT_RS_TEST_RUNTIME_IMAGE"]),
+                              ("--oracle-image", environment["GIT_RS_TEST_ORACLE_IMAGE"]),
+                              ("--helm", "/usr/local/bin/helm"), ("--artifacts", "/opt/git-rs/istio-inputs")):
+            self.assertEqual(argv[argv.index(option) + 1], value)
+        self.assertNotIn("--prepare", argv)
+        self.assertNotIn("--provision", argv)
+
+
+class ObservedScopeContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.token = "f" * 32
+        self.unit = "git-rs-blame-observer-fixture123.service"
+        self.slice = "git-rs-blame-observer-fixture123.slice"
+        self.group = "/" + self.slice
+        self.controller = self.group + "/" + self.unit
+        local = self.root / self.token
+        local.mkdir()
+        self.path = local / "unit-proof.json"
+        self.proof = {"owner": self.token, "unit": self.unit, "slice": self.slice,
+                      "group": self.group, "controller": self.controller}
+        self.path.write_text(json.dumps(self.proof))
+        self.path.chmod(0o644)
+        self.owner = 0
+        cgroup = self.root / "cgroups" / self.slice
+        cgroup.mkdir(parents=True)
+        for name, value in {"memory.max": str(4 * 1024**3), "pids.max": "256",
+                            "cpu.max": "200000 100000", "memory.swap.max": "0",
+                            "cpuset.cpus.effective": "24-25"}.items():
+            (cgroup / name).write_text(value)
+        self.cgroup = cgroup
+        self.proof["envelope"] = runtime.gate.verify_limits(cgroup)
+        self.path.write_text(json.dumps(self.proof))
+        real_read_text, real_fstat = Path.read_text, os.fstat
+
+        def read_text(path, *args, **kwargs):
+            return "0::" + self.controller if str(path) == "/proc/self/cgroup" else real_read_text(path, *args, **kwargs)
+
+        def metadata(descriptor):
+            value = real_fstat(descriptor)
+            return SimpleNamespace(st_uid=self.owner, st_mode=value.st_mode, st_size=value.st_size)
+
+        # Simulate the root file-owner boundary on unprivileged CI accounts too.
+        for boundary in (patch.object(runtime, "DIRECTORIES", self.root),
+                         patch.object(runtime, "CGROUPS", self.root / "cgroups"),
+                         patch.object(runtime.gate, "invocation", return_value=self.token),
+                         patch.object(Path, "read_text", read_text),
+                         patch.object(runtime.os, "fstat", side_effect=metadata),
+                         patch.object(runtime.gate, "output", side_effect=AssertionError("system bus access"))):
+            boundary.start()
+            self.addCleanup(boundary.stop)
+
+    def test_exact_root_proof_and_live_limits_work_without_system_bus_access(self):
+        self.assertEqual(runtime.observed_scope(self.unit, self.slice), self.proof)
+
+    def test_candidate_proof_binds_profile_digest_and_actual_limits(self):
+        candidate = "candidate-4cpu-8g-v1"
+        for name, value in {"memory.max": str(8 * 1024**3), "cpu.max": "400000 100000",
+                            "cpuset.cpus.effective": "24-27"}.items():
+            (self.cgroup / name).write_text(value)
+        self.proof["envelope"] = runtime.gate.verify_limits(self.cgroup, candidate)
+        self.path.write_text(json.dumps(self.proof))
+        self.assertTrue(runtime.observed_scope(self.unit, self.slice, candidate)["envelope"]["exact_profile"])
+        with self.assertRaises(ValueError):
+            runtime.observed_scope(self.unit, self.slice)
+        for field, replacement in (("profile_sha256", "0" * 64), ("profile", runtime.gate.DEFAULT_RUNTIME_PROFILE)):
+            proof = json.loads(json.dumps(self.proof))
+            proof["envelope"][field] = replacement
+            self.path.write_text(json.dumps(proof))
+            with self.assertRaises(ValueError):
+                runtime.observed_scope(self.unit, self.slice, candidate)
+
+    def test_within_profile_changes_to_bound_actual_limits_are_rejected(self):
+        for name, value in {"memory.max": str(3 * 1024**3), "pids.max": "255",
+                            "cpu.max": "100000 100000", "cpuset.cpus.effective": "26-27"}.items():
+            path = self.cgroup / name
+            before = path.read_text()
+            with self.subTest(name=name):
+                path.write_text(value)
+                with self.assertRaisesRegex(ValueError, "attestation identity"):
+                    runtime.observed_scope(self.unit, self.slice)
+                path.write_text(before)
+
+    def test_image_owned_or_replayed_proof_and_changed_limits_are_rejected(self):
+        for fault in ("owner", "token", "controller", "unit", "mode", "limits"):
+            with self.subTest(fault=fault):
+                proof = dict(self.proof)
+                self.owner = 10001 if fault == "owner" else 0
+                self.path.chmod(0o600 if fault == "mode" else 0o644)
+                (self.cgroup / "memory.swap.max").write_text("1" if fault == "limits" else "0")
+                if fault == "token":
+                    proof["owner"] = "e" * 32
+                elif fault == "controller":
+                    proof["controller"] += ".different"
+                elif fault == "unit":
+                    proof["unit"] += ".different"
+                self.path.write_text(json.dumps(proof))
+                with self.assertRaises(ValueError):
+                    runtime.observed_scope(self.unit, self.slice)
+
+    def test_linked_attestation_is_not_followed(self):
+        target = self.path.with_name("replacement")
+        self.path.rename(target)
+        self.path.symlink_to(target)
+        with self.assertRaises(OSError):
+            runtime.observed_scope(self.unit, self.slice)
+
+
+class CompiledInputContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.target = self.root / "compiled"
+        deps = self.target / "debug/deps"
+        deps.mkdir(parents=True)
+        for name in runtime.CONTRACT_SUITES:
+            path = deps / (name + "-a1b2")
+            path.write_bytes(b"\x7fELFsynthetic-test-identity:" + name.encode())
+            path.chmod(0o555)
+        self.revision = "a" * 40
+        self.sealed = self.root / "sealed"
+        with patch.object(runtime.gate, "checkout_identity", return_value=self.revision):
+            runtime.export_contracts(SimpleNamespace(target_dir=self.target, destination=self.sealed))
+
+    def test_sealed_inputs_reject_a_changed_binary_and_revision(self):
+        runtime.verify_contracts(self.sealed, self.revision)
+        with self.assertRaisesRegex(ValueError, "inventory/revision"):
+            runtime.verify_contracts(self.sealed, "b" * 40)
+        binary = self.sealed / "debug/deps/maintenance-a1b2"
+        binary.chmod(0o755)
+        binary.write_bytes(b"\x7fELFchanged")
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            runtime.verify_contracts(self.sealed, self.revision)
+
+    def test_linked_contract_input_is_not_accepted_as_the_sealed_elf(self):
+        binary = self.sealed / "debug/deps/metadata-a1b2"
+        binary.unlink()
+        binary.symlink_to(self.target / "debug/deps/metadata-a1b2")
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            runtime.verify_contracts(self.sealed, self.revision)
+
+    def test_sql_contracts_have_separate_databases_and_exact_discovered_invocations(self):
+        observations, created, dropped = [], set(), set()
+        inventories = {"metadata": ["first_contract", "second_contract"], "maintenance": ["queue_contract"],
+                       "maintenance_leader": ["lock_contract"]}
+        local = self.root / "sql"
+        local.mkdir(mode=0o700)
+
+        def administrative_session(argv):
+            self.assertEqual(argv[:4], ["docker", "exec", "1" * 64, "psql"])
+            self.assertIn("--dbname=git_rs", argv)
+
+        def output(argv, **_):
+            if argv[:2] == ["docker", "create"]:
+                return "1" * 64
+            if argv[:2] == ["docker", "inspect"]:
+                return json.dumps([{"NetworkSettings": {"Ports": {"5432/tcp": [{"HostPort": "54321"}]}}}])
+            if argv[-2:] == ["--ignored", "--list"]:
+                binary = argv[argv.index("--entrypoint") + 1]
+                suite = Path(binary).name.split("-", 1)[0]
+                return "\n".join(name + ": test" for name in inventories[suite])
+            self.assertIn("FROM pg_stat_activity", argv[-1])
+            administrative_session(argv)
+            return "0"
+
+        def command(argv, **kwargs):
+            if argv[:2] == ["docker", "start"]:
+                return
+            if "--exact" in argv:
+                name = argv[argv.index("--exact") + 1]
+                database = next(value.removeprefix("PGDATABASE=") for value in argv
+                                if isinstance(value, str) and value.startswith("PGDATABASE="))
+                self.assertIn(database, created - dropped)
+                observations.append((name, database))
+                kwargs["stdout"].write((f"test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n").encode())
+                kwargs["stdout"].flush()
+            elif argv[-1].startswith("CREATE DATABASE "):
+                administrative_session(argv)
+                database = argv[-1].split()[-1]
+                self.assertNotIn(database, created)
+                created.add(database)
+            else:
+                self.assertTrue(argv[-1].startswith("DROP DATABASE "))
+                administrative_session(argv)
+                dropped.add(argv[-1].split()[-1])
+
+        with patch.object(runtime.gate, "output", side_effect=output), \
+                patch.object(runtime.gate, "command", side_effect=command), \
+                patch.object(runtime.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"1")):
+            results = runtime.serial_sql(SimpleNamespace(target_dir=self.sealed, slice="owned.slice"), local,
+                                         "oracle", "a" * 32, "0,1", time.monotonic() + 60)
+        self.assertEqual([name for name, _ in observations], ["first_contract", "second_contract", "queue_contract", "lock_contract"])
+        self.assertEqual(len({database for _, database in observations}), 4)
+        self.assertEqual(created, dropped)
+        self.assertFalse((local / ".metadata-env").exists())
+        self.assertEqual({name: row["executed"] for name, row in results.items()},
+                         {"metadata": 2, "maintenance": 1, "maintenance_leader": 1})
+
+
+class ControllerProxyContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / ".local").mkdir(mode=0o700)
+        for boundary in (patch.object(runtime, "ROOT", self.root),
+                         patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}),
+                         patch.object(runtime.gate, "invocation", return_value="a" * 32)):
+            boundary.start()
+            self.addCleanup(boundary.stop)
+
+    def test_controller_uses_the_bound_directory_and_executes_its_selected_proxy(self):
+        with patch.object(runtime.gate, "output", return_value="Docker version fixture") as probe, \
+                patch.object(runtime.os, "execv") as work:
+            runtime.inside(SimpleNamespace(phase="integration", cluster_container=None))
+        executable = self.root / ".local/runtime-gate-bin/docker"
+        self.assertTrue(executable.is_file())
+        self.assertEqual(Path(os.environ["PATH"].split(":")[0]), executable.parent)
+        probe.assert_called_once_with([str(executable), "version", "--format", "{{.Client.Version}}"])
+        self.assertEqual(work.call_count, 1)
+
+    def test_skipped_proxy_cannot_fall_through_to_the_host_cli(self):
+        with patch.object(runtime.shutil, "which", return_value="/usr/bin/docker"), \
+                patch.object(runtime.gate, "output") as probe, \
+                patch.object(runtime.os, "execv") as work:
+            with self.assertRaisesRegex(ValueError, "proxy is not the selected executable"):
+                runtime.inside(SimpleNamespace(phase="integration", cluster_container=None))
+        probe.assert_not_called()
+        work.assert_not_called()
+
+    def test_cache_matrix_dispatch_reaches_its_actual_argument_parser(self):
+        import cache_matrix
+        with patch.object(runtime.gate, "output", return_value="Docker version fixture"), \
+                patch.object(runtime.os, "execv") as work:
+            runtime.inside(SimpleNamespace(phase="cache-matrix", cluster_container="owned-cluster"))
+        arguments = work.call_args.args[1]
+        self.assertEqual(arguments[:2], [runtime.sys.executable, "-B"])
+        with patch("sys.argv", arguments[2:]), \
+                patch.dict(os.environ, {"GIT_RS_TEST_RUNTIME_IMAGE": "runtime",
+                    "GIT_RS_TEST_RUNTIME_FIXTURE_IMAGE": "fixture", "GIT_RS_TEST_REVISION": "revision"}), \
+                patch.object(cache_matrix, "load_config", side_effect=RuntimeError("parsed matrix configuration")):
+            with self.assertRaisesRegex(RuntimeError, "parsed matrix configuration"):
+                cache_matrix.main()
+
+    def test_kubernetes_dispatch_preserves_immutable_image_inputs(self):
+        environment = {"GIT_RS_TEST_RUNTIME_IMAGE": "runtime", "GIT_RS_TEST_ORACLE_IMAGE": "oracle",
+                       "GIT_RS_TEST_REVISION": "a" * 40}
+        with patch.dict(os.environ, environment), \
+                patch.object(runtime.gate, "output", return_value="Docker version fixture"), \
+                patch.object(runtime.os, "execv") as work:
+            runtime.inside(SimpleNamespace(phase="kubernetes", cluster_container="owned-cluster"))
+        self.assertEqual(work.call_args.args[1], [runtime.sys.executable, "-B", "/opt/git-rs/tests/kubernetes.py",
+            "--cluster-container", "owned-cluster", "--fixture-dir", "/opt/git-rs/.local/fixture",
+            "--runtime-image", "runtime", "--oracle-image", "oracle", "--revision", "a" * 40,
+            "--helm", "/usr/local/bin/helm"])
+
+    def test_selected_but_unexecutable_proxy_stops_before_work(self):
+        with patch.object(runtime.gate, "output", side_effect=PermissionError("noexec")), \
+                patch.object(runtime.os, "execv") as work:
+            with self.assertRaises(PermissionError):
+                runtime.inside(SimpleNamespace(phase="integration", cluster_container=None))
+        work.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,28 @@
+{{- if .Values.ssh.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "git-rs.fullname" . }}-ssh
+  labels:
+    {{- include "git-rs.labels" . | nindent 4 }}
+data:
+  sshd_config: |
+    Port 2222
+    ListenAddress 0.0.0.0
+    HostKey /etc/git-rs/host-keys/private/ssh_host_ed25519_key
+    PidFile /tmp/sshd.pid
+    AllowUsers git-rs
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    UsePAM no
+    PermitRootLogin no
+    PermitTTY no
+    DisableForwarding yes
+    X11Forwarding no
+    AuthorizedKeysFile none
+    AuthorizedKeysCommand /usr/local/bin/git-rs authorized-keys --file /etc/git-rs/authorized/principals --socket /run/git-rs/private/ssh.sock --type %t --key %k
+    AuthorizedKeysCommandUser git-rs
+    AcceptEnv GIT_PROTOCOL
+    # The helper always returns restrict and a fixed per-principal command.
+{{- end }}

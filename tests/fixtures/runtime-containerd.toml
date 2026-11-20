@@ -1,0 +1,6 @@
+version = 3
+
+# Limit the shim launcher through the manager's explicit environment. The runc
+# shim server's later reexec retains its own upstream scheduler policy.
+[plugins."io.containerd.shim.v1.manager"]
+env = ["GOMAXPROCS=1"]

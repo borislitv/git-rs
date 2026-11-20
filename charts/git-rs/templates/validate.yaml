@@ -1,0 +1,54 @@
+{{- if gt (add (int .Values.cpu.concurrency) (int .Values.cpu.waiters)) 4 }}
+{{- fail "cpu.concurrency + cpu.waiters must be at most four" }}
+{{- end }}
+{{- if .Values.maintenance.enabled }}
+{{- $m := .Values.maintenance }}
+{{- if eq (include "git-rs.maintenanceServiceAccount" .) (include "git-rs.serviceAccount" .) }}
+{{- fail "maintenance service account must be distinct from serving" }}
+{{- end }}
+{{- if or (le (int $m.renewGraceSeconds) (add 10 (int $m.expirySafetySeconds))) (ge (add (int $m.renewGraceSeconds) 10 (int $m.expirySafetySeconds)) (int $m.leaseSeconds)) }}
+{{- fail "maintenance Kubernetes lease margins must exceed the ten-second API deadline plus safety" }}
+{{- end }}
+{{- if or (ge (add (mul 2 (int $m.heartbeatSeconds)) 5 (int $m.expirySafetySeconds)) (int $m.pgFenceLeaseSeconds)) (ge (add (mul 2 (int $m.heartbeatSeconds)) 5 2) (int $m.jobLeaseSeconds)) }}
+{{- fail "maintenance PG/job leases are too short for heartbeat and SQL deadline margins" }}
+{{- end }}
+{{- if le (int $m.terminationGracePeriodSeconds) (add (int $m.shutdownSeconds) 5) }}
+{{- fail "maintenance terminationGracePeriodSeconds must exceed shutdownSeconds by more than five seconds" }}
+{{- end }}
+{{- end }}
+{{- if and .Values.cnpg.backup.enabled (not .Values.cnpg.enabled) }}
+{{- fail "cnpg.backup requires cnpg.enabled" }}
+{{- end }}
+{{- if and .Values.cnpg.backup.enabled (empty .Values.cnpg.backup.spec) }}
+{{- fail "cnpg.backup.spec requires a Barman ObjectStore configuration" }}
+{{- end }}
+{{- if and .Values.cnpg.enabled (hasKey .Values.cnpg.spec "bootstrap") }}
+{{- with .Values.cnpg.spec.bootstrap.initdb }}
+{{- if or (ne .database $.Values.postgresql.database) (ne .owner $.Values.postgresql.username) }}
+{{- fail "CNPG initdb database/owner must match postgresql.database/username" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.http.enabled }}
+{{- $_ := required "http.credentialsSecret is required when HTTP is enabled" .Values.http.credentialsSecret }}
+{{- if eq (int .Values.http.port) 8081 }}
+{{- fail "http.port must not collide with health port 8081" }}
+{{- end }}
+{{- if and .Values.ssh.enabled (eq (int .Values.http.port) 2222) }}
+{{- fail "http.port must not collide with SSH port 2222 while ssh.enabled" }}
+{{- end }}
+{{- if and .Values.ssh.enabled (eq (int .Values.http.port) (int .Values.service.sshPort)) }}
+{{- fail "HTTP and SSH Service ports must not collide while ssh.enabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.httpRoute.enabled }}
+{{- if not .Values.http.enabled }}
+{{- fail "httpRoute requires http.enabled" }}
+{{- end }}
+{{- if empty .Values.httpRoute.parentRefs }}
+{{- fail "httpRoute.parentRefs is required" }}
+{{- end }}
+{{- if empty .Values.httpRoute.hostnames }}
+{{- fail "httpRoute.hostnames is required" }}
+{{- end }}
+{{- end }}

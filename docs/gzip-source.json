@@ -1,0 +1,25 @@
+{
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "packages": {
+    "flate2": {
+      "version": "1.1.10",
+      "checksum": "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb",
+      "license": "MIT OR Apache-2.0",
+      "upstream": "https://github.com/rust-lang/flate2-rs",
+      "notices_in_source": ["LICENSE-MIT", "LICENSE-APACHE"]
+    },
+    "zlib-rs": {
+      "version": "0.6.8",
+      "checksum": "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112",
+      "license": "Zlib",
+      "upstream": "https://github.com/trifectatechfoundation/zlib-rs",
+      "notices_in_source": ["LICENSE"]
+    }
+  },
+  "default_features": false,
+  "features": ["zlib-rs"],
+  "resolved_features": {
+    "flate2": ["any_impl", "any_zlib", "zlib-rs"],
+    "zlib-rs": ["c-allocator", "default", "rust-allocator", "std"]
+  }
+}

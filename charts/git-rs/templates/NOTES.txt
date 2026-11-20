@@ -1,0 +1,14 @@
+git-rs is an experimental backend. Operations and recovery:
+https://github.com/borislitv/git-rs/blob/v{{ .Chart.AppVersion }}/OPERATIONS.md
+
+This chart has no Helm dependencies. Enabled CNPG/Rook/Barman custom resources
+require their operators and CRDs to be installed separately.
+
+SSH identity Secret lines are: PRINCIPAL KEY_TYPE BASE64_PUBLIC_KEY [COMMENT].
+The helper generates restrict and a forced command with the selected principal.
+The OpenSSH account is git-rs. Verify the server host key before connecting.
+
+CNPG Cluster and bucket claims are kept on Helm uninstall.
+The existing platform bucket class must use reclaimPolicy Retain.
+HTTP requires a credentials Secret, gateway HTTPS and an encrypted trusted pod path.
+Back up metadata and objects together; a Git bundle preserves Git history only.

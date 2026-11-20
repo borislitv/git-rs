@@ -1,0 +1,304 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "git-rs: полномочия, байты и Rust core",
+    "locale": "ru",
+    "output": "docs/site/graphs/git-rs.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/borislitv/git-rs.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "da6f02f1cba3852c899fc74e129fba20556e5cf8"
+    },
+    "views": [
+      {
+        "id": "read-journey",
+        "label": "Чтение: клиент → проверенные объекты",
+        "focus": ["git-client", "smart-http", "openssh-bridge", "rust-serving", "source-pg", "held-ranges", "ram-bytes", "immutable-packs"],
+        "note": "Сначала admission и SQL authority; затем RAM hit либо S3 ranges. Наличие байтов не даёт права читать объект."
+      },
+      {
+        "id": "push-commit",
+        "label": "Push: проверка → PUT → SQL",
+        "focus": ["smart-http", "openssh-bridge", "rust-serving", "held-ranges", "immutable-packs", "source-pg"],
+        "note": "Framing, все physical entries и graph обязательны. Staged intent → immutable PUT → confirmed SQL; весь batch атомарен."
+      },
+      {
+        "id": "blame-acceleration",
+        "label": "Blame: необязательное ускорение",
+        "focus": ["smart-http", "rust-serving", "source-pg", "held-ranges", "ram-bytes", "derived-artifacts", "cache-reclaimer"],
+        "note": "Body hit и completed WorkSet reuse сохраняют source hold, ACL и fences. Miss/непригодный cache → bounded local derivation."
+      },
+      {
+        "id": "maintenance-fences",
+        "label": "Два независимых maintenance-контура",
+        "focus": ["source-rewriter", "source-pg", "held-ranges", "immutable-packs", "cache-reclaimer", "derived-artifacts"],
+        "note": "Source runtime: Kubernetes candidacy + PG fence. CacheMaintenance: другой namespace/token/generation; не source authority."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "git-client",
+      "type": "external",
+      "label": "Git-клиент",
+      "sublabel": "clone / fetch / push",
+      "pos": [40, 40],
+      "size": [240, 76],
+      "sources": [
+        {"path": "docs/rust-data-plane.md", "line": 5, "end_line": 19, "label": "Native Git — клиент и oracle, не сервер"}
+      ]
+    },
+    {
+      "id": "smart-http",
+      "type": "security",
+      "label": "Smart HTTP / blame",
+      "sublabel": "Basic → principal → dispatch",
+      "pos": [400, 40],
+      "size": [260, 76],
+      "sources": [
+        {"path": "src/http.rs", "line": 301, "end_line": 326, "label": "Authentication и HTTP dispatch"},
+        {"path": "src/http.rs", "line": 366, "end_line": 409, "label": "Blame body hold до write/flush"},
+        {"path": "src/upload.rs", "line": 79, "end_line": 107, "label": "Discovery/RPC и bounded POST"}
+      ]
+    },
+    {
+      "id": "openssh-bridge",
+      "type": "security",
+      "label": "OpenSSH → bridge",
+      "sublabel": "forced command; не Git subprocess",
+      "pos": [40, 220],
+      "size": [240, 96],
+      "sources": [
+        {"path": "src/main.rs", "line": 192, "end_line": 248, "label": "Bounded fields и Unix-socket dispatch"},
+        {"path": "docs/rust-data-plane.md", "line": 35, "end_line": 39, "label": "Имена Git-сервисов — данные протокола"},
+        {"path": "src/auth.rs", "line": 200, "end_line": 273, "label": "Команда и серверная карта SSH-ключей"}
+      ]
+    },
+    {
+      "id": "rust-serving",
+      "type": "backend",
+      "label": "Bounded Rust serving",
+      "sublabel": "RAM: объекты + планы внутри",
+      "tag": "admission → source → core → cleanup",
+      "pos": [540, 300],
+      "size": [260, 96],
+      "sources": [
+        {"path": "src/cpu_jobs.rs", "line": 166, "end_line": 240, "label": "Общий pool, admission и cleanup"},
+        {"path": "src/receive.rs", "line": 456, "end_line": 627, "label": "Validation → единственный PUT/SQL path"},
+        {"path": "src/blame_derive.rs", "line": 63, "end_line": 187, "label": "Blame: source → reachability → cache/core"}
+      ]
+    },
+    {
+      "id": "source-pg",
+      "type": "database",
+      "label": "Source PostgreSQL",
+      "sublabel": "источник истины, не кэш",
+      "tag": "authority: generation / epoch",
+      "pos": [40, 640],
+      "size": [240, 96],
+      "sources": [
+        {"path": "src/metadata.rs", "line": 311, "end_line": 345, "label": "Committed lease перед catalog read"},
+        {"path": "src/metadata.rs", "line": 372, "end_line": 454, "label": "Atomic publish и lost-COMMIT witness"},
+        {"path": "src/object_source.rs", "line": 138, "end_line": 163, "label": "Текущие ACL, generation, epoch и lease"}
+      ]
+    },
+    {
+      "id": "held-ranges",
+      "type": "backend",
+      "label": "Source / RangePackSet",
+      "sublabel": "leased catalog → verified object",
+      "tag": "без request bare repo / scratch pack",
+      "pos": [540, 640],
+      "size": [260, 96],
+      "sources": [
+        {"path": "src/object_source.rs", "line": 269, "end_line": 357, "label": "Ranges, bypass и копирование индекса"},
+        {"path": "crates/git-core/src/pack_ranges.rs", "line": 305, "end_line": 348, "label": "Полная authentication для encoded reuse"},
+        {"path": "crates/git-core/src/pack_ranges.rs", "line": 735, "end_line": 811, "label": "CRC, inflate и exact physical framing"}
+      ]
+    },
+    {
+      "id": "ram-bytes",
+      "type": "database",
+      "label": "RAM source-byte cache",
+      "sublabel": "индексы / immutable ranges",
+      "tag": "hit · single-flight miss · bypass",
+      "pos": [430, 790],
+      "size": [220, 96],
+      "sources": [
+        {"path": "src/cache.rs", "line": 1, "end_line": 46, "label": "Arc backing, pins и fill ownership"},
+        {"path": "src/cache.rs", "line": 95, "end_line": 166, "label": "Invalidation, eviction и private bypass"},
+        {"path": "src/main.rs", "line": 330, "end_line": 344, "label": "Serving cache и transport cap"}
+      ]
+    },
+    {
+      "id": "immutable-packs",
+      "type": "cloud",
+      "label": "Immutable source S3",
+      "sublabel": "pack / idx bytes + SHA-256",
+      "tag": "authority байтов; не refs / ACL",
+      "pos": [940, 640],
+      "size": [260, 96],
+      "sources": [
+        {"path": "src/blob.rs", "line": 198, "end_line": 265, "label": "Durable intent → pack/index PUT"},
+        {"path": "src/object_source.rs", "line": 269, "end_line": 309, "label": "Controlled immutable GET ranges"},
+        {"path": "src/maintenance/gc.rs", "line": 37, "end_line": 63, "label": "DELETE только durable retired keys"}
+      ]
+    },
+    {
+      "id": "derived-artifacts",
+      "type": "database",
+      "label": "Кэш PostgreSQL / S3",
+      "sublabel": "готовый blame + части работы",
+      "tag": "опционально; не source authority",
+      "pos": [940, 300],
+      "size": [260, 96],
+      "sources": [
+        {"path": "src/derived_cache/mod.rs", "line": 1, "end_line": 36, "label": "Cache hold не разрешает source access"},
+        {"path": "src/derived_cache/mod.rs", "line": 64, "end_line": 119, "label": "Независимая migration и read hold v4"},
+        {"path": "src/blame_derive.rs", "line": 133, "end_line": 187, "label": "Body hit / authenticated WorkSet branch"}
+      ]
+    },
+    {
+      "id": "source-rewriter",
+      "type": "backend",
+      "label": "Source maintenance",
+      "sublabel": "отдельный runtime / durable jobs",
+      "tag": "Kubernetes candidacy ≠ PG fence",
+      "pos": [540, 1000],
+      "size": [260, 96],
+      "sources": [
+        {"path": "src/maintenance/runtime.rs", "line": 379, "end_line": 407, "label": "compact / orphan_scan / retire_gc"},
+        {"path": "src/maintenance/runtime.rs", "line": 438, "end_line": 498, "label": "Primary, renew fence, scan и claim"},
+        {"path": "src/maintenance/gc.rs", "line": 9, "end_line": 63, "label": "Exclusive barrier, retirement, late PUT"}
+      ]
+    },
+    {
+      "id": "cache-reclaimer",
+      "type": "backend",
+      "label": "CacheMaintenance",
+      "sublabel": "expire / retire / reconcile / delete",
+      "tag": "только cache namespace + fence",
+      "pos": [940, 40],
+      "size": [260, 96],
+      "sources": [
+        {"path": "src/derived_cache/maintenance.rs", "line": 21, "end_line": 37, "label": "Namespace/owner/token/generation claim"},
+        {"path": "src/derived_cache/maintenance.rs", "line": 50, "end_line": 109, "label": "Bounded retirement и guarded DELETE"}
+      ]
+    }
+  ],
+  "connections": [
+    {"id": "client-http", "from": "git-client", "to": "smart-http", "label": "HTTP", "variant": "emphasis"},
+    {"id": "client-ssh", "from": "git-client", "to": "openssh-bridge", "label": "SSH"},
+    {"id": "http-admission", "from": "smart-http", "to": "rust-serving", "label": "principal", "variant": "security"},
+    {"id": "ssh-admission", "from": "openssh-bridge", "to": "rust-serving", "label": "Unix socket", "variant": "security"},
+    {"id": "source-authority", "from": "rust-serving", "to": "source-pg", "label": "lease; PUT → SQL", "variant": "security"},
+    {"id": "held-object-provider", "from": "rust-serving", "to": "held-ranges", "label": "source hold", "variant": "emphasis"},
+    {"id": "source-recheck", "from": "held-ranges", "to": "source-pg", "label": "ACL / fences", "variant": "security"},
+    {"id": "source-byte-lookup", "from": "held-ranges", "to": "ram-bytes", "label": "hit / fill"},
+    {"id": "source-byte-fallback", "from": "held-ranges", "to": "immutable-packs", "label": "miss / bypass"},
+    {"id": "validated-push-put", "from": "rust-serving", "to": "immutable-packs", "label": "validated push PUT"},
+    {"id": "optional-blame-artifact", "from": "rust-serving", "to": "derived-artifacts", "label": "опц.; source valid"},
+    {"id": "source-job-fence", "from": "source-rewriter", "to": "source-pg", "label": "fence / journal", "variant": "security"},
+    {"id": "maintenance-source", "from": "source-rewriter", "to": "held-ranges", "label": "held catalog"},
+    {"id": "source-retired-delete", "from": "source-rewriter", "to": "immutable-packs", "label": "PUT / retired GC", "variant": "security"},
+    {"id": "cache-only-retirement", "from": "cache-reclaimer", "to": "derived-artifacts", "label": "cache-only fence", "variant": "security"}
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Как читать эту карту",
+      "items": [
+        "Карта компонентов и условий, а не последовательность таймингов: клиент → HTTP/SSH → bounded serving → SQL authority → verified source. Rust serving объединяет transport adapters, общий CPU runtime и upload/receive/blame core; это не отдельный микросервис на каждый алгоритм.",
+        "PostgreSQL разрешает доступ и публикацию refs/catalog; source S3 хранит immutable pack/idx bytes. RAM, decoder cache и derived artifacts — ускорение, а не альтернативный источник полномочий. Стрелки к хранилищам показывают инициатора операции, а не направление возвращаемых байтов.",
+        "Модель закреплена на da6f02f1cba3852c899fc74e129fba20556e5cf8. Исходный контракт не доказывает runtime/performance/native-parity квалификацию текущего образа. В карте нет измерений latency, throughput, CPU или RSS.",
+        "Источник: https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/docs/rust-data-plane.md#L5-L60"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Транспорт, admission и жизненный цикл",
+      "items": [
+        "HTTP discovery и RPC независимо проходят authentication; production listener требует внешней TLS-границы. SSH использует server-owned key map, forced command и ограниченный bridge; backend получает principal/service/slug по Unix socket. Имена git-upload-pack/git-receive-pack не запускают Git executable.",
+        "Transport admission общая для HTTP/SSH: 4 соединения. Общий CPU runtime: workers 1..=4, queued 0..=3, сумма <=4. Actual-work admission берётся до body/source acquisition; generic CapacityBudget — 1 GiB, а не предел измеренного RSS.",
+        "Job и готовый результат сохраняют source hold, backing buffers и permit до output/publication/cleanup. Deadline или отмена waiter не являются stop acknowledgment фактической работы. У coalesced blame фактическая работа и каждый waiter имеют независимое владение отменой.",
+        "Источники: src/main.rs:330–344; src/cpu_jobs.rs:166–240; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/docs/rust-data-plane.md#L55-L61"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Source authority проверяется независимо от cache hit",
+      "items": [
+        "Сначала фиксируется reader lease, затем отдельным protocol message читается согласованный refs/catalog на том же SQL checkout. Для write источник требует не-reader роль; snapshot несёт generation и storage epoch.",
+        "Source.check проверяет живой lease, ACL и storage epoch; strict read source дополнительно generation. Maintenance получает held source через fenced job, а не выдуманный пользовательский principal. Cache build claim никогда не заменяет этот source hold.",
+        "Source metadata reservation — 128 MiB; packs <=4096; aggregate loaded indexes <=128 MiB. Это admission/форматные ограничения, не обещание принять любой каталог такого размера и не RSS.",
+        "Источники: https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/metadata.rs#L311-L368 ; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/object_source.rs#L15-L163"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "RAM source cache, ranges и реальные копии",
+      "items": [
+        "Hit возвращает pinned immutable Arc; miss объединяет fills для одного ключа. Eviction/invalidation не освобождает backing живого reader. При bounded bypass RangeStore читает в private admitted buffer, без отключения source checks.",
+        "Cache key связывает repository, immutable key, digest, size и range. Полный индекс проверяется по catalog SHA-256 и копируется из cached backing в job-owned CapacityBuffer порциями 32 KiB; pack range может разделять Arc. read_exact собирает entry в отдельном input buffer.",
+        "Блочные чтения — до 4 MiB; inflate output, delta base/instructions/result и job-local decoder cache могут сосуществовать. Decoder cache — не процессный source-byte cache и не persisted derived cache. Zero-copy и отсутствие allocation не заявляются.",
+        "Источники: https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/cache.rs#L95-L180 ; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/object_source.rs#L269-L417"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Upload: negotiation и два способа записи pack",
+      "items": [
+        "HTTP — stateless discovery/RPC; SSH — interactive session. Один Rust UploadSession обслуживает v0/v1/v2, wants/haves и shallow/deepen; физическое присутствие OID в каталоге не даёт legal want вне видимого leased снимка.",
+        "Обычное object read: index/checksum → physical framing и CRC при наличии → bounded inflate/REF/OFS reconstruction → SHA-1 объекта. Index v1 без CRC не отменяет object identity. Ошибка источника/лимита прерывает запрос.",
+        "Encoded entry reuse требует полного catalog SHA-256 source pack, прочитанного bounded blocks, и повторной проверки block digest при копировании entry. Proof хранится в job, а не считается свойством RAM cache. Без подходящего candidate/base в output — verified-object recompression; это не fallback при corruption.",
+        "Upload HTTP wire/decoded body ограничены по 16 MiB; gzip создаёт второй admitted buffer. Output потоковый, без request bare repository или filesystem pack bridge. Источники: src/upload.rs:79–107,178–238; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/crates/git-core/src/pack_ranges.rs#L305-L348 ; crates/git-core/src/write_pack.rs:123–190."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Receive: ни bytes, ни HTTP 200 не означают опубликованный push",
+      "items": [
+        "Полное transport framing, structural pack ingestion и semantic graph validation — независимые обязательные свидетельства. HTTP body сохраняется в bounded RAM; optional gzip создаёт отдельный decoded owner. SSH использует command/single-pack boundary, не ожидание socket EOF.",
+        "Thin bases берутся из verified old source. После normalization проверяются все physical entries, включая duplicate/unreachable, object identities, typed closure, .gitmodules и ancestry. Immutable complete command batch нельзя заменить прошедшим подмножеством.",
+        "Перед первым PUT фиксируется durable staged intent. Pack/index PUT используют borrowed admitted slices; затем одна SQL-транзакция публикует весь batch и catalog с проверками old OID, ACL, epoch и lease. All-or-nothing действует и без --atomic; delete-only/noop не требуют выдуманного pack.",
+        "Unknown COMMIT подтверждается operation + principal + exact ordered command manifest, а не слепым повтором push. Git status следует из receipt. Ошибка последующего socket write не откатывает confirmed publication; serving не удаляет source objects.",
+        "Источники: https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/receive.rs#L456-L627 ; src/blob.rs:198–265; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/metadata.rs#L372-L454"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Blame: complete Rust core и опциональные derivations",
+      "items": [
+        "Авторизованный source и reachability предшествуют body lookup. NativeRootV1 в pinned Rust core выполняет whole-file Myers, ancestry/rename, metadata attribution и complete porcelain; native subprocess fallback отсутствует. Историческая квалификация профиля не квалифицирует текущий joined runtime.",
+        "Cache выключен, miss, pending build или непригодный optional artifact оставляют bounded local derivation. Body hit не отменяет source.check. Signing mode аутентифицирует complete bodies и checkpoints: обычный digest не доказывает авторство, unsigned body не заменяет подписанный.",
+        "WorkSet переиспользует только завершённые physical objects/mappings со scope producer/key/generation/epoch и полными line partitions. Vendor interner IDs и suspended traversal frontier не сохраняются; SQL/network I/O не выполняются в memory callbacks.",
+        "Opt-in post-confirmed warming — новая bounded работа на том же CPU pool, после cleanup receive и с fresh authorized source. Она не часть SQL publication и не может сделать confirmed push неуспешным.",
+        "Источники: https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/blame_derive.rs#L63-L187 ; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/AGENTS.md#L28-L49 ; docs/rust-data-plane.md:76–93."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Derived cache — отдельная зона хранения, не запасная source DB",
+      "items": [
+        "Независимо migrated PostgreSQL schema/pool; отдельно cache S3 credentials/namespace. Metadata выбирает inline PG body либо cache object storage. Lease/hold cache защищает payload lifetime, но не разрешает чтение repository и не участвует в authoritative publication.",
+        "raw-v1/zstd-v1 выбираются явной metadata, не payload magic. Stored и decoded sizes, digests и admitted codec workspace проверяются раздельно; compression не меняет logical key, signed descriptor или logical byte quotas.",
+        "Cache v4 — forward-only migration. Rollback требует cache disabled либо отдельную совместимую schema/database и новый owned prefix. CacheMaintenance использует свой namespace/owner/token/generation, bounded batches и необратимо retired payload identities; это не Kubernetes/source fence.",
+        "Источники: https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/derived_cache/mod.rs#L64-L175 ; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/derived_cache/maintenance.rs#L21-L109 ; AGENTS.md:46–55."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Отдельный source-maintenance контур: retire перед delete",
+      "items": [
+        "Kubernetes Lease даёт advisory candidacy. PostgreSQL primary + monotonic fence + durable job дают authority; потеря renewal/primary отзывает её. Runtime не превращает user HTTP/SSH запрос в unfenced cleanup.",
+        "Compaction читает весь physical catalog, включая unreachable objects, сохраняет bounded source ownership и публикует replacement по exact journal. Orphan age лишь назначает investigation: exclusive source barrier и committed epoch advance предшествуют retirement.",
+        "DELETE разрешён только durable retired key, отсутствующему в live catalog, после delete_after и job checks. PG check сам по себе не network fence: permanent tombstone запрещает reuse и позволяет повторно убрать arbitrarily late PUT. Требуется unversioned bucket; full_gc явно отклонён без retention policy.",
+        "Owner-only history truncate не является обычной GC: нужен verified bundle backup, reader/writer fencing и retirement. History/backup используют Rust traversal; отдельного HTTP history маршрута эта карта не обещает.",
+        "Источники: https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/maintenance/runtime.rs#L379-L498 ; https://github.com/borislitv/git-rs/blob/da6f02f1cba3852c899fc74e129fba20556e5cf8/src/maintenance/gc.rs#L9-L63 ; docs/rust-data-plane.md:25–53; AGENTS.md:23–24."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,174 @@
+nameOverride: ""
+fullnameOverride: ""
+replicaCount: 2
+image:
+  repository: ghcr.io/borislitv/git-rs
+  tag: "" # Defaults to Chart.appVersion.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  sshPort: 22
+  annotations: {}
+serviceAccount:
+  create: true
+  name: ""
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+    ephemeral-storage: 1Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+    ephemeral-storage: 1Gi
+cacheBytes: 67108864
+operationSeconds: 120 # Absolute Git request budget, configurable from 1 to 3600 seconds.
+cpu:
+  concurrency: 1
+  waiters: 0
+debugTimings: false # Opt-in bounded, lossy diagnostic records on backend stderr.
+terminationGracePeriodSeconds: 150
+
+# Upgrade the source schema with this disabled, then enable in a second upgrade.
+# These provisional limits require workload qualification; they are not an HA SLA.
+maintenance:
+  enabled: false
+  replicaCount: 2
+  leaseName: "" # Defaults to <fullname>-source; pre-created with empty spec.
+  serviceAccount:
+    create: true
+    name: ""
+  tokenAudience: "" # Empty uses the API server's default service-account audience.
+  leaseSeconds: 30
+  renewGraceSeconds: 15
+  expirySafetySeconds: 2
+  pgFenceLeaseSeconds: 20
+  heartbeatSeconds: 5
+  jobLeaseSeconds: 20
+  jobSeconds: 120
+  sourceConcurrency: 1
+  scanBatch: 100
+  scanSeconds: 60
+  scanBudgetMillis: 1000
+  deleteBatch: 100
+  cacheBytes: 536870912
+  shutdownSeconds: 90
+  terminationGracePeriodSeconds: 110
+  scratch:
+    medium: Memory # Empty string opts into node-backed ephemeral storage, not a PVC.
+    sizeLimit: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+      ephemeral-storage: 128Mi
+    limits:
+      cpu: "1"
+      memory: 4Gi
+      ephemeral-storage: 3Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+ssh:
+  enabled: true
+  # Existing Secrets; private keys and identity mappings are never chart values.
+  hostKeysSecret: git-rs-ssh-host-keys
+  authorizedKeysSecret: git-rs-ssh-authorized-keys
+  authorizedKeysKey: principals
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      # SSH crypto and bridge processes share this quota across all connections.
+      cpu: "1"
+      memory: 128Mi
+
+http:
+  enabled: false
+  # Existing Secret: PRINCIPAL TOKEN lines. Requires HTTPS and encrypted pod path.
+  credentialsSecret: ""
+  credentialsKey: credentials
+  port: 8080
+httpRoute:
+  enabled: false
+  # Existing Gateway API Gateway and explicit HTTPS listener sectionName.
+  parentRefs: []
+  hostnames: []
+  annotations: {}
+  # Optional Gateway API request/backendRequest durations; never retry POST.
+  timeouts: {}
+
+postgresql:
+  # Empty host/Secret names derive from the chart-managed CNPG Cluster.
+  host: ""
+  port: 5432
+  database: git_rs
+  username: git_rs
+  passwordSecret: ""
+  passwordKey: password
+  serverCASecret: ""
+  serverCAKey: ca.crt
+
+cnpg:
+  enabled: true
+  name: ""
+  # Passed as the standard CNPG Cluster.spec, not a dependent Helm chart.
+  # If bootstrap is absent, initdb uses postgresql.database and .username.
+  spec:
+    instances: 3
+    imageName: ghcr.io/cloudnative-pg/postgresql:18.6-system-bookworm@sha256:605c6e45e733ce0e908505e9ac3c441637d6794d330ec0e9d8d6f631b6918b1e
+    storage:
+      size: 20Gi
+    postgresql:
+      synchronous:
+        method: any
+        number: 1
+        dataDurability: required
+  backup:
+    enabled: false
+    schedule: "0 0 2 * * *"
+    # Standard barmancloud.cnpg.io/v1 ObjectStore.spec. Requires the separately
+    # installed Barman Cloud plugin. Use a distinct backup bucket and retention.
+    spec: {}
+
+s3:
+  # Required explicit HTTPS endpoint of the existing object service.
+  endpoint: ""
+  region: us-east-1
+  # With objectBucket.enabled, BUCKET_NAME comes from its generated ConfigMap.
+  bucket: ""
+  credentialsSecret: ""
+  accessKeyKey: AWS_ACCESS_KEY_ID
+  secretKeyKey: AWS_SECRET_ACCESS_KEY
+  # Optional custom CA for HTTPS; omit for a publicly trusted certificate.
+  caSecret: ""
+  caKey: ca.crt
+
+objectBucket:
+  enabled: true
+  name: ""
+  # Existing platform-managed bucket class MUST have reclaimPolicy: Retain.
+  storageClassName: ceph-bucket
+  # Empty requests a generated globally unique bucket name.
+  bucketName: ""
+  additionalConfig: {}
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+
+migration:
+  enabled: true
+  # Initializes/verifies the schema and refreshes its publication function. A hook runs
+  # once per install/upgrade; serving replicas never race to run migrations.
+  activeDeadlineSeconds: 600
+  # Finite migration Jobs can opt out of injected, long-running mesh sidecars.
+  podAnnotations: {}
