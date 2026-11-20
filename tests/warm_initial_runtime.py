@@ -9,10 +9,12 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import quote_from_bytes
 
-from warm_reconcile_runtime import Fixture, eventually, http, require, stop
+from warm_reconcile_runtime import PATH, SLUG, Fixture, complete_http, eventually, http, require, stop
 
 CHUNK_BYTES = 4 * 1024**2
+APPENDS = 16
 
 
 class Initial(Fixture):
@@ -48,7 +50,7 @@ class Initial(Fixture):
         eventually(released, "quantum did not release scoped hold")
         require(self.admin(f"SELECT count(*) FROM git_rs.repository_leases WHERE repo_id='{self.repo}'") == "0",
                 "worker retained a source hold between quanta")
-        require(not self.bodies(), "a partial quantum published a body")
+        require(not self.bodies() and not self.maps(), "a partial quantum published an artifact")
 
     def compressed_parts(self, body, expected):
         root = self.cache_sql("SELECT (p.state='live' AND p.object_key IS NULL AND p.body IS NOT NULL "
@@ -76,6 +78,49 @@ class Initial(Fixture):
                     f"body part {index} must be smaller zstd inline with exact logical and stored digests")
             stored_bytes += int(stored)
         print(f"PostgreSQL cached {len(rows)} compressed body parts: {len(expected)} logical, {stored_bytes} stored bytes")
+
+    def verify_append(self, receive_args, base, contents, maximum):
+        bodies, maps = self.bodies(), self.maps()
+        with self.service("append-push", receive_args, self.writer) as (health, listener):
+            eventually(lambda: http(health, "/readyz")[0] == 200, "append receive not ready")
+            appended = contents
+            for index in range(APPENDS - 1):
+                appended += f"append {index}\n".encode()
+                (self.checkout / os.fsdecode(PATH)).write_bytes(appended)
+                self.native("commit", "--quiet", "-am", f"append {index}")
+            tip = self.push(listener, appended + b"append last\n", "append last")
+            self.drain()
+        require(self.bodies() == bodies and self.maps() == maps, "push warmed the appended tip")
+        expected = self.oracle(tip)
+        env = self.foreground
+        args = [self.observer, "--socket", self.directory / "observer.sock", "--principal", "alice",
+                "--seconds", "30", "--concurrency", "1", "--waiters", "0", "--cache",
+                "--checkpoint-key-file", env["GIT_RS_BLAME_CHECKPOINT_KEY_FILE"]]
+        with self.service("initial-map-append", args, env) as (health, listener):
+            request = f"/{SLUG}.git/blame/{tip}?path={quote_from_bytes(PATH, safe='')}"
+            started = time.monotonic()
+            response = complete_http(listener, request, maximum)
+            seconds = time.monotonic() - started
+            require(response == expected, "append blame differed from native bytes")
+            status, data = http(health, "/metrics")
+            require(status == 200, "append observer metrics unavailable")
+            counters = dict(line.rsplit(b" ", 1) for line in data.splitlines() if line and not line.startswith(b"#"))
+            prefix = b"git_rs_fixture_work_last_"
+            suffix = b'{kind="foreground"}'
+            map_lines = int(counters[prefix + b"completed_map_lines" + suffix])
+            commits = int(counters[prefix + b"commits" + suffix])
+            scanned = int(counters[b'git_rs_blame_segment_work_total{unit="scanned_edges"}'])
+            require(counters[b"git_rs_fixture_work_completions" + suffix] == b"1"
+                    and counters[b"git_rs_fixture_body_hits_total"] == b"0",
+                    "append request bypassed foreground attribution")
+            print(f"append GET: {seconds:.6f}s, {len(response)} bytes, ready_maps={len(maps)}, "
+                  f"map_lines={map_lines}, commits={commits}, cold_scanned_edges={scanned}", flush=True)
+            self.drain()
+        require(maps == {("alice", base)} and map_lines == contents.count(b"\n")
+                and 0 < commits <= APPENDS + 1 and scanned == 0,
+                "initial warm map did not supply the unchanged lines after +16 commits")
+        require(self.bodies() == bodies and self.maps() == maps,
+                "append graft unexpectedly published a new signed artifact")
 
     def exercise(self, lanes):
         self.setup()
@@ -141,12 +186,22 @@ class Initial(Fixture):
                 "worker did not finish in independent renewed quanta")
         bodies = self.bodies()
         require(set(bodies) == {("alice", tip)}, "local run did not confirm the ordinary body")
-        require(not self.maps(), "initial worker issued unrelated cache material")
         expected = self.oracle(tip)
         if self.all_pg:
             self.compressed_parts(bodies[("alice", tip)][0], expected)
-        self.verify("initial-exact-hit", "alice", tip, True,
-                    maximum=16 * 1024**2 if self.all_pg else 256 * 1024, expected=expected)
+        maximum = 16 * 1024**2 if self.all_pg else 256 * 1024
+        self.verify("initial-exact-hit", "alice", tip, True, maximum=maximum, expected=expected)
+
+        # The 4 s quanta above deliberately expire across 5 s pauses. The map
+        # gets at most a quarter of the remaining quantum and needs a whole
+        # second for its build lease. Test that optional publication in a
+        # separate pass with the ordinary fixture budget.
+        self.evict()
+        del self.warmer["GIT_RS_WARM_QUANTUM_PAUSE_MS"]
+        self.warmer["GIT_RS_WARM_JOB_SECONDS"] = "30"
+        self.once()
+        require(set(self.bodies()) == {("alice", tip)}, "map warm lost the ordinary body")
+        self.verify_append(args, tip, contents, maximum)
 
 
 def main():
@@ -160,7 +215,8 @@ def main():
     os.umask(0o077)
     signal.signal(signal.SIGTERM, stop)
     Initial(args).exercise(args.initial_lanes)
-    print(f"initial warm contract passed ({args.cache_placement}): scoped renewal, cancellation, admission, exact native hit")
+    print(f"initial warm contract passed ({args.cache_placement}): scoped renewal, cancellation, admission, "
+          "exact native hit and changed-tip map reuse")
 
 
 if __name__ == "__main__":

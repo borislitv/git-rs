@@ -1,13 +1,13 @@
 //! Explicit single-invocation initial warming. Only a promptly reduced local
 //! summary crosses quanta; no snapshot, provider, cache claim or hold does.
 use super::super::{
-    Request, SourceAccess, artifact_key, body_stage_time,
+    Request, SourceAccess, artifact_key, body_stage_time, completed,
     derive::{self, Environment},
     lookup, optional_body_io, publish_body, with_body_renewal,
 };
 use crate::{
     Result,
-    derived_cache::{BlameBuilds, BuildLimits, BuildLookup},
+    derived_cache::{BlameBuilds, BuildLimits, BuildLookup, MAX_CHUNK_BYTES},
     invalid,
     object_source::{RangeStore, WarmSource},
     process::Operation,
@@ -446,14 +446,14 @@ fn finalize(
         else {
             return Err(invalid("initial warm final body already claimed"));
         };
-        let published = optional_body_io(&control, build.deadline(), |owner| {
+        let tip = gix::ObjectId::from(target.query.commit.0);
+        let request = BlameRequest {
+            commit: &tip,
+            path: &target.query.path,
+        };
+        let certificate = optional_body_io(&control, build.deadline(), |owner| {
             with_body_renewal(&build, owner, || {
                 let session = session(env, source, budget, &control)?;
-                let tip = gix::ObjectId::from(target.query.commit.0);
-                let request = BlameRequest {
-                    commit: &tip,
-                    path: &target.query.path,
-                };
                 let blame = receipt
                     .finish(&session, request, &env.options)?
                     .ok_or_else(|| invalid("initial warm summary not complete"))?;
@@ -466,10 +466,14 @@ fn finalize(
                     budget,
                     super::super::MAX_OUTPUT as usize,
                 )?;
-                drop(blame);
-                drop(session);
+                // Retain local attribution for the optional map only if the
+                // required body's staging buffer still fits.
+                let certificate = budget
+                    .reservation(MAX_CHUNK_BYTES)
+                    .is_ok()
+                    .then_some((session, blame));
                 target.check(&held)?;
-                optional_body_io(
+                let published = optional_body_io(
                     &control,
                     Instant::now() + body_stage_time(body.len()),
                     |_| {
@@ -483,13 +487,27 @@ fn finalize(
                             &env.observer,
                         )
                     },
-                )
-                .map(|answer| answer == Some(true))
+                )?;
+                if published != Some(true) {
+                    return Err(invalid("initial warm body publication not confirmed"));
+                }
+                Ok(certificate)
             })
         })?
-        .flatten();
-        if published != Some(true) {
-            return Err(invalid("initial warm body publication not confirmed"));
+        .flatten()
+        .ok_or_else(|| invalid("initial warm body publication not confirmed"))?;
+        target.check(&held)?;
+        if let Some((session, blame)) = certificate {
+            completed::publish_local(
+                env,
+                source,
+                &session,
+                &target.principal,
+                request,
+                &blame,
+                &control,
+                budget,
+            )?;
         }
         target.check(&held)
     })

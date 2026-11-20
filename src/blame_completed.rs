@@ -286,10 +286,10 @@ pub(super) fn load(
 /// producer and live resources, and rejects results that consumed a map.
 /// No caller can supply import bytes to the signer.
 #[allow(clippy::too_many_arguments)] // Explicit live source and CPU/capacity owners.
-pub(super) fn publish_local(
+pub(super) fn publish_local<P: git_rs_core::VerifiedObjectProvider>(
     env: &Environment,
     source: &Arc<Source>,
-    session: &SnapshotSession<LazySnapshot>,
+    session: &SnapshotSession<P>,
     principal: &str,
     request: BlameRequest<'_>,
     complete: &CompleteBlame,

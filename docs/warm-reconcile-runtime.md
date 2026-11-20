@@ -69,9 +69,15 @@ the prefix and tries the normal bounded reconciliation path. Restart begins agai
 durable target, not from a partial body or persisted frontier.
 
 Only the final quantum may sign the ordinary body, and only after the core finishes the
-complete locally computed prefix and verifies its provenance. An existing exact body is a skip;
-no imported maps or WorkSets are promoted into local signing authority. Finalization claims a
-fresh ordinary body build and must confirm publication. The foreground budget is unchanged.
+complete locally computed prefix and verifies its provenance. After confirming body publication,
+the same live worker may also publish a signed completed attribution map from that local result.
+Map publication is optional and has its own key and build lease within the final quantum's budget.
+It uses at most a quarter of the remaining time, capped at 15 s, and skips claiming if the
+allotted time cannot support a whole-second build lease.
+A later authorized GET of a changed tip may reuse this map after validating the intervening history.
+An existing exact body is a skip, even if its map is absent; to populate maps for old body-only
+entries, warm after expiry or in a fresh cache namespace. No imported maps or WorkSets are promoted
+into local signing authority. The foreground budget is unchanged.
 Admission is not an RSS guarantee; configure pod limits separately. The aggregate and quantum
 deadlines are work deadlines; bounded lease cleanup may finish after them. Use an outer process
 guard for a hard wall-clock limit. Run only one initial worker per target: replicas can duplicate
@@ -80,7 +86,10 @@ prefix work because no partial-build lease survives a quantum.
 For the synthetic runtime contract use a fresh fixture below and substitute
 `tests/warm_initial_runtime.py` in the same guarded command. It requires multiple committed
 hold releases, tests ACL revoke and process termination between quanta, checks memory and
-segment-count exhaustion, and only accepts a restarted foreground exact hit with native bytes.
+segment-count exhaustion, and requires a restarted foreground exact hit with native bytes.
+In a separate warm pass with enough time for an optional build lease, it then pushes 16 append
+commits in one batch and checks that a fresh foreground process uses the signed map for every
+unchanged line, without a full scan or a new signed result.
 Add `--cache-placement all-pg` to use a compressible multipart fixture. It omits cache S3
 configuration, checks PostgreSQL placement and the stored and logical hashes of each data
 chunk, then compares the fresh HTTP hit through socket EOF. The default tests S3-backed chunks.
